@@ -12,6 +12,7 @@ class TmdbCatalog {
   final JsonTransport transport;
   final Future<String> Function() credential;
   final CatalogCache _cache;
+  int _cacheRevision = 0;
   int seasonFetchRevision = 0;
   final _seasonFetchRevisions = <String, int>{};
 
@@ -24,7 +25,10 @@ class TmdbCatalog {
   TmdbCatalog(this.transport, this.credential, {AppStore? store})
     : _cache = CatalogCache(store);
 
-  void invalidateCache() => _cache.invalidate();
+  void invalidateCache() {
+    _cacheRevision++;
+    _cache.invalidate();
+  }
 
   String _requestKey(String secret, String path, Map<String, String> query) =>
       'catalog-v1:tmdb:${sha256.convert(utf8.encode(jsonEncode([secret, path, query])))}';
@@ -36,8 +40,10 @@ class TmdbCatalog {
     bool refresh = false,
   }) async {
     cancel?.check();
+    final revision = _cacheRevision;
     final secret = (await credential()).trim();
     cancel?.check();
+    if (revision != _cacheRevision) throw const Cancelled();
     if (secret.isEmpty) {
       throw const AppFailure('请先在设置 → 常规 → 作品资料中填写 TMDB API Key 或读取令牌。');
     }
@@ -94,6 +100,7 @@ class TmdbCatalog {
           : null,
     );
     cancel?.check();
+    if (revision != _cacheRevision) throw const Cancelled();
     return response;
   }
 

@@ -73,6 +73,150 @@ void main() {
   }
 
   test(
+    'clear removes disk hits and backoff and keeps the cache reusable',
+    () async {
+      final address = url('clear-cached');
+      final original = (await cache.load(address))!;
+      expect(await cache.load(url('broken')), isNull);
+      final before = requests;
+      final changes = <PosterCacheChange>[];
+      cache.changes.addListener(() => changes.add(cache.changes.value!));
+
+      await cache.clear();
+      expect(cache.resolvedFile(address), isNull);
+      expect(await directory.list().toList(), isEmpty);
+      expect(changes, hasLength(1));
+      expect(changes.single.all, isTrue);
+      // An old mounted image failure cannot reinstall failure backoff after clear.
+      await cache.invalidate(address, failedFile: original);
+      final replacement = (await cache.load(address))!;
+      expect(
+        posterFileRevision(replacement),
+        isNot(posterFileRevision(original)),
+      );
+      expect(await replacement.readAsBytes(), png);
+      expect(await cache.load(url('broken')), isNull);
+      expect(requests, before + 2);
+      await cache.clear();
+      expect(changes.where((change) => change.all), hasLength(2));
+    },
+  );
+
+  test(
+    'clear cancels stalled HTTP and waiters before late responses arrive',
+    () async {
+      responseGate = Completer<void>();
+      final downloads = [
+        for (var i = 0; i < 12; i++)
+          cache.loadVisible(url('clear-running-$i'))!,
+      ];
+      await waitForRequests(4);
+      final clearing = cache.clear();
+      expect(cache.clear(), same(clearing));
+      expect(cache.loadVisible(url('during-clear')), isNull);
+      expect(
+        cache.loadNearby(url('during-clear-nearby'), canStart: () => true),
+        isNull,
+      );
+      expect(await cache.load(url('during-clear-direct')), isNull);
+      await clearing.timeout(const Duration(seconds: 2));
+      expect(await Future.wait(downloads), everyElement(isNull));
+      expect(requests, 4);
+      expect(await directory.list().toList(), isEmpty);
+
+      // The server sends the cancelled responses after deletion has completed.
+      responseGate!.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(await directory.list().toList(), isEmpty);
+      expect(requests, 4);
+      final file = await cache.loadVisible(url('clear-running-0'))!;
+      expect(await file!.readAsBytes(), png);
+      expect(requests, 5);
+    },
+  );
+
+  test(
+    'clear releases suspended work without frames and preserves suspension',
+    () async {
+      cache.setActive(false);
+      final old = cache.loadVisible(url('suspended-clear'))!;
+      await cache.clear().timeout(const Duration(seconds: 2));
+      expect(await old, isNull);
+      final resumed = cache.loadVisible(url('suspended-clear'))!;
+      var completed = false;
+      resumed.then((_) => completed = true);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(requests, 0);
+      expect(completed, isFalse);
+      cache.setActive(true);
+      cache.setActive(false);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(requests, 0);
+      cache.setActive(true);
+      expect(await resumed, isNotNull);
+      expect(requests, 1);
+    },
+  );
+
+  test(
+    'clear drains restoration and invalidation and admits fresh restores',
+    () async {
+      final address = url('restore-clear');
+      await cache.restore(address, Uint8List.fromList(png));
+      final invalidating = cache.invalidate(address);
+      final restoring = cache.restore(
+        url('old-restore'),
+        Uint8List.fromList(png),
+      );
+      final clearing = cache.clear();
+      await cache.restore(url('during-clear'), Uint8List.fromList(png));
+      await clearing;
+      await Future.wait([restoring, invalidating]);
+      expect(await directory.list().toList(), isEmpty);
+      expect(cache.resolvedFile(address), isNull);
+      await cache.restore(address, Uint8List.fromList(png));
+      expect(await (await cache.load(address))!.readAsBytes(), png);
+      expect(requests, 0);
+    },
+  );
+
+  test(
+    'clear waits for an already issued rename before deleting files',
+    () async {
+      final renameStarted = Completer<void>();
+      final releaseRename = Completer<void>();
+      final outerZone = Zone.current;
+      await IOOverrides.runZoned(
+        () async {
+          final restoring = cache.restore(
+            url('late-rename'),
+            Uint8List.fromList(png),
+          );
+          await renameStarted.future;
+          final clearing = cache.clear();
+          var completed = false;
+          clearing.then((_) => completed = true);
+          await Future<void>.delayed(const Duration(milliseconds: 30));
+          expect(completed, isFalse);
+          expect(cache.resolvedFile(url('late-rename')), isNull);
+          releaseRename.complete();
+          await Future.wait([restoring, clearing]);
+          expect(await directory.list().toList(), isEmpty);
+          expect(cache.resolvedFile(url('late-rename')), isNull);
+        },
+        createFile: (path) {
+          final original = outerZone.run(() => File(path));
+          return path.endsWith('.sync-part')
+              ? _DelayedRenameFile(original, renameStarted, releaseRename)
+              : original;
+        },
+      );
+      expect(await cache.load(url('late-rename')), isNotNull);
+      expect(requests, 1);
+    },
+  );
+
+  test(
     'background pause stops refilling slots and resumes the same work',
     () async {
       responseGate = Completer<void>();
@@ -646,4 +790,35 @@ void main() {
       expect(cache.resolvedFile(address), isNull);
     },
   );
+}
+
+class _DelayedRenameFile implements File {
+  final File delegate;
+  final Completer<void> started, release;
+
+  _DelayedRenameFile(this.delegate, this.started, this.release);
+
+  @override
+  String get path => delegate.path;
+
+  @override
+  Future<File> writeAsBytes(
+    List<int> bytes, {
+    FileMode mode = FileMode.write,
+    bool flush = false,
+  }) => delegate.writeAsBytes(bytes, mode: mode, flush: flush);
+
+  @override
+  Future<File> rename(String newPath) async {
+    started.complete();
+    await release.future;
+    return delegate.rename(newPath);
+  }
+
+  @override
+  Future<FileSystemEntity> delete({bool recursive = false}) =>
+      delegate.delete(recursive: recursive);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

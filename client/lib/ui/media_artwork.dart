@@ -113,7 +113,11 @@ class _MediaArtworkState extends State<MediaArtwork> {
 
   void _cacheChanged() {
     final change = widget.cache?.changes.value;
-    if (!mounted || change == null || change.url != widget.poster) return;
+    if (!mounted ||
+        change == null ||
+        (!change.all && change.url != widget.poster)) {
+      return;
+    }
     void changed() {
       _cancelDecode();
       _failedImage = null;

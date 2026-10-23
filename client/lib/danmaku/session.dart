@@ -206,6 +206,7 @@ class DanmakuSession extends ChangeNotifier {
     int generation, {
     String? savedLabel,
   }) async {
+    final cacheEpoch = store.local('cacheClearEpoch');
     final key = api.cacheKey(match.episodeId);
     List<DanmakuComment>? cached;
     try {
@@ -233,6 +234,7 @@ class DanmakuSession extends ChangeNotifier {
       if (cached == null) {
         final encoded = await encodeComments(values);
         if (!_current(generation)) return;
+        if (cacheEpoch != store.local('cacheClearEpoch')) return;
         store.cacheJson(key, encoded);
         _cachedComments = values;
       }
@@ -303,6 +305,7 @@ class DanmakuSession extends ChangeNotifier {
 
   Future<void> refresh() async {
     if (busy || !active || _refreshRequest != null) return;
+    final cacheEpoch = store.local('cacheClearEpoch');
     final generation = _generation, id = episodeId!, cancel = CancelToken();
     _refreshRequest = cancel;
     try {
@@ -324,6 +327,7 @@ class DanmakuSession extends ChangeNotifier {
           final snapshot = comments;
           final encoded = await encodeComments(snapshot);
           if (!_current(generation) || cancel.cancelled) return;
+          if (cacheEpoch != store.local('cacheClearEpoch')) return;
           store.cacheJson(api.cacheKey(id), encoded);
           _cachedComments = snapshot;
         }

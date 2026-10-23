@@ -673,6 +673,7 @@ class LibraryCatalog {
   final _episodeRefreshRetries = <String, ({DateTime after, int failures})>{};
   final DateTime Function() _now;
   int _cacheRevision = 0;
+  bool cacheMaintenance = false;
   int _episodeFetchRevision = 0;
   final _episodeFetchRevisions = <String, int>{};
   Object get episodeNamesRevision =>
@@ -801,6 +802,7 @@ class LibraryCatalog {
     int? modified,
     CancelToken? cancel,
   }) async {
+    if (cacheMaintenance) throw const Cancelled();
     while (true) {
       cancel?.check();
       final cached = directoryPreview(sourceId, path, modified: modified);
@@ -819,16 +821,24 @@ class LibraryCatalog {
     }
   }
 
-  /// Explicit user refresh only. Ordinary recognition, including force=true,
-  /// reuses successful data. In-flight obsolete requests cannot refill it.
-  void invalidateMetadataCaches() {
+  /// Stop obsolete requests immediately without scanning persistent caches.
+  /// The cache-maintenance worker handles the database transaction separately.
+  void invalidateMemoryCaches() {
     _cacheRevision++;
-    store.setLocal('directoryPreviewEpoch', _directoryPreviewEpoch(store) + 1);
     _pending.clear();
     _cache.invalidate();
     _episodeRefreshes.invalidate();
     _episodeRefreshRetries.clear();
     tmdb.invalidateCache();
+    _directories.clear();
+    _directoryStamps.clear();
+  }
+
+  /// Explicit user refresh only. Ordinary recognition, including force=true,
+  /// reuses successful data. In-flight obsolete requests cannot refill it.
+  void invalidateMetadataCaches() {
+    invalidateMemoryCaches();
+    store.setLocal('directoryPreviewEpoch', _directoryPreviewEpoch(store) + 1);
     for (final prefix in [
       'catalog-v1:',
       'subject-v5:',
@@ -848,8 +858,6 @@ class LibraryCatalog {
         store.removeLocal(key);
       }
     }
-    _directories.clear();
-    _directoryStamps.clear();
   }
 
   /// Synchronization can replace persistent directory results while the
@@ -1013,9 +1021,13 @@ class LibraryCatalog {
   }
 
   Future<String> _tmdbContext({CancelToken? cancel}) async {
+    final revision = _cacheRevision;
     try {
       final credential = (await tmdbCredential()).trim();
       cancel?.check();
+      if (cacheMaintenance || revision != _cacheRevision) {
+        throw const Cancelled();
+      }
       return credential.isEmpty
           ? ''
           : sha256.convert(utf8.encode(credential)).toString();
@@ -1023,6 +1035,9 @@ class LibraryCatalog {
       rethrow;
     } catch (_) {
       cancel?.check();
+      if (cacheMaintenance || revision != _cacheRevision) {
+        throw const Cancelled();
+      }
       return '';
     }
   }
@@ -1042,6 +1057,7 @@ class LibraryCatalog {
     String? source,
     CancelToken? cancel,
   }) async {
+    if (cacheMaintenance) throw const Cancelled();
     cancel?.check();
     final query = metadataQuery(title);
     if (query.isEmpty) return [];
@@ -1212,6 +1228,7 @@ class LibraryCatalog {
     String season = '',
     CancelToken? cancel,
   }) async {
+    if (cacheMaintenance) throw const Cancelled();
     cancel?.check();
     if (subject['provider'] == 'tmdb') {
       return tmdb.details(subject, season: season, cancel: cancel);
@@ -1304,6 +1321,7 @@ class LibraryCatalog {
     CancelToken? cancel,
     bool force = false,
   }) async {
+    if (cacheMaintenance) throw const Cancelled();
     cancel?.check();
     final selectedStrategy = strategy();
     final revision = _cacheRevision;
@@ -1375,6 +1393,7 @@ class LibraryCatalog {
     Map<String, dynamic>? subject,
     CancelToken? cancel,
   }) async {
+    if (cacheMaintenance) throw const Cancelled();
     cancel?.check();
     if (subject?['provider'] == 'tmdb') {
       return tmdb.episodeNames(subject!, cancel: cancel);
@@ -1460,6 +1479,7 @@ class LibraryCatalog {
     CancelToken? cancel,
     bool refreshCached = true,
   }) async {
+    if (cacheMaintenance) throw const Cancelled();
     if (subject['provider'] == 'tmdb' && '${subject['season'] ?? ''}'.isEmpty) {
       subject = {...subject, 'season': collection.season};
     }
@@ -1565,6 +1585,7 @@ class LibraryCatalog {
     int? directoryModified,
     CancelToken? cancel,
   }) async {
+    if (cacheMaintenance) throw const Cancelled();
     cancel?.check();
     final context = _directoryContext(sourceId);
     final revision = _cacheRevision;

@@ -334,7 +334,8 @@ extension MetadataBackgroundTasks on AppModel {
   void _checkTaskReady(MetadataTask task) {
     if (_disposed) throw const Cancelled();
     task._cancel.check();
-    if (!task.manual && (!_foreground || activePlaybackMediaId != null)) {
+    if (_clearingCaches ||
+        (!task.manual && (!_foreground || activePlaybackMediaId != null))) {
       throw const _MetadataPaused();
     }
     task._workCancel.check();
@@ -356,10 +357,10 @@ extension MetadataBackgroundTasks on AppModel {
   }
 
   Future<void> _drainMetadataTasks() async {
-    if (_disposed || _metadataWorkerRunning) return;
+    if (_disposed || _clearingCaches || _metadataWorkerRunning) return;
     _metadataWorkerRunning = true;
     try {
-      while (!_disposed) {
+      while (!_disposed && !_clearingCaches) {
         final task = _metadataTasks
             .where(
               (t) =>

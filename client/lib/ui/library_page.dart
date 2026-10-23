@@ -1979,7 +1979,8 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   bool _sourceRefreshPending = false, _sourceRefreshScheduled = false;
   Timer? _sourceRefreshTimer;
   CancelToken? _sourceRefreshCancel;
-  bool get _canRefreshSource => mounted && _routeCurrent && _foreground;
+  bool get _canRefreshSource =>
+      mounted && _routeCurrent && _foreground && !model.clearingCaches;
   late (int, int) _recordsVersion;
   late int _progressRevision;
   late int _episodeTitleRevision;
@@ -2014,6 +2015,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
     _episodeTitleRevision = model.store.localPrefixRevision('episodeTitle:');
     _titleRevision = model.titleTranslations.revision;
     _updateHeader();
+    _cacheRevision = model.cacheRevision;
     model.addListener(_metadataChanged);
   }
 
@@ -2057,7 +2059,15 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
     if (selected != null && mounted) widget.onPlay(selected);
   }
 
+  int? _cacheRevision;
   void _metadataChanged() {
+    final revision = model.cacheRevision;
+    if (_cacheRevision != revision) {
+      _cacheRevision = revision;
+      _suspendSourceRefresh();
+      _snapshotNeedsRefresh = true;
+      if (!model.clearingCaches) _queueSourceRefresh();
+    }
     _scheduleMetadataRefresh();
   }
 

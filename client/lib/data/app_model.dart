@@ -4,6 +4,7 @@ import 'package:crypto/crypto.dart';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
+import 'package:flutter/painting.dart' show PaintingBinding;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
@@ -24,6 +25,7 @@ import 'sync_profile.dart';
 import 'sync_artwork.dart';
 import 'media_previews.dart';
 import 'library_catalog.dart';
+import 'cache_maintenance.dart';
 import 'library_snapshot.dart';
 import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
@@ -37,6 +39,7 @@ import '../subtitles/ai.dart';
 part 'app_model_metadata_ai.dart';
 part 'app_model_metadata_tasks.dart';
 part 'app_model_directory_recognition.dart';
+part 'app_model_cache.dart';
 
 Duration _syncRetryDelay(int failures) {
   const seconds = [3, 6, 12, 24, 48, 96, 180, 300];
@@ -100,13 +103,31 @@ class AppModel extends ChangeNotifier {
   PosterCache? _posterCache;
   PosterCache get posterCache => _posterCache ??= (PosterCache(
     directory: Directory(p.join(documents.path, 'poster-cache-v1')),
-  )..setActive(_foreground));
+  )..setActive(_foreground && !_clearingCaches));
 
   void _prefetchPoster(String url) {
     if (_disposed || url.isEmpty) return;
     // Persist confirmed artwork as part of identification, including records
     // with no visible card. Image failures must not delay metadata success.
     unawaited(posterCache.load(url));
+  }
+
+  Future<void>? _clearCacheWork;
+  bool _clearingCaches = false;
+  bool get clearingCaches => _clearingCaches;
+  int cacheRevision = 0;
+
+  /// Clear only rebuildable local data; imports, identities and history remain.
+  Future<void> clearCaches() {
+    final pending = _clearCacheWork;
+    if (pending != null) return pending;
+    if (_disposed) return Future.error(const Cancelled());
+    final done = Completer<void>();
+    _clearCacheWork = done.future;
+    _clearingCaches = true;
+    cacheRevision++;
+    unawaited(_clearCaches().then(done.complete, onError: done.completeError));
+    return done.future;
   }
 
   int directorySortRevision = 0;
@@ -218,6 +239,7 @@ class AppModel extends ChangeNotifier {
     Map<String, String> names,
     CancelToken? cancel,
   ) async {
+    if (_clearingCaches) throw const Cancelled();
     cancel?.check();
     if (_disposed) throw const Cancelled();
     final covered = store.path == ':memory:'
@@ -237,6 +259,7 @@ class AppModel extends ChangeNotifier {
     List<SourceEntry> entries,
     CancelToken? cancel,
   ) async {
+    if (_clearingCaches) throw const Cancelled();
     cancel?.check();
     if (_disposed) throw const Cancelled();
     final result = store.path == ':memory:'
@@ -267,6 +290,7 @@ class AppModel extends ChangeNotifier {
     DirectoryPreview preview,
     CancelToken? cancel,
   ) async {
+    if (_clearingCaches) throw const Cancelled();
     cancel?.check();
     if (_disposed) throw const Cancelled();
     if (store.path == ':memory:') {
@@ -290,6 +314,7 @@ class AppModel extends ChangeNotifier {
     String path,
     CancelToken? cancel,
   ) async {
+    if (_clearingCaches) throw const Cancelled();
     cancel?.check();
     if (_disposed) throw const Cancelled();
     final result = store.path == ':memory:'
@@ -430,7 +455,7 @@ class AppModel extends ChangeNotifier {
   void setForeground(bool foreground) {
     if (_disposed || _foreground == foreground) return;
     _foreground = foreground;
-    _posterCache?.setActive(foreground);
+    _posterCache?.setActive(foreground && !_clearingCaches);
     if (!foreground) {
       _directoryEnrichmentCancel.cancel();
       _directoryEnrichmentCancel = CancelToken();
@@ -460,6 +485,7 @@ class AppModel extends ChangeNotifier {
     _syncTimer?.cancel();
     _syncTimer = null;
     if (_disposed ||
+        _clearingCaches ||
         !backgroundWork ||
         !_foreground ||
         activePlaybackMediaId != null ||
@@ -484,14 +510,17 @@ class AppModel extends ChangeNotifier {
   }
 
   void _releaseAutomaticWork() {
-    if (!_foreground || activePlaybackMediaId != null) return;
+    if (_clearingCaches || !_foreground || activePlaybackMediaId != null) {
+      return;
+    }
     _automaticReady?.complete();
     _automaticReady = null;
     unawaited(_drainMetadataTasks());
   }
 
   Future<void> _waitForAutomaticWork(CancelToken cancel) async {
-    while (!_disposed && (!_foreground || activePlaybackMediaId != null)) {
+    while (!_disposed &&
+        (_clearingCaches || !_foreground || activePlaybackMediaId != null)) {
       final ready = _automaticReady ??= Completer<void>();
       await Future.any([ready.future, cancel.whenCancelled]);
       cancel.check();
@@ -1134,6 +1163,7 @@ class AppModel extends ChangeNotifier {
     String? anchorId,
     CancelToken? cancel,
   }) async {
+    if (_clearingCaches) throw const Cancelled();
     cancel?.check();
     if (_disposed) throw const Cancelled();
     final before = _directoryContentRevision;
@@ -1176,6 +1206,7 @@ class AppModel extends ChangeNotifier {
     String? anchorId,
     CancelToken? cancel,
   }) async {
+    if (_clearingCaches) throw const Cancelled();
     cancel?.check();
     if (_disposed) throw const Cancelled();
     final before = _directoryContentRevision;
@@ -1226,6 +1257,7 @@ class AppModel extends ChangeNotifier {
     SyncRecord record, {
     CancelToken? cancel,
   }) async {
+    if (_clearingCaches) throw const Cancelled();
     cancel?.check();
     final snapshot = await loadLibrarySnapshot(cancel: cancel);
     final current = snapshot.byId[record.id];
@@ -1630,7 +1662,9 @@ class AppModel extends ChangeNotifier {
     if (!_metadataPending.add(id)) return;
     if (_batchMediaBindings != null) return;
     store.setLocal('metadata:automatic-pending', _metadataPending.toList());
-    if (!_foreground || activePlaybackMediaId != null) return;
+    if (_clearingCaches || !_foreground || activePlaybackMediaId != null) {
+      return;
+    }
     _metadataTimer?.cancel();
     _metadataTimer = Timer(const Duration(milliseconds: 350), _identifyPending);
   }
@@ -1638,6 +1672,7 @@ class AppModel extends ChangeNotifier {
   Future<void> _identifyPending() async {
     if (_disposed ||
         _identifying ||
+        _clearingCaches ||
         !_foreground ||
         activePlaybackMediaId != null ||
         preferences.metadataStrategy == 'off') {
@@ -1647,6 +1682,7 @@ class AppModel extends ChangeNotifier {
     try {
       while (_metadataPending.isNotEmpty &&
           !_disposed &&
+          !_clearingCaches &&
           _foreground &&
           activePlaybackMediaId == null &&
           preferences.metadataStrategy != 'off') {
@@ -1971,6 +2007,9 @@ class AppModel extends ChangeNotifier {
       sourceMedia(sourceId, path)?.id ?? browsingMediaId(sourceId, path);
 
   String ensureSourceMediaPreview(String sourceId, SourceEntry entry) {
+    if (_disposed || _clearingCaches) {
+      return browsingMediaId(sourceId, entry.path);
+    }
     final id = sourcePreviewId(sourceId, entry.path);
     if (sourceMedia(sourceId, entry.path) == null) {
       store.setLocal('browse:$id', {
@@ -2051,7 +2090,12 @@ class AppModel extends ChangeNotifier {
   }
 
   void ensureMediaPreview(String id) {
-    if (_disposed || _previews == null || activePlaybackMediaId != null) return;
+    if (_disposed ||
+        _clearingCaches ||
+        _previews == null ||
+        activePlaybackMediaId != null) {
+      return;
+    }
     if (!_pendingPreviewChecks.add(id)) return;
     unawaited(
       _ensureMediaPreview(id)
@@ -2065,6 +2109,7 @@ class AppModel extends ChangeNotifier {
   }
 
   Future<void> _ensureMediaPreview(String id) async {
+    final revision = cacheRevision;
     while (!_disposed && _previews != null && activePlaybackMediaId == null) {
       final record = store.get('media', id);
       final request = _previewRequest(id);
@@ -2074,7 +2119,12 @@ class AppModel extends ChangeNotifier {
       }
       final saved = store.local('preview:$id');
       final needed = await needsMediaPreview(id);
-      if (_disposed || activePlaybackMediaId != null) return;
+      if (_disposed ||
+          _clearingCaches ||
+          revision != cacheRevision ||
+          activePlaybackMediaId != null) {
+        return;
+      }
       // A newer playback frame, source edit or progress update can arrive
       // while the filesystem responds. Only schedule the current snapshot.
       final current = store.local('preview:$id');
@@ -2137,7 +2187,7 @@ class AppModel extends ChangeNotifier {
     Uint8List bytes, {
     required double position,
   }) async {
-    if (_disposed || bytes.isEmpty) return;
+    if (_disposed || _clearingCaches || bytes.isEmpty) return;
     final request = _previewRequest(id);
     if (request == null ||
         request.position == null ||
@@ -2205,6 +2255,7 @@ class AppModel extends ChangeNotifier {
     int? height,
   }) {
     if (_disposed ||
+        _clearingCaches ||
         (store.get('media', id)?.deleted != false &&
             store.local('browse:$id') == null)) {
       return;
@@ -2551,7 +2602,9 @@ class AppModel extends ChangeNotifier {
 
   void _watchSync(String address, String token) {
     final identity = '$address\u0000$token';
-    if (!_foreground || activePlaybackMediaId != null) return;
+    if (_clearingCaches || !_foreground || activePlaybackMediaId != null) {
+      return;
+    }
     if (_syncWatchIdentity == identity && _syncWatch != null) return;
     _syncWatch?.cancel();
     _syncWatchIdentity = identity;
@@ -2609,7 +2662,9 @@ class AppModel extends ChangeNotifier {
   }
 
   Future<void> synchronize({bool quiet = false, bool sharedOnly = false}) {
-    if (_disposed || (quiet && !_foreground)) return Future.value();
+    if (_disposed || _clearingCaches || (quiet && !_foreground)) {
+      return Future.value();
+    }
     if (quiet && !sharedOnly && activePlaybackMediaId != null) {
       sharedOnly = true;
     }
@@ -2632,7 +2687,11 @@ class AppModel extends ChangeNotifier {
   Future<void> _drainSync() async {
     for (
       var pass = 0;
-      pass < 2 && _syncAgain && !_disposed && (_foreground || _syncVisible);
+      pass < 2 &&
+          _syncAgain &&
+          !_disposed &&
+          !_clearingCaches &&
+          (_foreground || _syncVisible);
       pass++
     ) {
       final connectionRevision = _syncConnectionRevision;

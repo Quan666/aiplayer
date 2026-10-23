@@ -291,6 +291,13 @@ class MediaPreviewQueue {
     await _working;
   }
 
+  /// The caller pauses and awaits native work before clearing its disk cache.
+  void clearPending() {
+    _pending.clear();
+    _failed.clear();
+    _requeueActive = false;
+  }
+
   void resume() {
     if (_paused > 0) _paused--;
     _start();

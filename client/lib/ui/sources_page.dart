@@ -1785,6 +1785,7 @@ class _SourceBrowserState extends State<SourceBrowser>
   final _listingFingerprints = <String, String>{};
   final _completedInspections = <String, (String, Object)>{};
   Object? _catalogRevision;
+  int? _cacheRevision;
   Timer? _refreshTimer;
   CancelToken? _refreshCancel;
   CancelToken? _loadCancel;
@@ -1795,7 +1796,12 @@ class _SourceBrowserState extends State<SourceBrowser>
   bool _openPending = false;
   int _refreshFailures = 0;
   bool get _canRefresh =>
-      mounted && widget.active && _routeCurrent && _foreground && !playing;
+      mounted &&
+      widget.active &&
+      _routeCurrent &&
+      _foreground &&
+      !playing &&
+      !widget.model.clearingCaches;
 
   // A favorite is a separate navigation entry point. Its stack must never
   // replace the ordinary source stack with a path missing its ancestors.
@@ -1854,6 +1860,7 @@ class _SourceBrowserState extends State<SourceBrowser>
     final lifecycle = WidgetsBinding.instance.lifecycleState;
     _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     widget.model.addListener(_modelChanged);
+    _cacheRevision = widget.model.cacheRevision;
     final stored = widget.model.store.local(_stateKey);
     if (stored is Map && widget.associateId == null) {
       final savedPaths = stored['paths'];
@@ -1892,6 +1899,22 @@ class _SourceBrowserState extends State<SourceBrowser>
 
   void _modelChanged() {
     _modelDirty = true;
+    final cacheRevision = widget.model.cacheRevision;
+    if (_cacheRevision != null && _cacheRevision != cacheRevision) {
+      _refreshTimer?.cancel();
+      _refreshCancel?.cancel();
+      _loadCancel?.cancel();
+      _directoryCancel.cancel();
+      cached.clear();
+      folderCollections.clear();
+      folderQueue.clear();
+      inspectedFolders.clear();
+      _listingFingerprints.clear();
+      _completedInspections.clear();
+      _refreshFailures = 0;
+      _openPending = true;
+    }
+    _cacheRevision = cacheRevision;
     final revision = widget.model.catalog.directoryInspectionRevision(
       widget.source['id'],
     );
@@ -2516,9 +2539,16 @@ class _SourceBrowserState extends State<SourceBrowser>
       frame: frame,
       folder: false,
       onRequestPreview: () async {
-        final needed = await widget.model.needsMediaPreview(id);
-        if (needed && mounted && ticket == generation) {
-          widget.model.ensureSourceMediaPreview(sourceId, entry);
+        final model = widget.model;
+        final revision = model.cacheRevision;
+        if (!_canRefresh) return;
+        final needed = await model.needsMediaPreview(id);
+        if (needed &&
+            _canRefresh &&
+            identical(model, widget.model) &&
+            revision == model.cacheRevision &&
+            ticket == generation) {
+          model.ensureSourceMediaPreview(sourceId, entry);
         }
       },
     );

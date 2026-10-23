@@ -35,6 +35,8 @@ class _SettingsPageState extends State<SettingsPage>
   final _pages = PageController();
   final _chipKeys = <String, GlobalKey>{};
   int _searchGeneration = 0;
+  int _cacheClearGeneration = 0;
+  bool _clearingCaches = false;
   bool testingMetadata = false, refreshingMetadata = false;
   bool loading = true, saving = false;
   String group = 'general', query = '';
@@ -92,6 +94,8 @@ class _SettingsPageState extends State<SettingsPage>
     if (oldWidget.model != widget.model) {
       oldWidget.model.removeListener(_modelChanged);
       model.addListener(_modelChanged);
+      _cacheClearGeneration++;
+      _clearingCaches = false;
     }
     if (widget.active) _settingsRevision = _revision;
   }
@@ -237,6 +241,28 @@ class _SettingsPageState extends State<SettingsPage>
       } catch (error) {
         if (mounted) showFailure(context, error);
       }
+    }
+  }
+
+  Future<void> clearCaches() async {
+    if (_clearingCaches) return;
+    final target = model;
+    final generation = ++_cacheClearGeneration;
+    bool current() =>
+        mounted &&
+        identical(model, target) &&
+        generation == _cacheClearGeneration;
+    bool visible() => widget.active && _foreground && _visible;
+    setState(() => _clearingCaches = true);
+    try {
+      await target.clearCaches();
+      if (mounted && current() && visible()) {
+        showGlassSuccess(context, '缓存已清除，重新进入文件夹即可重新加载');
+      }
+    } catch (error) {
+      if (mounted && current() && visible()) showFailure(context, error);
+    } finally {
+      if (current()) setState(() => _clearingCaches = false);
     }
   }
 
@@ -781,6 +807,14 @@ class _SettingsPageState extends State<SettingsPage>
       ),
     ),
     ListTile(
+      key: const ValueKey('clear-caches'),
+      leading: const Icon(Icons.cleaning_services_outlined),
+      title: Text(_clearingCaches ? '清理中…' : '一键清除缓存'),
+      subtitle: const Text('识别、目录与图片缓存；保留来源、影视库、播放记录和手动匹配。'),
+      enabled: !_clearingCaches,
+      onTap: _clearingCaches ? null : clearCaches,
+    ),
+    ListTile(
       leading: const Icon(Icons.restore_rounded),
       title: const Text('恢复播放与操作设置'),
       trailing: const Icon(Icons.chevron_right_rounded),
@@ -954,7 +988,7 @@ class _SettingsPageState extends State<SettingsPage>
         'about',
         '关于',
         Icons.info_outline_rounded,
-        '版本 许可 重置 恢复默认 日志 诊断 排查 错误 复制',
+        '版本 许可 重置 恢复默认 日志 诊断 排查 错误 复制 缓存 清理 清除',
       ),
     ];
     List<Widget Function()> content(String id) => switch (id) {
