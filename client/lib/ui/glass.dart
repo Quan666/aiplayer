@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'theme/app_theme.dart';
+import 'artwork_scroll_scope.dart';
 
 export 'theme/app_theme.dart';
 
@@ -63,19 +64,33 @@ Future<T?> showGlassBottomSheet<T>({
       borderRadius: GlassMetrics.sheet,
       blur: 0,
       tint: GlassPalette.of(context).surface,
-      child: GlassBlurScope(enabled: false, child: builder(context)),
+      child: GlassBlurScope(
+        enabled: false,
+        child: ArtworkScrollScope(child: builder(context)),
+      ),
     ),
   ),
 );
 
 class GlassBackground extends StatelessWidget {
   final Widget child;
-  const GlassBackground({super.key, required this.child});
+  final ValueChanged<bool>? onScrollActivityChanged;
+  const GlassBackground({
+    super.key,
+    required this.child,
+    this.onScrollActivityChanged,
+  });
   @override
   Widget build(BuildContext context) {
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: AppStyles.of(context).systemOverlay,
-      child: ColoredBox(color: GlassPalette.of(context).canvas, child: child),
+      child: ColoredBox(
+        color: GlassPalette.of(context).canvas,
+        child: ArtworkScrollScope(
+          onActivityChanged: onScrollActivityChanged,
+          child: child,
+        ),
+      ),
     );
   }
 }

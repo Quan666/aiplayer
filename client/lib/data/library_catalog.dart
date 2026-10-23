@@ -297,6 +297,7 @@ class LibraryCatalog {
   )?
   aiFallback;
   final String Function() aiContext;
+  final void Function(String)? onPoster;
   final _pending = <String, Future<DirectoryCollection?>>{};
   final _directories = <String, DirectoryPreview>{};
   late final _cache = CatalogCache(store);
@@ -309,6 +310,7 @@ class LibraryCatalog {
     bool Function()? tmdbNameAssist,
     Future<String> Function()? tmdbCredential,
     this.aiFallback,
+    this.onPoster,
     String Function()? aiContext,
   }) : transport = transport ?? IoJsonTransport(),
        provider = provider ?? (() => 'bangumi'),
@@ -487,6 +489,7 @@ class LibraryCatalog {
               'episodeTitles': collection.episodeTitles,
             },
     });
+    if (collection != null) onPoster?.call(collection.poster);
   }
 
   Map<String, dynamic> _bangumiSubject(Map<String, dynamic> subject) {
@@ -1026,6 +1029,7 @@ class LibraryCatalog {
         cached.fingerprint == key &&
         cached.collection?.subject != null) {
       cancel?.check();
+      onPoster?.call(cached.collection!.poster);
       return cached.collection;
     }
     Future<DirectoryCollection?> inspectFresh() async {

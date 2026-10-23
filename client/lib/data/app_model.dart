@@ -16,6 +16,7 @@ import '../sources/configuration.dart';
 import '../sources/apple_access.dart';
 import '../sources/directory_sort.dart';
 import 'store.dart';
+import 'record_keys.dart';
 import 'credential_storage.dart';
 import 'preferences.dart';
 import 'sync.dart';
@@ -41,6 +42,14 @@ class AppModel extends ChangeNotifier {
   PosterCache get posterCache => _posterCache ??= PosterCache(
     directory: Directory(p.join(documents.path, 'poster-cache-v1')),
   );
+
+  void _prefetchPoster(String url) {
+    if (_disposed || url.isEmpty) return;
+    // Persist confirmed artwork as part of identification, including records
+    // with no visible card. Image failures must not delay metadata success.
+    unawaited(posterCache.load(url));
+  }
+
   int directorySortRevision = 0;
   DirectorySort directorySorting(String key) => DirectorySort.fromJson(
     store.local(key) ?? store.local('directorySort:default'),
@@ -123,6 +132,7 @@ class AppModel extends ChangeNotifier {
     tmdbNameAssist: () => preferences.tmdbNameAssist,
     aiFallback: _identifyDirectoryWithAi,
     aiContext: () => _metadataAiContext,
+    onPoster: _prefetchPoster,
     tmdbCredential: () async {
       final key = await secrets.read(key: 'tmdb.apiKey') ?? '';
       AppLog.instance.rememberSecret(key);
@@ -298,6 +308,7 @@ class AppModel extends ChangeNotifier {
     }
     return _preferences!;
   }
+
   Future<void> updatePreferences(Map<String, dynamic> patch) async {
     final checked = preferences.checkedPatch(patch);
     store.setLocal('settings', {...settings, ...checked});
@@ -597,6 +608,7 @@ class AppModel extends ChangeNotifier {
         title.isNotEmpty && store.local('episodeTitle:$id') != title;
     if (dataChanged) store.save('media', id, updated);
     if (titleChanged) store.setLocal('episodeTitle:$id', title);
+    if (collection.subject != null) _prefetchPoster(collection.poster);
     if (notify && (dataChanged || titleChanged)) notifyListeners();
     return dataChanged || titleChanged;
   }
@@ -864,8 +876,10 @@ class AppModel extends ChangeNotifier {
           .toSet();
       if (ids.length != 1) continue;
       final missing = group
-          .where((item) =>
-              item.data['bangumiId'] == null && item.data['tmdbId'] == null)
+          .where(
+            (item) =>
+                item.data['bangumiId'] == null && item.data['tmdbId'] == null,
+          )
           .toList();
       for (var offset = 0; offset < missing.length; offset += 24) {
         await _waitForAutomaticWork(_metadataCancel);
@@ -943,6 +957,7 @@ class AppModel extends ChangeNotifier {
       for (final key in _metadataFields)
         if (donor.data.containsKey(key)) key: donor.data[key],
     });
+    _prefetchPoster('${donor.data['poster'] ?? ''}');
     final names = store.local('metadataEpisodeNames:${_identityKey(record)}');
     final episodeName = names is Map
         ? names['${record.data['episode']}']
@@ -1017,8 +1032,9 @@ class AppModel extends ChangeNotifier {
   Iterable<SyncRecord> _metadataRecords(Set<String>? mediaIds) {
     if (mediaIds == null) return media;
     final ids = mediaIds.toList()..sort();
-    return [for (final id in ids) ?store.get('media', id)]
-        .where((record) => !record.deleted && record.data['transient'] != true);
+    return [
+      for (final id in ids) ?store.get('media', id),
+    ].where((record) => !record.deleted && record.data['transient'] != true);
   }
 
   Future<void> _applyEpisodeNames(
@@ -1677,7 +1693,8 @@ class AppModel extends ChangeNotifier {
           if (store.recordsRevision('media') != donorRevision) {
             donors = {};
             for (final item in media) {
-              if (item.data['bangumiId'] != null || item.data['tmdbId'] != null) {
+              if (item.data['bangumiId'] != null ||
+                  item.data['tmdbId'] != null) {
                 (donors[_identityKey(item)] ??= []).add(item);
               }
             }
@@ -1764,10 +1781,13 @@ class AppModel extends ChangeNotifier {
     String? targetSeason,
     Set<String>? mediaIds,
   }) {
+    var applied = false;
+    final fields = subjectMediaFields(subject);
     for (final item in _metadataRecords(mediaIds).where(
       (m) =>
           mediaIds != null ||
-          (normalizedSeries('${m.data['series']}') == normalizedSeries(series) &&
+          (normalizedSeries('${m.data['series']}') ==
+                  normalizedSeries(series) &&
               (season == null || '${m.data['season'] ?? ''}' == season)),
     )) {
       if (!manual &&
@@ -1781,7 +1801,7 @@ class AppModel extends ChangeNotifier {
         ..remove('tmdbId');
       store.save('media', item.id, {
         ...data,
-        ...subjectMediaFields(subject),
+        ...fields,
         if (manual && targetSeason != null) 'season': targetSeason,
         if (subject['mediaType'] == 'movie') ...{
           'season': '',
@@ -1791,19 +1811,15 @@ class AppModel extends ChangeNotifier {
       });
       store.removeLocal('episodeTitle:${item.id}');
       if (manual) store.setLocal('manualMetadata:${item.id}', true);
+      applied = true;
     }
+    if (applied) _prefetchPoster('${fields['poster']}');
     notifyListeners();
   }
 
   String progressKey(SyncRecord media) =>
       '${media.id}:${(store.local('location:${media.id}')?['size'] ?? media.data['size'] ?? 0)}';
-  String watchedKey(SyncRecord media) => sha256
-      .convert(
-        utf8.encode(
-          '${media.data['tmdbId'] != null ? 'tmdb:${media.data['metadataType'] ?? 'tv'}:${media.data['tmdbId']}' : media.data['bangumiId'] ?? media.data['series']}:${media.data['season']}:${media.data['episode']}',
-        ),
-      )
-      .toString();
+  String watchedKey(SyncRecord media) => mediaWatchedKey(media);
   void requestArtworkSync(String mediaId) {
     if (_disposed) return;
     _syncArtworkIds.add(mediaId);
@@ -1830,6 +1846,18 @@ class AppModel extends ChangeNotifier {
     _syncWatch?.cancel();
     _syncWatchIdentity = identity;
     final cancel = _syncWatch = CancelToken();
+    Future<void> pause(Duration duration) async {
+      if (cancel.cancelled) return;
+      final elapsed = Completer<void>();
+      final timer = Timer(duration, elapsed.complete);
+      try {
+        await Future.any([elapsed.future, cancel.whenCancelled]);
+      } finally {
+        // Winning the cancellation race must also release its delayed timer.
+        timer.cancel();
+      }
+    }
+
     unawaited(() async {
       while (!_disposed && !cancel.cancelled) {
         final started = DateTime.now();
@@ -1843,10 +1871,7 @@ class AppModel extends ChangeNotifier {
           realtimeConnected = true;
           if (changed) await synchronize(quiet: true, sharedOnly: true);
           if (DateTime.now().difference(started).inMilliseconds < 1000) {
-            await Future.any([
-              Future<void>.delayed(const Duration(seconds: 1)),
-              cancel.whenCancelled,
-            ]);
+            await pause(const Duration(seconds: 1));
           }
         } on Cancelled {
           return;
@@ -1854,10 +1879,7 @@ class AppModel extends ChangeNotifier {
           if (_disposed || cancel.cancelled) return;
           realtimeConnected = false;
           if (!_disposed) notifyListeners();
-          await Future.any([
-            Future<void>.delayed(const Duration(seconds: 3)),
-            cancel.whenCancelled,
-          ]);
+          await pause(const Duration(seconds: 3));
         }
       }
     }());
@@ -1883,13 +1905,18 @@ class AppModel extends ChangeNotifier {
   }
 
   Future<void> _drainSync() async {
-    for (var pass = 0;
-        pass < 2 && _syncAgain && !_disposed && (_foreground || _syncVisible);
-        pass++) {
+    for (
+      var pass = 0;
+      pass < 2 && _syncAgain && !_disposed && (_foreground || _syncVisible);
+      pass++
+    ) {
       final connectionRevision = _syncConnectionRevision;
       final full = _syncNeedsFull, visible = _syncVisible;
-      final artworkIds = Set<String>.of(_syncArtworkIds);
-      _syncArtworkIds.clear();
+      // Compression/encryption and source snapshots can wait until playback
+      // ends. Keep their IDs queued while only progress is being uploaded.
+      final deferArtwork = !visible && activePlaybackMediaId != null;
+      final artworkIds = deferArtwork ? <String>{} : Set<String>.of(_syncArtworkIds);
+      if (!deferArtwork) _syncArtworkIds.clear();
       _syncAgain = false;
       _syncNeedsFull = false;
       _syncVisible = false;
@@ -1955,6 +1982,7 @@ class AppModel extends ChangeNotifier {
         sharedOnly: sharedOnly,
         artworkIds: artworkIds,
         deferProfile: deferProfile,
+        playbackOnly: quiet && sharedOnly && deferProfile,
         cancel: cancel,
       );
       if (_disposed ||
@@ -1963,7 +1991,7 @@ class AppModel extends ChangeNotifier {
         return false;
       }
       _nextSyncAttempt = null;
-      if (_catalogProfileRevision != sync.profileRevision) {
+      if (!deferProfile && _catalogProfileRevision != sync.profileRevision) {
         catalog.reloadSyncedDirectoryPreviews();
         _catalogProfileRevision = sync.profileRevision;
       }
@@ -1984,10 +2012,14 @@ class AppModel extends ChangeNotifier {
       final message = '同步失败：${safeFailure(e).message}';
       if (!quiet) status = message;
       AppLog.instance.warning('同步', message);
-      if (!_disposed) notifyListeners();
+      if (!_disposed && (!quiet || activePlaybackMediaId == null)) {
+        notifyListeners();
+      }
       return false;
     }
-    if (!_disposed) notifyListeners();
+    if (!_disposed && (!quiet || activePlaybackMediaId == null)) {
+      notifyListeners();
+    }
     return true;
   }
 

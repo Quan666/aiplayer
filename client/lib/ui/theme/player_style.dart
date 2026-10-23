@@ -25,14 +25,20 @@ abstract final class PlayerTheme {
   static const menuMaxHeight = 420.0;
   static const menuGap = 8.0;
   static const menuRowHeight = 42.0;
-  static const choiceRowWithSubtitleHeight = 48.0;
+  static const choiceRowHeight = 40.0;
+  static const choiceTrackRowHeight = 44.0;
+  static const choiceRowWithSubtitleHeight = 56.0;
   static const choiceContentPadding = EdgeInsets.symmetric(horizontal: 16);
-  static const choiceTitleGap = 8.0;
+  static const choiceTilePadding = EdgeInsets.symmetric(
+    horizontal: 8,
+    vertical: 4,
+  );
+  static const choiceTitleGap = 4.0;
   static const choiceIconSize = 20.0;
   static const menuLabelPadding = 76.0;
   static const viewportInset = 12.0;
   static const controlsEntranceMilliseconds = 240;
-  static const choiceMenuPadding = EdgeInsets.fromLTRB(12, 8, 12, 12);
+  static const choiceMenuPadding = EdgeInsets.all(6);
 
   static const blurSigma = 14.0;
   static const glassEdgeWidth = .8;

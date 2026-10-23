@@ -188,7 +188,30 @@ static void my_application_activate(GApplication* application) {
     gtk_window_set_title(window, "映库");
   }
 
-  gtk_window_set_default_size(window, 1280, 720);
+  // GTK sizes the content independently of the title bar. Fit smaller screens
+  // proportionally instead of letting the window manager clip a 720p window.
+  int width = 1280;
+  int height = 720;
+  GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(window));
+  GdkMonitor* monitor = gdk_display_get_primary_monitor(display);
+  if (!monitor && gdk_display_get_n_monitors(display) > 0) {
+    monitor = gdk_display_get_monitor(display, 0);
+  }
+  if (monitor) {
+    GdkRectangle work;
+    gdk_monitor_get_workarea(monitor, &work);
+    int title_height = 0;
+    if (GtkWidget* titlebar = gtk_window_get_titlebar(window)) {
+      gtk_widget_get_preferred_height(titlebar, nullptr, &title_height);
+    }
+    const double scale = std::max(0.0, std::min({1.0,
+        (work.width * 0.9 - 16) / width,
+        (work.height * 0.9 - std::max(48, title_height)) / height}));
+    width = std::max(1, static_cast<int>(std::floor(width * scale)));
+    height = std::max(1, static_cast<int>(std::floor(height * scale)));
+  }
+  gtk_window_set_default_size(window, width, height);
+  gtk_window_set_position(window, GTK_WIN_POS_CENTER);
   g_autofree gchar* executable = g_file_read_link("/proc/self/exe", nullptr);
   if (executable != nullptr) {
     g_autofree gchar* directory = g_path_get_dirname(executable);

@@ -718,13 +718,14 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                   (track) => track.id == current.player.state.track.audio.id,
                 ) +
                 1,
-            itemExtent: 56 * MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+            itemExtent:
+                PlayerTheme.choiceTrackRowHeight *
+                MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
             padding: PlayerTheme.choiceMenuPadding,
             itemCount: tracks.isEmpty ? 2 : tracks.length + 1,
             itemBuilder: (_, index) {
               if (index == 0) {
-                return ListTile(
-                  contentPadding: PlayerTheme.choiceContentPadding,
+                return PlayerChoiceTile(
                   title: Text(
                     '音轨',
                     style: PlayerTheme.of(context).selectedLabelStyle,
@@ -732,10 +733,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                 );
               }
               if (tracks.isEmpty) {
-                return const ListTile(
-                  contentPadding: PlayerTheme.choiceContentPadding,
-                  title: Text('暂无可用音轨'),
-                );
+                return const PlayerChoiceTile(title: Text('暂无可用音轨'));
               }
               final track = tracks[index - 1];
               return _trackRow(
@@ -771,13 +769,14 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       builder: (c) => PlayerMenuList(
         key: const ValueKey('player-speed-popup'),
         selectedIndex: rates.indexOf(current.player.state.rate) + 1,
-        itemExtent: 48 * MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+        itemExtent:
+            PlayerTheme.choiceRowHeight *
+            MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
         padding: PlayerTheme.choiceMenuPadding,
         itemCount: rates.length + 1,
         itemBuilder: (_, index) {
           if (index == 0) {
-            return ListTile(
-              contentPadding: PlayerTheme.choiceContentPadding,
+            return PlayerChoiceTile(
               title: Text(
                 '播放速度',
                 style: PlayerTheme.of(context).selectedLabelStyle,
@@ -841,13 +840,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                     Switch(
                       value: d.visible,
                       onChanged: (v) {
-                        d.configure(show: v);
                         session.updateSettings({'danmuVisible': v});
-                        if (v && d.episodeId == null) {
-                          d.identify(
-                            ReleaseName(title.text, season.text, episode.text),
-                          );
-                        }
                       },
                     ),
                   ],
@@ -1319,6 +1312,10 @@ class _PlayerControlsState extends State<_PlayerControls>
   void initState() {
     super.initState();
     s.addListener(update);
+    FocusManager.instance.addEarlyKeyEventHandler(_keyEvent);
+    if (!mobile) {
+      GestureBinding.instance.pointerRouter.addGlobalRoute(_desktopPointer);
+    }
     widget.display.orientation.addListener(_gravityChanged);
     WidgetsBinding.instance.addObserver(this);
     widget.display.readBrightness().then((value) {
@@ -1558,17 +1555,21 @@ class _PlayerControlsState extends State<_PlayerControls>
     final p = widget.model.preferences;
     switch (action) {
       case 'playPause':
+      case 'playPauseAlternate':
         unawaited(s.togglePlayback());
       case 'seekBackward':
       case 'seekForward':
+      case 'skipBackward':
+      case 'skipForward':
         if (s.player.state.duration <= Duration.zero) {
           _feedback('当前视频暂不支持跳转', Icons.info_outline_rounded);
           return;
         }
-        final backwards = action == 'seekBackward';
-        seekBy(backwards ? -p.seekStepSeconds : p.seekStepSeconds);
+        final backwards = action == 'seekBackward' || action == 'skipBackward';
+        final seconds = action.startsWith('skip') ? 89 : p.seekStepSeconds;
+        seekBy(backwards ? -seconds : seconds);
         _feedback(
-          '${backwards ? '−' : '+'}${p.seekStepSeconds} 秒',
+          '${backwards ? '−' : '+'}$seconds 秒',
           backwards ? Icons.fast_rewind_rounded : Icons.fast_forward_rounded,
         );
       case 'volumeUp':
@@ -1769,6 +1770,61 @@ class _PlayerControlsState extends State<_PlayerControls>
     }
   }
 
+  void _desktopPointer(PointerEvent event) {
+    if (!mounted ||
+        s.closed ||
+        _closing ||
+        (event is! PointerHoverEvent && event is! PointerMoveEvent)) {
+      return;
+    }
+    // Receive movement even while fullscreen transitions or disappearing
+    // controls change the hit-test path beneath the mouse.
+    final box = context.findRenderObject();
+    if (box is! RenderBox ||
+        !box.hasSize ||
+        !(Offset.zero & box.size).contains(box.globalToLocal(event.position))) {
+      return;
+    }
+    _pointerActivity(event);
+  }
+
+  KeyEventResult _keyEvent(KeyEvent event) {
+    if (!mounted ||
+        s.closed ||
+        _closing ||
+        ModalRoute.of(context)?.isCurrent != true) {
+      return KeyEventResult.ignored;
+    }
+    final focus = FocusManager.instance.primaryFocus?.context;
+    if (focus?.widget is EditableText ||
+        focus?.findAncestorWidgetOfExactType<EditableText>() != null) {
+      return KeyEventResult.ignored;
+    }
+    // Handle player keys before a focused slider or button consumes arrows
+    // and Space. Modal routes and text fields retain their own keyboard input.
+    if (!mobile &&
+        event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.escape) {
+      unawaited(widget.fullscreen ? _exitFull() : _back());
+      return KeyEventResult.handled;
+    }
+    final p = widget.model.preferences;
+    if (!p.keyboardEnabled || locked) return KeyEventResult.ignored;
+    final action = shortcutAction(event, p.shortcuts);
+    if (action == null) {
+      // Suppressed toggle repeats must not fall through to a focused button's
+      // default Space/Enter activation (which accepts repeats).
+      if (event is KeyRepeatEvent &&
+          shortcutAction(event, p.shortcuts, respectRepeatPolicy: false) !=
+              null) {
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    _action(action);
+    return KeyEventResult.handled;
+  }
+
   void reveal() {
     show = true;
     hideTimer.configure(
@@ -1847,6 +1903,10 @@ class _PlayerControlsState extends State<_PlayerControls>
   @override
   void dispose() {
     _cancelSurfaceTaps(rebuild: false);
+    FocusManager.instance.removeEarlyKeyEventHandler(_keyEvent);
+    if (!mobile) {
+      GestureBinding.instance.pointerRouter.removeGlobalRoute(_desktopPointer);
+    }
     hideTimer.dispose();
     final preview = seekPreview;
     if (preview != null) PlayerPage._trackDisposal(preview.close());
@@ -2038,20 +2098,25 @@ class _PlayerControlsState extends State<_PlayerControls>
           key: const ValueKey('player-playlist-popup'),
           selectedIndex:
               items.indexWhere((media) => media.id == s.media.id) + 1,
-          itemExtent: 76 * MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+          itemExtent:
+              PlayerTheme.choiceRowWithSubtitleHeight *
+              MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
           padding: PlayerTheme.choiceMenuPadding,
           itemCount: items.length + 1,
           itemBuilder: (_, index) {
             if (index == 0) {
-              return ListTile(
-                contentPadding: PlayerTheme.choiceContentPadding,
-                title: Text(
-                  '播放列表',
+              return PlayerChoiceTile(
+                title: Text.rich(
+                  TextSpan(
+                    text: '播放列表',
+                    children: [
+                      TextSpan(
+                        text: ' · ${items.length} 集',
+                        style: PlayerTheme.of(context).mutedStyle,
+                      ),
+                    ],
+                  ),
                   style: PlayerTheme.of(context).selectedLabelStyle,
-                ),
-                trailing: Text(
-                  '${items.length} 集',
-                  style: PlayerTheme.of(context).mutedStyle,
                 ),
               );
             }
@@ -2108,34 +2173,6 @@ class _PlayerControlsState extends State<_PlayerControls>
       _ => '完整显示',
     }, Icons.fit_screen_rounded);
     if (mounted) setState(reveal);
-  }
-
-  Future<void> _screenshot() async {
-    try {
-      final path = await _panel<String>(() => s.saveScreenshot());
-      if (path != null && mounted) _feedback('截图已保存', Icons.check_rounded);
-    } catch (error) {
-      if (mounted) {
-        await _panel<void>(
-          () => showDialog<void>(
-            context: PlayerTheme.routeContext(context),
-            barrierColor: PlayerTheme.of(context).barrierColor,
-            builder: (c) => PlayerTheme.surface(
-              PlayerDialog(
-                title: const Text('截图失败'),
-                content: Text(safeFailure(error).message),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(c),
-                    child: const Text('关闭'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      }
-    }
   }
 
   Widget _touchSurface(Widget child) => Listener(
@@ -2277,38 +2314,6 @@ class _PlayerControlsState extends State<_PlayerControls>
       },
       child: Focus(
         autofocus: true,
-        onKeyEvent: (node, event) {
-          // Escape remains the window's exit key even with touch controls
-          // locked or configurable playback shortcuts disabled.
-          if (!mobile &&
-              event is KeyDownEvent &&
-              event.logicalKey == LogicalKeyboardKey.escape &&
-              ModalRoute.of(context)?.isCurrent == true) {
-            if (widget.fullscreen) {
-              unawaited(_exitFull());
-            } else {
-              unawaited(_back());
-            }
-            return KeyEventResult.handled;
-          }
-          if (!p.keyboardEnabled ||
-              locked ||
-              ModalRoute.of(context)?.isCurrent != true) {
-            return KeyEventResult.ignored;
-          }
-          final focus = FocusManager.instance.primaryFocus?.context;
-          final editing =
-              focus?.widget is EditableText ||
-              focus?.findAncestorWidgetOfExactType<EditableText>() != null;
-          final action = shortcutAction(
-            event,
-            p.shortcuts,
-            editingText: editing,
-          );
-          if (action == null) return KeyEventResult.ignored;
-          _action(action);
-          return KeyEventResult.handled;
-        },
         child: MouseRegion(
           cursor: !mobile && widget.fullscreen && !show
               ? SystemMouseCursors.none
@@ -2759,9 +2764,10 @@ class _PlayerControlsState extends State<_PlayerControls>
                                         onPressed: _settings,
                                       ),
                                       _PlayerButton(
-                                        tooltip: '截图',
-                                        icon: Icons.camera_alt_outlined,
-                                        onPressed: _screenshot,
+                                        tooltip: '弹幕',
+                                        icon: Icons.chat_bubble_outline_rounded,
+                                        onPressed: () =>
+                                            _panel<void>(widget.onDanmaku),
                                       ),
                                       _PlayerButton(
                                         key: _playlistAnchor,
@@ -2980,4 +2986,3 @@ class _OptionRow extends StatelessWidget {
     onTap: onTap,
   );
 }
-

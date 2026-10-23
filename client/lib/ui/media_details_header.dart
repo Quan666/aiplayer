@@ -184,18 +184,28 @@ class _MediaTitleTranslationState extends State<MediaTitleTranslation> {
   String error = '';
   CancelToken? cancel;
   Set<String>? _titles;
+  int _titlesRevision = -1;
   late int _titleRevision;
   late String _profile;
   String get seriesKey => widget.records.isEmpty
       ? 'title:${widget.title}'
       : mediaSeriesKey(widget.records.first);
-  Set<String> get titles => _titles ??= {
-    widget.title,
-    for (final item in widget.records) mediaSeriesName(item),
-    for (final item in widget.records)
-      if (widget.model.originalEpisodeTitle(item).trim().isNotEmpty)
-        widget.model.originalEpisodeTitle(item),
-  };
+  Set<String> get titles {
+    final revision = widget.model.store.localRevision;
+    // Episode names can arrive after the media snapshot, without changing its
+    // records. Refresh lazily when checking or requesting a translation.
+    if (_titles == null || _titlesRevision != revision) {
+      _titlesRevision = revision;
+      final result = {widget.title};
+      for (final item in widget.records) {
+        result.add(mediaSeriesName(item));
+        final episodeTitle = widget.model.originalEpisodeTitle(item);
+        if (episodeTitle.trim().isNotEmpty) result.add(episodeTitle);
+      }
+      _titles = result;
+    }
+    return _titles!;
+  }
 
   @override
   void initState() {
@@ -218,6 +228,7 @@ class _MediaTitleTranslationState extends State<MediaTitleTranslation> {
   void didUpdateWidget(MediaTitleTranslation oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.title != widget.title ||
+        oldWidget.model != widget.model ||
         oldWidget.records != widget.records) {
       _titles = null;
     }

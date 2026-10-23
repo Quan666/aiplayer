@@ -111,4 +111,71 @@ void main() {
       expect(clock.pendingTimers, isEmpty);
     });
   });
+
+  test('slow periodic writes do not block timers and close waits for each', () {
+    fakeAsync((clock) {
+      final pending = <Completer<void>>[];
+      var captures = 0;
+      final checkpoints = PlaybackCheckpoints(
+        isPlaying: () => true,
+        saveProgress: () {
+          final write = Completer<void>();
+          pending.add(write);
+          return write.future;
+        },
+        capturePreview: () async => captures++,
+        onError: (error) => fail('$error'),
+      )..start();
+      clock.elapse(const Duration(seconds: 30));
+      expect(pending, hasLength(3));
+      expect(captures, 0);
+
+      var closed = false;
+      checkpoints.close().then((_) => closed = true);
+      clock.flushMicrotasks();
+      expect(captures, 1);
+      for (final write in pending.skip(1)) {
+        write.complete();
+      }
+      clock.flushMicrotasks();
+      expect(closed, isFalse);
+      pending.first.complete();
+      clock.flushMicrotasks();
+      expect(closed, isTrue);
+      expect(clock.pendingTimers, isEmpty);
+    });
+  });
+
+  test(
+    'asynchronous persistence errors are reported and later saves continue',
+    () {
+      fakeAsync((clock) {
+        final first = Completer<void>();
+        final errors = <Object>[];
+        var saves = 0;
+        final checkpoints = PlaybackCheckpoints(
+          isPlaying: () => true,
+          saveProgress: () {
+            saves++;
+            if (saves == 1) return first.future;
+          },
+          capturePreview: () async {},
+          onError: errors.add,
+        )..start();
+        clock.elapse(PlaybackCheckpoints.interval);
+        final failure = StateError('Disk unavailable');
+        first.completeError(failure);
+        clock.flushMicrotasks();
+        expect(errors, [failure]);
+        clock.elapse(PlaybackCheckpoints.interval);
+        expect(saves, 2);
+        var closed = false;
+        checkpoints.close().then((_) => closed = true);
+        clock.flushMicrotasks();
+        expect(closed, isTrue);
+        expect(errors, [failure]);
+        expect(clock.pendingTimers, isEmpty);
+      });
+    },
+  );
 }

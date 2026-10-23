@@ -1,6 +1,7 @@
 import 'package:aiplayer/ui/player_theme.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 List<Color> _glassColors(WidgetTester tester, Finder glass) {
@@ -34,7 +35,7 @@ void main() {
                 height: 280,
                 child: PlayerMenuList(
                   selectedIndex: selected,
-                  itemExtent: 56,
+                  itemExtent: PlayerTheme.choiceRowHeight,
                   itemCount: 1000,
                   itemBuilder: (_, index) {
                     built.add(index);
@@ -55,6 +56,19 @@ void main() {
         expect(built.length, lessThan(30));
         final viewport = tester.getRect(find.byType(ListView));
         final item = tester.getRect(find.byKey(ValueKey(selected)));
+        expect(item.height, PlayerTheme.choiceRowHeight);
+        final title = find.text('选项 $selected');
+        final titleRect = tester.getRect(title);
+        expect(titleRect.left, closeTo(item.left + 8, .1));
+        expect(titleRect.center.dy, closeTo(item.center.dy, .1));
+        expect(
+          tester
+              .renderObject<RenderParagraph>(
+                find.descendant(of: title, matching: find.byType(RichText)),
+              )
+              .textAlign,
+          TextAlign.start,
+        );
         if (selected == 0) {
           expect(item.top, viewport.top);
         } else if (selected == 999) {
@@ -248,9 +262,12 @@ void main() {
         final selectedLabel = selected == 'contain' ? '完整显示' : '填满画面';
         await tester.tap(find.text(selectedLabel));
         await tester.pumpAndSettle();
-        final selectedTile = find.widgetWithText(ListTile, selectedLabel);
+        final selectedTile = find.widgetWithText(
+          PlayerChoiceTile,
+          selectedLabel,
+        );
         final nestedTheme = Theme.of(tester.element(selectedTile));
-        expect(tester.widget<ListTile>(selectedTile).selected, isTrue);
+        expect(tester.widget<PlayerChoiceTile>(selectedTile).selected, isTrue);
         expect(nestedTheme.extension<PlayerTokens>(), tokens);
         expect(nestedTheme.extension<GlassColors>()!.danger, appearance.danger);
         expect(nestedTheme.textTheme.bodyMedium!.fontFamily, appearance.font);
@@ -281,7 +298,7 @@ void main() {
         );
         await tester.tap(
           find.widgetWithText(
-            ListTile,
+            PlayerChoiceTile,
             selected == 'contain' ? '填满画面' : '完整显示',
           ),
         );
@@ -365,7 +382,10 @@ void main() {
         );
         await tester.tap(find.text('原始音轨'));
         await tester.pumpAndSettle();
-        final selected = find.widgetWithText(ListTile, '原始音轨');
+        final selected = find.widgetWithText(
+          popover ? ListTile : PlayerChoiceTile,
+          '原始音轨',
+        );
         expect(
           Theme.of(tester.element(selected)).extension<PlayerTokens>(),
           initial,
@@ -393,7 +413,12 @@ void main() {
         expect(theme.colorScheme.error, danger);
         expect(theme.textTheme.bodyMedium!.fontFamily, 'ReplacementPlayerFont');
         expect(theme.textTheme.bodySmall!.fontSize, 16);
-        expect(tester.widget<ListTile>(selected).selected, isTrue);
+        expect(
+          popover
+              ? tester.widget<ListTile>(selected).selected
+              : tester.widget<PlayerChoiceTile>(selected).selected,
+          isTrue,
+        );
         expect(theme.listTileTheme.selectedColor, replacement.foreground);
         expect(
           theme.listTileTheme.selectedTileColor,
@@ -797,11 +822,11 @@ void main() {
     expect(find.byType(BackdropFilter), findsNothing);
     expect(
       Theme.of(
-        tester.element(find.widgetWithText(ListTile, '填满画面')),
+        tester.element(find.widgetWithText(PlayerChoiceTile, '填满画面')),
       ).brightness,
       Brightness.dark,
     );
-    await tester.tap(find.widgetWithText(ListTile, '填满画面'));
+    await tester.tap(find.widgetWithText(PlayerChoiceTile, '填满画面'));
     await tester.pumpAndSettle();
     expect(selected, 'cover');
     await tester.pumpWidget(
@@ -926,7 +951,7 @@ void main() {
     );
     await tester.tap(find.text('音轨 0'));
     await tester.pumpAndSettle();
-    expect(find.byType(ListTile).evaluate().length, lessThan(30));
+    expect(find.byType(PlayerChoiceTile).evaluate().length, lessThan(30));
     expect(find.text('音轨 499'), findsNothing);
     final scroll = tester
         .state<ScrollableState>(

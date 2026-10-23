@@ -20,6 +20,30 @@ import 'package:aiplayer/danmaku/overlay.dart';
 import 'package:aiplayer/main.dart';
 import 'package:aiplayer/core/external_open.dart';
 import 'package:aiplayer/ui/player_page.dart';
+import 'package:aiplayer/ui/player_theme.dart';
+
+void expectChoiceTextAlignment(WidgetTester tester, Finder title) {
+  final tile = find.ancestor(
+    of: title,
+    matching: find.byType(PlayerChoiceTile),
+  );
+  final tileRect = tester.getRect(tile);
+  final textBlock = find.descendant(of: tile, matching: find.byType(Column));
+  expect(tester.getRect(title).left, closeTo(tileRect.left + 8, .1));
+  expect(
+    tester.getRect(textBlock).center.dy,
+    closeTo(tileRect.center.dy, .1),
+    reason: 'The title and subtitle form one vertically centered text block',
+  );
+  expect(
+    tester
+        .renderObject<RenderParagraph>(
+          find.descendant(of: title, matching: find.byType(RichText)),
+        )
+        .textAlign,
+    TextAlign.start,
+  );
+}
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -216,7 +240,7 @@ void main() {
         await tester.pump(const Duration(milliseconds: 100));
       }
       expect(playback.player.state.position.inSeconds, closeTo(12, 1));
-      playback.saveProgress();
+      await playback.saveProgress();
       expect(
         model.store
             .get('progress', model.progressKey(record))!
@@ -302,11 +326,15 @@ void main() {
       }
       expect(pagePlayback.error, isEmpty);
       expect(pagePlayback.ready, true);
+      // Keep the initial toolbar assertion stable while the native host is
+      // busy; auto-hide is exercised separately with playback running below.
+      await pagePlayback.player.pause();
+      await tester.pump(const Duration(milliseconds: 100));
       expect(
         Theme.of(tester.element(find.byType(Video))).brightness,
         Brightness.dark,
       );
-      if (find.byTooltip('播放器设置').evaluate().isEmpty) {
+      if (find.byTooltip('播放器设置').hitTestable().evaluate().isEmpty) {
         await tester.tapAt(tester.getCenter(find.byType(Video)));
         await tester.pump(const Duration(milliseconds: 350));
       }
@@ -316,6 +344,8 @@ void main() {
         findsNothing,
         reason: 'Revealing controls must not blur the live video texture',
       );
+      expect(find.byTooltip('截图'), findsNothing);
+      expect(find.byTooltip('弹幕').hitTestable(), findsOneWidget);
       expect(find.byTooltip('加入同步播放'), findsNothing);
       expect(find.byTooltip('退出同步播放'), findsNothing);
       expect(
@@ -423,13 +453,13 @@ void main() {
       final castRect = tester.getRect(find.byTooltip('投屏'));
       final volumeRect = tester.getRect(find.byTooltip('静音'));
       final settingsRect = tester.getRect(find.byTooltip('播放器设置'));
-      final screenshotRect = tester.getRect(find.byTooltip('截图'));
+      final danmakuRect = tester.getRect(find.byTooltip('弹幕'));
       expect(find.byTooltip('退出全屏'), findsNothing);
       expect(find.byTooltip('切换全屏'), findsNothing);
       expect(castRect.center.dx, lessThan(volumeRect.center.dx));
       expect((castRect.center.dy - volumeRect.center.dy).abs(), lessThan(2));
       expect(
-        (settingsRect.center.dy - screenshotRect.center.dy).abs(),
+        (settingsRect.center.dy - danmakuRect.center.dy).abs(),
         lessThan(2),
       );
       await tester.tap(find.byTooltip('画面适配'));
@@ -463,10 +493,21 @@ void main() {
         matching: find.text(model.episodeLabel(record)),
       );
       expect(playlistTitle, findsOneWidget);
+      expectChoiceTextAlignment(tester, playlistTitle);
       expect(
-        tester.getRect(playlistTitle).left - tester.getRect(popup).left,
-        closeTo(28, 1),
-        reason: 'Episode titles include menu padding and a padded choice row',
+        tester.getRect(playlistTitle).left,
+        closeTo(tester.getRect(popup).left + 14, 1),
+      );
+      expect(
+        tester
+            .getSize(
+              find.ancestor(
+                of: playlistTitle,
+                matching: find.byType(PlayerChoiceTile),
+              ),
+            )
+            .height,
+        PlayerTheme.choiceRowWithSubtitleHeight,
       );
       expect(
         tester.getRect(popup).bottom,
@@ -529,8 +570,13 @@ void main() {
       );
       await tester.tap(find.byTooltip('播放速度'));
       await tester.pump(const Duration(milliseconds: 350));
-      final selectedSpeed = find.widgetWithText(ListTile, '1.5×');
+      final selectedSpeed = find.widgetWithText(PlayerChoiceTile, '1.5×');
       await tester.ensureVisible(selectedSpeed);
+      expect(tester.getSize(selectedSpeed).height, PlayerTheme.choiceRowHeight);
+      expectChoiceTextAlignment(
+        tester,
+        find.descendant(of: selectedSpeed, matching: find.text('1.5×')),
+      );
       expect(
         find.descendant(
           of: selectedSpeed,
@@ -559,9 +605,18 @@ void main() {
       await tester.pump(const Duration(milliseconds: 300));
       await tester.tap(find.text('音轨'));
       await tester.pump(const Duration(milliseconds: 350));
+      final selectedAudio = find.widgetWithText(PlayerChoiceTile, '关闭音轨');
+      expect(
+        tester.getSize(selectedAudio).height,
+        PlayerTheme.choiceTrackRowHeight,
+      );
+      expectChoiceTextAlignment(
+        tester,
+        find.descendant(of: selectedAudio, matching: find.text('关闭音轨')),
+      );
       expect(
         find.descendant(
-          of: find.widgetWithText(ListTile, '关闭音轨'),
+          of: selectedAudio,
           matching: find.byIcon(Icons.check_rounded),
         ),
         findsOneWidget,
@@ -891,10 +946,71 @@ void main() {
       await tester.pump(const Duration(milliseconds: 100));
 
       debugPrint('player regression: keyboard actions');
+      final keyboardTimelineFocus = tester
+          .widget<FocusableActionDetector>(
+            find.descendant(
+              of: find.byKey(const ValueKey('player-timeline')),
+              matching: find.byType(FocusableActionDetector),
+            ),
+          )
+          .focusNode!;
+      keyboardTimelineFocus.requestFocus();
+      await tester.pump();
+      expect(keyboardTimelineFocus.hasPrimaryFocus, isTrue);
+      final volumeBeforeKey = model.preferences.volume;
+      final positionBeforeKey = pagePlayback.player.state.position;
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(model.preferences.volume, volumeBeforeKey - 5);
+      expect(
+        pagePlayback.player.state.position,
+        positionBeforeKey,
+        reason: 'Focused timeline must not consume volume arrows as seeking',
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(model.preferences.volume, volumeBeforeKey);
+      await pagePlayback.seek(const Duration(seconds: 2));
+      await tester.pump(const Duration(milliseconds: 200));
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(pagePlayback.player.state.position.inSeconds, closeTo(12, 1));
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyJ);
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(
+        pagePlayback.player.state.position.inSeconds,
+        greaterThanOrEqualTo(29),
+      );
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyJ);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(
+        pagePlayback.player.state.position.inSeconds,
+        lessThanOrEqualTo(1),
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(pagePlayback.player.state.playing, isTrue);
+      Focus.of(tester.element(find.byTooltip('播放器设置'))).requestFocus();
+      await tester.pump();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(pagePlayback.player.state.playing, isFalse);
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.space);
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.space);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.space);
+      await tester.pump(const Duration(milliseconds: 150));
+      expect(pagePlayback.player.state.playing, isFalse);
+      expect(
+        find.byKey(const ValueKey('player-settings-popup')),
+        findsNothing,
+        reason: 'Holding Space must not activate the focused settings button',
+      );
       // Exercise the actual focused player, including replacing the default S
       // binding. The pure parser tests cannot verify focus and action dispatch.
       await model.updatePreferences({
-        'shortcuts': {'subtitles': 'K'},
+        'shortcuts': {'subtitles': 'K', 'playPauseAlternate': 'None'},
       });
       await tester.pump(const Duration(milliseconds: 100));
       Focus.of(tester.element(find.byTooltip('播放器设置'))).requestFocus();
@@ -911,7 +1027,7 @@ void main() {
       expect(model.preferences.subtitlesEnabled, true);
       expect(await pageNative.getProperty('sub-visibility'), 'yes');
       await model.updatePreferences({
-        'shortcuts': {'subtitles': 'S'},
+        'shortcuts': {'subtitles': 'S', 'playPauseAlternate': 'K'},
       });
       expect(tester.takeException(), isNull);
       await tester.tap(find.byTooltip('播放器设置'));
@@ -935,6 +1051,29 @@ void main() {
         await tester.pump(const Duration(milliseconds: 100));
       }
       expect(find.byTooltip('播放器设置'), findsOneWidget);
+      if (DesktopWindow.supported) {
+        await model.updatePreferences({'controlsHideSeconds': 3});
+        await pagePlayback.seek(const Duration(seconds: 2));
+        await pagePlayback.player.play();
+        await tester.pump(const Duration(seconds: 4));
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(find.byTooltip('播放器设置'), findsNothing);
+        final fullscreenMouse = await tester.createGesture(
+          kind: ui.PointerDeviceKind.mouse,
+        );
+        final center = tester.getCenter(find.byType(Video));
+        await fullscreenMouse.addPointer(location: center);
+        await fullscreenMouse.moveTo(center + const Offset(15, 10));
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(
+          find.byTooltip('播放器设置').hitTestable(),
+          findsOneWidget,
+          reason: 'Mouse movement reveals fullscreen controls',
+        );
+        expect(find.byTooltip('退出全屏').hitTestable(), findsOneWidget);
+        await pagePlayback.player.pause();
+        await fullscreenMouse.removePointer();
+      }
       debugPrint('player regression: seek immediately followed by system Back');
       // The seek command may return before decoding finishes. Closing must not
       // save the previous nonblank frame under this new resume position.
@@ -943,8 +1082,13 @@ void main() {
       await tester.pump(const Duration(milliseconds: 300));
       expect(find.byType(PlayerPage), findsOneWidget);
       expect(find.byTooltip('退出全屏'), findsNothing);
-      expect(identical((tester.state(find.byType(PlayerPage)) as dynamic).session,
-          pagePlayback), isTrue);
+      expect(
+        identical(
+          (tester.state(find.byType(PlayerPage)) as dynamic).session,
+          pagePlayback,
+        ),
+        isTrue,
+      );
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       for (var i = 0; i < 20; i++) {
         await tester.pump(const Duration(milliseconds: 100));
@@ -968,11 +1112,15 @@ void main() {
     FlutterSecureStorage.setMockInitialValues({});
     final root = await Directory.systemTemp.createTemp('aiplayer-inline-');
     final model = AppModel(
-      AppStore('${root.path}/test.db'), root,
-      enableThumbnails: false, backgroundWork: false,
+      AppStore('${root.path}/test.db'),
+      root,
+      enableThumbnails: false,
+      backgroundWork: false,
     );
     await model.updatePreferences({
-      'autoPlay': false, 'enterFullscreen': false, 'hardwareDecoding': false,
+      'autoPlay': false,
+      'enterFullscreen': false,
+      'hardwareDecoding': false,
     });
     addTearDown(() async {
       await tester.pumpWidget(const SizedBox());
@@ -994,17 +1142,23 @@ void main() {
       );
       await delivered.future;
     }
+
     final configured = <PlaybackSession>{};
     Future<PlaybackSession> loaded() async {
       for (var attempt = 0; attempt < 200; attempt++) {
         await tester.pump(const Duration(milliseconds: 50));
-        expect(find.byType(PlayerPage, skipOffstage: false).evaluate().length,
-            lessThanOrEqualTo(1));
+        expect(
+          find.byType(PlayerPage, skipOffstage: false).evaluate().length,
+          lessThanOrEqualTo(1),
+        );
         if (find.byType(PlayerPage).evaluate().isNotEmpty) {
           final state = tester.state(find.byType(PlayerPage)) as dynamic;
           final session = state.session as PlaybackSession;
           if (configured.add(session)) {
-            await (session.player.platform as NativePlayer).setProperty('ao', 'null');
+            await (session.player.platform as NativePlayer).setProperty(
+              'ao',
+              'null',
+            );
           }
           if (session.ready) return session;
           expect(session.error, isEmpty);
@@ -1012,6 +1166,7 @@ void main() {
       }
       throw StateError('In-app playback did not become ready');
     }
+
     await open();
     final first = await loaded();
     // Multiple native requests during replacement must settle on one player.
@@ -1131,7 +1286,7 @@ void main() {
           '锁定控件',
           '播放速度',
           '播放器设置',
-          '截图',
+          '弹幕',
           '播放列表',
           if (DesktopWindow.supported) '全屏',
         ]) {
@@ -1146,8 +1301,9 @@ void main() {
           of: popup,
           matching: find.text(model.episodeLabel(record)),
         );
-        final titleInset = tester.getRect(title).left - popupRect.left;
-        expect(titleInset, closeTo(28, 1));
+        final titleLeft = tester.getRect(title).left;
+        expectChoiceTextAlignment(tester, title);
+        expect(titleLeft, closeTo(popupRect.left + 14, 1));
         expect(popupRect.left, greaterThanOrEqualTo(padding.left + 12));
         expect(
           popupRect.right,
@@ -1155,7 +1311,7 @@ void main() {
         );
         debugPrint(
           'Safe area $padding: controls margins $leftMargin/$rightMargin, '
-          'playlist text inset $titleInset',
+          'playlist text left $titleLeft',
         );
         final boundary =
             boundaryKey.currentContext!.findRenderObject()!

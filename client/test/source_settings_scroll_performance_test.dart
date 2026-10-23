@@ -240,15 +240,48 @@ void main() {
       expect(model.collectionReads, 0);
       expect(model.seriesReads, 0);
       model.sortApplications = 0;
+      model.recentReads = 0;
       for (var i = 0; i < 5; i++) {
         store.setLocal('preview:$i', {'path': '/unused/$i.jpg'});
         model.changed();
         await tester.pumpAndSettle();
       }
       expect(model.sortApplications, 0);
-      model.setDirectorySorting('directorySort:nas:', const DirectorySort(descending: true));
+      expect(model.collectionReads, 0);
+      expect(model.seriesReads, 0);
+      expect(model.recentReads, 0);
+      model.setDirectorySorting(
+        'directorySort:nas:',
+        const DirectorySort(descending: true),
+      );
       await tester.pumpAndSettle();
       expect(model.sortApplications, 1);
+      expect(model.collectionReads, 0);
+      expect(model.seriesReads, 0);
+      expect(model.recentReads, 0);
+
+      final record = model.sourceMedia('nas', _Episodes.entries.first.path)!;
+      store.save('progress', model.progressKey(record), {
+        'position': 60,
+        'duration': 120,
+      });
+      store.setLocal('episodeTitle:${record.id}', '新的分集名称');
+      model.changed();
+      await tester.pumpAndSettle();
+      expect(find.text('继续观看'), findsOneWidget);
+      expect(find.textContaining('新的分集名称'), findsWidgets);
+      expect(find.textContaining('01:00 / 02:00'), findsWidgets);
+      expect(model.recentReads, 1);
+      expect(model.collectionReads, 0);
+      expect(model.seriesReads, 0);
+
+      store.save('media', record.id, {
+        ...record.data,
+        'metadataTitle': '更新后的作品名',
+      });
+      model.changed();
+      await tester.pumpAndSettle();
+      expect(find.text('更新后的作品名'), findsOneWidget);
       expect(model.collectionReads, greaterThan(0));
       expect(model.seriesReads, greaterThan(0));
       expect(tester.takeException(), isNull);
@@ -259,7 +292,7 @@ void main() {
 
 class _CountingModel extends AppModel {
   int collectionReads = 0, seriesReads = 0, mediaReads = 0;
-  int sortApplications = 0;
+  int sortApplications = 0, recentReads = 0;
   @override
   DirectorySort directorySorting(String key) =>
       _CountingSort(super.directorySorting(key), () => sortApplications++);
@@ -294,6 +327,15 @@ class _CountingModel extends AppModel {
   }
 
   @override
+  List<SyncRecord> recentMedia({
+    bool groupSeries = true,
+    Iterable<SyncRecord>? items,
+  }) {
+    recentReads++;
+    return super.recentMedia(groupSeries: groupSeries, items: items);
+  }
+
+  @override
   Future<SourceAdapter> adapter(String id) async => _Episodes();
 
   @override
@@ -324,9 +366,16 @@ class _Episodes extends SourceAdapter {
 class _CountingSort extends DirectorySort {
   final VoidCallback onApply;
   _CountingSort(DirectorySort value, this.onApply)
-      : super(field: value.field, descending: value.descending, showSubtitles: value.showSubtitles);
+    : super(
+        field: value.field,
+        descending: value.descending,
+        showSubtitles: value.showSubtitles,
+      );
   @override
-  List<SourceEntry> apply(Iterable<SourceEntry> entries, {bool hideHiddenFiles = true}) {
+  List<SourceEntry> apply(
+    Iterable<SourceEntry> entries, {
+    bool hideHiddenFiles = true,
+  }) {
     onApply();
     return super.apply(entries, hideHiddenFiles: hideHiddenFiles);
   }

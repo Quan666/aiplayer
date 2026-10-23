@@ -66,6 +66,13 @@ class _LibraryPageState extends State<LibraryPage> {
   bool? _libraryDesktop;
   bool _detailsVisible = false, _libraryNeedsRefresh = false;
   int _coveringRoutes = 0;
+  bool _libraryScrolling = false;
+
+  void _onLibraryActivityChanged(bool active) {
+    _libraryScrolling = active;
+    if (!active) _refreshUncoveredLibrary();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -78,12 +85,15 @@ class _LibraryPageState extends State<LibraryPage> {
   void _changed() {
     _hideNavigationOnScroll = model.preferences.hideNavigationOnScroll;
     if (!_hideNavigationOnScroll) _navigationHidden.value = false;
-    if (_detailsVisible || _coveringRoutes > 0) {
+    if (_detailsVisible ||
+        _coveringRoutes > 0 ||
+        (page == 0 && _libraryScrolling)) {
       _libraryNeedsRefresh = true;
       return;
     }
     if (page == 0) {
       _libraryContent = null;
+      _libraryNeedsRefresh = false;
     } else {
       _libraryNeedsRefresh = true;
     }
@@ -92,6 +102,8 @@ class _LibraryPageState extends State<LibraryPage> {
 
   void _refreshUncoveredLibrary() {
     if (!mounted ||
+        page != 0 ||
+        _libraryScrolling ||
         _detailsVisible ||
         _coveringRoutes > 0 ||
         !_libraryNeedsRefresh) {
@@ -1113,6 +1125,7 @@ class _LibraryPageState extends State<LibraryPage> {
       _libraryContent = null;
     }
     return GlassBackground(
+      onScrollActivityChanged: _onLibraryActivityChanged,
       child: Scaffold(
         extendBody: true,
         floatingActionButton: model.metadataTasks.isEmpty
@@ -1263,6 +1276,23 @@ class _ContinueWatchingCarousel extends StatefulWidget {
 
 class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
   final _scroll = ScrollController();
+  final _arrows = ValueNotifier((left: false, right: false));
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_refreshArrows);
+  }
+
+  void _refreshArrows() {
+    if (!_scroll.hasClients || !_scroll.position.hasContentDimensions) return;
+    final position = _scroll.position;
+    // The buttons only change at either edge, not on every scroll pixel.
+    _arrows.value = (
+      left: position.pixels > position.minScrollExtent,
+      right: position.pixels < position.maxScrollExtent,
+    );
+  }
 
   void _scrollPage(int direction) {
     if (!_scroll.hasClients) return;
@@ -1318,6 +1348,7 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
   @override
   void dispose() {
     _scroll.dispose();
+    _arrows.dispose();
     super.dispose();
   }
 
@@ -1364,28 +1395,18 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
                   ),
                 ),
                 if (desktop && overflow)
-                  AnimatedBuilder(
-                    animation: _scroll,
-                    builder: (context, _) => Row(
+                  ValueListenableBuilder<({bool left, bool right})>(
+                    valueListenable: _arrows,
+                    builder: (context, arrows, _) => Row(
                       children: [
                         IconButton(
                           tooltip: '向左滚动',
-                          onPressed:
-                              _scroll.hasClients &&
-                                  _scroll.offset >
-                                      _scroll.position.minScrollExtent
-                              ? () => _scrollPage(-1)
-                              : null,
+                          onPressed: arrows.left ? () => _scrollPage(-1) : null,
                           icon: const Icon(Icons.chevron_left_rounded),
                         ),
                         IconButton(
                           tooltip: '向右滚动',
-                          onPressed:
-                              !_scroll.hasClients ||
-                                  _scroll.offset <
-                                      _scroll.position.maxScrollExtent
-                              ? () => _scrollPage(1)
-                              : null,
+                          onPressed: arrows.right ? () => _scrollPage(1) : null,
                           icon: const Icon(Icons.chevron_right_rounded),
                         ),
                       ],
@@ -1397,10 +1418,13 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
             SizedBox(
               height: widget.cardHeight + scrollbarInset,
               child: NotificationListener<ScrollMetricsNotification>(
-                onNotification: (_) {
+                onNotification: (notification) {
                   // A resize or changed history can alter the scroll range
                   // without a scroll event. Refresh the arrow availability.
-                  if (mounted) setState(() {});
+                  if (notification.depth == 0 &&
+                      notification.metrics.axis == Axis.horizontal) {
+                    _refreshArrows();
+                  }
                   return false;
                 },
                 child: _carouselScrollbars(
@@ -1466,122 +1490,140 @@ class _PosterTile extends StatefulWidget {
 
 class _PosterTileState extends State<_PosterTile> {
   bool hovered = false, pressed = false;
+  final _scale = ValueNotifier(1.0);
+
+  void _interaction({bool? hover, bool? press}) {
+    if (hover != null) hovered = hover;
+    if (press != null) pressed = press;
+    _scale.value = pressed ? .985 : (hovered ? 1.012 : 1);
+  }
+
+  @override
+  void dispose() {
+    _scale.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = GlassPalette.of(context);
-    return AnimatedScale(
-      scale: pressed
-          ? .985
-          : hovered
-          ? 1.012
-          : 1,
-      duration: MotionScope.duration(context, 140),
-      curve: Curves.easeOutCubic,
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        onEnter: (_) => setState(() => hovered = true),
-        onExit: (_) => setState(() => hovered = false),
-        child: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            key: ValueKey('play:${widget.mediaId}'),
-            onTap: widget.onTap,
-            onLongPress: widget.onRemove,
-            onSecondaryTap: widget.onRemove,
-            onTapDown: (_) => setState(() => pressed = true),
-            onTapUp: (_) => setState(() => pressed = false),
-            onTapCancel: () => setState(() => pressed = false),
-            borderRadius: LibraryStyles.posterRadius,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  child: ClipRRect(
-                    borderRadius: LibraryStyles.posterRadius,
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        MediaArtwork(
-                          cache: widget.cache,
-                          poster: widget.poster,
-                          thumbnail: widget.thumbnail,
-                          onRequestPreview: widget.onRequestPreview,
-                        ),
-                        Positioned(
-                          top: 4,
-                          right: 4,
-                          child: SizedBox(
-                            width: 36,
-                            height: 36,
-                            child: Material(
-                              color: Colors.transparent,
-                              child: IconButton(
-                                key: ValueKey('details:${widget.mediaId}'),
-                                tooltip: '查看详情',
-                                onPressed: widget.onDetails,
+    return ValueListenableBuilder<double>(
+      valueListenable: _scale,
+      builder: (context, scale, child) => AnimatedScale(
+        scale: scale,
+        duration: MotionScope.duration(context, 140),
+        curve: Curves.easeOutCubic,
+        child: child,
+      ),
+      child: RepaintBoundary(
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          onEnter: (_) => _interaction(hover: true),
+          onExit: (_) => _interaction(hover: false),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              key: ValueKey('play:${widget.mediaId}'),
+              onTap: widget.onTap,
+              onLongPress: widget.onRemove,
+              onSecondaryTap: widget.onRemove,
+              onTapDown: (_) => _interaction(press: true),
+              onTapUp: (_) => _interaction(press: false),
+              onTapCancel: () => _interaction(press: false),
+              borderRadius: LibraryStyles.posterRadius,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: LibraryStyles.posterRadius,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          MediaArtwork(
+                            cache: widget.cache,
+                            poster: widget.poster,
+                            thumbnail: widget.thumbnail,
+                            onRequestPreview: widget.onRequestPreview,
+                          ),
+                          Positioned(
+                            top: 4,
+                            right: 4,
+                            child: SizedBox(
+                              width: 36,
+                              height: 36,
+                              child: Material(
+                                color: Colors.transparent,
+                                child: IconButton(
+                                  key: ValueKey('details:${widget.mediaId}'),
+                                  tooltip: '查看详情',
+                                  onPressed: widget.onDetails,
+                                  padding: EdgeInsets.zero,
+                                  icon: Icon(
+                                    Icons.info_outline_rounded,
+                                    color: c.onMedia,
+                                    shadows: LibraryStyles.of(
+                                      context,
+                                    ).posterIconShadows,
+                                    size: LibraryStyles.iconButton,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          if (widget.onRemove != null)
+                            Positioned(
+                              top: 4,
+                              left: 4,
+                              child: PopupMenuButton<String>(
+                                key: ValueKey(
+                                  'media-actions:${widget.mediaId}',
+                                ),
+                                tooltip: '视频操作',
                                 padding: EdgeInsets.zero,
                                 icon: Icon(
-                                  Icons.info_outline_rounded,
+                                  Icons.more_horiz_rounded,
                                   color: c.onMedia,
                                   shadows: LibraryStyles.of(
                                     context,
                                   ).posterIconShadows,
-                                  size: LibraryStyles.iconButton,
                                 ),
+                                onSelected: (_) => widget.onRemove!(),
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(
+                                    value: 'remove',
+                                    child: Text('从影视库移除'),
+                                  ),
+                                ],
                               ),
                             ),
-                          ),
-                        ),
-                        if (widget.onRemove != null)
-                          Positioned(
-                            top: 4,
-                            left: 4,
-                            child: PopupMenuButton<String>(
-                              key: ValueKey('media-actions:${widget.mediaId}'),
-                              tooltip: '视频操作',
-                              padding: EdgeInsets.zero,
-                              icon: Icon(
-                                Icons.more_horiz_rounded,
-                                color: c.onMedia,
-                                shadows: LibraryStyles.of(
-                                  context,
-                                ).posterIconShadows,
+                          if (widget.count > 1)
+                            Positioned(
+                              bottom: 7,
+                              right: 8,
+                              child: Text(
+                                '${widget.count} 集',
+                                style: LibraryStyles.of(context).posterCount,
                               ),
-                              onSelected: (_) => widget.onRemove!(),
-                              itemBuilder: (_) => const [
-                                PopupMenuItem(
-                                  value: 'remove',
-                                  child: Text('从影视库移除'),
-                                ),
-                              ],
                             ),
-                          ),
-                        if (widget.count > 1)
-                          Positioned(
-                            bottom: 7,
-                            right: 8,
-                            child: Text(
-                              '${widget.count} 集',
-                              style: LibraryStyles.of(context).posterCount,
-                            ),
-                          ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(height: 7),
-                Text(
-                  widget.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: LibraryStyles.of(context).posterTitle,
-                ),
-                if (widget.duration > 0 && widget.count == 1)
+                  const SizedBox(height: 7),
                   Text(
-                    mediaTime(widget.duration),
-                    style: AppStyles.of(context).micro,
+                    widget.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: LibraryStyles.of(context).posterTitle,
                   ),
-              ],
+                  if (widget.duration > 0 && widget.count == 1)
+                    Text(
+                      mediaTime(widget.duration),
+                      style: AppStyles.of(context).micro,
+                    ),
+                ],
+              ),
             ),
           ),
         ),

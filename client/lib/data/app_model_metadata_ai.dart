@@ -245,17 +245,19 @@ extension MediaAiIdentification on AppModel {
     if (!_aiRecordCurrent(record, manual, context)) return false;
     final identity = result.identity;
     final movie = subject['mediaType'] == 'movie';
+    final fields = subjectMediaFields(subject);
     final data = {...record.data}
       ..remove('bangumiId')
       ..remove('tmdbId')
       ..remove('episodeTitle');
     store.save('media', record.id, {
       ...data,
-      ...subjectMediaFields(subject),
+      ...fields,
       'series': identity.name,
       'season': movie ? '' : identity.season,
       'episode': movie ? '' : identity.episode,
     });
+    _prefetchPoster('${fields['poster']}');
     store.removeLocal('episodeTitle:${record.id}');
     if (manual) store.setLocal('manualMetadata:${record.id}', true);
     if (notify) changed();

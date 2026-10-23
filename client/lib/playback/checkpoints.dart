@@ -1,16 +1,17 @@
 import 'dart:async';
 
-/// Progress is cheap enough to checkpoint while playing. Artwork is only
+/// Progress persistence runs asynchronously while playing. Artwork is only
 /// requested by a pause/background/exit event, after its UI updates settle.
 class PlaybackCheckpoints {
   static const interval = Duration(seconds: 10);
   static const eventDelay = Duration(milliseconds: 250);
   final bool Function() isPlaying;
-  final void Function() saveProgress;
+  final FutureOr<void> Function() saveProgress;
   final Future<void> Function() capturePreview;
   final void Function(Object) onError;
   Timer? _periodic, _event;
   Future<void>? _capture, _closing;
+  final _saves = <Future<void>>{};
   bool _pendingPreview = false, _stopped = false;
 
   PlaybackCheckpoints({
@@ -23,7 +24,7 @@ class PlaybackCheckpoints {
   void start() {
     if (_stopped || _periodic != null) return;
     _periodic = Timer.periodic(interval, (_) {
-      if (isPlaying()) _save();
+      if (isPlaying()) unawaited(_save());
     });
   }
 
@@ -33,18 +34,21 @@ class PlaybackCheckpoints {
     _event ??= Timer(eventDelay, _flush);
   }
 
-  void _save() {
-    try {
-      saveProgress();
-    } catch (error) {
-      onError(error);
-    }
+  Future<void> _save() {
+    late final Future<void> work;
+    work = Future<void>.sync(saveProgress)
+        .catchError((Object error) => onError(error))
+        .whenComplete(() {
+          _saves.remove(work);
+        });
+    _saves.add(work);
+    return work;
   }
 
   void _flush() {
     _event = null;
     if (_stopped) return;
-    _save();
+    unawaited(_save());
     if (!_pendingPreview || _capture != null) return;
     _pendingPreview = false;
     _capture = Future<void>.sync(capturePreview)
@@ -73,7 +77,7 @@ class PlaybackCheckpoints {
 
   Future<void> _close() async {
     stop();
-    _save();
+    unawaited(_save());
     await _capture;
     try {
       await capturePreview();
@@ -81,6 +85,7 @@ class PlaybackCheckpoints {
       onError(error);
     }
     // A pending seek may have finished while the native screenshot completed.
-    _save();
+    await _save();
+    await Future.wait(_saves.toList());
   }
 }

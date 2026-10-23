@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/store.dart';
@@ -24,7 +25,13 @@ void main() {
     device.progress(40, '2026-10-22T12:00:00Z');
     await device.sync();
     expect(server.records['progress:video:10']!.data['position'], 40);
-    expect(server.records.keys.any((key) => key.startsWith('vault:')), false);
+    expect(server.records['vault:unread-artwork'], isNull);
+    expect(
+      server.records.values
+          .where((record) => record.kind == 'vault')
+          .map((record) => record.id.split(':').first),
+      ['source', 'binding'],
+    );
     expect(device.profile.prepares, 0);
   });
 
@@ -104,11 +111,12 @@ void main() {
   );
 
   test(
-    'lightweight first sync uploads a new remote location without staging settings or local media',
+    'lightweight first sync publishes NAS dependencies before media and restores a blank device',
     () async {
       final server = _Server();
-      final device = _Device(server);
+      final device = _Device(server), receiver = _Device(server, seed: false);
       device.store.setLocal('settings', {'playbackRate': 1.5});
+      device.store.save('vault', 'unrelated-artwork', {'pending': true});
       device.store.save('media', 'local-video', {'title': 'private'});
       device.store.setLocal('location:local-video', {
         'id': 'local-video',
@@ -118,15 +126,109 @@ void main() {
       device.progress(40, '2026-10-22T12:00:00Z');
       await device.sync();
       expect(server.records['progress:video:10']!.data['position'], 40);
-      expect(server.records.keys.any((key) => key.startsWith('vault:')), false);
+      final vault = server.records.values
+          .where((record) => record.kind == 'vault')
+          .toList();
+      expect(vault.map((record) => record.id.split(':').first), [
+        'source',
+        'binding',
+      ]);
+      expect(
+        server.changes.map(
+          (record) =>
+              record.kind == 'vault' ? record.id.split(':').first : record.kind,
+        ),
+        containsAllInOrder(['source', 'binding', 'media']),
+      );
+      expect(
+        jsonEncode(vault.map((record) => record.toJson()).toList()),
+        isNot(contains('nas-password')),
+      );
+      expect(server.records['vault:unrelated-artwork'], isNull);
+      expect(device.store.get('vault', 'unrelated-artwork')!.dirty, true);
       expect(server.records.containsKey('media:local-video'), false);
       expect(device.profile.prepares, 0);
       expect(device.profile.applies, 0);
-      await device.client.synchronize(_origin, _token);
-      expect(device.profile.prepares, 1);
-      expect(server.records.keys.any((key) => key.startsWith('vault:')), true);
+      expect(receiver.store.local('location:video'), isNull);
+      expect(receiver.store.local('sources'), isNull);
+      expect(receiver.secrets.values['source:nas'], isNull);
+      await receiver.sync();
+      expect(
+        receiver.store.get('media', 'video')!.data['title'],
+        'Remote video',
+      );
+      expect(
+        receiver.store.local('location:video'),
+        device.store.local('location:video'),
+      );
+      expect(receiver.store.local('sources'), device.store.local('sources'));
+      expect(receiver.secrets.values['source:nas'], 'nas-password');
+      expect(receiver.store.local('settings'), isNull);
+      expect(receiver.store.get('media', 'local-video'), isNull);
+      expect(receiver.profile.prepares, 0);
     },
   );
+
+  test(
+    'a failed binding upload cannot publish media and succeeds on retry',
+    () async {
+      final server = _Server();
+      final device = _Device(server), receiver = _Device(server, seed: false);
+      server.beforePut = (record) async {
+        if (record.kind == 'vault' && record.id.startsWith('binding:')) {
+          throw const AppFailure('binding upload failed', 503);
+        }
+      };
+      await expectLater(device.sync(), throwsA(isA<AppFailure>()));
+      expect(server.records['media:video'], isNull);
+      expect(device.store.get('media', 'video')!.dirty, true);
+      expect(
+        server.records.values
+            .where((record) => record.kind == 'vault')
+            .single
+            .id,
+        startsWith('source:'),
+      );
+
+      server.beforePut = null;
+      await device.sync();
+      await receiver.sync();
+      expect(server.records['media:video'], isNotNull);
+      expect(device.store.get('media', 'video')!.dirty, false);
+      expect(
+        receiver.store.local('location:video'),
+        device.store.local('location:video'),
+      );
+      expect(receiver.store.local('sources'), device.store.local('sources'));
+      expect(receiver.secrets.values['source:nas'], 'nas-password');
+    },
+  );
+
+  for (final missing in ['source', 'path', 'location']) {
+    test(
+      'lightweight sync keeps media pending when its $missing is missing',
+      () async {
+        final server = _Server();
+        final device = _Device(server);
+        device.profile.rememberRemoteMedia('video');
+        switch (missing) {
+          case 'source':
+            device.store.setLocal('sources', []);
+          case 'path':
+            device.store.setLocal('location:video', {
+              'id': 'video',
+              'source': 'nas',
+              'size': 10,
+            });
+          case 'location':
+            device.store.removeLocal('location:video');
+        }
+        await device.sync();
+        expect(server.records['media:video'], isNull);
+        expect(device.store.get('media', 'video')!.dirty, true);
+      },
+    );
+  }
 
   test(
     'queued synchronization uploads an edit made while its predecessor is in flight',
@@ -258,11 +360,23 @@ class _BindingCountingStore extends AppStore {
 
 class _Device {
   final store = AppStore(':memory:');
-  late final _Profile profile = _Profile(store);
+  final secrets = _MemorySecrets();
+  late final _Profile profile = _Profile(store, secrets);
   late final SyncClient client;
-  _Device(_Server server) {
+  _Device(_Server server, {bool seed = true}) {
     addTearDown(store.dispose);
     client = SyncClient(store, profile: profile, transport: server);
+    if (!seed) return;
+    secrets.values['source:nas'] = 'nas-password';
+    store.setLocal('sources', [
+      {
+        'id': 'nas',
+        'kind': 'webdav',
+        'url': 'https://nas.internal/dav/',
+        'label': 'NAS',
+        'username': 'user',
+      },
+    ]);
     store.save('media', 'video', {'title': 'Remote video', 'size': 10});
     store.setLocal('location:video', {
       'id': 'video',
@@ -281,12 +395,8 @@ class _Device {
 
 class _Profile extends SyncProfile {
   int prepares = 0, applies = 0;
-  _Profile(AppStore store)
-    : super(
-        store,
-        const FlutterSecureStorage(),
-        watchedKey: (record) => record.id,
-      );
+  _Profile(super.store, super.secrets)
+    : super(watchedKey: (record) => record.id);
   @override
   Future<void> prepare({CancelToken? cancel}) async {
     prepares++;
@@ -305,6 +415,7 @@ class _Server implements JsonTransport {
   final changes = <SyncRecord>[];
   int activePuts = 0, maxPuts = 0;
   Future<void> Function(Uri, String)? before;
+  Future<void> Function(SyncRecord)? beforePut;
   @override
   Future<Map<String, dynamic>> send(
     Uri uri, {
@@ -322,6 +433,7 @@ class _Server implements JsonTransport {
       cancel?.check();
       if (method == 'PUT') {
         final incoming = SyncRecord.fromJson(body!);
+        await beforePut?.call(incoming);
         final key = '${incoming.kind}:${incoming.id}';
         final current = records[key];
         if (incoming.version != (current?.version ?? 0)) {
@@ -351,4 +463,48 @@ class _Server implements JsonTransport {
       if (method == 'PUT') activePuts--;
     }
   }
+}
+
+class _MemorySecrets extends FlutterSecureStorage {
+  final values = <String, String>{};
+
+  @override
+  Future<String?> read({
+    required String key,
+    IOSOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    MacOsOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async => values[key];
+
+  @override
+  Future<void> write({
+    required String key,
+    required String? value,
+    IOSOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    MacOsOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async {
+    if (value == null) {
+      values.remove(key);
+    } else {
+      values[key] = value;
+    }
+  }
+
+  @override
+  Future<void> delete({
+    required String key,
+    IOSOptions? iOptions,
+    AndroidOptions? aOptions,
+    LinuxOptions? lOptions,
+    WebOptions? webOptions,
+    MacOsOptions? mOptions,
+    WindowsOptions? wOptions,
+  }) async => values.remove(key);
 }

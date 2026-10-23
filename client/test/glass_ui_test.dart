@@ -38,6 +38,29 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  for (final platform in TargetPlatform.values) {
+    testWidgets('$platform avoids backdrop filtering by default', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: GlassPalette.theme().copyWith(platform: platform),
+          home: const Column(
+            children: [
+              GlassSurface(
+                tint: Color(0x88FFFFFF),
+                child: SizedBox(width: 100, height: 100),
+              ),
+              GlassControlBackground(child: SizedBox(width: 100, height: 40)),
+            ],
+          ),
+        ),
+      );
+      expect(find.byType(BackdropFilter), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
   for (final brightness in Brightness.values) {
     test(
       'off switches retain visible boundaries and thumbs in $brightness',

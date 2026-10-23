@@ -20,9 +20,23 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var terminationCompletion: (() -> Void)?
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
-    let windowFrame = self.frame
     self.contentViewController = flutterViewController
-    self.setFrame(windowFrame, display: true)
+    // Keep the playback area at 16:9; the native title bar is extra.
+    var contentSize = NSSize(width: 1280, height: 720)
+    if let display = screen ?? NSScreen.main {
+      let work = display.visibleFrame
+      let outer = frameRect(forContentRect: NSRect(origin: .zero, size: contentSize))
+      let scale = max(0, min(1,
+        (work.width * 0.9 - (outer.width - contentSize.width)) / contentSize.width,
+        (work.height * 0.9 - (outer.height - contentSize.height)) / contentSize.height))
+      contentSize = NSSize(width: max(1, floor(contentSize.width * scale)),
+                           height: max(1, floor(contentSize.height * scale)))
+      setContentSize(contentSize)
+      setFrameOrigin(NSPoint(x: work.midX - frame.width / 2,
+                             y: work.midY - frame.height / 2))
+    } else {
+      setContentSize(contentSize)
+    }
     self.title = "映库"
 
     RegisterGeneratedPlugins(registry: flutterViewController)

@@ -77,11 +77,18 @@ class AppPreferences {
     'subtitles': 'S',
     'danmaku': 'D',
     'settings': 'Comma',
+    // Keep new defaults after existing bindings so stored custom keys win.
+    'skipForward': 'J',
+    'skipBackward': 'Shift+J',
+    'playPauseAlternate': 'K',
   };
   static const shortcutLabels = <String, String>{
     'playPause': '播放 / 暂停',
+    'playPauseAlternate': '播放 / 暂停（备用）',
     'seekBackward': '后退',
     'seekForward': '快进',
+    'skipForward': '前进 89 秒',
+    'skipBackward': '后退 89 秒',
     'volumeUp': '增大音量',
     'volumeDown': '减小音量',
     'mute': '静音',

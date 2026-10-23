@@ -1,12 +1,15 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
+import 'package:aiplayer/data/media_presentation.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/library_page.dart';
 import 'package:aiplayer/ui/media_details_header.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -188,6 +191,45 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'title completeness refreshes local episode names with reused records',
+    (tester) async {
+      episode(1);
+      final records = store.all('media');
+      final key = mediaSeriesKey(records.first);
+      store.setLocal('episodeTitle:episode-1', 'Opening');
+      store.setLocal(
+        'media-title-display:${sha256.convert(utf8.encode(jsonEncode([key, model.titleTranslations.profile])))}',
+        {
+          'visible': true,
+          'titles': {'长篇作品': 'Translated show', 'Opening': '开场'},
+        },
+      );
+      Future<void> mount() => tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MediaTitleTranslation(
+              model: model,
+              title: '长篇作品',
+              records: records,
+            ),
+          ),
+        ),
+      );
+      await mount();
+      expect(find.text('标题原文'), findsOneWidget);
+      expect(find.text('翻译新增标题'), findsNothing);
+
+      store.setLocal('episodeTitle:episode-1', 'A newly fetched episode name');
+      model.changed();
+      // Source headers rebuild while retaining their unchanged media snapshot.
+      await mount();
+      expect(find.text('翻译新增标题'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 
   testWidgets(
     'collapsed long synopses shape a bounded preview and expand to full text',

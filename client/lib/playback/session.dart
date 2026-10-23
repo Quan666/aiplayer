@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'dart:convert';
 import 'package:media_kit/media_kit.dart';
@@ -62,6 +61,7 @@ class PlaybackSession extends ChangeNotifier {
   (Duration, int)? _lastPreviewCapture;
   (Uint8List, double)? _pendingPreviewSave;
   Future<void>? _previewSaveWork;
+  Future<void> _progressWork = Future.value();
   Future<void> _technicalWork = Future.value();
   Future<void>? _diagnosticWork;
   String? _technicalFingerprint;
@@ -271,6 +271,10 @@ class PlaybackSession extends ChangeNotifier {
       }
     }
     danmaku?.configure(show: p.danmuVisible, seconds: p.refreshInterval);
+    if (!p.danmuVisible && danmaku?.episodeId == null) {
+      // Hiding cancels an in-flight first match. Showing it must start again.
+      _danmakuStarted = false;
+    }
     if (p.danmuVisible && danmaku != null && !_danmakuStarted) {
       _identifyDanmaku();
     }
@@ -542,6 +546,7 @@ class PlaybackSession extends ChangeNotifier {
     _openCalled = true;
     _startupClock.start();
     model.activePlaybackMediaId = media.id;
+    unawaited(_prepareDanmaku());
     try {
       _previewsPaused = true;
       // Source connection, decoder configuration and preview cleanup are
@@ -675,23 +680,6 @@ class PlaybackSession extends ChangeNotifier {
       AppLog.instance.info('播放', '视频已打开');
       _checkpoints.start();
       _notify();
-      // Optional credentials must never prevent subtitle setup or video playback.
-      final api = await model.danmu().catchError((Object _) {
-        notice = '无法读取弹幕配置，请在设置中重新保存。';
-        return null;
-      });
-      if (closed) return;
-      if (api != null) {
-        danmaku = DanmakuSession(model.store, api, media.id)
-          ..addListener(_notify);
-        danmaku!.configure(
-          isPlaying: player.state.playing && !player.state.buffering,
-          show: model.preferences.danmuVisible,
-          seconds: model.preferences.refreshInterval,
-        );
-        if (danmaku!.visible) _identifyDanmaku();
-      }
-      _notify();
       unawaited(_findSubtitles(path));
       unawaited(refreshDiagnostics());
     } catch (e) {
@@ -701,6 +689,28 @@ class PlaybackSession extends ChangeNotifier {
         _notify();
         _resumePreviews();
       }
+    }
+  }
+
+  Future<void> _prepareDanmaku() async {
+    // Credential lookup and matching run alongside source connection/decoding.
+    // An optional service failure must never delay video or subtitle startup.
+    try {
+      final api = await model.danmu();
+      if (closed || api == null) return;
+      danmaku = DanmakuSession(model.store, api, media.id)
+        ..addListener(_notify);
+      danmaku!.configure(
+        isPlaying: player.state.playing && !player.state.buffering,
+        show: model.preferences.danmuVisible,
+        seconds: model.preferences.refreshInterval,
+      );
+      if (danmaku!.visible) _identifyDanmaku();
+      _notify();
+    } catch (_) {
+      if (closed) return;
+      notice = '无法读取弹幕配置，请在设置中重新保存。';
+      _notify();
     }
   }
 
@@ -1179,25 +1189,6 @@ class PlaybackSession extends ChangeNotifier {
     return bytes;
   }
 
-  Future<String?> saveScreenshot({bool includeSubtitles = true}) async {
-    try {
-      final bytes = await captureScreenshot(includeSubtitles: includeSubtitles);
-      if (closed) return null;
-      final name = 'AIPlayer-${DateTime.now().millisecondsSinceEpoch}.jpg';
-      final path = await FilePicker.platform.saveFile(
-        dialogTitle: '保存视频截图',
-        fileName: name,
-        type: FileType.custom,
-        allowedExtensions: ['jpg'],
-        bytes: bytes,
-      );
-      if (path != null) AppLog.instance.info('截图', '视频截图已保存。');
-      return path;
-    } catch (e) {
-      throw safeFailure(e, action: '截图失败');
-    }
-  }
-
   Future<void> setSoftware(bool value) async {
     await updateSettings({'hardwareDecoding': !value});
     await refreshDiagnostics();
@@ -1288,37 +1279,41 @@ class PlaybackSession extends ChangeNotifier {
     }
   }
 
-  void saveProgress() {
+  Future<void> saveProgress() {
     if (_transient ||
         remotePlayback ||
         !ready ||
         player.state.duration <= Duration.zero) {
-      return;
+      return Future.value();
     }
     final duration = player.state.duration.inMilliseconds / 1000;
     final position = player.state.completed
         ? duration
         : player.state.position.inMilliseconds / 1000;
     final progressId = model.progressKey(media);
-    final previous = model.store.get('progress', progressId);
-    if (previous?.deleted == false &&
-        previous?.data['position'] == position &&
-        previous?.data['duration'] == duration) {
-      return;
-    }
-    model.store.save('progress', progressId, {
+    final data = <String, dynamic>{
       'position': position,
       'duration': duration,
       'updatedAt': DateTime.now().toUtc().toIso8601String(),
       'devicePlatform': Platform.operatingSystem,
+    };
+    final watchedId = position / duration >= .95
+        ? model.watchedKey(media)
+        : null;
+    // Snapshot before queuing: a slow write must never replace a later seek or
+    // exit checkpoint with a position read after that event. SQLite persistence
+    // owns its worker; this future only preserves ordering and schedules sync.
+    final saving = _progressWork.then((_) async {
+      final changed = await model.store.savePlaybackProgress(
+        progressId,
+        data,
+        watchedId: watchedId,
+      );
+      if (changed) model.requestProgressSync();
     });
-    model.requestProgressSync();
-    if (duration > 0 &&
-        position / duration >= .95 &&
-        model.store.get('watched', model.watchedKey(media))?.data['watched'] !=
-            true) {
-      model.store.save('watched', model.watchedKey(media), {'watched': true});
-    }
+    // Return errors to this caller without poisoning subsequent checkpoints.
+    _progressWork = saving.catchError((Object _) {});
+    return saving;
   }
 
   /// Every caller observes the same completion, including route disposal while
@@ -1343,7 +1338,7 @@ class PlaybackSession extends ChangeNotifier {
     _closeHooks.clear();
     try {
       if (ready) await player.pause();
-      saveProgress();
+      await saveProgress();
     } catch (e) {
       AppLog.instance.warning('观看记录', safeFailure(e).message);
     }
@@ -1376,6 +1371,7 @@ class PlaybackSession extends ChangeNotifier {
       await cleanup(subscription.cancel);
     }
     await cleanup(_checkpoints.close);
+    await cleanup(() => _progressWork);
     await cleanup(player.dispose);
     position.dispose();
     await cleanup(() async {

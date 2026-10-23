@@ -637,34 +637,78 @@ class SyncProfile {
     }, cancel: cancel);
   }
 
-  /// A paused/exiting player's screenshot needs only its source, binding and
-  /// artwork. Avoid scanning every library location and encoding other posters.
-  Future<Set<String>> prepareArtwork(
+  /// Stages only the encrypted playback dependencies of the selected media.
+  /// The caller must acknowledge these records before publishing their media.
+  Future<Map<String, Set<String>>> prepareMediaBindings(
     Set<String> mediaIds, {
     CancelToken? cancel,
   }) async {
     cancel?.check();
     final snapshot = <String, _ProfileEntry>{};
-    void put(String type, String key, dynamic value) {
-      final entry = _ProfileEntry(type, key, value);
-      snapshot[entry.id] = entry;
-    }
+    final dependencies = await _snapshotMediaBindings(
+      mediaIds,
+      snapshot,
+      cancel: cancel,
+    );
+    await _prepareEntries(snapshot, snapshot.keys.toSet(), cancel: cancel);
+    return dependencies;
+  }
 
+  Future<Map<String, Set<String>>> _snapshotMediaBindings(
+    Set<String> mediaIds,
+    Map<String, _ProfileEntry> snapshot, {
+    CancelToken? cancel,
+  }) async {
+    final dependencies = <String, Set<String>>{};
     final sources = (store.local('sources') as List? ?? []).whereType<Map>();
-    final sourceIds = <String>{};
+    final sourceEntries = <String, _ProfileEntry?>{};
+    var processed = 0;
     for (final id in mediaIds) {
+      if (++processed % 32 == 0) await Future<void>.delayed(Duration.zero);
       cancel?.check();
       final location = store.local('location:$id');
-      if (location is! Map ||
+      if (id.isEmpty ||
+          location is! Map ||
+          location['id'] != id ||
           location['source'] is! String ||
+          (location['source'] as String).isEmpty ||
           location['source'] == 'local' ||
+          location['path'] is! String ||
           store.isPrivateMedia(id) ||
           store.get('media', id)?.deleted != false) {
         continue;
       }
       final sourceId = location['source'] as String;
-      sourceIds.add(sourceId);
-      put('binding', id, {
+      if (!sourceEntries.containsKey(sourceId)) {
+        final source = sources
+            .where((source) => source['id'] == sourceId)
+            .firstOrNull;
+        _ProfileEntry? entry;
+        if (source != null) {
+          if (source['transient'] != true && _validSource(sourceId, source)) {
+            final password = await secrets.read(key: 'source:$sourceId');
+            cancel?.check();
+            if (recoverMissingCredentials && password == null) {
+              throw const AppFailure('来源密码尚未恢复，请重新保存来源密码后再同步。');
+            }
+            entry = _ProfileEntry('source', sourceId, {
+              'configuration': {...source}..remove('password'),
+              'password': password ?? '',
+            });
+          }
+        } else {
+          final external = store.local('externalSource:$sourceId');
+          if (external is Map &&
+              external['transient'] != true &&
+              _validSource(sourceId, external)) {
+            entry = _ProfileEntry('external', sourceId, external);
+          }
+        }
+        sourceEntries[sourceId] = entry;
+      }
+      final source = sourceEntries[sourceId];
+      if (source == null) continue;
+      final binding = _ProfileEntry('binding', id, {
         'location': {
           for (final key in [
             'id',
@@ -682,31 +726,28 @@ class SyncProfile {
           if (_validFacts(kind, store.local('$kind:$id'), location))
             kind: store.local('$kind:$id'),
       });
+      snapshot[source.id] = source;
+      snapshot[binding.id] = binding;
+      dependencies[id] = {source.id, binding.id};
     }
-    for (final id in sourceIds) {
-      cancel?.check();
-      final source = sources.where((source) => source['id'] == id).firstOrNull;
-      if (source != null && source['kind'] != 'local') {
-        final password = await secrets.read(key: 'source:$id');
-        if (recoverMissingCredentials && password == null) {
-          throw const AppFailure('来源密码尚未恢复，请重新保存来源密码后再同步。');
-        }
-        put('source', id, {
-          'configuration': {...source}..remove('password'),
-          'password': password ?? '',
-        });
-      }
-      final external = store.local('externalSource:$id');
-      if (external is Map &&
-          ['http', 'smb', 'webdav'].contains(external['kind'])) {
-        put('external', id, external);
-      }
-    }
+    return dependencies;
+  }
+
+  /// A paused/exiting player's screenshot needs only its source, binding and
+  /// artwork. Avoid scanning every library location and encoding other posters.
+  Future<Set<String>> prepareArtwork(
+    Set<String> mediaIds, {
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    final snapshot = <String, _ProfileEntry>{};
+    await _snapshotMediaBindings(mediaIds, snapshot, cancel: cancel);
     for (final row
         in (await artwork?.snapshot(mediaIds: mediaIds, cancel: cancel) ??
                 <String, dynamic>{})
             .entries) {
-      put('artwork', row.key, row.value);
+      final entry = _ProfileEntry('artwork', row.key, row.value);
+      snapshot[entry.id] = entry;
     }
     await _prepareEntries(snapshot, snapshot.keys.toSet(), cancel: cancel);
     return snapshot.keys.toSet();

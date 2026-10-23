@@ -21,7 +21,7 @@ void main() {
         duration: Duration(minutes: 10),
         videoParams: VideoParams(w: 1920, h: 1080),
       );
-      session.saveProgress();
+      await session.saveProgress();
       session.checkpoint();
       await session.close();
       expect(model.store.get('progress', 'v'), isNull);
@@ -115,9 +115,70 @@ void main() {
       expect(session.timelineRevision, 49);
       expect(model.store.get('progress', 'v'), isNull);
       expect(model.syncRequests, 0);
-      session.saveProgress();
+      await session.saveProgress();
       expect(model.store.get('progress', 'v')!.data['position'], 49);
       expect(model.syncRequests, 1);
+    },
+  );
+
+  test(
+    'slow progress writes preserve seek order and finish before close',
+    () async {
+      final store = _DelayedStore();
+      final model = _Model(store: store);
+      final session = _Session(model)..ready = true;
+      addTearDown(model.dispose);
+      session.player.state = const PlayerState(
+        position: Duration(seconds: 20),
+        duration: Duration(minutes: 10),
+      );
+      final first = session.saveProgress();
+      await session.seek(const Duration(seconds: 40));
+      final second = session.saveProgress();
+      await session.seek(const Duration(seconds: 580));
+      final closing = session.close();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(store.positions, [20]);
+      expect(model.syncRequests, 0);
+      expect(session.player.disposed, isFalse);
+      expect(store.get('progress', 'v'), isNull);
+      store.firstWrite.complete();
+      await Future.wait([first, second, closing]);
+
+      expect(store.positions.take(3), [20, 40, 580]);
+      expect(model.syncedPositions, [20, 40, 580]);
+      expect(store.get('progress', 'v')!.data['position'], 580);
+      expect(store.get('progress', 'v')!.revision, 3);
+      expect(store.get('watched', 'v')!.data['watched'], isTrue);
+      expect(session.player.disposed, isTrue);
+      expect(session.player.screenshots, 0);
+    },
+  );
+
+  test(
+    'failed progress persistence does not discard the next checkpoint',
+    () async {
+      final store = _DelayedStore()..failFirst = true;
+      final model = _Model(store: store);
+      final session = _Session(model)..ready = true;
+      addTearDown(model.dispose);
+      addTearDown(session.close);
+      session.player.state = const PlayerState(
+        position: Duration(seconds: 20),
+        duration: Duration(minutes: 10),
+      );
+      final failure = expectLater(session.saveProgress(), throwsStateError);
+      await session.seek(const Duration(seconds: 40));
+      final next = session.saveProgress();
+      store.firstWrite.complete();
+      await failure;
+      await next;
+
+      expect(store.positions, [20, 40]);
+      expect(model.syncedPositions, [40]);
+      expect(store.get('progress', 'v')!.data['position'], 40);
+      expect(store.get('progress', 'v')!.revision, 1);
     },
   );
 
@@ -194,10 +255,13 @@ class _Session extends PlaybackSession {
 }
 
 class _Model extends ChangeNotifier implements AppModel {
+  _Model({AppStore? store}) : store = store ?? AppStore(':memory:');
+
   final _settings = <String, dynamic>{};
   @override
-  final store = AppStore(':memory:');
+  final AppStore store;
   int syncRequests = 0;
+  final syncedPositions = <num>[];
   final externalDisposals = <String>[];
   @override
   Future<void> disposeExternalMedia(String id) async =>
@@ -209,7 +273,11 @@ class _Model extends ChangeNotifier implements AppModel {
   @override
   String watchedKey(SyncRecord media) => media.id;
   @override
-  void requestProgressSync() => syncRequests++;
+  void requestProgressSync() {
+    syncRequests++;
+    syncedPositions.add(store.get('progress', 'v')!.data['position'] as num);
+  }
+
   @override
   Future<void> savePlaybackPreview(
     String id,
@@ -245,6 +313,28 @@ class _Model extends ChangeNotifier implements AppModel {
   void ensureMediaPreview(String id) {}
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _DelayedStore extends AppStore {
+  _DelayedStore() : super(':memory:');
+
+  final firstWrite = Completer<void>();
+  final positions = <num>[];
+  bool failFirst = false;
+
+  @override
+  Future<bool> savePlaybackProgress(
+    String progressId,
+    Map<String, dynamic> data, {
+    String? watchedId,
+  }) async {
+    positions.add(data['position'] as num);
+    if (positions.length == 1) {
+      await firstWrite.future;
+      if (failFirst) throw StateError('Disk unavailable');
+    }
+    return super.savePlaybackProgress(progressId, data, watchedId: watchedId);
+  }
 }
 
 class _Player implements Player {

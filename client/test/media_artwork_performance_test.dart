@@ -1,7 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:aiplayer/data/poster_cache.dart';
+import 'package:aiplayer/ui/artwork_scroll_scope.dart';
 import 'package:aiplayer/ui/media_artwork.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -15,6 +18,19 @@ class _RecordingPosterCache extends PosterCache {
   Future<File?> load(String url) async {
     requested.add(url);
     return null;
+  }
+}
+
+class _DelayedPosterCache extends PosterCache {
+  final result = Completer<File?>();
+  int requests = 0;
+
+  _DelayedPosterCache() : super(directory: Directory.systemTemp);
+
+  @override
+  Future<File?> load(String url) {
+    requests++;
+    return result.future;
   }
 }
 
@@ -35,6 +51,185 @@ class _DeferredPhysics extends ScrollPhysics {
 }
 
 void main() {
+  testWidgets('wheel bursts defer newly visible posters and previews', (
+    tester,
+  ) async {
+    final cache = _RecordingPosterCache();
+    final previews = <int>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ArtworkScrollScope(
+          child: Align(
+            alignment: Alignment.topLeft,
+            child: SizedBox(
+              width: 200,
+              height: 200,
+              child: ListView.builder(
+                physics: const ClampingScrollPhysics(),
+                scrollCacheExtent: const ScrollCacheExtent.pixels(1000),
+                itemExtent: 100,
+                itemCount: 20,
+                itemBuilder: (_, index) => MediaArtwork(
+                  poster: 'poster-$index',
+                  cache: cache,
+                  onRequestPreview: () => previews.add(index),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(cache.requested, ['poster-0', 'poster-1']);
+    expect(previews, [0, 1]);
+    Future<void> wheel(double delta) => tester.sendEventToBinding(
+      PointerScrollEvent(
+        kind: PointerDeviceKind.mouse,
+        position: tester.getCenter(find.byType(ListView)),
+        scrollDelta: Offset(0, delta),
+      ),
+    );
+    await wheel(300);
+    await tester.pump(const Duration(milliseconds: 90));
+    expect(cache.requested, hasLength(2));
+    await wheel(100);
+    await tester.pump(const Duration(milliseconds: 119));
+    expect(cache.requested, hasLength(2));
+    expect(previews, [0, 1]);
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(cache.requested, ['poster-0', 'poster-1', 'poster-4', 'poster-5']);
+    expect(previews, [0, 1, 4, 5]);
+    await tester.pumpWidget(const SizedBox());
+    cache.close();
+  });
+
+  testWidgets('a poster arriving between wheel events waits for idle', (
+    tester,
+  ) async {
+    final cache = _DelayedPosterCache();
+    final imageCache = PaintingBinding.instance.imageCache;
+    imageCache.clear();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ArtworkScrollScope(
+          child: ListView(
+            physics: const ClampingScrollPhysics(),
+            children: [
+              SizedBox(
+                height: 100,
+                child: MediaArtwork(poster: 'late-poster', cache: cache),
+              ),
+              const SizedBox(height: 4000),
+            ],
+          ),
+        ),
+      ),
+    );
+    expect(cache.requests, 1);
+    await tester.sendEventToBinding(
+      PointerScrollEvent(
+        kind: PointerDeviceKind.mouse,
+        position: tester.getCenter(find.byType(ListView)),
+        scrollDelta: const Offset(0, 20),
+      ),
+    );
+    cache.result.complete(File('assets/branding/app_icon.png'));
+    await tester.pump(const Duration(milliseconds: 119));
+    expect(find.byType(Image), findsNothing);
+    await tester.pump(const Duration(milliseconds: 1));
+    await tester.pump();
+    expect(find.byType(Image), findsOneWidget);
+    expect(cache.requests, 1);
+    await tester.pumpWidget(const SizedBox());
+    imageCache.clear();
+    cache.close();
+  });
+
+  testWidgets('a poster arriving during a fling waits before decoding', (
+    tester,
+  ) async {
+    final cache = _DelayedPosterCache();
+    final imageCache = PaintingBinding.instance.imageCache;
+    imageCache.clear();
+    var defer = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ListView(
+          physics: _DeferredPhysics(() => defer),
+          children: [
+            SizedBox(
+              height: 100,
+              child: MediaArtwork(poster: 'late-poster', cache: cache),
+            ),
+          ],
+        ),
+      ),
+    );
+    expect(cache.requests, 1);
+    defer = true;
+    cache.result.complete(File('assets/branding/app_icon.png'));
+    await tester.pump();
+    expect(find.byType(Image), findsNothing);
+    await tester.pump(const Duration(milliseconds: 160));
+    expect(find.byType(Image), findsNothing);
+
+    defer = false;
+    await tester.pump(const Duration(milliseconds: 80));
+    await tester.pump();
+    expect(find.byType(Image), findsOneWidget);
+    expect(cache.requests, 1);
+    await tester.pumpWidget(const SizedBox());
+    imageCache.clear();
+    cache.close();
+  });
+
+  testWidgets('an offscreen poster result waits until its card is visible', (
+    tester,
+  ) async {
+    final cache = _DelayedPosterCache();
+    final controller = ScrollController();
+    final imageCache = PaintingBinding.instance.imageCache;
+    imageCache.clear();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Align(
+          alignment: Alignment.topLeft,
+          child: SizedBox(
+            width: 200,
+            height: 200,
+            child: ListView(
+              controller: controller,
+              scrollCacheExtent: const ScrollCacheExtent.pixels(1000),
+              children: [
+                SizedBox(
+                  height: 100,
+                  child: MediaArtwork(poster: 'late-poster', cache: cache),
+                ),
+                const SizedBox(height: 1000),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(cache.requests, 1);
+    controller.jumpTo(300);
+    await tester.pump();
+    cache.result.complete(File('assets/branding/app_icon.png'));
+    await tester.pump();
+    expect(find.byType(Image), findsNothing);
+    controller.jumpTo(0);
+    await tester.pump();
+    await tester.pump();
+    expect(find.byType(Image), findsOneWidget);
+    expect(cache.requests, 1);
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
+    imageCache.clear();
+    cache.close();
+  });
+
   testWidgets('decoded covers reappear immediately during a fling', (
     tester,
   ) async {

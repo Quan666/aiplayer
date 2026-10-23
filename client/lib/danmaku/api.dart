@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:isolate';
 import 'package:crypto/crypto.dart';
+import '../core/logger.dart';
 import '../core/network.dart';
 
 class DanmakuComment {
@@ -92,28 +93,31 @@ List<DanmakuComment> normalizeComments(List<dynamic> input) {
   return indexed.map((e) => e.$2).toList();
 }
 
-Future<List<DanmakuComment>> normalizeCommentsAsync(List<dynamic> input) async =>
-    input.length < 1000
-        ? normalizeComments(input)
-        : await Isolate.run(() => normalizeComments(input));
+Future<List<DanmakuComment>> normalizeCommentsAsync(
+  List<dynamic> input,
+) async => input.length < 1000
+    ? normalizeComments(input)
+    : await Isolate.run(() => normalizeComments(input));
 
 List<DanmakuComment>? _decodeCachedComments(String text) {
   final value = jsonDecode(text);
-  return value is List && value.isNotEmpty ? normalizeComments(value) : null;
+  if (value is! List || value.isEmpty) return null;
+  final comments = normalizeComments(value);
+  return comments.isEmpty ? null : comments;
 }
 
 Future<List<DanmakuComment>?> decodeCachedComments(String text) async =>
     text.length < 64 * 1024
-        ? _decodeCachedComments(text)
-        : await Isolate.run(() => _decodeCachedComments(text));
+    ? _decodeCachedComments(text)
+    : await Isolate.run(() => _decodeCachedComments(text));
 
 String _encodeComments(List<DanmakuComment> comments) =>
     jsonEncode(comments.map((comment) => comment.toJson()).toList());
 
 Future<String> encodeComments(List<DanmakuComment> comments) async =>
     comments.length < 1000
-        ? _encodeComments(comments)
-        : await Isolate.run(() => _encodeComments(comments));
+    ? _encodeComments(comments)
+    : await Isolate.run(() => _encodeComments(comments));
 
 class EpisodeMatch {
   final String episodeId, animeTitle, episodeTitle;
@@ -167,12 +171,41 @@ class DanmuApiClient {
     Map<String, String>? query,
     Map<String, dynamic>? body,
     CancelToken? cancel,
-  }) => transport.send(
-    origin.replace(path: '/$_token/api/v2/$path', queryParameters: query),
-    method: body == null ? 'GET' : 'POST',
-    body: body,
-    cancel: cancel,
-  );
+  }) async {
+    final operation = switch (path) {
+      'search/episodes' => '弹幕搜索',
+      'match' => '弹幕匹配',
+      _ => '弹幕下载',
+    };
+    final clock = Stopwatch()..start();
+    try {
+      return await transport.send(
+        origin.replace(path: '/$_token/api/v2/$path', queryParameters: query),
+        method: body == null ? 'GET' : 'POST',
+        body: body,
+        cancel: cancel,
+      );
+    } on AppFailure catch (failure) {
+      if (failure.status == 404) {
+        throw AppFailure(
+          path.startsWith('comment/')
+              ? '该剧集的弹幕请求返回 HTTP 404，请重新匹配；若所有视频均失败，请检查服务地址和 Token。'
+              : '$operation请求返回 HTTP 404，请检查服务地址、Token 及接口兼容性。',
+          404,
+        );
+      }
+      rethrow;
+    } finally {
+      // Record slow stages without authenticated URLs or response contents.
+      if (clock.elapsedMilliseconds >= 1000 && cancel?.cancelled != true) {
+        AppLog.instance.info(
+          '弹幕',
+          '$operation ${clock.elapsedMilliseconds} ms',
+        );
+      }
+    }
+  }
+
   Future<List<EpisodeMatch>> search(
     String anime, {
     String episode = '',

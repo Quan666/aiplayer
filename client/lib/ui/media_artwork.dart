@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import '../core/logger.dart';
 import '../data/poster_cache.dart';
+import 'artwork_scroll_scope.dart';
 import 'glass.dart';
 import 'theme/library_styles.dart';
 
@@ -38,6 +40,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
   Timer? _posterRetry;
   bool _previewPending = false, _previewFrameScheduled = false;
   bool _imageLoadingAllowed = false;
+  ValueListenable<bool>? _scrollActivity;
   final _scrollPositions = <ScrollPosition>{};
   ModalRoute<dynamic>? _route;
   Animation<double>? _routeTransition;
@@ -58,10 +61,18 @@ class _MediaArtworkState extends State<MediaArtwork> {
       _routeTransition = transition;
       _routeTransition?.addStatusListener(_routeSettled);
     }
+    final activity = ArtworkScrollScope.maybeOf(context);
+    if (_scrollActivity != activity) {
+      _scrollActivity?.removeListener(_activityChanged);
+      _scrollActivity = activity;
+      _scrollActivity?.addListener(_activityChanged);
+    }
     final positions = <ScrollPosition>{};
-    for (final axis in Axis.values) {
-      final position = Scrollable.maybeOf(context, axis: axis)?.position;
-      if (position != null) positions.add(position);
+    if (_scrollActivity == null) {
+      for (final axis in Axis.values) {
+        final position = Scrollable.maybeOf(context, axis: axis)?.position;
+        if (position != null) positions.add(position);
+      }
     }
     for (final position in _scrollPositions.difference(positions)) {
       position.removeListener(_scrollChanged);
@@ -78,6 +89,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
   }
 
   bool get _deferLoading =>
+      _scrollActivity?.value == true ||
       Scrollable.recommendDeferredLoadingForContext(
         context,
         axis: Axis.vertical,
@@ -88,11 +100,23 @@ class _MediaArtworkState extends State<MediaArtwork> {
       );
 
   void _retryLoading() {
+    // The shared scope will wake every pending cover once when the region is
+    // idle. Avoid a timer per card while wheel/trackpad events keep arriving.
+    if (_scrollActivity?.value == true) return;
     _posterRetry ??= Timer(const Duration(milliseconds: 80), () {
       _posterRetry = null;
       if (!mounted) return;
       _loadArtwork();
     });
+  }
+
+  void _activityChanged() {
+    if (_scrollActivity?.value == true) {
+      _posterRetry?.cancel();
+      _posterRetry = null;
+    } else {
+      _loadArtwork();
+    }
   }
 
   void _scrollChanged() {
@@ -195,7 +219,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
   }
 
   bool _canLoadImage(File file, int width) {
-    if (_imageLoadingAllowed) return true;
+    // Permission granted before a download is not permission to decode its
+    // result later: scrolling can begin while the file is still in flight.
+    if (_imageLoadingAllowed && !_deferLoading && _visible) return true;
     var cached = false;
     // FileImage and ResizeImage return synchronous keys. Use the resolved key,
     // not the provider object, to reuse decoded/pending textures while flinging.
@@ -205,12 +231,17 @@ class _MediaArtworkState extends State<MediaArtwork> {
     ).obtainKey(ImageConfiguration.empty).then((key) {
       cached = PaintingBinding.instance.imageCache.statusForKey(key).tracked;
     });
+    if (!cached) {
+      _imageLoadingAllowed = false;
+      _loadArtwork();
+    }
     return cached;
   }
 
   @override
   void dispose() {
     _posterRetry?.cancel();
+    _scrollActivity?.removeListener(_activityChanged);
     _routeTransition?.removeStatusListener(_routeSettled);
     for (final position in _scrollPositions) {
       position.removeListener(_scrollChanged);

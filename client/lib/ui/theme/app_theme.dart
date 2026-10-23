@@ -696,8 +696,8 @@ class GlassControlStyles {
   );
 }
 
-/// Opaque sheets already hide their backdrop, so descendant controls can share
-/// the glass decoration without filtering the moving sheet again.
+/// Surfaces keep the glass decoration without sampling a moving backdrop for
+/// every control. A scope can explicitly enable filtering where it is needed.
 class GlassBlurScope extends InheritedWidget {
   final bool enabled;
   const GlassBlurScope({
@@ -708,7 +708,7 @@ class GlassBlurScope extends InheritedWidget {
 
   static bool enabledOf(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<GlassBlurScope>()?.enabled ??
-      true;
+      false;
 
   @override
   bool updateShouldNotify(GlassBlurScope oldWidget) =>

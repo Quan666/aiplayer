@@ -94,36 +94,84 @@ class PlayerChoiceTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final style = PlayerTheme.of(context);
     final radius = BorderRadius.circular(style.controlRadius);
-    return Material(
-      color: selected ? style.selectedColor : Colors.transparent,
-      borderRadius: radius,
-      clipBehavior: Clip.antiAlias,
-      child: ListTile(
-        title: title,
-        subtitle: subtitle,
-        leading: leading,
-        trailing:
-            trailing ??
-            (selected
-                ? const Icon(
-                    Icons.check_rounded,
-                    size: PlayerTheme.choiceIconSize,
-                  )
-                : null),
-        selected: selected,
-        selectedTileColor: Colors.transparent,
-        dense: true,
-        minTileHeight: subtitle == null
-            ? PlayerTheme.menuRowHeight
-            : PlayerTheme.choiceRowWithSubtitleHeight,
-        contentPadding: PlayerTheme.choiceContentPadding,
-        horizontalTitleGap: PlayerTheme.choiceTitleGap,
-        titleTextStyle: style.optionLabelStyle.merge(
-          selected ? style.selectedLabelStyle : null,
+    final marker =
+        trailing ?? (selected ? const Icon(Icons.check_rounded) : null);
+    return Semantics(
+      selected: selected,
+      child: Material(
+        color: selected ? style.selectedColor : Colors.transparent,
+        borderRadius: radius,
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          borderRadius: radius,
+          onTap: onTap,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              minHeight: subtitle == null
+                  ? PlayerTheme.choiceRowHeight
+                  : PlayerTheme.choiceRowWithSubtitleHeight,
+            ),
+            child: Padding(
+              padding: PlayerTheme.choiceTilePadding,
+              child: IconTheme.merge(
+                data: IconThemeData(
+                  color: selected
+                      ? style.foreground
+                      : style.secondaryForeground,
+                  size: PlayerTheme.choiceIconSize,
+                ),
+                child: Stack(
+                  alignment: AlignmentDirectional.centerStart,
+                  children: [
+                    // Center the text block vertically; reserve only the icon space.
+                    Padding(
+                      padding: EdgeInsetsDirectional.only(
+                        start: leading == null
+                            ? 0
+                            : PlayerTheme.choiceIconSize +
+                                  PlayerTheme.choiceTitleGap,
+                        end:
+                            PlayerTheme.choiceIconSize +
+                            PlayerTheme.choiceTitleGap,
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          DefaultTextStyle.merge(
+                            style: style.optionLabelStyle
+                                .merge(
+                                  selected ? style.selectedLabelStyle : null,
+                                )
+                                .copyWith(height: 1.2),
+                            textAlign: TextAlign.start,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            child: title,
+                          ),
+                          if (subtitle != null)
+                            DefaultTextStyle.merge(
+                              style: style.optionValueStyle.copyWith(
+                                height: 1.2,
+                              ),
+                              textAlign: TextAlign.start,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              child: subtitle!,
+                            ),
+                        ],
+                      ),
+                    ),
+                    if (leading != null)
+                      PositionedDirectional(start: 0, child: leading!),
+                    if (marker != null)
+                      PositionedDirectional(end: 0, child: marker),
+                  ],
+                ),
+              ),
+            ),
+          ),
         ),
-        subtitleTextStyle: style.optionValueStyle,
-        shape: RoundedRectangleBorder(borderRadius: radius),
-        onTap: onTap,
       ),
     );
   }
@@ -207,14 +255,16 @@ class PlayerSelect<T> extends StatelessWidget {
         isScrollControlled: true,
         builder: (c) => PlayerSheet(
           child: PlayerMenuList(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            padding: PlayerTheme.choiceMenuPadding,
             selectedIndex:
                 options.indexWhere((option) => option.value == value) + 1,
-            itemExtent: 56 * MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+            itemExtent:
+                PlayerTheme.choiceTrackRowHeight *
+                MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
             itemCount: options.length + 1,
             itemBuilder: (_, index) {
               if (index == 0) {
-                return ListTile(
+                return PlayerChoiceTile(
                   title: Text(
                     label,
                     style: PlayerTheme.of(context).selectedLabelStyle,

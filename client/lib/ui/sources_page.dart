@@ -1661,10 +1661,13 @@ class _SourceBrowserState extends State<SourceBrowser> {
   final cached = <String, List<SourceEntry>>{};
   List<SourceEntry> allEntries = [];
   DirectoryCollection? collection;
-  DirectoryCollection? _recordsCollection;
+  Object? _recordsKey;
   List<SyncRecord> _collectionRecords = const [];
   bool _hasCollectionHeader = false;
   List<SyncRecord>? _headerSeriesRecords;
+  MediaCollectionDetails? _headerDetails;
+  Object? _headerProgressKey;
+  SyncRecord? _headerLatest;
   final folderCollections = <String, DirectoryCollection?>{};
   final folderQueue = <({SourceEntry entry, String parent})>[];
   final inspectedFolders = <String>{};
@@ -1696,6 +1699,7 @@ class _SourceBrowserState extends State<SourceBrowser> {
     _sortedListings[values] = (key, result);
     return result;
   }
+
   String get current => paths.lastOrNull?.path ?? '';
 
   @override
@@ -1745,11 +1749,15 @@ class _SourceBrowserState extends State<SourceBrowser> {
     scheduleMicrotask(() {
       _modelRefreshScheduled = false;
       if (!mounted) return;
-      _recordsCollection = null;
-      _headerSeriesRecords = null;
-      knownFolders = _knownFolderIndex.read(widget.model);
+      final known = _knownFolderIndex.read(widget.model);
+      final metadataChanged = !identical(knownFolders, known);
+      knownFolders = known;
       setState(() {
         if (!busy) entries = _visible(allEntries);
+        // Preview completions and playback updates still refresh visible rows,
+        // but must not rescan every episode and visited folder. Episode names
+        // and progress are read directly from the model by each visible row.
+        if (!metadataChanged) return;
         collection = _knownCollection(
           widget.model,
           widget.source['id'],
@@ -1950,11 +1958,21 @@ class _SourceBrowserState extends State<SourceBrowser> {
     DirectoryCollection value,
     List<SyncRecord> records,
   ) {
-    final latest = widget.model.recentMedia(items: records).firstOrNull;
+    final progressKey = (
+      records,
+      widget.model.store.recordsRevision('progress'),
+    );
+    if (progressKey != _headerProgressKey) {
+      _headerLatest = widget.model.recentMedia(items: records).firstOrNull;
+      _headerProgressKey = progressKey;
+    }
+    final latest = _headerLatest;
     final seriesRecords = _headerSeriesRecords ??= widget.model.seriesRecords(
       records.first,
     );
-    final details = MediaCollectionDetails.fromRecords(seriesRecords);
+    final details = _headerDetails ??= MediaCollectionDetails.fromRecords(
+      seriesRecords,
+    );
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 2, 8, 14),
       child: Column(
@@ -2359,7 +2377,12 @@ class _SourceBrowserState extends State<SourceBrowser> {
   @override
   Widget build(BuildContext context) {
     final value = collection;
-    if (value != null && !identical(value, _recordsCollection)) {
+    final recordsKey = (
+      value,
+      widget.model.store.recordsRevision('media'),
+      widget.model.store.locationRevision,
+    );
+    if (value != null && recordsKey != _recordsKey) {
       _collectionRecords = widget.model.collectionRecords(
         widget.source['id'],
         value,
@@ -2372,7 +2395,8 @@ class _SourceBrowserState extends State<SourceBrowser> {
             (record) => mediaSeriesKey(record) == seriesKey,
           );
       _headerSeriesRecords = null;
-      _recordsCollection = value;
+      _headerDetails = null;
+      _recordsKey = recordsKey;
     }
     final records = value == null ? const <SyncRecord>[] : _collectionRecords;
     final hasCollectionHeader = value != null && _hasCollectionHeader;

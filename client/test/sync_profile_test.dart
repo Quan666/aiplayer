@@ -105,6 +105,49 @@ void main() {
   );
 
   test(
+    'shared polling restores deferred bindings without downloading new changes',
+    () async {
+      final server = _SyncServer();
+      final first = _Device(server), second = _Device(server);
+      first.seedRemote();
+      await first.sync();
+      await second.client.synchronize(
+        _origin,
+        _token,
+        sharedOnly: true,
+        deferProfile: true,
+      );
+      expect(second.store.get('media', 'remote-video'), isNotNull);
+      expect(second.store.local('sources'), isNull);
+      expect(second.store.local('location:remote-video'), isNull);
+      final cursor = second.store.local('syncCursor:$_origin');
+      expect(cursor, server.changes.length);
+
+      final restarted = SyncClient(
+        second.store,
+        profile: SyncProfile(
+          second.store,
+          second.secrets,
+          watchedKey: second.profile.watchedKey,
+        ),
+        transport: server,
+      );
+      await restarted.synchronize(_origin, _token, sharedOnly: true);
+      expect(second.store.local('syncCursor:$_origin'), cursor);
+      expect(second.store.local('sources'), first.store.local('sources'));
+      expect(second.secrets.values['source:nas'], 'nas-password');
+      expect(
+        second.store.local('location:remote-video'),
+        first.store.local('location:remote-video'),
+      );
+      expect(restarted.profileRevision, 1);
+
+      await restarted.synchronize(_origin, _token, sharedOnly: true);
+      expect(restarted.profileRevision, 1);
+    },
+  );
+
+  test(
     'deferred remote settings and bindings converge to the latest local edit',
     () async {
       final server = _SyncServer();
@@ -773,6 +816,43 @@ void main() {
       await second.sync();
       expect(second.secrets.values['aiSubtitleToken'], isNull);
       expect(second.store.conflicts, isEmpty);
+    },
+  );
+
+  test(
+    'shared polling retries failed source restoration without new changes',
+    () async {
+      final server = _SyncServer();
+      final first = _Device(server), second = _Device(server);
+      first.seedRemote();
+      await first.sync();
+      second.secrets.failWriteKey = 'source:nas';
+      await expectLater(
+        second.client.synchronize(_origin, _token, sharedOnly: true),
+        throwsStateError,
+      );
+      expect(second.store.get('media', 'remote-video'), isNotNull);
+      expect(second.store.local('sources'), isNull);
+      expect(second.store.local('location:remote-video'), isNull);
+      expect(second.store.local('lastSync'), isNull);
+      final cursor = second.store.local('syncCursor:$_origin');
+      expect(cursor, server.changes.length);
+      final uploads = server.puts;
+
+      second.secrets.failWriteKey = null;
+      await second.client.synchronize(_origin, _token, sharedOnly: true);
+      expect(second.store.local('syncCursor:$_origin'), cursor);
+      expect(server.puts, uploads);
+      expect(second.store.local('sources'), first.store.local('sources'));
+      expect(second.secrets.values['source:nas'], 'nas-password');
+      expect(
+        second.store.local('location:remote-video'),
+        first.store.local('location:remote-video'),
+      );
+      expect(second.client.profileRevision, 1);
+
+      await second.client.synchronize(_origin, _token, sharedOnly: true);
+      expect(second.client.profileRevision, 1);
     },
   );
 

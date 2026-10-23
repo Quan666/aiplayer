@@ -21,6 +21,7 @@ String? shortcutAction(
   KeyEvent event,
   Map<String, String> shortcuts, {
   bool editingText = false,
+  bool respectRepeatPolicy = true,
 }) {
   if (editingText || (event is! KeyDownEvent && event is! KeyRepeatEvent)) {
     return null;
@@ -59,7 +60,8 @@ String? shortcutAction(
       parts.last,
     ].join('+');
     if (normalized != pressed) continue;
-    if (event is KeyRepeatEvent &&
+    if (respectRepeatPolicy &&
+        event is KeyRepeatEvent &&
         !{
           'seekBackward',
           'seekForward',

@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:uuid/uuid.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
@@ -73,9 +75,10 @@ class AppStore {
   int _localRevision = 0, _locationRevision = 0;
   int _knownChanges = 0;
   late int _dataVersion;
+  Map<String, int> _changeCounters = {};
+  Future<void> _playbackWrites = Future.value();
   AppStore(this.path) : db = sqlite3.open(path) {
-    db.execute('PRAGMA busy_timeout=5000');
-    db.execute('PRAGMA journal_mode=WAL');
+    _configureConnection();
     db.execute(
       '''CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL,id TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,revision INTEGER NOT NULL DEFAULT 0,dirty INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,PRIMARY KEY(kind,id));
       CREATE TABLE IF NOT EXISTS local(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -93,8 +96,13 @@ class AppStore {
         );
       }
     }
+    db.execute(
+      'CREATE INDEX IF NOT EXISTS records_dirty '
+      'ON records(kind,id) WHERE dirty=1',
+    );
+    _createChangeCounters();
     db.execute('PRAGMA user_version=2');
-    _dataVersion = db.select('PRAGMA data_version').first.values.first as int;
+    _readInitialRevisions();
     if (local('syncDevice:id') == null) {
       setLocal('syncDevice:id', const Uuid().v4());
     }
@@ -108,6 +116,70 @@ class AppStore {
       };
       setLocal('syncDevice:name', '${Platform.localHostname} · $platform');
     }
+  }
+
+  /// Worker connections share an already migrated database. Opening a worker
+  /// must not run schema or device initialization writes on every checkpoint.
+  AppStore.openExisting(this.path)
+    : db = sqlite3.open(path, mode: OpenMode.readWrite) {
+    try {
+      _configureConnection();
+      _readInitialRevisions();
+    } catch (_) {
+      dispose();
+      rethrow;
+    }
+  }
+
+  void _configureConnection() {
+    db.execute('PRAGMA busy_timeout=5000');
+    db.execute('PRAGMA journal_mode=WAL');
+  }
+
+  void _createChangeCounters() {
+    // data_version alone cannot distinguish our checkpoint worker from a
+    // concurrent library edit in another Flutter engine. These counters are
+    // committed atomically with every mutation, including direct SQL writes.
+    db.execute(
+      'CREATE TABLE IF NOT EXISTS store_change_counters('
+      'scope TEXT PRIMARY KEY,value INTEGER NOT NULL)',
+    );
+    for (final table in ['records', 'local', 'cache', 'conflicts']) {
+      for (final event in ['INSERT', 'UPDATE', 'DELETE']) {
+        final row = event == 'DELETE' ? 'OLD' : 'NEW';
+        final scope = switch (table) {
+          'records' || 'conflicts' =>
+            "CASE WHEN $row.kind IN ('progress','watched')"
+                '${event == 'UPDATE' ? ' AND OLD.kind=NEW.kind' : ''}'
+                " THEN $row.kind ELSE 'other' END",
+          'local' =>
+            "CASE WHEN ($row.key='lastSync' OR substr($row.key,1,4)='sync')"
+                '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
+                " THEN 'sync' ELSE 'other' END",
+          _ => "'other'",
+        };
+        db.execute(
+          'CREATE TRIGGER IF NOT EXISTS store_change_${table}_${event.toLowerCase()} '
+          'AFTER $event ON $table BEGIN '
+          'INSERT INTO store_change_counters(scope,value) VALUES($scope,1) '
+          'ON CONFLICT(scope) DO UPDATE SET value=value+1; END',
+        );
+      }
+    }
+  }
+
+  Map<String, int> _readChangeCounters() => {
+    for (final row in _select('SELECT scope,value FROM store_change_counters'))
+      row['scope'] as String: row['value'] as int,
+  };
+
+  void _readInitialRevisions() {
+    final row = _select(
+      'SELECT total_changes() AS changes, data_version FROM pragma_data_version',
+    ).first;
+    _knownChanges = row['changes'] as int;
+    _dataVersion = row['data_version'] as int;
+    _changeCounters = _readChangeCounters();
   }
 
   PreparedStatement _statement(String sql) =>
@@ -128,8 +200,8 @@ class AppStore {
   }
 
   /// Cheap invalidation for view snapshots. Known writes only invalidate their
-  /// own kind; SQL issued directly and commits from another database connection
-  /// invalidate every snapshot. No record JSON is read to check freshness.
+  /// own kind. Playback worker commits invalidate progress, while unrelated
+  /// external edits still invalidate every snapshot. No record JSON is read.
   int recordsRevision(String kind) {
     _checkChanges();
     final own = _recordRevisions[kind] ?? 0;
@@ -156,7 +228,32 @@ class AppStore {
     ).first;
     final changes = row['changes'] as int;
     final version = row['data_version'] as int;
-    if (changes != _knownChanges || version != _dataVersion) {
+    var unknown = changes != _knownChanges;
+    if (unknown || version != _dataVersion) {
+      final counters = _readChangeCounters();
+      final changed = {
+        for (final scope in {...counters.keys, ..._changeCounters.keys})
+          if (counters[scope] != _changeCounters[scope]) scope,
+      };
+      unknown |= changed.isEmpty || changed.contains('other');
+      if (!unknown) {
+        for (final scope in changed) {
+          final revision = ++_revision;
+          if (scope == 'sync') {
+            _localRevision = revision;
+            for (final key in _localKeyRevisions.keys) {
+              if (key.startsWith('sync') || key == 'lastSync') {
+                _localKeyRevisions[key] = revision;
+              }
+            }
+          } else {
+            _recordRevisions[scope] = revision;
+          }
+        }
+      }
+      _changeCounters = counters;
+    }
+    if (unknown) {
       _unknownRevision = ++_revision;
       _locationIndex = null;
       _locationKeys.clear();
@@ -167,8 +264,20 @@ class AppStore {
 
   void _written({String? kind, String? localKey}) {
     final count = db.updatedRows;
-    _knownChanges += count;
+    // Each app-table mutation also changes one durable counter via its trigger.
+    _knownChanges += count * 2;
     if (count == 0) return;
+    final scope = kind == 'progress' || kind == 'watched'
+        ? kind!
+        : localKey != null &&
+              (localKey.startsWith('sync') || localKey == 'lastSync')
+        ? 'sync'
+        : 'other';
+    _changeCounters.update(
+      scope,
+      (value) => value + count,
+      ifAbsent: () => count,
+    );
     final revision = ++_revision;
     if (kind != null) _recordRevisions[kind] = revision;
     if (localKey != null) {
@@ -203,16 +312,11 @@ class AppStore {
   List<SyncRecord> all(String kind) => _select(
     'SELECT * FROM records WHERE kind=? AND deleted=0 ORDER BY id',
     [kind],
-  )
-      .map(_row)
-      .where((record) => record.data['transient'] != true)
-      .toList();
+  ).map(_row).where((record) => record.data['transient'] != true).toList();
   List<SyncRecord> records(String kind) => _select(
     'SELECT * FROM records WHERE kind=? ORDER BY id',
     [kind],
-  )
-      .map(_row)
-      .toList();
+  ).map(_row).toList();
   Map<String, dynamic> localEntries(String prefix) {
     // substr(key, ...) forces a scan of the complete local/cache table. A
     // binary range uses its primary-key index and treats SQL wildcards literally.
@@ -249,12 +353,12 @@ class AppStore {
     return record != null && shouldSyncRecord(record) ? record : null;
   }
 
-  List<SyncRecord> pendingRecords({bool includeVault = true}) => _select(
-        'SELECT r.* FROM records r LEFT JOIN conflicts c ON c.kind=r.kind AND c.id=r.id WHERE r.dirty=1 AND c.id IS NULL${includeVault ? '' : " AND r.kind!='vault'"} ORDER BY r.kind,r.id',
-      )
-      .map(_row)
-      .where(shouldSyncRecord)
-      .toList();
+  List<SyncRecord> pendingRecords({
+    bool includeVault = true,
+    bool playbackOnly = false,
+  }) => _select(
+    'SELECT r.* FROM records r LEFT JOIN conflicts c ON c.kind=r.kind AND c.id=r.id WHERE r.dirty=1 AND c.id IS NULL${includeVault ? '' : " AND r.kind!='vault'"}${playbackOnly ? " AND r.kind IN ('progress','watched')" : ''} ORDER BY r.kind,r.id',
+  ).map(_row).where(shouldSyncRecord).toList();
 
   String get deviceId => local('syncDevice:id') as String;
   String get deviceName => local('syncDevice:name') as String;
@@ -281,6 +385,61 @@ class AppStore {
     }
     if (record.kind == 'watched') return !isPrivateMedia(id);
     return true;
+  }
+
+  /// Capture the checkpoint immediately, then persist it on a separate isolate.
+  /// Disk waits cannot hold up rendering, and later seeks cannot overtake an
+  /// earlier checkpoint that is still waiting for the database writer lock.
+  Future<bool> savePlaybackProgress(
+    String progressId,
+    Map<String, dynamic> data, {
+    String? watchedId,
+  }) async {
+    final snapshot = jsonEncode(data);
+    if (path == ':memory:') {
+      return _savePlaybackProgress(progressId, jsonDecode(snapshot), watchedId);
+    }
+    final databasePath = path;
+    final pending = _playbackWrites.then(
+      (_) => _savePlaybackProgressInWorker(
+        databasePath,
+        progressId,
+        snapshot,
+        watchedId,
+      ),
+    );
+    // Each caller still receives its error. A failed write must not poison the
+    // queue and prevent the final pause/exit checkpoint from being persisted.
+    _playbackWrites = pending.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return pending;
+  }
+
+  bool _savePlaybackProgress(
+    String progressId,
+    Map<String, dynamic> data,
+    String? watchedId,
+  ) {
+    var changed = false;
+    transaction(() {
+      final previous = get('progress', progressId);
+      if (previous?.deleted != false ||
+          previous!.data['position'] != data['position'] ||
+          previous.data['duration'] != data['duration']) {
+        save('progress', progressId, data);
+        changed = true;
+      }
+      if (watchedId != null) {
+        final watched = get('watched', watchedId);
+        if (watched?.deleted != false || watched!.data['watched'] != true) {
+          save('watched', watchedId, {'watched': true});
+          changed = true;
+        }
+      }
+    });
+    return changed;
   }
 
   void save(
@@ -362,38 +521,79 @@ class AppStore {
   }
 
   void conflict(SyncRecord r) {
-    _execute(
-      'INSERT OR REPLACE INTO conflicts(kind,id,remote) VALUES(?,?,?)',
-      [r.kind, r.id, jsonEncode(r.toJson())],
-    );
-    _written();
+    _execute('INSERT OR REPLACE INTO conflicts(kind,id,remote) VALUES(?,?,?)', [
+      r.kind,
+      r.id,
+      jsonEncode(r.toJson()),
+    ]);
+    _written(kind: r.kind);
   }
 
-  List<SyncRecord> get conflicts => _select('SELECT remote FROM conflicts')
-      .map((r) => SyncRecord.fromJson(jsonDecode(r['remote'])))
-      .toList();
-  void resolve(SyncRecord remote, {required bool keepLocal}) {
+  List<SyncRecord> get conflicts => conflictRecords();
+
+  SyncRecord? conflictRecord(String kind, String id) {
+    final rows = _select('SELECT remote FROM conflicts WHERE kind=? AND id=?', [
+      kind,
+      id,
+    ]);
+    return rows.isEmpty
+        ? null
+        : SyncRecord.fromJson(jsonDecode(rows.single['remote']));
+  }
+
+  List<SyncRecord> conflictRecords({
+    bool playbackOnly = false,
+    bool includeVault = true,
+  }) => _select(
+    'SELECT remote FROM conflicts WHERE 1=1'
+    '${includeVault ? '' : " AND kind!='vault'"}'
+    '${playbackOnly ? " AND kind IN ('progress','watched')" : ''}',
+  ).map((r) => SyncRecord.fromJson(jsonDecode(r['remote']))).toList();
+
+  bool resolveLatest(SyncRecord remote) {
     transaction(() {
-      if (keepLocal) {
-        _execute(
-          'UPDATE records SET version=?,dirty=1,revision=revision+1 WHERE kind=? AND id=?',
-          [remote.version, remote.kind, remote.id],
-        );
-        _written(kind: remote.kind);
-      } else {
-        _execute('DELETE FROM records WHERE kind=? AND id=?', [
+      // The checkpoint worker can commit while an upload awaits its response.
+      // Read the winner only after acquiring the same SQLite writer lock.
+      final own = get(remote.kind, remote.id);
+      if (own != null && own.version > remote.version) {
+        _execute('DELETE FROM conflicts WHERE kind=? AND id=?', [
           remote.kind,
           remote.id,
         ]);
         _written(kind: remote.kind);
-        applyRemote(remote);
+        return;
       }
-      _execute('DELETE FROM conflicts WHERE kind=? AND id=?', [
+      _resolve(
+        remote,
+        keepLocal: own != null && own.dirty && newerLocalRecord(own, remote),
+      );
+    });
+    return true;
+  }
+
+  void resolve(SyncRecord remote, {required bool keepLocal}) =>
+      transaction(() => _resolve(remote, keepLocal: keepLocal));
+
+  void _resolve(SyncRecord remote, {required bool keepLocal}) {
+    if (keepLocal) {
+      _execute(
+        'UPDATE records SET version=?,dirty=1,revision=revision+1 WHERE kind=? AND id=?',
+        [remote.version, remote.kind, remote.id],
+      );
+      _written(kind: remote.kind);
+    } else {
+      _execute('DELETE FROM records WHERE kind=? AND id=?', [
         remote.kind,
         remote.id,
       ]);
-      _written();
-    });
+      _written(kind: remote.kind);
+      applyRemote(remote);
+    }
+    _execute('DELETE FROM conflicts WHERE kind=? AND id=?', [
+      remote.kind,
+      remote.id,
+    ]);
+    _written(kind: remote.kind);
   }
 
   dynamic local(String key) {
@@ -522,10 +722,8 @@ class AppStore {
   }
 
   List<Map<String, dynamic>> get locations => _select(
-        "SELECT value FROM local WHERE key>='location:' AND key<'location;' ORDER BY rowid",
-      )
-      .map((r) => Map<String, dynamic>.from(jsonDecode(r['value'])))
-      .toList();
+    "SELECT value FROM local WHERE key>='location:' AND key<'location;' ORDER BY rowid",
+  ).map((r) => Map<String, dynamic>.from(jsonDecode(r['value']))).toList();
   dynamic cached(String key, {DateTime? now}) {
     final text = cachedJson(key);
     if (text == null) return null;
@@ -547,10 +745,11 @@ class AppStore {
 
   void cacheJson(String key, String encoded, {DateTime? now}) {
     if (cachedJson(key) == encoded) return;
-    _execute(
-      'INSERT OR REPLACE INTO cache(key,created,value) VALUES(?,?,?)',
-      [key, (now ?? DateTime.now()).millisecondsSinceEpoch, encoded],
-    );
+    _execute('INSERT OR REPLACE INTO cache(key,created,value) VALUES(?,?,?)', [
+      key,
+      (now ?? DateTime.now()).millisecondsSinceEpoch,
+      encoded,
+    ]);
     _written();
   }
 
@@ -565,6 +764,7 @@ class AppStore {
       _unknownRevision = ++_revision;
       _locationIndex = null;
       _locationKeys.clear();
+      _changeCounters = _readChangeCounters();
       rethrow;
     }
   }
@@ -575,5 +775,40 @@ class AppStore {
     }
     _statements.clear();
     db.dispose();
+  }
+}
+
+Future<bool> _savePlaybackProgressInWorker(
+  String path,
+  String progressId,
+  String snapshot,
+  String? watchedId,
+) => Isolate.run(() async {
+  final store = await retryStoreBusy(() => AppStore.openExisting(path));
+  try {
+    return await retryStoreBusy(
+      () => store._savePlaybackProgress(
+        progressId,
+        jsonDecode(snapshot),
+        watchedId,
+      ),
+    );
+  } finally {
+    store.dispose();
+  }
+});
+
+/// SQLite can return BUSY without invoking its configured busy handler. Worker
+/// operations retry their complete atomic mutation after yielding; other errors
+/// still reach the caller, and contention cannot hold a worker indefinitely.
+Future<T> retryStoreBusy<T>(FutureOr<T> Function() operation) async {
+  final elapsed = Stopwatch()..start();
+  while (true) {
+    try {
+      return await operation();
+    } on SqliteException catch (error) {
+      if (error.resultCode != 5 || elapsed.elapsedMilliseconds >= 5000) rethrow;
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
   }
 }

@@ -38,7 +38,7 @@ class DanmakuSession extends ChangeNotifier {
     }
     error = message;
     if (failure is AppFailure) {
-      if (failure.status == 429) {
+      if (failure.status == 429 || failure.status == 404) {
         _retryAfter = DateTime.now().add(const Duration(minutes: 5));
       }
       if (failure.status == 401 || failure.status == 403) interval = 0;
@@ -59,6 +59,21 @@ class DanmakuSession extends ChangeNotifier {
   Future<void> identify(ReleaseName guess, {bool restore = true}) async {
     final cancel = _begin(), generation = _generation;
     try {
+      final missingIds = <String>{};
+      AppFailure? missing;
+      Future<bool> load(EpisodeMatch match, {String? savedLabel}) async {
+        if (missingIds.contains(match.episodeId)) return false;
+        try {
+          await _load(match, cancel, generation, savedLabel: savedLabel);
+          return true;
+        } on AppFailure catch (failure) {
+          if (failure.status != 404) rethrow;
+          missingIds.add(match.episodeId);
+          missing = failure;
+          return false;
+        }
+      }
+
       final saved = store.get('match', mediaId);
       if (restore &&
           saved != null &&
@@ -66,7 +81,7 @@ class DanmakuSession extends ChangeNotifier {
           saved.data['provider'] == api.origin.origin) {
         final d = saved.data;
         offset = (d['offset'] as num?)?.toDouble() ?? 0;
-        await select(
+        final restored = await load(
           EpisodeMatch(
             '${d['episodeId']}',
             d['label'] ?? '',
@@ -75,7 +90,7 @@ class DanmakuSession extends ChangeNotifier {
           ),
           savedLabel: d['label'],
         );
-        return;
+        if (restored || !_current(generation)) return;
       }
       var found = <EpisodeMatch>[];
       if (guess.anime.length >= 2 && guess.episode.isNotEmpty) {
@@ -96,18 +111,20 @@ class DanmakuSession extends ChangeNotifier {
             (guess.season.isEmpty ||
                 parseReleaseName(found.first.animeTitle).season ==
                     guess.season)) {
-          await select(found.first);
-          return;
+          if (await load(found.first) || !_current(generation)) return;
         }
       }
       final result = await api.match(guess.matchName, cancel: cancel);
       if (!_current(generation)) return;
       candidates = {
-        for (final v in [...found, ...result.matches]) v.episodeId: v,
+        for (final v in [...found, ...result.matches])
+          if (!missingIds.contains(v.episodeId)) v.episodeId: v,
       }.values.toList();
-      if (result.matched) {
-        await select(result.matches.single);
-        return;
+      if (result.matched && await load(result.matches.single)) return;
+      if (!_current(generation)) return;
+      candidates.removeWhere((match) => missingIds.contains(match.episodeId));
+      if (candidates.isEmpty && missing != null) {
+        throw missing!;
       }
       error = candidates.isEmpty ? '未找到弹幕，请修改作品名称或集数。' : '请选择正确的作品和集数。';
     } on Cancelled {
@@ -116,8 +133,10 @@ class DanmakuSession extends ChangeNotifier {
       if (_current(generation)) _failure(e);
     } finally {
       if (_current(generation)) {
-        busy = false;
-        _notify();
+        if (busy || error.isNotEmpty) {
+          busy = false;
+          _notify();
+        }
         _schedule();
       }
     }
@@ -147,41 +166,60 @@ class DanmakuSession extends ChangeNotifier {
   Future<void> select(EpisodeMatch match, {String? savedLabel}) async {
     final cancel = _begin(), generation = _generation;
     try {
-      final key = api.cacheKey(match.episodeId);
-      final saved = store.cachedJson(key);
-      final cached = saved == null ? null : await decodeCachedComments(saved);
-      if (!_current(generation)) return;
-      final values =
-          cached ?? await api.comments(match.episodeId, cancel: cancel);
-      if (!_current(generation)) return;
-      comments = values;
-      _cachedComments = cached;
-      episodeId = match.episodeId;
-      label = savedLabel ?? match.label;
-      shift = match.shift;
-      candidates = [];
-      _retryAfter = null;
-      _saveMatch();
-      try {
-        if (cached == null) {
-          final encoded = await encodeComments(values);
-          if (!_current(generation)) return;
-          store.cacheJson(key, encoded);
-          _cachedComments = values;
-        }
-      } catch (_) {
-        /* playback does not depend on cache space */
-      }
+      await _load(match, cancel, generation, savedLabel: savedLabel);
     } on Cancelled {
       /* superseded */
     } catch (e) {
       if (_current(generation)) _failure(e);
     } finally {
       if (_current(generation)) {
-        busy = false;
-        _notify();
+        if (busy || error.isNotEmpty) {
+          busy = false;
+          _notify();
+        }
         _schedule();
       }
+    }
+  }
+
+  Future<void> _load(
+    EpisodeMatch match,
+    CancelToken cancel,
+    int generation, {
+    String? savedLabel,
+  }) async {
+    final key = api.cacheKey(match.episodeId);
+    List<DanmakuComment>? cached;
+    try {
+      final saved = store.cachedJson(key);
+      if (saved != null) cached = await decodeCachedComments(saved);
+    } catch (_) {
+      // An unreadable local cache must not prevent fetching fresh comments.
+    }
+    if (!_current(generation)) return;
+    final values =
+        cached ?? await api.comments(match.episodeId, cancel: cancel);
+    if (!_current(generation)) return;
+    comments = values;
+    _cachedComments = cached;
+    episodeId = match.episodeId;
+    label = savedLabel ?? match.label;
+    shift = match.shift;
+    candidates = [];
+    _retryAfter = null;
+    _saveMatch();
+    busy = false;
+    _notify();
+    // Render the first snapshot before encoding or persisting large caches.
+    try {
+      if (cached == null) {
+        final encoded = await encodeComments(values);
+        if (!_current(generation)) return;
+        store.cacheJson(key, encoded);
+        _cachedComments = values;
+      }
+    } catch (_) {
+      /* playback does not depend on cache space */
     }
   }
 
@@ -233,7 +271,7 @@ class DanmakuSession extends ChangeNotifier {
   }
 
   void _schedule() {
-    if (!active || _timer != null || _refreshRequest != null) return;
+    if (busy || !active || _timer != null || _refreshRequest != null) return;
     var delay = Duration(seconds: interval);
     if (_retryAfter != null) {
       final remaining = _retryAfter!.difference(DateTime.now());
@@ -246,7 +284,7 @@ class DanmakuSession extends ChangeNotifier {
   }
 
   Future<void> refresh() async {
-    if (!active || _refreshRequest != null) return;
+    if (busy || !active || _refreshRequest != null) return;
     final generation = _generation, id = episodeId!, cancel = CancelToken();
     _refreshRequest = cancel;
     try {
@@ -257,12 +295,12 @@ class DanmakuSession extends ChangeNotifier {
           id != episodeId) {
         return;
       }
-      if (!listEquals(values, comments)) {
-        comments = values;
-        _notify();
-      }
+      final changed = !listEquals(values, comments),
+          hadError = error.isNotEmpty;
+      if (changed) comments = values;
       error = '';
       _retryAfter = null;
+      if (changed || hadError) _notify();
       try {
         if (!identical(_cachedComments, comments)) {
           final snapshot = comments;
@@ -275,7 +313,7 @@ class DanmakuSession extends ChangeNotifier {
     } on Cancelled {
       /* pause or switching */
     } on AppFailure catch (e) {
-      if (_current(generation) && !cancel.cancelled) {
+      if (_current(generation) && !cancel.cancelled && id == episodeId) {
         _failure(e);
         _notify();
       }

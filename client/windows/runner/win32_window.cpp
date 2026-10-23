@@ -3,6 +3,9 @@
 #include <dwmapi.h>
 #include <flutter_windows.h>
 
+#include <algorithm>
+#include <cmath>
+
 #include "resource.h"
 
 namespace {
@@ -143,6 +146,37 @@ bool Win32Window::Create(const std::wstring& title,
   if (!window) {
     return false;
   }
+
+  // |size| describes Flutter's content, excluding the native title bar and
+  // borders. Measure the actual decorations at this monitor's DPI.
+  RECT outer;
+  GetWindowRect(window, &outer);
+  RECT client = GetClientArea();
+  const int border_width = (outer.right - outer.left) - client.right;
+  const int border_height = (outer.bottom - outer.top) - client.bottom;
+  double content_width = size.width * scale_factor;
+  double content_height = size.height * scale_factor;
+  int x = outer.left;
+  int y = outer.top;
+  MONITORINFO monitor_info{sizeof(MONITORINFO)};
+  const bool has_work_area = GetMonitorInfo(monitor, &monitor_info);
+  if (has_work_area) {
+    const RECT& work = monitor_info.rcWork;
+    const double fit = std::max(0.0, std::min({1.0,
+        ((work.right - work.left) * 0.9 - border_width) / content_width,
+        ((work.bottom - work.top) * 0.9 - border_height) / content_height}));
+    content_width *= fit;
+    content_height *= fit;
+  }
+  const int width = std::max(1, static_cast<int>(std::floor(content_width))) + border_width;
+  const int height = std::max(1, static_cast<int>(std::floor(content_height))) + border_height;
+  if (has_work_area) {
+    const RECT& work = monitor_info.rcWork;
+    x = work.left + (work.right - work.left - width) / 2;
+    y = work.top + (work.bottom - work.top - height) / 2;
+  }
+  SetWindowPos(window, nullptr, x, y, width, height,
+      SWP_NOACTIVATE | SWP_NOZORDER);
 
   UpdateTheme(window);
 

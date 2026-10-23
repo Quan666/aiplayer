@@ -15,32 +15,35 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => FlutterSecureStorage.setMockInitialValues({'syncToken': _token}));
 
-  testWidgets('background suspends polling and retries, then resumes dirty work', (tester) async {
-    final f = await _Fixture.create(tester, backgroundWork: true);
-    f.progress(10);
-    unawaited(f.model.synchronize(quiet: true));
-    await tester.pump();
-    f.model.setForeground(false);
-    expect(f.client.requests.single.cancel?.cancelled, true);
-    await tester.pump();
-    f.progress(20);
-    f.model.requestProgressSync();
-    await tester.pump(const Duration(minutes: 5));
-    expect(f.client.requests, hasLength(1));
-    expect(f.client.waits, 0);
-    expect(f.progressRecord.dirty, true);
-    f.model.setForeground(true);
-    await tester.pump();
-    expect(f.client.requests, hasLength(2));
-    expect(f.client.requests.last.position, 20);
-    f.client.requests.last.complete();
-    await tester.pump();
-    expect(f.progressRecord.dirty, false);
-    expect(f.client.waits, 1);
-    expect(f.client.maxActive, 1);
-    f.disposeModel();
-    await tester.pump();
-  });
+  testWidgets(
+    'background suspends polling and retries, then resumes dirty work',
+    (tester) async {
+      final f = await _Fixture.create(tester, backgroundWork: true);
+      f.progress(10);
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.model.setForeground(false);
+      expect(f.client.requests.single.cancel?.cancelled, true);
+      await tester.pump();
+      f.progress(20);
+      f.model.requestProgressSync();
+      await tester.pump(const Duration(minutes: 5));
+      expect(f.client.requests, hasLength(1));
+      expect(f.client.waits, 0);
+      expect(f.progressRecord.dirty, true);
+      f.model.setForeground(true);
+      await tester.pump();
+      expect(f.client.requests, hasLength(2));
+      expect(f.client.requests.last.position, 20);
+      f.client.requests.last.complete();
+      await tester.pump();
+      expect(f.progressRecord.dirty, false);
+      expect(f.client.waits, 1);
+      expect(f.client.maxActive, 1);
+      f.disposeModel();
+      await tester.pump();
+    },
+  );
 
   testWidgets(
     'progress sync uses a short debounce and skips the full profile',
@@ -86,6 +89,7 @@ void main() {
       expect(f.client.requests, hasLength(2));
       expect(f.client.requests.last.sharedOnly, true);
       expect(f.client.requests.last.deferProfile, true);
+      expect(f.client.requests.last.playbackOnly, true);
       f.client.requests.last.complete();
       await tester.pump();
       expect(f.client.waits, 0);
@@ -97,6 +101,7 @@ void main() {
       expect(f.client.requests, hasLength(3));
       expect(f.client.requests.last.sharedOnly, false);
       expect(f.client.requests.last.deferProfile, false);
+      expect(f.client.requests.last.playbackOnly, false);
       f.client.requests.last.complete();
       await tester.pump();
       expect(f.client.waits, 1);
@@ -179,6 +184,43 @@ void main() {
       f.client.requests.last.complete();
       await tester.pump();
       expect(f.client.maxActive, 1);
+    },
+  );
+
+  testWidgets(
+    'playback heartbeats defer artwork and do not notify hidden pages',
+    (tester) async {
+      final f = await _Fixture.create(tester, backgroundWork: true);
+      f.model.activePlaybackMediaId = 'video';
+      var notifications = 0;
+      f.model.addListener(() => notifications++);
+      f.progress(10);
+      f.model.requestArtworkSync('video');
+      await tester.pump(const Duration(milliseconds: 150));
+      final playing = f.client.requests.single;
+      expect(playing.playbackOnly, true);
+      expect(playing.artworkIds, isEmpty);
+      playing.complete();
+      await tester.pump();
+      expect(notifications, 0);
+
+      f.progress(20);
+      f.model.requestProgressSync();
+      await tester.pump(const Duration(milliseconds: 150));
+      f.client.requests.last.fail();
+      await tester.pump();
+      expect(notifications, 0, reason: 'a quiet failure is not a UI change');
+
+      f.model.activePlaybackMediaId = null;
+      await tester.pump(const Duration(seconds: 1));
+      final idle = f.client.requests.last;
+      expect(idle.playbackOnly, false);
+      expect(idle.artworkIds, {'video'});
+      idle.complete();
+      await tester.pump();
+      expect(notifications, greaterThan(0));
+      f.disposeModel();
+      await tester.pump();
     },
   );
 
@@ -383,7 +425,7 @@ class _Model extends AppModel {
 
 class _Request {
   final String address, token;
-  final bool sharedOnly, deferProfile;
+  final bool sharedOnly, deferProfile, playbackOnly;
   final Set<String> artworkIds;
   final CancelToken? cancel;
   final List<SyncRecord> records;
@@ -393,6 +435,7 @@ class _Request {
     this.token,
     this.sharedOnly,
     this.deferProfile,
+    this.playbackOnly,
     this.artworkIds,
     this.cancel,
     this.records,
@@ -419,12 +462,14 @@ class _Client extends SyncClient {
     bool sharedOnly = false,
     Set<String> artworkIds = const {},
     bool deferProfile = false,
+    bool playbackOnly = false,
   }) async {
     final request = _Request(
       address,
       token,
       sharedOnly,
       deferProfile,
+      playbackOnly,
       Set.of(artworkIds),
       cancel,
       store.pending,

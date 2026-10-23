@@ -1,5 +1,6 @@
 import 'package:aiplayer/danmaku/api.dart';
 import 'package:aiplayer/danmaku/layout.dart';
+import 'package:aiplayer/data/preferences.dart';
 import 'package:aiplayer/playback/input.dart';
 import 'package:aiplayer/playback/display.dart';
 import 'package:flutter/services.dart';
@@ -63,6 +64,10 @@ void main() {
       timeStamp: Duration.zero,
     );
     expect(shortcutAction(repeat, {'fullscreen': 'F'}), isNull);
+    expect(
+      shortcutAction(repeat, {'fullscreen': 'F'}, respectRepeatPolicy: false),
+      'fullscreen',
+    );
     expect(shortcutAction(repeat, {'seekForward': 'F'}), 'seekForward');
     const release = KeyUpEvent(
       physicalKey: PhysicalKeyboardKey.keyF,
@@ -93,6 +98,53 @@ void main() {
       await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
     }
   });
+  testWidgets(
+    'desktop defaults support volume, seeking, pause and long skips',
+    (tester) async {
+      final shortcuts = AppPreferences({}).shortcuts;
+      final bindings = {
+        LogicalKeyboardKey.arrowLeft: 'seekBackward',
+        LogicalKeyboardKey.arrowRight: 'seekForward',
+        LogicalKeyboardKey.arrowUp: 'volumeUp',
+        LogicalKeyboardKey.arrowDown: 'volumeDown',
+        LogicalKeyboardKey.space: 'playPause',
+        LogicalKeyboardKey.keyK: 'playPauseAlternate',
+        LogicalKeyboardKey.keyJ: 'skipForward',
+      };
+      for (final binding in bindings.entries) {
+        final event = KeyDownEvent(
+          physicalKey: PhysicalKeyboardKey.keyA,
+          logicalKey: binding.key,
+          timeStamp: Duration.zero,
+        );
+        expect(shortcutAction(event, shortcuts), binding.value);
+        expect(shortcutAction(event, shortcuts, editingText: true), isNull);
+        final repeat = KeyRepeatEvent(
+          physicalKey: event.physicalKey,
+          logicalKey: event.logicalKey,
+          timeStamp: Duration.zero,
+        );
+        // Holding arrows adjusts continuously; a held skip or pause fires once.
+        expect(
+          shortcutAction(repeat, shortcuts),
+          binding.value.startsWith('seek') || binding.value.startsWith('volume')
+              ? binding.value
+              : isNull,
+        );
+      }
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      try {
+        const skip = KeyDownEvent(
+          physicalKey: PhysicalKeyboardKey.keyJ,
+          logicalKey: LogicalKeyboardKey.keyJ,
+          timeStamp: Duration.zero,
+        );
+        expect(shortcutAction(skip, shortcuts), 'skipBackward');
+      } finally {
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      }
+    },
+  );
   test(
     'seek and level gestures scale with viewport and clamp at boundaries',
     () {

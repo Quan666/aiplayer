@@ -168,6 +168,35 @@ void main() {
     expect(preferences.shortcuts['playPause'], 'X');
   });
 
+  test('new shortcuts preserve existing custom bindings after upgrade', () {
+    final defaults = AppPreferences({}).shortcuts;
+    expect(defaults['skipForward'], 'J');
+    expect(defaults['skipBackward'], 'Shift+J');
+    expect(defaults['playPauseAlternate'], 'K');
+    final shortcuts = AppPreferences({
+      'shortcuts': {'settings': 'J', 'danmaku': 'Shift+J', 'mute': 'K'},
+    }).shortcuts;
+    expect(shortcuts['settings'], 'J');
+    expect(shortcuts['danmaku'], 'Shift+J');
+    expect(shortcuts['mute'], 'K');
+    expect(shortcuts['skipForward'], 'None');
+    expect(shortcuts['skipBackward'], 'None');
+    expect(shortcuts['playPauseAlternate'], 'None');
+    expect(
+      () => AppPreferences({}).checkedPatch({
+        'shortcuts': {'fullscreen': 'J'},
+      }),
+      throwsArgumentError,
+    );
+    final swapped =
+        AppPreferences({}).checkedPatch({
+              'shortcuts': {'skipForward': 'F', 'fullscreen': 'J'},
+            })['shortcuts']
+            as Map;
+    expect(swapped['skipForward'], 'F');
+    expect(swapped['fullscreen'], 'J');
+  });
+
   test(
     'preferences survive restart; reset preserves credentials, sources and library',
     () async {
