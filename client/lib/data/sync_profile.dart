@@ -359,19 +359,38 @@ class SyncProfile {
     }
     final remoteIds = _remoteMedia;
     final localIds = _localMedia;
+    final catalogIds = (store.local(AppStore.catalogMediaKey) as List? ?? [])
+        .cast<String>()
+        .toSet();
     var processed = 0;
+    for (final record in store.records('media')) {
+      if (++processed % 32 == 0) await Future<void>.delayed(Duration.zero);
+      cancel?.check();
+      if (!record.deleted &&
+          record.data['transient'] != true &&
+          (record.data['localOnly'] == true || localIds.contains(record.id)) &&
+          !remoteIds.contains(record.id)) {
+        catalogIds.add(record.id);
+      }
+    }
     for (final location in store.locations) {
       if (++processed % 32 == 0) await Future<void>.delayed(Duration.zero);
       cancel?.check();
       final id = location['id'], source = location['source'];
       if (id is! String || source is! String) continue;
-      if (store.get('media', id)?.data['transient'] == true) continue;
-      if (source == 'local' || store.isPrivateMedia(id)) {
+      final record = store.get('media', id);
+      if (record?.data['transient'] == true) continue;
+      if (source == 'local' ||
+          record?.data['localOnly'] == true ||
+          localIds.contains(id)) {
         localIds.add(id);
+        if (record?.deleted == false && !remoteIds.contains(id)) {
+          catalogIds.add(id);
+        }
         continue;
       }
       remoteIds.add(id);
-      if (store.get('media', id)?.deleted != false) continue;
+      if (record?.deleted != false) continue;
       put('binding', id, {
         'location': {
           for (final key in [
@@ -393,6 +412,7 @@ class SyncProfile {
     }
     store.setLocal(_remoteMediaKey, remoteIds.toList());
     store.setLocal(_localMediaKey, localIds.toList());
+    store.setLocal(AppStore.catalogMediaKey, catalogIds.toList());
     for (final favorite in SourceFavorites(store).all) {
       if (favorite.sourceId != 'local') {
         put('favorite', favorite.key, favorite.toJson());
@@ -660,6 +680,7 @@ class SyncProfile {
     CancelToken? cancel,
   }) async {
     final dependencies = <String, Set<String>>{};
+    _readMediaBindings();
     final sources = (store.local('sources') as List? ?? []).whereType<Map>();
     final sourceEntries = <String, _ProfileEntry?>{};
     var processed = 0;
@@ -667,6 +688,13 @@ class SyncProfile {
       if (++processed % 32 == 0) await Future<void>.delayed(Duration.zero);
       cancel?.check();
       final location = store.local('location:$id');
+      if (store.isCatalogMedia(id) ||
+          (location == null &&
+              !store.isPrivateMedia(id) &&
+              !_knownRemoteMedia.contains(id))) {
+        dependencies[id] = {};
+        continue;
+      }
       if (id.isEmpty ||
           location is! Map ||
           location['id'] != id ||
@@ -894,6 +922,12 @@ class SyncProfile {
 
   bool shouldUpload(SyncRecord record) {
     if (record.kind == 'vault') return true;
+    if (record.kind == 'media' &&
+        (store.isCatalogMedia(record.id) ||
+            (store.local('location:${record.id}') == null &&
+                !store.isPrivateMedia(record.id)))) {
+      return record.data['transient'] != true;
+    }
     // Lightweight progress sync skips the full encrypted snapshot. Remembered
     // remote bindings still identify eligible records after an app restart.
     _readMediaBindings();
@@ -931,6 +965,12 @@ class SyncProfile {
   }
 
   bool shouldReceive(SyncRecord record) {
+    if (record.kind == 'media' && store.isCatalogMedia(record.id)) {
+      // A previously synchronized record may be deliberately associated with
+      // a different local file before this device first connects. Wait until
+      // its encrypted binding distinguishes that override from a catalogue.
+      return (store.get('media', record.id)?.version ?? 0) > 0;
+    }
     var id = record.id;
     if (record.kind == 'progress' && id.contains(':')) {
       id = id.substring(0, id.lastIndexOf(':'));
@@ -1105,6 +1145,14 @@ class SyncProfile {
           entry?.descriptor ?? (old?['descriptor'] as Map?) ?? now?.descriptor;
       if (descriptor?['type'] == 'binding' &&
           _localMedia.contains(descriptor?['key'])) {
+        final key = descriptor!['key'] as String;
+        store.setLocal(_remoteMediaKey, (_remoteMedia..add(key)).toList());
+        store.setLocal(
+          AppStore.catalogMediaKey,
+          (store.local(AppStore.catalogMediaKey) as List? ?? [])
+              .where((id) => id != key)
+              .toList(),
+        );
         // A local association is a device override, not a deletion of the
         // shared binding, including when its ciphertext/version has changed.
         baseline[record.id] = {
@@ -1227,6 +1275,12 @@ class SyncProfile {
         // file. Such a location is never replaced by another device's path.
         if (_localMedia.contains(key) ||
             (store.local('location:$key') as Map?)?['source'] == 'local') {
+          final ids = _remoteMedia..add(key);
+          store.setLocal(_remoteMediaKey, ids.toList());
+          final catalog = (store.local(AppStore.catalogMediaKey) as List? ?? [])
+              .where((id) => id != key)
+              .toList();
+          store.setLocal(AppStore.catalogMediaKey, catalog);
           return;
         }
         if (deleted) {

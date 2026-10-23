@@ -17,8 +17,19 @@ class SyncArtwork {
   final AppStore store;
   final Directory documents;
   final PosterCache posterCache;
+  final bool background;
+  final ValueChanged<String>? onPosterChanged;
   final _encoded = <String, (String, String)>{};
-  SyncArtwork(this.store, this.documents, this.posterCache);
+  SyncArtwork(
+    this.store,
+    this.documents,
+    this.posterCache, {
+    this.background = false,
+    this.onPosterChanged,
+  });
+
+  Future<String?> _portable(Uint8List bytes) async =>
+      background ? _portableImage(bytes) : await compute(_portableImage, bytes);
 
   static bool valid(String key, dynamic value) {
     if (value is! Map || value['image'] is! String) return false;
@@ -86,7 +97,7 @@ class SyncArtwork {
         _encoded[file.path] = saved!;
         return saved.$2;
       }
-      final image = await compute(_portableImage, await file.readAsBytes());
+      final image = await _portable(await file.readAsBytes());
       if (image != null) {
         _encoded[file.path] = (stamp, image);
         // Each pause may produce a new file path. Bound the encoded copies
@@ -175,7 +186,25 @@ class SyncArtwork {
       // Retain an original-quality local image when it produced this exact
       // portable copy, but replace old cached artwork when its content changes.
       if (await _encode(posterCache.cachedFile(url)) == value['image']) return;
-      await posterCache.restore(url, bytes, replace: true);
+      if (background) {
+        // dart:ui image decoding belongs to the engine isolate. The sync
+        // worker validates with the same bounded pure-Dart image decoder used
+        // for portable artwork, then atomically installs the original bytes.
+        if (await _portable(bytes) == null) {
+          throw const FormatException('Invalid synchronized artwork');
+        }
+        final file = posterCache.cachedFile(url);
+        await file.parent.create(recursive: true);
+        final temporary = File('${file.path}.sync-part');
+        await temporary.writeAsBytes(bytes, flush: true);
+        await temporary.rename(file.path);
+        posterCache.fileChanged(url);
+      } else {
+        await posterCache.restore(url, bytes, replace: true);
+      }
+      // Report each committed file immediately: later profile entries may
+      // fail, but their failure must not leave this successful write invisible.
+      onPosterChanged?.call(url);
       return;
     }
     final id = value['mediaId'] as String;
@@ -202,7 +231,7 @@ class SyncArtwork {
     }
     if (!await file.exists()) {
       // Header-only or corrupt images must never be installed as a good cache.
-      if (await compute(_portableImage, bytes) == null) return;
+      if (await _portable(bytes) == null) return;
       await directory.create(recursive: true);
       final temporary = File('${file.path}.part');
       await temporary.writeAsBytes(bytes, flush: true);

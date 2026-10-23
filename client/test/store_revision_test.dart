@@ -4,6 +4,68 @@ import 'package:aiplayer/data/store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'prefix revisions isolate writes and detect direct SQL and rollback',
+    () {
+      final store = AppStore(':memory:');
+      addTearDown(store.dispose);
+      final preview = store.localPrefixRevision('preview:');
+      final names = store.localPrefixRevision('episodeTitle:');
+      store.setLocal('preview:video', {'path': '/cover.jpg'});
+      final changed = store.localPrefixRevision('preview:');
+      expect(changed, greaterThan(preview));
+      expect(store.localPrefixRevision('episodeTitle:'), names);
+      store.setLocal('settings', {'volume': 50});
+      expect(store.localPrefixRevision('preview:'), changed);
+      store.setLocal('preview:video', {'path': '/cover.jpg'});
+      expect(store.localPrefixRevision('preview:'), changed);
+      late int uncommitted;
+      expect(
+        () => store.transaction(() {
+          store.removeLocal('preview:video');
+          uncommitted = store.localPrefixRevision('preview:');
+          throw StateError('rollback');
+        }),
+        throwsStateError,
+      );
+      expect(store.localPrefixRevision('preview:'), greaterThan(uncommitted));
+      final rolledBack = store.localPrefixRevision('preview:');
+      store.db.execute('DELETE FROM local WHERE key=?', ['preview:video']);
+      expect(store.localPrefixRevision('preview:'), greaterThan(rolledBack));
+    },
+  );
+
+  test(
+    'location lookup and prefix revisions see worker writes without polling',
+    () {
+      final directory = Directory.systemTemp.createTempSync('store-prefix-');
+      final first = AppStore('${directory.path}/app.db');
+      final worker = AppStore.openExisting(first.path);
+      addTearDown(() {
+        worker.dispose();
+        first.dispose();
+        directory.deleteSync(recursive: true);
+      });
+      expect(first.locationFor('nas', 'video.mkv'), isNull);
+      final previews = first.localPrefixRevision('preview:');
+      worker.transaction(() {
+        worker.setLocal('location:video', {
+          'id': 'video',
+          'source': 'nas',
+          'path': 'video.mkv',
+        });
+        worker.setLocal('preview:video', {'path': '/cover.jpg'});
+      });
+      expect(first.locationFor('nas', 'video.mkv')?['id'], 'video');
+      expect(first.localPrefixRevision('preview:'), greaterThan(previews));
+      final updated = first.localPrefixRevision('preview:');
+      final sync = first.localPrefixRevision('sync');
+      worker.setLocal('lastSync', '2026-10-23T12:00:00Z');
+      expect(first.localPrefixRevision('sync'), greaterThan(sync));
+      expect(first.localPrefixRevision('preview:'), updated);
+    },
+  );
+
   test('playback pending query excludes vault before JSON decoding', () {
     final store = AppStore(':memory:');
     addTearDown(store.dispose);

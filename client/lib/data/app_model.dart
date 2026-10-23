@@ -24,14 +24,65 @@ import 'sync_profile.dart';
 import 'sync_artwork.dart';
 import 'media_previews.dart';
 import 'library_catalog.dart';
+import 'library_snapshot.dart';
+import 'directory_metadata_worker.dart';
 import 'media_presentation.dart';
 import 'media_title_translation.dart';
 import 'poster_cache.dart';
+import 'source_preview.dart';
 import 'media_ai_recognition.dart';
 import '../subtitles/ai.dart';
 
 part 'app_model_metadata_ai.dart';
 part 'app_model_metadata_tasks.dart';
+part 'app_model_directory_recognition.dart';
+
+dynamic _copyJson(dynamic value) => switch (value) {
+  Map() => <String, dynamic>{
+    for (final entry in value.entries)
+      entry.key as String: _copyJson(entry.value),
+  },
+  List() => [for (final entry in value) _copyJson(entry)],
+  _ => value,
+};
+
+dynamic _immutableJson(dynamic value) => switch (value) {
+  Map() => Map<String, dynamic>.unmodifiable({
+    for (final entry in value.entries)
+      entry.key as String: _immutableJson(entry.value),
+  }),
+  List() => List<dynamic>.unmodifiable(value.map(_immutableJson)),
+  _ => value,
+};
+
+Future<List<SourceEntry>> _listSourceDirectory(
+  SourceAdapter connection,
+  String path,
+  Set<CancelToken> cancellation,
+) async {
+  for (final token in cancellation) {
+    token.check();
+  }
+  final stopped = Completer<List<SourceEntry>>();
+  final subscriptions = [
+    for (final token in cancellation)
+      token.whenCancelled.asStream().listen((_) {
+        if (!stopped.isCompleted) stopped.completeError(const Cancelled());
+      }),
+  ];
+  try {
+    // The caller's finally closes the adapter as soon as cancellation wins,
+    // even when a network listing has not answered. This top-level helper and
+    // removable subscriptions never retain AppModel through a long-lived token.
+    return await Future.any([connection.list(path), stopped.future]);
+  } finally {
+    for (final subscription in subscriptions) {
+      // Future.asStream has no asynchronous resource to release. Cancelling
+      // synchronously detaches the callback; it must not delay source cleanup.
+      unawaited(subscription.cancel());
+    }
+  }
+}
 
 class AppModel extends ChangeNotifier {
   final AppStore store;
@@ -89,7 +140,7 @@ class AppModel extends ChangeNotifier {
     store,
     secrets,
     recoverMissingCredentials: secrets is LocalCredentialStorage,
-    watchedKey: watchedKey,
+    watchedKey: mediaWatchedKey,
     artwork: SyncArtwork(store, documents, posterCache),
   );
   late final SyncClient sync = SyncClient(store, profile: syncProfile);
@@ -140,6 +191,11 @@ class AppModel extends ChangeNotifier {
     },
   );
   final _metadataCancel = CancelToken();
+  DirectoryMetadataWorker? _directoryMetadataWorker;
+  CancelToken? _directoryRecognitionCancel;
+  bool recognizingDirectory = false;
+  DirectoryRecognitionProgress directoryRecognitionProgress =
+      const DirectoryRecognitionProgress();
   final _metadataPending = <String>{};
   Map<String, List<SyncRecord>>? _batchMetadataDonors;
   Map<String, bool>? _batchMediaBindings;
@@ -176,6 +232,7 @@ class AppModel extends ChangeNotifier {
     this.documents, {
     FlutterSecureStorage? secrets,
     bool enableThumbnails = false,
+    PreviewCapture? previewCapture,
     this.backgroundWork = true,
     bool deferBackgroundWork = false,
   }) : secrets = secrets ?? createCredentialStorage(documents) {
@@ -186,14 +243,12 @@ class AppModel extends ChangeNotifier {
       _previews = MediaPreviewQueue(
         directory: Directory(p.join(documents.path, 'previews')),
         openSource: adapter,
-        isCurrent: (request) =>
-            !_disposed &&
-            (store.get('media', request.id)?.deleted == false ||
-                store.local('browse:${request.id}') != null) &&
-            _previewRequest(request.id)?.fingerprint == request.fingerprint,
+        capture: previewCapture,
+        isCurrent: (request) => _currentPreviewId(request) != null,
         onReady: (request, path, preview) {
-          final oldPath =
-              (store.local('preview:${request.id}') as Map?)?['path'];
+          final id = _currentPreviewId(request);
+          if (id == null) return;
+          final oldPath = (store.local('preview:$id') as Map?)?['path'];
           if (oldPath is String &&
               oldPath != path &&
               p.isWithin(p.join(documents.path, 'previews'), oldPath)) {
@@ -201,7 +256,7 @@ class AppModel extends ChangeNotifier {
               File(oldPath).delete().catchError((Object _) => File(oldPath)),
             );
           }
-          store.setLocal('preview:${request.id}', {
+          store.setLocal('preview:$id', {
             'path': path,
             'fingerprint': request.fingerprint,
             'contentFingerprint': request.contentFingerprint,
@@ -210,7 +265,7 @@ class AppModel extends ChangeNotifier {
             'formatVersion': MediaPreview.formatVersion,
           });
           recordMediaMetadata(
-            request.id,
+            id,
             duration: preview.duration,
             width: preview.width,
             height: preview.height,
@@ -298,8 +353,76 @@ class AppModel extends ChangeNotifier {
     cancel.check();
   }
 
-  Map<String, dynamic> get settings =>
-      Map<String, dynamic>.from(store.local('settings') ?? {});
+  int _settingsRevision = -1,
+      _sourcesRevision = -1,
+      _mediaSnapshotRevision = -1;
+  Map<String, dynamic> _settingsSnapshot = const {};
+  List<Map<String, dynamic>> _sourcesSnapshot = const [];
+  List<SyncRecord> _mediaSnapshot = const [];
+  LibrarySnapshotReader? _librarySnapshotReader;
+  LibrarySnapshot? _librarySnapshot;
+  (int, int, int)? _librarySnapshotRevision;
+  Future<void>? _librarySnapshotWork;
+
+  (int, int, int) get _libraryReadRevision => (
+    store.recordsRevision('media'),
+    store.recordsRevision('progress'),
+    store.locationRevision,
+  );
+
+  /// Prepare all library reads, history sorting and search grouping away from
+  /// the UI isolate. Keep a single worker request even if multiple tabs ask.
+  Future<LibrarySnapshot> loadLibrarySnapshot({
+    String query = '',
+    CancelToken? cancel,
+  }) async {
+    final search = query.toLowerCase();
+    while (true) {
+      cancel?.check();
+      if (_disposed) throw const Cancelled();
+      final revision = _libraryReadRevision;
+      final cached = _librarySnapshot;
+      if (_librarySnapshotRevision == revision && cached?.query == search) {
+        return cached!;
+      }
+      final work = _librarySnapshotWork ??= _prepareLibrarySnapshot(
+        search,
+        revision,
+      ).whenComplete(() => _librarySnapshotWork = null);
+      await Future.any<void>([
+        work,
+        if (cancel != null)
+          cancel.whenCancelled.then((_) => throw const Cancelled()),
+      ]);
+    }
+  }
+
+  Future<void> _prepareLibrarySnapshot(
+    String query,
+    (int, int, int) revision,
+  ) async {
+    final reader = _librarySnapshotReader ??= LibrarySnapshotReader(store);
+    final snapshot = await reader.read(query: query, revision: revision);
+    if (_disposed || revision != _libraryReadRevision) return;
+    _librarySnapshot = snapshot;
+    _librarySnapshotRevision = revision;
+    // Business readers can reuse the worker's immutable media snapshot too.
+    _mediaSnapshot = snapshot.media;
+    _mediaSnapshotRevision = revision.$1;
+  }
+
+  Map<String, dynamic> get settings {
+    final revision = store.localKeyRevision('settings');
+    if (_settingsRevision != revision) {
+      _settingsSnapshot = Map<String, dynamic>.from(
+        store.local('settings') ?? {},
+      );
+      _settingsRevision = revision;
+    }
+    // Callers edit a detached draft before saving, including nested shortcuts.
+    return _copyJson(_settingsSnapshot) as Map<String, dynamic>;
+  }
+
   int _preferencesRevision = -1;
   AppPreferences? _preferences;
   AppPreferences get preferences {
@@ -313,8 +436,12 @@ class AppModel extends ChangeNotifier {
 
   Future<void> updatePreferences(Map<String, dynamic> patch) async {
     final checked = preferences.checkedPatch(patch);
-    store.setLocal('settings', {...settings, ...checked});
-    notifyListeners();
+    final current = settings;
+    checked.removeWhere((key, value) => current[key] == value);
+    if (checked.isEmpty) return;
+    final revision = store.localKeyRevision('settings');
+    store.setLocal('settings', {...current, ...checked});
+    if (store.localKeyRevision('settings') != revision) notifyListeners();
   }
 
   Future<void> resetPreferences() async {
@@ -322,8 +449,9 @@ class AppModel extends ChangeNotifier {
     for (final key in [...AppPreferences.defaults.keys, 'shortcuts']) {
       next.remove(key);
     }
+    final revision = store.localKeyRevision('settings');
     store.setLocal('settings', next);
-    notifyListeners();
+    if (store.localKeyRevision('settings') != revision) notifyListeners();
   }
 
   ThemeMode get themeMode => store.local('appearance:theme') == 'dark'
@@ -339,11 +467,44 @@ class AppModel extends ChangeNotifier {
     notifyListeners();
   }
 
-  List<Map<String, dynamic>> get sources =>
-      (store.local('sources') as List? ?? [])
-          .map((v) => Map<String, dynamic>.from(v))
+  List<Map<String, dynamic>> get sources {
+    final revision = store.localKeyRevision('sources');
+    if (_sourcesRevision != revision) {
+      _sourcesSnapshot = (store.local('sources') as List? ?? [])
+          .map((value) => Map<String, dynamic>.from(value))
           .toList();
-  List<SyncRecord> get media => store.all('media');
+      _sourcesRevision = revision;
+    }
+    return [
+      for (final source in _sourcesSnapshot)
+        _copyJson(source) as Map<String, dynamic>,
+    ];
+  }
+
+  /// Shared read-only snapshot; only a media revision requires SQL/JSON work.
+  List<SyncRecord> get media {
+    final revision = store.recordsRevision('media');
+    if (_mediaSnapshotRevision != revision) {
+      _mediaSnapshot = List.unmodifiable([
+        for (final record in store.all('media'))
+          SyncRecord(
+            id: record.id,
+            kind: record.kind,
+            data: _immutableJson(record.data) as Map<String, dynamic>,
+            modifiedAt: record.modifiedAt,
+            deviceId: record.deviceId,
+            deviceName: record.deviceName,
+            version: record.version,
+            revision: record.revision,
+            deleted: record.deleted,
+            dirty: record.dirty,
+          ),
+      ]);
+      _mediaSnapshotRevision = revision;
+    }
+    return _mediaSnapshot;
+  }
+
   Map<String, dynamic>? progressFor(SyncRecord record) {
     final value = store.get('progress', progressKey(record));
     return value?.deleted == false ? value!.data : null;
@@ -391,11 +552,19 @@ class AppModel extends ChangeNotifier {
     bool groupSeries = true,
     Iterable<SyncRecord>? items,
   }) {
-    // Sorting must not query SQLite on every comparison. Read each progress
-    // record once and sort its timestamp alongside the media snapshot.
+    // Read two snapshots instead of doing location and progress SQL queries for
+    // every video. A large library refresh must not block the scroll UI.
+    final progressById = {
+      for (final record in store.records('progress'))
+        if (!record.deleted) record.id: record.data,
+    };
+    final locations = store.localEntries('location:');
     final candidates = <({SyncRecord media, String updatedAt})>[];
     for (final item in items ?? media) {
-      final progress = progressFor(item);
+      // Match progressKey's device-local size precedence and fallback exactly.
+      final size =
+          locations['location:${item.id}']?['size'] ?? item.data['size'] ?? 0;
+      final progress = progressById['${item.id}:$size'];
       if (((progress?['position'] as num?) ?? 0) > 0) {
         candidates.add((
           media: item,
@@ -454,6 +623,7 @@ class AppModel extends ChangeNotifier {
   }
 
   Future<void> saveSource(Map<String, dynamic> source, String password) async {
+    _directoryRecognitionCancel?.cancel();
     final persisted = Map<String, dynamic>.from(source)..remove('password');
     AppLog.instance.rememberSecret(password);
     await secrets.write(key: 'source:${source['id']}', value: password);
@@ -498,6 +668,7 @@ class AppModel extends ChangeNotifier {
         !ids.toSet().containsAll(current.map((v) => v['id'] as String))) {
       throw const AppFailure('来源顺序无效，请重试。');
     }
+    if (listEquals(ids, current.map((value) => value['id']).toList())) return;
     final byId = {for (final value in current) value['id']: value};
     store.setLocal('sources', [for (final id in ids) byId[id]]);
     notifyListeners();
@@ -515,6 +686,7 @@ class AppModel extends ChangeNotifier {
 
   Future<void> removeSource(String id) async {
     if (id == 'local') throw const AppFailure('本地视频入口不能删除。');
+    _directoryRecognitionCancel?.cancel();
     await secrets.delete(key: 'source:$id');
     store.setLocal(
       'sources',
@@ -590,12 +762,16 @@ class AppModel extends ChangeNotifier {
       if (existingId != null &&
           (existingId.toString() != '${collection.subject!['id']}' ||
               record.data['tmdbId'] != incoming['tmdbId'] ||
-              record.data['bangumiId'] != incoming['bangumiId'])) {
+              record.data['bangumiId'] != incoming['bangumiId'] ||
+              (record.data['tmdbId'] != null &&
+                  (record.data['metadataType'] ?? 'tv') !=
+                      incoming['metadataType']))) {
         return false;
       }
       data.remove('bangumiId');
       data.remove('tmdbId');
     }
+    final title = collection.episodeTitle(entry.path);
     final updated = {
       ...data,
       'series': identity.anime,
@@ -603,9 +779,9 @@ class AppModel extends ChangeNotifier {
       'episode': identity.episode,
       if (collection.subject != null)
         ...subjectMediaFields(collection.subject!),
+      if (title.isNotEmpty) 'episodeTitle': title,
     };
     final dataChanged = !_equalMetadata(updated, record.data);
-    final title = collection.episodeTitle(entry.path);
     final titleChanged =
         title.isNotEmpty && store.local('episodeTitle:$id') != title;
     if (dataChanged) store.save('media', id, updated);
@@ -658,11 +834,13 @@ class AppModel extends ChangeNotifier {
   }
 
   /// Catalogue and source browsing share the same records, including episodes
-  /// that have not been played yet. Manual selections always win over lookup.
+  /// that have not been played yet. Recognized collections import missing
+  /// episodes by default; explicit false keeps update-only callers unchanged.
+  /// Manual selections always win over lookup.
   DirectoryCollection synchronizeCollection(
     String sourceId,
     DirectoryCollection value, {
-    bool importMissing = false,
+    bool? importMissing,
   }) {
     final known = [
       for (final entry in value.videos) ?sourceMedia(sourceId, entry.path),
@@ -681,9 +859,24 @@ class AppModel extends ChangeNotifier {
     var resolved = value;
     if (keys.length == 1) {
       final donor = donors.first;
-      final names = <String, String>{...value.episodeTitles};
+      final sameSubject =
+          value.subject != null &&
+          '${value.subject!['id']}' ==
+              '${donor.data['tmdbId'] ?? donor.data['bangumiId']}' &&
+          (value.subject!['provider'] == 'tmdb') ==
+              (donor.data['tmdbId'] != null) &&
+          (donor.data['tmdbId'] == null ||
+              (value.subject!['mediaType'] ?? 'tv') ==
+                  (donor.data['metadataType'] ?? 'tv')) &&
+          (value.season.isEmpty ? '1' : value.season) ==
+              ('${donor.data['season'] ?? ''}'.isEmpty
+                  ? '1'
+                  : '${donor.data['season']}');
+      final names = <String, String>{if (sameSubject) ...value.episodeTitles};
       for (final item in known) {
-        final name = store.local('episodeTitle:${item.id}');
+        if (mediaSeriesKey(item) != mediaSeriesKey(donor)) continue;
+        final name =
+            store.local('episodeTitle:${item.id}') ?? item.data['episodeTitle'];
         if (name is String && name.isNotEmpty) {
           names['${item.data['episode']}'] = name;
         }
@@ -700,11 +893,7 @@ class AppModel extends ChangeNotifier {
               value.identities[entry.path]?.episode ?? '',
             ),
         },
-        subject:
-            manual.isEmpty &&
-                value.subject != null &&
-                '${value.subject!['id']}' ==
-                    '${donor.data['tmdbId'] ?? donor.data['bangumiId']}'
+        subject: manual.isEmpty && sameSubject
             ? {...mediaFieldsSubject(donor.data), ...value.subject!}
             : mediaFieldsSubject(donor.data),
         episodeTitles: names,
@@ -715,7 +904,7 @@ class AppModel extends ChangeNotifier {
     for (final entry in resolved.videos) {
       final existing = sourceMedia(sourceId, entry.path);
       if (existing == null &&
-          (!importMissing ||
+          (!(importMissing ?? resolved.subject != null) ||
               store.local(_sourceExclusionKey(sourceId, entry.path)) == true)) {
         continue;
       }
@@ -736,6 +925,96 @@ class AppModel extends ChangeNotifier {
       [for (final entry in value.videos) ?sourceMedia(sourceId, entry.path)]
         ..sort(compareMediaEpisodes);
 
+  Object get _directoryContentRevision => (
+    store.recordsRevision('media'),
+    store.locationRevision,
+    store.localPrefixRevision('preview:'),
+    store.localPrefixRevision('mediaMetadata:'),
+    store.localPrefixRevision('episodeTitle:'),
+  );
+
+  Future<DirectoryCollection> synchronizeCollectionInBackground(
+    String sourceId,
+    DirectoryCollection value, {
+    bool? importMissing,
+    String? anchorId,
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    final before = _directoryContentRevision;
+    try {
+      final result = store.path == ':memory:'
+          ? synchronizeDirectoryCollection(
+              store,
+              sourceId,
+              value,
+              importMissing: importMissing,
+              anchorId: anchorId,
+            )
+          : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+              store.path,
+            )).synchronize(
+              sourceId,
+              value,
+              importMissing: importMissing,
+              anchorId: anchorId,
+              cancel: cancel ?? _metadataCancel,
+            );
+      cancel?.check();
+      if (_disposed) throw const Cancelled();
+      if (result.changed) _prefetchPoster(result.collection.poster);
+      return result.collection;
+    } finally {
+      // Cancelling the requesting page cannot hide an atomic commit from the
+      // library that has just become visible. Keep the cancellation exception.
+      if (!_disposed && before != _directoryContentRevision) notifyListeners();
+    }
+  }
+
+  /// Directory parsing, large episode lists and record writes share the
+  /// bounded metadata worker. Browsers and library details use this entry point
+  /// after asynchronously obtaining a source listing.
+  Future<DirectoryCollection?> synchronizeDirectoryEntriesInBackground(
+    String sourceId,
+    String path,
+    List<SourceEntry> entries, {
+    String? anchorId,
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    final before = _directoryContentRevision;
+    try {
+      final result = store.path == ':memory:'
+          ? await synchronizeDirectoryListing(
+              store,
+              sourceId,
+              path,
+              entries,
+              hideHidden: preferences.hideHiddenFiles,
+              anchorId: anchorId,
+              cancel: cancel ?? _metadataCancel,
+            )
+          : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+              store.path,
+            )).synchronizeListing(
+              sourceId,
+              path,
+              entries,
+              hideHidden: preferences.hideHiddenFiles,
+              anchorId: anchorId,
+              cancel: cancel ?? _metadataCancel,
+            );
+      cancel?.check();
+      if (_disposed) throw const Cancelled();
+      if (result?.changed == true) _prefetchPoster(result!.collection.poster);
+      return result?.collection;
+    } finally {
+      if (!_disposed && before != _directoryContentRevision) notifyListeners();
+    }
+  }
+
   List<SyncRecord> seriesRecords(SyncRecord record) =>
       media
           .where((item) => mediaSeriesKey(item) == mediaSeriesKey(record))
@@ -749,30 +1028,47 @@ class AppModel extends ChangeNotifier {
     CancelToken? cancel,
   }) async {
     cancel?.check();
-    final existing = seriesRecords(store.get('media', record.id) ?? record);
+    final snapshot = await loadLibrarySnapshot(cancel: cancel);
+    final current = snapshot.byId[record.id];
+    if (current == null) return const [];
+    final existing = snapshot.series[mediaSeriesKey(current)] ?? [current];
     final directories = <String>{};
     for (final item in existing) {
       cancel?.check();
-      final location = store.local('location:${item.id}');
-      if (location is! Map || '${item.data['episode'] ?? ''}'.isEmpty) continue;
+      final location = snapshot.locations[item.id];
+      if (location == null || item.data['metadataType'] == 'movie') continue;
       final sourceId = '${location['source']}';
       final path = p.posix.dirname('${location['path']}'.replaceAll('\\', '/'));
       if (!directories.add('$sourceId:$path')) continue;
       SourceAdapter? connection;
       try {
+        // An already recognized folder is usable even while its source is
+        // offline. Import its complete cached series before optional listing.
+        final cached = catalog.directoryPreview(sourceId, path)?.collection;
+        if (cached?.subject != null) {
+          await synchronizeCollectionInBackground(
+            sourceId,
+            cached!,
+            importMissing: true,
+            anchorId: item.id,
+            cancel: cancel,
+          );
+        }
         connection = await adapter(sourceId);
         cancel?.check();
-        final entries = (await connection.list(path))
-            .where(
-              (entry) => !preferences.hideHiddenFiles || !isHiddenEntry(entry),
-            )
-            .toList();
+        final entries = await _listSourceDirectory(connection, path, {
+          _metadataCancel,
+          ?cancel,
+        });
         cancel?.check();
-        final collection = identifyDirectory(path, entries);
         if (_disposed) break;
-        if (collection != null) {
-          synchronizeCollection(sourceId, collection, importMissing: true);
-        }
+        await synchronizeDirectoryEntriesInBackground(
+          sourceId,
+          path,
+          entries,
+          anchorId: item.id,
+          cancel: cancel,
+        );
       } on Cancelled {
         rethrow;
       } catch (_) {
@@ -785,7 +1081,9 @@ class AppModel extends ChangeNotifier {
         }
       }
     }
-    return seriesRecords(store.get('media', record.id) ?? record);
+    final updated = await loadLibrarySnapshot(cancel: cancel);
+    return updated.series[mediaSeriesKey(updated.byId[record.id] ?? record)] ??
+        const [];
   }
 
   Future<bool> identifyMediaRecords(
@@ -839,6 +1137,7 @@ class AppModel extends ChangeNotifier {
       if (existing?['previewRevision'] != null)
         'previewRevision': existing?['previewRevision'],
     });
+    adoptBrowsingMediaPreview(store, sourceId, entry.path, id);
     if (_batchMediaBindings != null) {
       _batchMediaBindings![id] = sourceId == 'local';
     } else if (sourceId != 'local') {
@@ -1052,25 +1351,25 @@ class AppModel extends ChangeNotifier {
     );
     cancel?.check();
     if (_disposed) return;
-    store.setLocal('metadataEpisodeNames:${_identityKey(record)}', names);
-    for (final item in _metadataRecords(mediaIds).where(
-      (item) => mediaIds != null || _identityKey(item) == _identityKey(record),
-    )) {
-      final sameSubject = subject['provider'] == 'tmdb'
-          ? '${item.data['tmdbId']}' == '${subject['id']}' &&
-                '${item.data['metadataType'] ?? 'tv'}' ==
-                    '${subject['mediaType'] ?? 'tv'}'
-          : '${item.data['bangumiId']}' == '${subject['id']}';
-      if (!sameSubject ||
-          '${item.data['season'] ?? ''}' != '${record.data['season'] ?? ''}') {
-        continue;
-      }
-      final name = names['${item.data['episode']}'];
-      if (name != null && name.isNotEmpty) {
-        store.setLocal('episodeTitle:${item.id}', name);
-      }
-    }
-    notifyListeners();
+    final changed = store.path == ':memory:'
+        ? persistDirectoryEpisodeNames(
+            store,
+            record,
+            subject,
+            names,
+            mediaIds: mediaIds,
+          )
+        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+            store.path,
+          )).persistEpisodeNames(
+            record,
+            subject,
+            names,
+            mediaIds: mediaIds,
+            cancel: cancel ?? _metadataCancel,
+          );
+    cancel?.check();
+    if (!_disposed && changed) notifyListeners();
   }
 
   Future<void> fillEpisodeNames(
@@ -1300,6 +1599,23 @@ class AppModel extends ChangeNotifier {
     );
   }
 
+  String? _currentPreviewId(MediaPreviewRequest request) {
+    if (_disposed) return null;
+    // A browse capture may finish after recognition has imported the video.
+    // Publish directly to its library ID, while rejecting a newer playback
+    // position, replaced source content or a record removed in the meantime.
+    final id = request.id.startsWith('browse-')
+        ? sourceMedia(request.source, request.path)?.id ?? request.id
+        : request.id;
+    if (store.get('media', id)?.deleted != false &&
+        (store.local('browse:$id') == null ||
+            store.local(_sourceExclusionKey(request.source, request.path)) ==
+                true)) {
+      return null;
+    }
+    return _previewRequest(id)?.fingerprint == request.fingerprint ? id : null;
+  }
+
   double? _previewPosition(String id) {
     final record = store.get('media', id);
     if (record == null) return null;
@@ -1310,8 +1626,7 @@ class AppModel extends ChangeNotifier {
   }
 
   String sourcePreviewId(String sourceId, String path) =>
-      sourceMedia(sourceId, path)?.id ??
-      'browse-${sha256.convert(utf8.encode('$sourceId:$path'))}';
+      sourceMedia(sourceId, path)?.id ?? browsingMediaId(sourceId, path);
 
   String ensureSourceMediaPreview(String sourceId, SourceEntry entry) {
     final id = sourcePreviewId(sourceId, entry.path);
@@ -1964,7 +2279,9 @@ class AppModel extends ChangeNotifier {
       // Compression/encryption and source snapshots can wait until playback
       // ends. Keep their IDs queued while only progress is being uploaded.
       final deferArtwork = !visible && activePlaybackMediaId != null;
-      final artworkIds = deferArtwork ? <String>{} : Set<String>.of(_syncArtworkIds);
+      final artworkIds = deferArtwork
+          ? <String>{}
+          : Set<String>.of(_syncArtworkIds);
       if (!deferArtwork) _syncArtworkIds.clear();
       _syncAgain = false;
       _syncNeedsFull = false;
@@ -2102,6 +2419,10 @@ class AppModel extends ChangeNotifier {
     _syncResumeTimer?.cancel();
     _syncWatch?.cancel();
     _activeSync?.cancel();
+    unawaited(sync.dispose());
+    _librarySnapshotReader?.dispose();
+    unawaited(_directoryMetadataWorker?.close());
+    _directoryRecognitionCancel?.cancel();
     _metadataTimer?.cancel();
     _metadataCancel.cancel();
     _automaticReady?.complete();

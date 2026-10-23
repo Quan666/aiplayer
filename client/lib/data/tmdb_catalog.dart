@@ -209,29 +209,16 @@ class TmdbCatalog {
   }) async {
     final detail = await identity(subject, cancel: cancel);
     if (detail['mediaType'] == 'movie') return detail;
-    final number = int.tryParse(season.isEmpty ? '1' : season);
-    if (number == null || number < 0 || number > 10000) {
-      throw const AppFailure('季度编号无效。');
-    }
-    final seasonData = await _get(
-      'tv/${detail['id']}/season/$number',
+    final seasonData = await _season(
+      '${detail['id']}',
+      season.isEmpty ? '${subject['season'] ?? ''}' : season,
       cancel: cancel,
     );
-    if (seasonData['season_number'] != number) {
-      throw const AppFailure('TMDB 返回的季度与所选季度不一致。');
-    }
-    final episodes = (seasonData['episodes'] as List? ?? [])
-        .whereType<Map>()
-        .toList();
     return {
       ...detail,
-      'season': '$number',
-      'season_episodes': episodes.length,
-      'episodeNames': {
-        for (final episode in episodes)
-          if (episode['episode_number'] is num && episode['name'] is String)
-            '${episode['episode_number']}': episode['name'],
-      },
+      'season': '${seasonData['season_number']}',
+      'season_episodes': (seasonData['episodes'] as List? ?? []).length,
+      'episodeNames': _episodeNames(seasonData),
       if ('${seasonData['poster_path'] ?? ''}'.isNotEmpty)
         'images': {
           'large':
@@ -240,6 +227,63 @@ class TmdbCatalog {
       if ('${seasonData['air_date'] ?? ''}'.isNotEmpty)
         'date': seasonData['air_date'],
     };
+  }
+
+  Future<Map<String, dynamic>> _season(
+    String id,
+    String season, {
+    CancelToken? cancel,
+  }) async {
+    if (!RegExp(r'^\d+$').hasMatch(id)) throw const AppFailure('TMDB 作品编号无效。');
+    final number = int.tryParse(season.isEmpty ? '1' : season);
+    if (number == null || number < 0 || number > 10000) {
+      throw const AppFailure('季度编号无效。');
+    }
+    final seasonData = await _get('tv/$id/season/$number', cancel: cancel);
+    if (seasonData['season_number'] != number) {
+      throw const AppFailure('TMDB 返回的季度与所选季度不一致。');
+    }
+    return seasonData;
+  }
+
+  Map<String, String> _episodeNames(Map<String, dynamic> season) => {
+    for (final episode in (season['episodes'] as List? ?? []).whereType<Map>())
+      if (episode['episode_number'] case final num number)
+        if (number.isFinite && number == number.roundToDouble())
+          if (episode['name'] case final String name
+              when name.trim().isNotEmpty)
+            '${number.toInt()}': name.trim(),
+  };
+
+  /// A saved identity can omit episode names. Recover the complete season from
+  /// the same persistent, shared request used by details, never per episode.
+  Future<Map<String, String>> episodeNames(
+    Map<String, dynamic> subject, {
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    if (subject['mediaType'] == 'movie') return {};
+    final saved = Map<String, String>.from(subject['episodeNames'] ?? {});
+    final count = (subject['season_episodes'] as num?)?.toInt();
+    if (saved.isNotEmpty && (count == null || saved.length >= count)) {
+      return saved;
+    }
+    try {
+      final season = await _season(
+        '${subject['id']}',
+        '${subject['season'] ?? ''}',
+        cancel: cancel,
+      );
+      return {...saved, ..._episodeNames(season)};
+    } on Cancelled {
+      rethrow;
+    } on AppFailure {
+      // A synced snapshot can outlive its raw season cache. Keep known titles
+      // while offline; the failed request remains eligible for the next retry.
+      cancel?.check();
+      if (saved.isEmpty) rethrow;
+      return saved;
+    }
   }
 
   List<String> names(Map<String, dynamic> subject) =>

@@ -212,7 +212,10 @@ void main() {
       model.applyBangumi('Example', subject(88), mediaIds: {selected});
       final resolved = model.synchronizeCollection(
         'local',
-        identifyDirectory(root.path, videos)!.withMetadata(subject(7), {}),
+        identifyDirectory(
+          root.path,
+          videos,
+        )!.withMetadata(subject(7), {'1': '错误作品第一集', '2': '错误作品第二集'}),
         importMissing: true,
       );
       expect(resolved.subject?['id'], '88');
@@ -223,6 +226,13 @@ void main() {
         isTrue,
       );
       expect(store.get('media', unrelated)?.data['bangumiId'], isNull);
+      expect(resolved.episodeTitles, isEmpty);
+      expect(
+        model
+            .collectionRecords('local', resolved)
+            .every((item) => model.originalEpisodeTitle(item).isEmpty),
+        isTrue,
+      );
     },
   );
 

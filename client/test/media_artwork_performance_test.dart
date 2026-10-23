@@ -4,10 +4,12 @@ import 'dart:io';
 import 'package:aiplayer/data/poster_cache.dart';
 import 'package:aiplayer/ui/artwork_scroll_scope.dart';
 import 'package:aiplayer/ui/media_artwork.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:image/image.dart' as images;
 
 class _RecordingPosterCache extends PosterCache {
   final requested = <String>[];
@@ -34,6 +36,54 @@ class _DelayedPosterCache extends PosterCache {
   }
 }
 
+class _RepairingPosterCache extends PosterCache {
+  int requests = 0, invalidations = 0;
+  final repair = Completer<void>();
+  final File broken;
+
+  _RepairingPosterCache(this.broken) : super(directory: Directory.systemTemp);
+
+  @override
+  Future<File?> load(String url) {
+    requests++;
+    return SynchronousFuture(broken);
+  }
+
+  @override
+  Future<void> invalidate(
+    String url, {
+    File? failedFile,
+    bool retryImmediately = false,
+  }) {
+    expect(failedFile, same(broken));
+    expect(retryImmediately, isTrue);
+    invalidations++;
+    return repair.future;
+  }
+}
+
+class _FullPosterCache extends _RecordingPosterCache {
+  bool full = true;
+  final available = ChangeNotifier();
+
+  @override
+  Listenable get capacity => available;
+
+  @override
+  Future<File?>? loadVisible(String url) => full ? null : load(url);
+
+  void release() {
+    full = false;
+    available.notifyListeners();
+  }
+
+  @override
+  void close() {
+    available.dispose();
+    super.close();
+  }
+}
+
 class _DeferredPhysics extends ScrollPhysics {
   final bool Function() defer;
   const _DeferredPhysics(this.defer, {super.parent});
@@ -50,7 +100,456 @@ class _DeferredPhysics extends ScrollPhysics {
   ) => defer();
 }
 
+class _TransformProbe extends SingleChildRenderObjectWidget {
+  final VoidCallback onTransform;
+
+  const _TransformProbe({required this.onTransform, required super.child});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderTransformProbe(onTransform);
+}
+
+class _RenderTransformProbe extends RenderProxyBox {
+  final VoidCallback onTransform;
+
+  _RenderTransformProbe(this.onTransform);
+
+  @override
+  void applyPaintTransform(RenderBox child, Matrix4 transform) {
+    onTransform();
+    super.applyPaintTransform(child, transform);
+  }
+}
+
 void main() {
+  testWidgets('same-path replacement refreshes mounted and new covers', (
+    tester,
+  ) async {
+    late Directory directory;
+    late PosterCache cache;
+    const poster = 'https://example.com/replaced-cover.png';
+    await tester.runAsync(() async {
+      directory = await Directory.systemTemp.createTemp('artwork-generation-');
+      cache = PosterCache(directory: directory);
+      await cache.restore(
+        poster,
+        images.encodePng(images.Image(width: 20, height: 30)),
+      );
+    });
+    final imageCache = PaintingBinding.instance.imageCache;
+    imageCache.clear();
+    Widget cover(Key key) => MaterialApp(
+      home: Center(
+        child: SizedBox(
+          width: 80,
+          height: 120,
+          child: MediaArtwork(key: key, poster: poster, cache: cache),
+        ),
+      ),
+    );
+    Future<void> expectWidth(int width) async {
+      for (var i = 0; i < 30; i++) {
+        await tester.pump();
+        if (tester
+            .widgetList<RawImage>(find.byType(RawImage))
+            .any((image) => image.image?.width == width)) {
+          return;
+        }
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)),
+        );
+      }
+      fail('The current file generation did not render at width $width.');
+    }
+
+    try {
+      await tester.pumpWidget(cover(const ValueKey('mounted')));
+      await expectWidth(20);
+      final first = tester.widget<Image>(find.byType(Image)).image;
+      await tester.runAsync(() async {
+        await cache.restore(
+          poster,
+          images.encodePng(images.Image(width: 40, height: 60)),
+          replace: true,
+        );
+      });
+      await expectWidth(40);
+      expect(tester.widget<Image>(find.byType(Image)).image, isNot(first));
+      // A worker's atomic same-path replacement also invalidates old pixels.
+      await tester.runAsync(() async {
+        await cache
+            .cachedFile(poster)
+            .writeAsBytes(
+              images.encodePng(images.Image(width: 60, height: 90)),
+            );
+      });
+      cache.fileChanged(poster);
+      await expectWidth(60);
+      final newest = tester.widget<Image>(find.byType(Image)).image;
+      await tester.pumpWidget(cover(const ValueKey('new-detail')));
+      expect(tester.widget<RawImage>(find.byType(RawImage)).image?.width, 60);
+      expect(tester.widget<Image>(find.byType(Image)).image, same(newest));
+    } finally {
+      await tester.pumpWidget(const SizedBox());
+      cache.close();
+      imageCache.clear();
+      await tester.runAsync(() => directory.delete(recursive: true));
+    }
+  });
+
+  testWidgets(
+    'card, smaller details and larger viewer share the resident first frame',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final navigator = GlobalKey<NavigatorState>();
+      late Directory directory;
+      late PosterCache cache;
+      var downloads = 0;
+      const poster = 'https://example.com/shared-cover.png';
+      await tester.runAsync(() async {
+        directory = await Directory.systemTemp.createTemp('artwork-shared-');
+        cache = PosterCache(
+          directory: directory,
+          createClient: () {
+            downloads++;
+            throw StateError('The local poster must be reused');
+          },
+        );
+        await cache.restore(
+          poster,
+          await File('assets/branding/app_icon.png').readAsBytes(),
+        );
+      });
+      addTearDown(() async {
+        cache.close();
+        await directory.delete(recursive: true);
+      });
+      final imageCache = PaintingBinding.instance.imageCache;
+      imageCache.clear();
+      Widget cover(String name, double edge, {int maxEdge = 640}) => Center(
+        child: SizedBox(
+          width: edge,
+          height: edge,
+          child: MediaArtwork(
+            key: ValueKey(name),
+            poster: poster,
+            cache: cache,
+            maxDecodeEdge: maxEdge,
+            fit: BoxFit.contain,
+          ),
+        ),
+      );
+      Image image(String name) => tester.widget<Image>(
+        find.descendant(
+          of: find.byKey(ValueKey(name), skipOffstage: false),
+          matching: find.byType(Image, skipOffstage: false),
+          skipOffstage: false,
+        ),
+      );
+      RawImage raw(String name) => tester.widget<RawImage>(
+        find.descendant(
+          of: find.byKey(ValueKey(name), skipOffstage: false),
+          matching: find.byType(RawImage, skipOffstage: false),
+          skipOffstage: false,
+        ),
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          navigatorKey: navigator,
+          home: Scaffold(body: cover('card', 256)),
+        ),
+      );
+      await tester.pump();
+      for (var i = 0; i < 30 && raw('card').image == null; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)),
+        );
+        await tester.pump();
+      }
+      final cardProvider = image('card').image;
+      final cardPixels = raw('card').image!;
+      final decodedCount = imageCache.currentSize;
+      navigator.currentState!.push<void>(
+        MaterialPageRoute(
+          builder: (_) => Scaffold(body: cover('details', 112)),
+        ),
+      );
+      // No settled transition or async file work is needed for this frame.
+      await tester.pump();
+      expect(raw('details').image, isNotNull);
+      expect(raw('details').image!.isCloneOf(cardPixels), isTrue);
+      expect(image('details').image, same(cardProvider));
+      expect(imageCache.pendingImageCount, 0);
+      expect(imageCache.currentSize, decodedCount);
+      await tester.pumpAndSettle();
+
+      final detailPixels = raw('details').image!;
+      navigator.currentState!.push<void>(
+        MaterialPageRoute(
+          builder: (_) => Scaffold(body: cover('viewer', 800, maxEdge: 2048)),
+        ),
+      );
+      await tester.pump();
+      expect(raw('viewer').image, isNotNull);
+      expect(raw('viewer').image!.isCloneOf(detailPixels), isTrue);
+      expect(image('viewer').image, same(cardProvider));
+      await tester.pump();
+      final viewerProvider = image('viewer').image as ResizeImage;
+      expect(viewerProvider.width, 832);
+      expect(viewerProvider.height, 832);
+      // The lower-resolution cover stays visible during the larger decode.
+      expect(raw('viewer').image, isNotNull);
+      expect(downloads, 0);
+      await tester.pumpWidget(const SizedBox());
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 30)),
+      );
+      imageCache.clear();
+    },
+  );
+
+  testWidgets('an evicted texture is not retained by the variant index', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final imageCache = PaintingBinding.instance.imageCache;
+    imageCache.clear();
+    const path = 'assets/branding/app_icon.png';
+    await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+    await tester.runAsync(
+      () => precacheImage(
+        artworkImage(File(path), 256),
+        tester.element(find.byType(SizedBox).last),
+      ),
+    );
+    await tester.pump();
+    imageCache.clear();
+    expect(imageCache.currentSize, 0);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ListView(
+          physics: _DeferredPhysics(() => true),
+          children: const [
+            SizedBox(height: 100, child: MediaArtwork(thumbnail: path)),
+          ],
+        ),
+      ),
+    );
+    expect(find.byType(Image), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    imageCache.clear();
+  });
+
+  testWidgets('a full queue wakes visible artwork without timers or rebuilds', (
+    tester,
+  ) async {
+    final cache = _FullPosterCache();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 100,
+            height: 150,
+            child: MediaArtwork(poster: 'deferred', cache: cache),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(cache.requested, isEmpty);
+    cache.release();
+    await tester.pumpAndSettle();
+    expect(cache.requested, ['deferred']);
+    await tester.pumpWidget(const SizedBox());
+    cache.close();
+  });
+
+  testWidgets('leaving a full queue removes its pending capacity listener', (
+    tester,
+  ) async {
+    final cache = _FullPosterCache();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MediaArtwork(poster: 'disposed', cache: cache),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(const SizedBox());
+    cache.release();
+    await tester.pumpAndSettle();
+    expect(cache.requested, isEmpty);
+    expect(tester.takeException(), isNull);
+    cache.close();
+  });
+
+  for (final leaveBeforeRepair in [false, true]) {
+    testWidgets(
+      'a failed disk cover ${leaveBeforeRepair ? 'does not reload after disposal' : 'repairs without reopening details'}',
+      (tester) async {
+        late Directory directory;
+        late File file;
+        await tester.runAsync(() async {
+          directory = await Directory.systemTemp.createTemp('artwork-repair-');
+          file = await File(
+            '${directory.path}/poster.image',
+          ).writeAsString('broken image');
+        });
+        addTearDown(() => directory.delete(recursive: true));
+        final cache = _RepairingPosterCache(file);
+        final imageCache = PaintingBinding.instance.imageCache;
+        imageCache.clear();
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Center(
+              child: SizedBox(
+                width: 100,
+                height: 150,
+                child: MediaArtwork(poster: 'repair', cache: cache),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        for (var i = 0; i < 20 && cache.invalidations == 0; i++) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(cache.invalidations, 1);
+        expect(cache.requests, 1);
+        if (leaveBeforeRepair) await tester.pumpWidget(const SizedBox());
+        await tester.runAsync(() async {
+          await file.writeAsBytes(
+            await File('assets/branding/app_icon.png').readAsBytes(),
+          );
+        });
+        cache.repair.complete();
+        await tester.pumpAndSettle();
+        expect(cache.requests, leaveBeforeRepair ? 1 : 2);
+        expect(cache.invalidations, 1);
+        if (!leaveBeforeRepair) {
+          bool decoded() => tester
+              .widgetList<RawImage>(find.byType(RawImage))
+              .any((image) => image.image != null);
+          for (var i = 0; i < 20 && !decoded(); i++) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 10)),
+            );
+            await tester.pump();
+          }
+          expect(
+            decoded(),
+            isTrue,
+            reason:
+                'The repaired image uses the same file path and must replace its old failed ImageStream.',
+          );
+        }
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox());
+        imageCache.clear();
+        cache.close();
+      },
+    );
+  }
+
+  testWidgets('busy artwork skips viewport transforms until the scope idles', (
+    tester,
+  ) async {
+    final controller = ScrollController();
+    final cache = _RecordingPosterCache();
+    late StateSetter update;
+    var showArtwork = false, transforms = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ArtworkScrollScope(
+          child: StatefulBuilder(
+            builder: (context, setState) {
+              update = setState;
+              return ListView(
+                controller: controller,
+                children: [
+                  if (showArtwork)
+                    _TransformProbe(
+                      onTransform: () => transforms++,
+                      child: SizedBox(
+                        height: 100,
+                        child: MediaArtwork(poster: 'new-poster', cache: cache),
+                      ),
+                    ),
+                  const SizedBox(height: 4000),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    final drag = controller.position.drag(DragStartDetails(), () {});
+    update(() => showArtwork = true);
+    await tester.pump();
+    expect(cache.requested, isEmpty);
+    expect(transforms, 0);
+    drag.end(DragEndDetails(primaryVelocity: 0));
+    await tester.pump(const Duration(milliseconds: 120));
+    expect(cache.requested, ['new-poster']);
+    expect(transforms, greaterThan(0));
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
+    cache.close();
+  });
+
+  testWidgets('rebuilding a decoded cover skips viewport transforms', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetDevicePixelRatio);
+    const path = 'assets/branding/app_icon.png';
+    final imageCache = PaintingBinding.instance.imageCache;
+    imageCache.clear();
+    await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+    await tester.runAsync(
+      () => precacheImage(
+        artworkImage(File(path), 128),
+        tester.element(find.byType(SizedBox).last),
+      ),
+    );
+    late StateSetter update;
+    var transforms = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: StatefulBuilder(
+          builder: (context, setState) {
+            update = setState;
+            return Center(
+              child: _TransformProbe(
+                onTransform: () => transforms++,
+                child: SizedBox(
+                  width: 100,
+                  height: 100,
+                  child: MediaArtwork(thumbnail: path),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.byType(Image), findsOneWidget);
+    transforms = 0;
+    update(() {});
+    // Exclude the accessibility pass, which legitimately transforms geometry.
+    await tester.pump(null, EnginePhase.paint);
+    expect(transforms, 0);
+    expect(find.byType(Image), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+    imageCache.clear();
+  });
+
   testWidgets('opening details starts cache lookup during the transition', (
     tester,
   ) async {

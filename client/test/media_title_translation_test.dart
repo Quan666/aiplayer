@@ -215,10 +215,10 @@ void main() {
           ),
         ),
       );
-      expect(find.text('Example · 第 1 集 · Encounter'), findsOneWidget);
+      expect(find.text('Example'), findsOneWidget);
       await tester.tap(find.text('标题译文'));
       await tester.pumpAndSettle();
-      expect(find.text('译文 Example · 第 1 集 · 译文 Encounter'), findsOneWidget);
+      expect(find.text('译文 Example'), findsOneWidget);
       expect(model.displayTitle(record), '译文 Example · 第 1 集 · 译文 Encounter');
       expect(store.get('media', 'one')!.data, original);
       expect(store.local('episodeTitle:one'), 'Encounter');

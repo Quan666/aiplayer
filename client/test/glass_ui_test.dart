@@ -283,6 +283,7 @@ void main() {
       tester.view.devicePixelRatio = 1;
       try {
         expect(model.themeMode, ThemeMode.light);
+        await tester.runAsync(() => model!.loadLibrarySnapshot());
         await tester.pumpWidget(AIPlayerApp(model: model));
         await tester.pumpAndSettle();
         expect(
@@ -351,6 +352,7 @@ void main() {
         store = AppStore(databasePath);
         model = AppModel(store, root);
         expect(model.themeMode, ThemeMode.dark);
+        await tester.runAsync(() => model!.loadLibrarySnapshot());
         await tester.pumpWidget(AIPlayerApp(model: model));
         await tester.pumpAndSettle();
         expect(

@@ -17,7 +17,8 @@ import 'navigation_reveal.dart';
 
 class SettingsPage extends StatefulWidget {
   final AppModel model;
-  const SettingsPage({super.key, required this.model});
+  final bool active;
+  const SettingsPage({super.key, required this.model, this.active = true});
   @override
   State<SettingsPage> createState() => _SettingsPageState();
 }
@@ -36,13 +37,53 @@ class _SettingsPageState extends State<SettingsPage> {
   bool testingMetadata = false, refreshingMetadata = false;
   bool loading = true, saving = false;
   String group = 'general', query = '';
+  Object? _settingsRevision;
+  AppPreferences? _sectionPreferences;
   AppModel get model => widget.model;
-  AppPreferences get prefs => model.preferences;
+  AppPreferences get prefs => _sectionPreferences ?? model.preferences;
   bool get mobile => Platform.isAndroid || Platform.isIOS;
   @override
   void initState() {
     super.initState();
+    _settingsRevision = _revision;
+    model.addListener(_modelChanged);
     load();
+  }
+
+  Object get _revision => (
+    model.store,
+    model.store.localKeyRevision('settings'),
+    model.store.localKeyRevision('appearance:theme'),
+  );
+
+  void _modelChanged() {
+    if (!mounted || !widget.active) return;
+    final revision = _revision;
+    if (_settingsRevision == revision) return;
+    _settingsRevision = revision;
+    // Refresh switches and options without reloading controllers: connection
+    // credentials and unsaved drafts belong to this editing session.
+    setState(() {});
+  }
+
+  @override
+  void didUpdateWidget(SettingsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.model != widget.model) {
+      oldWidget.model.removeListener(_modelChanged);
+      model.addListener(_modelChanged);
+    }
+    if (widget.active) _settingsRevision = _revision;
+  }
+
+  Widget _buildSection(Widget Function() builder) {
+    final previous = _sectionPreferences;
+    _sectionPreferences = model.preferences;
+    try {
+      return builder();
+    } finally {
+      _sectionPreferences = previous;
+    }
   }
 
   Future<void> load() async {
@@ -69,6 +110,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    model.removeListener(_modelChanged);
     for (final c in [
       origin,
       token,
@@ -667,7 +709,7 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
       const SizedBox(height: 6),
       Text(
-        '同步设置（含 API Key）、远程来源及密码、收藏、匹配资料、播放记录、海报、封面截图和已有的标题译文及视频参数。图片会压缩后加密同步；本地视频、设备文件路径、运行日志和临时任务保留在本机。各设备使用新版客户端或扩展，填写相同的服务地址和 Token 即可加入。',
+        '同步全部视频的目录信息、设置（含 API Key）、远程来源及密码、收藏、匹配资料，以及远程视频的播放记录、海报、封面截图和已有译文。图片压缩后加密同步。视频文件、本地路径、本地视频的播放记录与抓帧封面留在本机；其他设备可查看本地视频条目并关联自己的文件。各设备填写相同的服务地址和 Token 即可加入。',
         style: AppStyles.of(context).micro,
       ),
       const SizedBox(height: 12),
@@ -918,7 +960,7 @@ class _SettingsPageState extends State<SettingsPage> {
               key: key,
               padding: const EdgeInsets.only(bottom: 12),
               itemCount: sections.length,
-              itemBuilder: (_, index) => sections[index](),
+              itemBuilder: (_, index) => _buildSection(sections[index]),
               separatorBuilder: (_, _) => const SizedBox(height: 12),
             );
         return Center(

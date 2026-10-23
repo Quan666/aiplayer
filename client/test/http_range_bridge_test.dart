@@ -11,6 +11,47 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test(
+    'HTTP bridge reuses its probe connection for the first video bytes',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final ports = <int>[];
+      final methods = <String>[];
+      server.listen((request) async {
+        ports.add(request.connectionInfo!.remotePort);
+        methods.add(request.method);
+        request.response.headers.set('Accept-Ranges', 'bytes');
+        request.response.contentLength = 1024;
+        if (request.method == 'GET') {
+          request.response.statusCode = 206;
+          request.response.headers.set('Content-Range', 'bytes 0-1023/1024');
+          request.response.add(Uint8List(1024));
+        }
+        await request.response.close();
+      });
+      final source = HttpSource('http://127.0.0.1:${server.port}/video.mkv');
+      final client = HttpClient();
+      RangeBridge? bridge;
+      try {
+        bridge = await RangeBridge.open(source, '');
+        await source.close();
+        expect(bridge.entry.size, 1024);
+        final response = await (await client.getUrl(bridge.uri)).close();
+        expect(
+          await response.fold<int>(0, (n, bytes) => n + bytes.length),
+          1024,
+        );
+        expect(methods, ['HEAD', 'GET']);
+        expect(ports.toSet(), hasLength(1));
+      } finally {
+        client.close(force: true);
+        await bridge?.close();
+        await source.close();
+        await server.close(force: true);
+      }
+    },
+  );
+
+  test(
     'HTTP worker preserves authenticated ranges, HEAD and token checks',
     () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);

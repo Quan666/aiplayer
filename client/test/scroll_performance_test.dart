@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/preferences.dart';
 import 'package:aiplayer/data/store.dart';
+import 'package:aiplayer/data/library_snapshot.dart';
+import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/main.dart';
 import 'package:aiplayer/ui/media_artwork.dart';
 import 'package:flutter/gestures.dart';
@@ -53,6 +55,7 @@ void main() {
         .position;
     final extent = scroll.maxScrollExtent;
     model.mediaReads = 0;
+    model.snapshotReads = 0;
     model.preferenceReads = 0;
     await tester.drag(list, const Offset(0, -400));
     await tester.pumpAndSettle();
@@ -134,6 +137,7 @@ void main() {
         await tester.pump();
         final retained = tester.widget<CustomScrollView>(library);
         model.mediaReads = 0;
+        model.snapshotReads = 0;
         store.save('media', 'new', {'title': '新视频.mp4', 'series': '未分类'});
         for (var i = 0; i < 5; i++) {
           model.changed();
@@ -146,7 +150,7 @@ void main() {
         // The shared idle grace also covers consecutive desktop wheel ticks.
         await tester.pump(const Duration(milliseconds: 140));
         await tester.pumpAndSettle();
-        expect(model.mediaReads, 1);
+        expect(model.snapshotReads, 1);
         expect(tester.widget<CustomScrollView>(library), isNot(same(retained)));
         expect(find.text('121'), findsOneWidget);
         expect(tester.takeException(), isNull);
@@ -183,6 +187,7 @@ void main() {
     final vertical = position(library), horizontal = position(carousel);
     final retained = tester.widget<CustomScrollView>(library);
     model.mediaReads = 0;
+    model.snapshotReads = 0;
     unawaited(
       horizontal.animateTo(
         100,
@@ -216,7 +221,7 @@ void main() {
     expect(vertical.isScrollingNotifier.value, isFalse);
     await tester.pump(const Duration(milliseconds: 140));
     await tester.pumpAndSettle();
-    expect(model.mediaReads, 1);
+    expect(model.snapshotReads, 1);
     expect(tester.widget<CustomScrollView>(library), isNot(same(retained)));
     expect(find.text('121'), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -243,6 +248,7 @@ void main() {
         .position;
     final retained = tester.widget<CustomScrollView>(library);
     model.mediaReads = 0;
+    model.snapshotReads = 0;
     unawaited(
       scroll.animateTo(
         80,
@@ -265,7 +271,7 @@ void main() {
 
     await tester.tap(find.text('影视库').last);
     await tester.pumpAndSettle();
-    expect(model.mediaReads, 1);
+    expect(model.snapshotReads, 1);
     expect(tester.widget<CustomScrollView>(library), isNot(same(retained)));
     expect(find.text('121'), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -310,6 +316,7 @@ void main() {
           )
           .position;
       model.mediaReads = 0;
+      model.snapshotReads = 0;
       for (var i = 0; i < 5; i++) {
         await tester.sendEventToBinding(
           PointerScrollEvent(
@@ -331,7 +338,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 140));
       await tester.pumpAndSettle();
       expect(tester.widget<CustomScrollView>(library), isNot(same(retained)));
-      expect(model.mediaReads, 1);
+      expect(model.snapshotReads, 1);
       position.jumpTo(0);
       await tester.pumpAndSettle();
       expect(find.text('125'), findsOneWidget);
@@ -371,7 +378,7 @@ void main() {
     }),
   );
 
-  test('history sorting reads progress once per candidate', () {
+  test('history sorting uses the batch snapshot without per-video reads', () {
     final items = model.media;
     for (var i = 0; i < items.length; i++) {
       store.save('progress', model.progressKey(items[i]), {
@@ -389,7 +396,7 @@ void main() {
       recent.map((item) => item.id),
       items.reversed.map((item) => item.id),
     );
-    expect(model.progressReads, items.length);
+    expect(model.progressReads, 0);
   });
 
   testWidgets('thumbnail and status updates reuse library groups and history', (
@@ -398,6 +405,7 @@ void main() {
     await tester.pumpWidget(AIPlayerApp(model: model));
     await tester.pumpAndSettle();
     model.mediaReads = model.historyReads = 0;
+    model.snapshotReads = 0;
     for (var i = 0; i < 5; i++) {
       store.setLocal('preview:$i', {'path': '/unused/preview-$i.jpg'});
       model.changed();
@@ -414,7 +422,8 @@ void main() {
     model.changed();
     await tester.pumpAndSettle();
     expect(model.mediaReads, 0);
-    expect(model.historyReads, 1);
+    expect(model.historyReads, 0);
+    expect(model.snapshotReads, 1);
     expect(find.text('继续观看'), findsOneWidget);
 
     // A changed association changes the progress key even when no media or
@@ -422,12 +431,13 @@ void main() {
     store.setLocal('location:0', {'size': 999});
     model.changed();
     await tester.pumpAndSettle();
-    expect(model.historyReads, 2);
+    expect(model.historyReads, 0);
+    expect(model.snapshotReads, 2);
     expect(find.text('继续观看'), findsNothing);
     store.save('media', 'new', {'title': '新增.mp4', 'series': '未分类'});
     model.changed();
     await tester.pumpAndSettle();
-    expect(model.mediaReads, 1);
+    expect(model.snapshotReads, 3);
     expect(find.text('121'), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
   });
@@ -496,6 +506,17 @@ class _CountingModel extends AppModel {
   List<SyncRecord> get media {
     mediaReads++;
     return super.media;
+  }
+
+  int snapshotReads = 0;
+
+  @override
+  Future<LibrarySnapshot> loadLibrarySnapshot({
+    String query = '',
+    CancelToken? cancel,
+  }) {
+    snapshotReads++;
+    return super.loadLibrarySnapshot(query: query, cancel: cancel);
   }
 
   @override

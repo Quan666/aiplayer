@@ -53,7 +53,10 @@ void main() {
       );
 
       await second.sync();
-      expect((await server.changes())['cursor'], published['cursor']);
+      expect(
+        (await server.changes())['cursor'],
+        (published['cursor'] as int) + 1,
+      );
       expect(second.store.local('settings'), {
         'syncOrigin': 'https://device-local-bootstrap.example',
         'metadataStrategy': 'balanced',
@@ -106,6 +109,9 @@ void main() {
       second.store.setLocal('episodeTitle:remote-video', '更新的小标题');
       await second.sync();
       await first.sync();
+      expect(first.store.get('media', 'local-only')!.data['title'], '本机视频');
+      expect(first.store.local('location:local-only'), isNull);
+      expect(first.store.get('progress', 'local-only:8'), isNull);
       expect(
         (first.store.local('settings') as Map)['metadataStrategy'],
         'conservative',
@@ -164,7 +170,10 @@ void main() {
       });
       expect(first.store.conflicts, isEmpty);
       expect(second.store.conflicts, isEmpty);
-      expect(jsonEncode(await server.changes()), isNot(contains('local-only')));
+      final allChanges = jsonEncode(await server.changes());
+      expect(allChanges, contains('local-only'));
+      expect(allChanges, isNot(contains('/device/private.mkv')));
+      expect(allChanges, isNot(contains('local-only:8')));
     },
     skip: skip,
   );

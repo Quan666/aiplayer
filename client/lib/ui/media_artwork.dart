@@ -17,6 +17,10 @@ class MediaArtwork extends StatefulWidget {
   final Widget? placeholder;
   final BoxFit fit;
 
+  /// Bounds decoding in physical pixels. Fullscreen viewers can opt into a
+  /// larger image while their first frame reuses the already visible cover.
+  final int maxDecodeEdge;
+
   /// Runs after layout, when the surrounding scrollables allow expensive work.
   /// A later widget update retries a previously full preview queue.
   final VoidCallback? onRequestPreview;
@@ -27,8 +31,9 @@ class MediaArtwork extends StatefulWidget {
     this.cache,
     this.placeholder,
     this.fit = BoxFit.cover,
+    this.maxDecodeEdge = 640,
     this.onRequestPreview,
-  });
+  }) : assert(maxDecodeEdge >= 64);
   @override
   State<MediaArtwork> createState() => _MediaArtworkState();
 }
@@ -36,10 +41,14 @@ class MediaArtwork extends StatefulWidget {
 class _MediaArtworkState extends State<MediaArtwork> {
   String? _reportedFailure;
   bool _posterInvalidated = false;
+  bool _repairingPoster = false;
+  int _posterRevision = 0;
+  Listenable? _cacheCapacity;
   Future<File?>? _poster;
   Timer? _posterRetry;
   bool _previewPending = false, _previewFrameScheduled = false;
   bool _imageLoadingAllowed = false;
+  bool _active = true;
   ValueListenable<bool>? _scrollActivity;
   final _scrollPositions = <ScrollPosition>{};
   ModalRoute<dynamic>? _route;
@@ -49,11 +58,34 @@ class _MediaArtworkState extends State<MediaArtwork> {
   void initState() {
     super.initState();
     _previewPending = widget.onRequestPreview != null;
+    widget.cache?.changes.addListener(_cacheChanged);
+  }
+
+  void _cacheChanged() {
+    final change = widget.cache?.changes.value;
+    if (!mounted || change == null || change.url != widget.poster) return;
+    void changed() {
+      _poster = change.file == null ? null : SynchronousFuture(change.file);
+      _posterRevision++;
+    }
+
+    if (_active) {
+      setState(changed);
+    } else {
+      // A hidden route reads the newest generation once it becomes active.
+      changed();
+    }
+    _loadArtwork();
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _active = TickerMode.valuesOf(context).enabled;
+    if (!_active) {
+      _posterRetry?.cancel();
+      _posterRetry = null;
+    }
     _route = ModalRoute.of(context);
     final transition = _route?.secondaryAnimation;
     if (transition != _routeTransition) {
@@ -102,7 +134,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
   void _retryLoading() {
     // The shared scope will wake every pending cover once when the region is
     // idle. Avoid a timer per card while wheel/trackpad events keep arriving.
-    if (_scrollActivity?.value == true) return;
+    if (!_active || _scrollActivity?.value == true) return;
     _posterRetry ??= Timer(const Duration(milliseconds: 80), () {
       _posterRetry = null;
       if (!mounted) return;
@@ -163,14 +195,19 @@ class _MediaArtworkState extends State<MediaArtwork> {
   void _loadArtwork() {
     final needsPoster =
         _poster == null && widget.cache != null && widget.poster.isNotEmpty;
-    if ((!needsPoster && !_previewPending && _imageLoadingAllowed) ||
+    if (!_active ||
+        _repairingPoster ||
+        _scrollActivity?.value == true ||
+        (!needsPoster && !_previewPending && _imageLoadingAllowed) ||
         _previewFrameScheduled) {
       return;
     }
     _previewFrameScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _previewFrameScheduled = false;
-      if (!mounted || !_visible) return;
+      if (!mounted || !_active || _scrollActivity?.value == true || !_visible) {
+        return;
+      }
       // Cached sliver children are laid out before they enter the viewport.
       // Request expensive artwork only for the cards the user can see.
       if (_deferLoading) {
@@ -181,10 +218,20 @@ class _MediaArtworkState extends State<MediaArtwork> {
       _posterRetry = null;
       if (!_imageLoadingAllowed) setState(() => _imageLoadingAllowed = true);
       if (_poster == null && widget.cache != null && widget.poster.isNotEmpty) {
-        final poster = widget.cache!.load(widget.poster);
-        setState(() {
-          _poster = poster;
-        });
+        final cache = widget.cache!;
+        final poster = cache.loadVisible(widget.poster);
+        if (poster == null) {
+          if (_cacheCapacity != cache.capacity) {
+            _cacheCapacity?.removeListener(_loadArtwork);
+            _cacheCapacity = cache.capacity..addListener(_loadArtwork);
+          }
+        } else {
+          _cacheCapacity?.removeListener(_loadArtwork);
+          _cacheCapacity = null;
+          setState(() {
+            _poster = poster;
+          });
+        }
       }
       if (_previewPending) {
         _previewPending = false;
@@ -197,6 +244,10 @@ class _MediaArtworkState extends State<MediaArtwork> {
   @override
   void didUpdateWidget(MediaArtwork oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.cache != widget.cache) {
+      oldWidget.cache?.changes.removeListener(_cacheChanged);
+      widget.cache?.changes.addListener(_cacheChanged);
+    }
     if (oldWidget.thumbnail != widget.thumbnail ||
         oldWidget.poster != widget.poster) {
       _imageLoadingAllowed = false;
@@ -205,6 +256,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
     if (oldWidget.poster != widget.poster || oldWidget.cache != widget.cache) {
       _reportedFailure = null;
       _posterInvalidated = false;
+      _repairingPoster = false;
+      _cacheCapacity?.removeListener(_loadArtwork);
+      _cacheCapacity = null;
       _posterRetry?.cancel();
       _posterRetry = null;
       _poster = null;
@@ -218,26 +272,46 @@ class _MediaArtworkState extends State<MediaArtwork> {
     _loadArtwork();
   }
 
-  bool _canLoadImage(File file, int width) {
+  bool _canLoadImage(ResizeImage provider) {
     // Permission granted before a download is not permission to decode its
     // result later: scrolling can begin while the file is still in flight.
-    if (_imageLoadingAllowed && !_deferLoading && _visible) return true;
     var cached = false;
     // FileImage and ResizeImage return synchronous keys. Use the resolved key,
     // not the provider object, to reuse decoded/pending textures while flinging.
-    artworkImage(file, width).obtainKey(ImageConfiguration.empty).then((key) {
+    provider.obtainKey(ImageConfiguration.empty).then((key) {
       cached = PaintingBinding.instance.imageCache.statusForKey(key).tracked;
     });
-    if (!cached) {
-      _imageLoadingAllowed = false;
-      _loadArtwork();
+    // Warm images require neither decoding nor viewport transforms. A parent
+    // rebuild used to walk every ancestor and multiply global transforms for
+    // each already-decoded poster, even though it can be displayed immediately.
+    if (cached) return true;
+    if (!_active) return false;
+    if (_imageLoadingAllowed && !_deferLoading && _visible) return true;
+    _imageLoadingAllowed = false;
+    _loadArtwork();
+    return false;
+  }
+
+  ResizeImage _imageFor(File file, int edge) {
+    final requested = artworkImage(file, edge);
+    final warm = _warmArtworkImage(file, edge, widget.maxDecodeEdge);
+    if (warm == null) return requested;
+    if (warm.width! >= edge && warm.width! <= widget.maxDecodeEdge) {
+      // A card's larger texture is already sharp enough for the detail header.
+      // Sharing its exact provider avoids another disk read and decode.
+      return warm;
     }
-    return cached;
+    // Present the resident texture on the first frame, including while the
+    // route opens or scrolling is busy. Only then request a more suitable
+    // decode; Image's gapless playback keeps the warm frame during that work.
+    return _canLoadImage(requested) ? requested : warm;
   }
 
   @override
   void dispose() {
     _posterRetry?.cancel();
+    widget.cache?.changes.removeListener(_cacheChanged);
+    _cacheCapacity?.removeListener(_loadArtwork);
     _scrollActivity?.removeListener(_activityChanged);
     _routeTransition?.removeStatusListener(_routeSettled);
     for (final position in _scrollPositions) {
@@ -245,6 +319,26 @@ class _MediaArtworkState extends State<MediaArtwork> {
       position.isScrollingNotifier.removeListener(_scrollChanged);
     }
     super.dispose();
+  }
+
+  void _repairPoster(String poster, File file) {
+    final cache = widget.cache;
+    if (_posterInvalidated || cache == null) return;
+    _posterInvalidated = true;
+    _repairingPoster = true;
+    // A stale or corrupt disk entry must be evicted from both caches. Repair
+    // once per mounted cover, after the error builder has finished its frame.
+    scheduleMicrotask(() async {
+      await _evictArtworkImages(file);
+      await cache.invalidate(poster, failedFile: file, retryImmediately: true);
+      if (!mounted || widget.poster != poster || widget.cache != cache) return;
+      setState(() {
+        _poster = null;
+        _repairingPoster = false;
+        _posterRevision++;
+      });
+      _loadArtwork();
+    });
   }
 
   void _reportFailure(Object error) {
@@ -278,23 +372,25 @@ class _MediaArtworkState extends State<MediaArtwork> {
           ),
         );
     final pixelRatio = MediaQuery.devicePixelRatioOf(context);
-    Widget frame(int decodeWidth) =>
-        thumbnail == null ||
-            thumbnail.isEmpty ||
-            !_canLoadImage(File(thumbnail), decodeWidth)
-        ? placeholder
-        : Image(
-            image: artworkImage(File(thumbnail), decodeWidth),
-            fit: fit,
-            width: double.infinity,
-            height: double.infinity,
-            filterQuality: FilterQuality.low,
-            gaplessPlayback: true,
-            errorBuilder: (_, error, _) {
-              _reportFailure(error);
-              return placeholder;
-            },
-          );
+    Widget frame(int decodeWidth) {
+      if (thumbnail == null || thumbnail.isEmpty) return placeholder;
+      final provider = _imageFor(File(thumbnail), decodeWidth);
+      return !_canLoadImage(provider)
+          ? placeholder
+          : Image(
+              image: provider,
+              fit: fit,
+              width: double.infinity,
+              height: double.infinity,
+              filterQuality: FilterQuality.low,
+              gaplessPlayback: true,
+              errorBuilder: (_, error, _) {
+                _reportFailure(error);
+                return placeholder;
+              },
+            );
+    }
+
     return RepaintBoundary(
       child: LayoutBuilder(
         builder: (context, constraints) {
@@ -305,35 +401,37 @@ class _MediaArtworkState extends State<MediaArtwork> {
               ? constraints.hasBoundedHeight
                     ? constraints.biggest.longestSide
                     : constraints.maxWidth
-              : 640 / pixelRatio;
+              : widget.maxDecodeEdge / pixelRatio;
           final decodeWidth = ((edge * pixelRatio / 64).ceil() * 64).clamp(
             64,
-            640,
+            widget.maxDecodeEdge,
           );
           return poster.isNotEmpty
               ? FutureBuilder<File?>(
-                  key: ValueKey(poster),
+                  // The repaired file keeps its path. Replace the failed
+                  // Image element as well as its decoded-cache entry so that
+                  // FileImage's equal path key cannot retain the old error.
+                  key: ValueKey((poster, widget.cache, _posterRevision)),
                   future: _poster,
                   initialData: widget.cache?.resolvedFile(poster),
-                  builder: (_, snapshot) =>
-                      snapshot.data == null ||
-                          !_canLoadImage(snapshot.data!, decodeWidth)
-                      ? frame(decodeWidth)
-                      : Image(
-                          image: artworkImage(snapshot.data!, decodeWidth),
-                          fit: fit,
-                          width: double.infinity,
-                          height: double.infinity,
-                          filterQuality: FilterQuality.low,
-                          gaplessPlayback: true,
-                          errorBuilder: (_, error, _) {
-                            if (!_posterInvalidated) {
-                              _posterInvalidated = true;
-                              unawaited(widget.cache?.invalidate(poster));
-                            }
-                            return frame(decodeWidth);
-                          },
-                        ),
+                  builder: (_, snapshot) {
+                    if (snapshot.data == null) return frame(decodeWidth);
+                    final provider = _imageFor(snapshot.data!, decodeWidth);
+                    return !_canLoadImage(provider)
+                        ? frame(decodeWidth)
+                        : Image(
+                            image: provider,
+                            fit: fit,
+                            width: double.infinity,
+                            height: double.infinity,
+                            filterQuality: FilterQuality.low,
+                            gaplessPlayback: true,
+                            errorBuilder: (_, error, _) {
+                              _repairPoster(poster, snapshot.data!);
+                              return frame(decodeWidth);
+                            },
+                          );
+                  },
                 )
               : frame(decodeWidth);
         },
@@ -351,10 +449,79 @@ String mediaTime(double seconds) {
   return hours > 0 ? '$hours:$minutes:$secs' : '$minutes:$secs';
 }
 
+// This bounded index owns only providers/keys, never decoded images or stream
+// listeners. Flutter's ImageCache remains responsible for texture residency
+// and eviction. Index lookup is O(1), with at most 32 size variants per file.
+final _artworkVariants = <(String, int), Map<int, ResizeImage>>{};
+
 /// Use the same SDK provider/key for lookup and display, bounding both axes.
-ResizeImage artworkImage(File file, int edge) => ResizeImage(
-  FileImage(file),
-  width: edge,
-  height: edge,
-  policy: ResizeImagePolicy.fit,
-);
+ResizeImage artworkImage(File file, int edge) {
+  final revision = posterFileRevision(file);
+  final identity = (file.path, revision);
+  final variants = _artworkVariants.remove(identity) ?? <int, ResizeImage>{};
+  _artworkVariants[identity] = variants;
+  while (_artworkVariants.length > 512) {
+    _artworkVariants.remove(_artworkVariants.keys.first);
+  }
+  final provider =
+      variants.remove(edge) ??
+      ResizeImage(
+        _VersionedFileImage(file, revision),
+        width: edge,
+        height: edge,
+        policy: ResizeImagePolicy.fit,
+      );
+  variants[edge] = provider;
+  while (variants.length > 32) {
+    variants.remove(variants.keys.first);
+  }
+  return provider;
+}
+
+ResizeImage? _warmArtworkImage(File file, int edge, int maxDecodeEdge) {
+  ResizeImage? suitable, fallback;
+  final variants = _artworkVariants[(file.path, posterFileRevision(file))];
+  if (variants == null) return null;
+  for (final provider in variants.values) {
+    var decoded = false;
+    // FileImage/ResizeImage keys resolve synchronously, without file access.
+    provider.obtainKey(ImageConfiguration.empty).then((key) {
+      final status = PaintingBinding.instance.imageCache.statusForKey(key);
+      decoded = !status.pending && (status.keepAlive || status.live);
+    });
+    if (!decoded) continue;
+    final size = provider.width!;
+    if (size >= edge && size <= maxDecodeEdge) {
+      if (suitable == null || size < suitable.width!) suitable = provider;
+    } else if (fallback == null ||
+        (size <= maxDecodeEdge &&
+            (fallback.width! > maxDecodeEdge || size > fallback.width!))) {
+      fallback = provider;
+    }
+  }
+  return suitable ?? fallback;
+}
+
+Future<void> _evictArtworkImages(File file) async {
+  final variants = _artworkVariants.remove((
+    file.path,
+    posterFileRevision(file),
+  ));
+  if (variants == null) return;
+  await Future.wait(variants.values.map((provider) => provider.evict()));
+}
+
+class _VersionedFileImage extends FileImage {
+  final int revision;
+
+  const _VersionedFileImage(super.file, this.revision);
+
+  @override
+  bool operator ==(Object other) =>
+      other is _VersionedFileImage &&
+      other.revision == revision &&
+      super == other;
+
+  @override
+  int get hashCode => Object.hash(super.hashCode, revision);
+}

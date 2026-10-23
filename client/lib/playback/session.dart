@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:flutter/foundation.dart';
 import 'dart:convert';
 import 'package:media_kit/media_kit.dart';
@@ -24,6 +25,25 @@ import '../subtitles/chinese.dart';
 import '../subtitles/ai.dart';
 import '../subtitles/io.dart';
 import '../subtitles/mkv.dart';
+
+// One directory-sized task, with only its input crossing the isolate boundary.
+// A large NAS folder must not sort/rank its entries on the rendering isolate.
+Future<List<SourceEntry>> _rankExternalSubtitles(
+  List<SourceEntry> entries,
+  String videoName,
+  String language,
+) => Isolate.run(() {
+  final ranked =
+      [
+        for (final entry in entries)
+          if (!entry.directory && isSubtitle(entry.name))
+            (entry, externalSubtitleRank(videoName, entry.name, language)),
+      ]..sort((a, b) {
+        final rank = b.$2.compareTo(a.$2);
+        return rank == 0 ? a.$1.name.compareTo(b.$1.name) : rank;
+      });
+  return [for (final item in ranked) item.$1];
+});
 
 class PlaybackSession extends ChangeNotifier {
   // libass's embedded-font provider matches the legacy family (name ID 1),
@@ -74,6 +94,10 @@ class PlaybackSession extends ChangeNotifier {
   bool get firstFrameRendered => _firstFrameRendered;
   bool get _transient => media.data['transient'] == true;
   final _startupClock = Stopwatch();
+  final _startupCancel = CancelToken();
+  final _startupTimings = <String, int>{};
+  Map<String, int> get startupTimings => Map.unmodifiable(_startupTimings);
+  String? _subtitleSearchPath;
   static const _playbackErrorMessage = '播放发生错误，可尝试软解或重新打开视频。';
   final _clock = Stopwatch();
   // Position has its own notifier: moving the seek thumb must not rebuild the
@@ -486,13 +510,24 @@ class PlaybackSession extends ChangeNotifier {
         return;
       }
       _firstFrameRendered = true;
+      _startupTimings['firstFrame'] = _startupClock.elapsedMilliseconds;
       video.rect.removeListener(_videoOutputChanged);
       _watchingVideoOutput = false;
       _firstFrameRetry?.cancel();
-      AppLog.instance.info('播放', '首帧 ${_startupClock.elapsedMilliseconds} ms');
+      AppLog.instance.info(
+        '播放',
+        '首帧 ${_startupClock.elapsedMilliseconds} ms'
+            '（来源 ${_startupTimings['source'] ?? 0} ms，'
+            '内核准备 ${_startupTimings['native'] ?? 0} ms，'
+            '预览退出 ${_startupTimings['previews'] ?? 0} ms）',
+      );
       _recoverPlaybackError();
       _scheduleTechnicalInfo();
       _notify();
+      // Directory enumeration shares the SMB worker with video reads. Let the
+      // decoder deliver its first frame before optional subtitle discovery.
+      final path = _subtitleSearchPath;
+      if (path != null) unawaited(_findSubtitles(path));
     } catch (_) {
       // A frame is unavailable while mpv is still preparing its output.
     }
@@ -515,30 +550,54 @@ class PlaybackSession extends ChangeNotifier {
   Future<(String, String)> _preparePlaybackSource() async {
     final location = model.store.local('location:${media.id}');
     if (location == null) throw const AppFailure('请先关联本机视频位置。');
-    final opened = await model.adapter(location['source']);
+    final sourceId = location['source'] as String;
+    final opened = await _openSource(sourceId, _startupCancel);
     if (closed) {
       await opened.close();
       return ('', '');
     }
     source = opened;
     final path = location['path'] as String;
-    final stat = await opened.stat(path);
+    final SourceEntry stat;
+    final String uri;
+    if (opened is LocalSource) {
+      stat = await subtitleCancelable(opened.stat(path), _startupCancel);
+      uri = path;
+    } else {
+      // The bridge owns network reads. In particular, HTTP stat and the first
+      // GET must use its same worker/client to reuse the warmed TCP/TLS socket.
+      final serving = await RangeBridge.open(
+        opened,
+        path,
+        cancel: _startupCancel,
+      );
+      bridge = serving;
+      stat = serving.entry;
+      uri = serving.uri.toString();
+    }
     if (closed) return ('', '');
-    model.store.setLocal('location:${media.id}', {
-      ...Map<String, dynamic>.from(location),
-      'size': stat.size,
-    });
+    if (location['size'] != stat.size) {
+      await model.store.updatePlaybackLocationSize(
+        media.id,
+        sourceId: sourceId,
+        path: path,
+        size: stat.size,
+      );
+      if (closed) return ('', '');
+    }
     _technicalFingerprint = MediaTechnicalInfo.fingerprint(model.store, media);
-    final uri = opened is LocalSource
-        ? path
-        : (bridge = await RangeBridge.open(
-            opened,
-            path,
-            entry: stat,
-          )).uri.toString();
     playbackUri = opened is LocalSource ? File(path).uri.toString() : uri;
     if (!stat.seekable) notice = '此来源未声明范围读取能力，拖动可能不可用。';
     return (uri, path);
+  }
+
+  Future<T> _measureStartup<T>(String phase, Future<T> Function() work) async {
+    final clock = Stopwatch()..start();
+    try {
+      return await work();
+    } finally {
+      _startupTimings[phase] = clock.elapsedMilliseconds;
+    }
   }
 
   Future<void> open({bool? play, bool resume = true}) async {
@@ -553,13 +612,17 @@ class PlaybackSession extends ChangeNotifier {
       // independent. Do not add their latency together before decoding.
       late (String, String) preparedSource;
       _nativeOpening = Future.wait<void>([
-        model.pausePreviews(),
-        _prepareNativePlayback(),
-        _preparePlaybackSource().then((value) => preparedSource = value),
+        _measureStartup('previews', model.pausePreviews),
+        _measureStartup('native', _prepareNativePlayback),
+        _measureStartup(
+          'source',
+          _preparePlaybackSource,
+        ).then((value) => preparedSource = value),
       ]).then((_) {});
       await _nativeOpening;
       if (closed) return;
       final (uri, path) = preparedSource;
+      _subtitleSearchPath = path;
       _subscriptions.add(
         player.stream.position.listen((position) {
           _anchor = position.inMicroseconds / 1000000;
@@ -660,6 +723,7 @@ class PlaybackSession extends ChangeNotifier {
               duration: (progress?.data['duration'] as num?)?.toDouble(),
             )
           : 0.0;
+      _startupTimings['loadRequested'] = _startupClock.elapsedMilliseconds;
       _nativeOpening = () async {
         if (closed) return;
         await player.open(
@@ -680,7 +744,6 @@ class PlaybackSession extends ChangeNotifier {
       AppLog.instance.info('播放', '视频已打开');
       _checkpoints.start();
       _notify();
-      unawaited(_findSubtitles(path));
       unawaited(refreshDiagnostics());
     } catch (e) {
       if (!closed) {
@@ -728,6 +791,7 @@ class PlaybackSession extends ChangeNotifier {
   }
 
   Future<void> _findSubtitles(String path) async {
+    if (closed) return;
     try {
       if (source is HttpSource && !(source as HttpSource).webdav) return;
       final directory = source is LocalSource
@@ -737,20 +801,15 @@ class PlaybackSession extends ChangeNotifier {
       if (closed) return;
       final language = model.preferences.subtitleLanguage;
       final name = p.basename(path);
-      externalSubtitles =
-          entries.where((e) => !e.directory && isSubtitle(e.name)).toList()
-            ..sort((a, b) {
-              final result = externalSubtitleRank(
-                name,
-                b.name,
-                language,
-              ).compareTo(externalSubtitleRank(name, a.name, language));
-              return result == 0 ? a.name.compareTo(b.name) : result;
-            });
+      final ranked = await _rankExternalSubtitles(entries, name, language);
+      if (closed) return;
+      externalSubtitles = ranked;
       _notify();
-      final same = externalSubtitles
-          .where((e) => externalSubtitleRank(name, e.name, language) >= 0)
-          .firstOrNull;
+      final best = externalSubtitles.firstOrNull;
+      final same =
+          best != null && externalSubtitleRank(name, best.name, language) >= 0
+          ? best
+          : null;
       if (same != null &&
           !_subtitleUserSelected &&
           model.preferences.subtitlesEnabled &&
@@ -773,7 +832,7 @@ class PlaybackSession extends ChangeNotifier {
     _subtitleCancel = token;
     final generation = _subtitleGeneration;
     final location = model.store.local('location:${media.id}');
-    final adapter = await _subtitleAdapter(location['source'] as String, token);
+    final adapter = await _openSource(location['source'] as String, token);
     try {
       final stat = await subtitleCancelable(adapter.stat(entry.path), token);
       if (stat.size > 16 * 1024 * 1024) {
@@ -824,10 +883,7 @@ class PlaybackSession extends ChangeNotifier {
     }
   }
 
-  Future<SourceAdapter> _subtitleAdapter(
-    String sourceId,
-    CancelToken token,
-  ) async {
+  Future<SourceAdapter> _openSource(String sourceId, CancelToken token) async {
     token.check();
     final pending = model.adapter(sourceId);
     var taken = false;
@@ -906,7 +962,7 @@ class PlaybackSession extends ChangeNotifier {
     final index = _embeddedSubtitleTracks.indexWhere((t) => t.id == track.id);
     if (index < 0) throw const AppFailure('无法找到原始字幕轨道，请重新选择内嵌字幕或加载外挂字幕。');
     final location = model.store.local('location:${media.id}');
-    final adapter = await _subtitleAdapter(location['source'] as String, token);
+    final adapter = await _openSource(location['source'] as String, token);
     try {
       final path = location['path'] as String;
       final stat = await subtitleCancelable(adapter.stat(path), token);
@@ -1322,6 +1378,7 @@ class PlaybackSession extends ChangeNotifier {
 
   Future<void> _close() async {
     closed = true;
+    _startupCancel.cancel();
     _firstFrameRetry?.cancel();
     if (_watchingVideoOutput) {
       video.rect.removeListener(_videoOutputChanged);

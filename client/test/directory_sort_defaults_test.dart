@@ -6,6 +6,7 @@ import 'package:aiplayer/main.dart';
 import 'package:aiplayer/sources/directory_sort.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/ui/glass.dart';
+import 'package:aiplayer/ui/media_details_content.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -128,7 +129,10 @@ void main() {
       }
       final details = find.byKey(const ValueKey('series-details-list'));
       List<String> episodeOrder() => find
-          .descendant(of: details, matching: find.byType(ListTile))
+          .descendant(
+            of: details,
+            matching: find.byType(MediaDetailsEpisodeTile),
+          )
           .evaluate()
           .map((element) => element.widget.key)
           .whereType<ValueKey<String>>()

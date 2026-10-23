@@ -139,9 +139,9 @@ Future<SourceAdapter> connectSource(
       );
       final share = value['share'] as String? ?? '';
       if (share.isEmpty) {
-        final server = SmbServerSource(connect);
-        await server.initialize();
-        return server;
+        // A known video path already names its share. Only root browsing needs
+        // IPC$ discovery; avoid a second authentication before opening a video.
+        return SmbServerSource(connect);
       }
       return SmbSource(await connect(share), reconnect: () => connect(share));
     case 'webdav':

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -53,9 +54,6 @@ void main() {
       final server = SmbServerSource(
         (share) async => connections[share] = _SmbFixture(),
       );
-      await server.initialize();
-      expect((await server.list('')).single.path, 'video/');
-      expect(server.dialect, 0x0311);
       expect((await server.stat('video/')).directory, true);
       expect(
         await server
@@ -64,12 +62,74 @@ void main() {
             .toList(),
         [3, 4, 5],
       );
+      // A stored playback path already selects its share; discovery would add
+      // an unnecessary IPC$ authentication before the first video read.
+      expect(connections.keys, ['video']);
+      expect((await server.list('')).single.path, 'video/');
+      expect(server.dialect, 0x0311);
       expect(connections.keys, containsAll(['IPC\$', 'video']));
       expect(connections['video']!.offsets, [3]);
       await server.close();
       expect(connections.values.every((connection) => connection.closed), true);
     },
   );
+  test(
+    'concurrent SMB root listings share one lazy discovery connection',
+    () async {
+      final pending = Completer<SmbConnection>();
+      var connections = 0;
+      final server = SmbServerSource((share) {
+        expect(share, 'IPC\$');
+        connections++;
+        return pending.future;
+      });
+      final connection = _SmbFixture();
+      try {
+        final first = server.list(''), second = server.list('');
+        expect(connections, 1);
+        pending.complete(connection);
+        expect((await first).single.path, 'video/');
+        expect((await second).single.path, 'video/');
+        expect((await server.list('')).single.path, 'video/');
+        expect(connections, 1);
+      } finally {
+        await server.close();
+      }
+      expect(connection.closed, true);
+    },
+  );
+  test('failed lazy SMB discovery can retry', () async {
+    var connections = 0;
+    final connection = _SmbFixture();
+    final server = SmbServerSource((_) async {
+      if (++connections == 1) throw const SmbFailure(-111);
+      return connection;
+    });
+    try {
+      await expectLater(server.list(''), throwsA(isA<SmbFailure>()));
+      expect((await server.list('')).single.path, 'video/');
+      expect(connections, 2);
+    } finally {
+      await server.close();
+    }
+    expect(connection.closed, true);
+  });
+  test('closing during SMB discovery releases a late connection', () async {
+    final pending = Completer<SmbConnection>();
+    var connections = 0;
+    final server = SmbServerSource((_) {
+      connections++;
+      return pending.future;
+    });
+    final opening = expectLater(server.list(''), throwsA(isA<AppFailure>()));
+    await server.close();
+    final connection = _SmbFixture();
+    pending.complete(connection);
+    await opening;
+    expect(connection.closed, true);
+    await expectLater(server.initialize(), throwsA(isA<AppFailure>()));
+    expect(connections, 1);
+  });
   test(
     'SMB errors preserve actionable status without native server messages',
     () {
@@ -187,9 +247,58 @@ void main() {
   );
 
   test(
+    'SMB header and seek probes arrive before the remaining video is available',
+    () async {
+      final connection = _SmbProbeFixture();
+      final source = SmbSource(connection);
+      try {
+        // The fixture exposes only the first 64 KiB of each probe. Waiting for
+        // a larger native read would withhold the decoder's header forever.
+        for (final offset in [0, 5 * 1024 * 1024 + 13]) {
+          final probe = await source
+              .read('video.mkv', offset, offset + 8 * 1024 * 1024 - 1)
+              .first
+              .timeout(const Duration(seconds: 2));
+          expect(probe.length, 64 * 1024);
+          expect(probe.first, offset % 256);
+          expect(probe.last, (offset + probe.length - 1) % 256);
+        }
+        // Taking only the probe cancels the stream before any bulk read starts.
+        expect(connection.offsets, [0, 5 * 1024 * 1024 + 13]);
+      } finally {
+        await source.close();
+      }
+    },
+  );
+  test(
+    'SMB sequential reads keep large chunks and exact range boundaries',
+    () async {
+      final connection = _SmbFixture();
+      final source = SmbSource(connection);
+      const start = 17, length = 3 * 1024 * 1024 + 31;
+      try {
+        final chunks = await source
+            .read('video.mkv', start, start + length - 1)
+            .toList();
+        expect(chunks.length, lessThanOrEqualTo(5));
+        var offset = start;
+        for (final chunk in chunks) {
+          expect(chunk.first, offset % 256);
+          expect(chunk.last, (offset + chunk.length - 1) % 256);
+          offset += chunk.length;
+        }
+        expect(offset, start + length);
+        final tail = await source.read('video.mkv', 987, 1000).toList();
+        expect(tail.single, [for (var i = 987; i <= 1000; i++) i % 256]);
+      } finally {
+        await source.close();
+      }
+    },
+  );
+  test(
     'SMB reconnect resumes at the failed byte offset without duplicating bytes',
     () async {
-      final first = _SmbFixture(failAt: 1024 * 1024), second = _SmbFixture();
+      final first = _SmbFixture(failAt: 64 * 1024), second = _SmbFixture();
       var connections = 0;
       final source = SmbSource(
         first,
@@ -205,10 +314,41 @@ void main() {
       expect(result.length, 1024 * 1024 + 7);
       expect(result.sublist(result.length - 7), [0, 1, 2, 3, 4, 5, 6]);
       expect(connections, 1);
-      expect(second.offsets, [1024 * 1024]);
+      expect(second.offsets, [64 * 1024]);
       expect(first.closed, true);
       await source.close();
       expect(second.closed, true);
+    },
+  );
+  test(
+    'HTTP metadata probe keeps its socket for the first video range',
+    () async {
+      final server = await HttpServer.bind('127.0.0.1', 0);
+      final ports = <int>[];
+      server.listen((request) async {
+        ports.add(request.connectionInfo!.remotePort);
+        request.response.headers.set('Accept-Ranges', 'bytes');
+        request.response.contentLength = 10;
+        if (request.method == 'GET') {
+          request.response.statusCode = 206;
+          request.response.headers.set('Content-Range', 'bytes 0-9/10');
+          request.response.add(List.filled(10, 42));
+        }
+        await request.response.close();
+      });
+      final source = HttpSource('http://127.0.0.1:${server.port}/video.mkv');
+      try {
+        expect((await source.stat('')).size, 10);
+        expect(
+          await source.read('', 0, 9).expand((b) => b).toList(),
+          List.filled(10, 42),
+        );
+        expect(ports, hasLength(2));
+        expect(ports.toSet(), hasLength(1));
+      } finally {
+        await source.close();
+        await server.close(force: true);
+      }
     },
   );
   test(
@@ -435,4 +575,20 @@ class _SmbFixture implements SmbConnection {
   Future<List<Map<String, dynamic>>> list(String path) async => [];
   @override
   Future<Map<String, dynamic>> stat(String path) async => {};
+}
+
+class _SmbProbeFixture extends _SmbFixture {
+  final _remainingVideo = Completer<void>();
+
+  @override
+  Future<Uint8List> read(String path, int offset, int length) async {
+    if (length > 64 * 1024) await _remainingVideo.future;
+    return super.read(path, offset, length);
+  }
+
+  @override
+  Future<void> close() async {
+    if (!_remainingVideo.isCompleted) _remainingVideo.complete();
+    await super.close();
+  }
 }

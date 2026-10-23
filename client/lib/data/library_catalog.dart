@@ -952,7 +952,7 @@ class LibraryCatalog {
   }) async {
     cancel?.check();
     if (subject?['provider'] == 'tmdb') {
-      return Map<String, String>.from(subject?['episodeNames'] ?? {});
+      return tmdb.episodeNames(subject!, cancel: cancel);
     }
     final key = 'catalog-v1:bangumi:episodes:$subjectId';
     final legacy = store.local('episode-names:$subjectId');

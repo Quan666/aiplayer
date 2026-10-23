@@ -277,10 +277,22 @@ class SmbServerSource extends SourceAdapter {
   final Future<SmbConnection> Function(String share) connect;
   final Map<String, Future<SmbSource>> _shares = {};
   SmbConnection? _ipc;
+  Future<void>? _initializing;
   bool _closed = false;
   SmbServerSource(this.connect);
   int get dialect => _ipc?.dialect ?? 0;
   Future<void> initialize() async {
+    if (_closed) throw const AppFailure('来源已关闭。');
+    if (_ipc != null) return;
+    final pending = _initializing ??= _initialize();
+    try {
+      await pending;
+    } finally {
+      if (identical(_initializing, pending)) _initializing = null;
+    }
+  }
+
+  Future<void> _initialize() async {
     final connection = await connect('IPC\$');
     if (_closed) {
       await connection.close();
@@ -465,13 +477,19 @@ class SmbSource extends SourceAdapter {
   @override
   Stream<List<int>> read(String path, int start, int end) async* {
     var cursor = start;
+    var firstRead = true;
     while (cursor <= end) {
+      // Native SMB reads complete only after the entire requested block arrives.
+      // Deliver a small header/seek probe before switching to large sequential
+      // reads, so opening a video does not wait for a full MiB over the network.
+      final limit = firstRead ? 64 * 1024 : 1024 * 1024;
       final bytes = await _readWithRetry(
-        (c) => c.read(path, cursor, (end - cursor + 1).clamp(1, 1024 * 1024)),
+        (c) => c.read(path, cursor, (end - cursor + 1).clamp(1, limit)),
       );
       if (bytes.isEmpty) throw const AppFailure('SMB 文件读取提前结束。');
       yield bytes;
       cursor += bytes.length;
+      firstRead = false;
     }
   }
 

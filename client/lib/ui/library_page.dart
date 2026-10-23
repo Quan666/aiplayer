@@ -11,6 +11,7 @@ import '../data/media_presentation.dart';
 import '../data/media_episodes.dart';
 import '../data/media_technical_info.dart';
 import '../data/poster_cache.dart';
+import '../data/library_snapshot.dart';
 import '../sources/source.dart';
 import 'player_page.dart';
 import 'settings_page.dart';
@@ -20,7 +21,7 @@ import 'theme/library_styles.dart';
 import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
 import 'metadata_tasks_sheet.dart';
-import 'media_details_header.dart';
+import 'media_details_content.dart';
 import 'search_header.dart';
 import 'navigation_reveal.dart';
 import 'device_icon.dart';
@@ -88,11 +89,15 @@ class _LibraryPageState extends State<LibraryPage> {
   final _pendingPreviewRequests = <String>{};
   List<SyncRecord> _recent = const [];
   List<SyncRecord> _media = const [];
-  int? _mediaRevision, _recentProgressRevision, _recentLocationRevision;
-  String? _groupQuery;
+  LibrarySnapshot? _snapshot;
+  Object? _snapshotVersion, _requestedSnapshotVersion;
+  CancelToken? _snapshotCancel;
   List<MapEntry<String, List<SyncRecord>>> _posters = const [],
       _filesByGroup = const [];
   Widget? _libraryContent;
+  Widget? _sourcesContent, _settingsContent;
+  Object? _sourcesContentKey, _settingsContentKey;
+  Object? _libraryDataKey, _chromeKey;
   bool? _libraryDesktop;
   bool _detailsVisible = false, _libraryNeedsRefresh = false;
   int _coveringRoutes = 0;
@@ -110,33 +115,117 @@ class _LibraryPageState extends State<LibraryPage> {
     _navigationCollapsed =
         model.store.local('desktopNavigationCollapsed') == true;
     model.addListener(_changed);
+    _loadLibrarySnapshot();
   }
 
   void _changed() {
     _hideNavigationOnScroll = model.preferences.hideNavigationOnScroll;
     if (!_hideNavigationOnScroll) _navigationHidden.value = false;
+    _libraryNeedsRefresh |=
+        _libraryDataKey != _libraryVersion ||
+        _snapshotVersion != _snapshotReadVersion;
     if (_detailsVisible ||
         _coveringRoutes > 0 ||
         (page == 0 && _libraryScrolling)) {
-      _libraryNeedsRefresh = true;
       return;
     }
-    if (page == 0) {
-      _libraryContent = null;
-      _libraryNeedsRefresh = false;
-    } else {
-      _libraryNeedsRefresh = true;
+    final refreshLibrary = page == 0 && _libraryNeedsRefresh;
+    if (refreshLibrary) _refreshUncoveredLibrary();
+    if (mounted && _chromeKey != _chromeVersion) {
+      setState(() {});
     }
-    if (mounted) setState(() {});
   }
 
+  Object get _snapshotReadVersion => (
+    model.store.recordsRevision('media'),
+    model.store.recordsRevision('progress'),
+    model.store.locationRevision,
+    query.toLowerCase(),
+  );
+
+  bool get _canRefreshLibrary =>
+      mounted &&
+      page == 0 &&
+      !_libraryScrolling &&
+      !_detailsVisible &&
+      _coveringRoutes == 0;
+
+  Future<void> _loadLibrarySnapshot() async {
+    if (!_canRefreshLibrary) return;
+    final version = _snapshotReadVersion;
+    if (_requestedSnapshotVersion == version) return;
+    _snapshotCancel?.cancel();
+    final cancel = _snapshotCancel = CancelToken();
+    _requestedSnapshotVersion = version;
+    try {
+      final snapshot = await model.loadLibrarySnapshot(
+        query: query,
+        cancel: cancel,
+      );
+      if (!mounted || cancel.cancelled || _snapshotCancel != cancel) return;
+      _requestedSnapshotVersion = null;
+      _snapshotCancel = null;
+      if (!_canRefreshLibrary || version != _snapshotReadVersion) {
+        _libraryNeedsRefresh = true;
+        _refreshUncoveredLibrary();
+        return;
+      }
+      setState(() {
+        _snapshot = snapshot;
+        _snapshotVersion = version;
+        _media = snapshot.media;
+        _recent = snapshot.recent;
+        _posters = snapshot.posters;
+        _filesByGroup = snapshot.files;
+        _selectedMedia.removeWhere((id) => !snapshot.byId.containsKey(id));
+        _libraryNeedsRefresh = false;
+        _libraryContent = null;
+      });
+    } on Cancelled {
+      // Another search, a model change or disposal superseded this request.
+    } catch (error) {
+      if (mounted && _snapshotCancel == cancel) {
+        _requestedSnapshotVersion = null;
+        _snapshotCancel = null;
+        showFailure(context, error);
+      }
+    }
+  }
+
+  Object get _libraryVersion => (
+    model.store.recordsRevision('media'),
+    model.store.recordsRevision('progress'),
+    model.store.locationRevision,
+    model.store.localPrefixRevision('preview:'),
+    model.store.localPrefixRevision('mediaMetadata:'),
+    model.store.localPrefixRevision('episodeTitle:'),
+    model.store.localPrefixRevision('media-title-display:'),
+    model.store.localKeyRevision('settings'),
+    model.scanning,
+  );
+
+  Object get _chromeVersion => (
+    model.metadataTasks.length,
+    model.metadataTasks.where((task) => task.running).length,
+    _hideNavigationOnScroll,
+  );
+
   void _refreshUncoveredLibrary() {
-    if (!mounted ||
-        page != 0 ||
+    if (!mounted) return;
+    // A details loader can persist new episodes without a separate global
+    // notification. Recheck revisions when the covering route settles.
+    _libraryNeedsRefresh |=
+        _libraryDataKey != _libraryVersion ||
+        _snapshotVersion != _snapshotReadVersion;
+    if (page != 0 ||
         _libraryScrolling ||
         _detailsVisible ||
         _coveringRoutes > 0 ||
         !_libraryNeedsRefresh) {
+      return;
+    }
+    if (_snapshotVersion != _snapshotReadVersion) {
+      _loadLibrarySnapshot();
       return;
     }
     _libraryNeedsRefresh = false;
@@ -164,14 +253,24 @@ class _LibraryPageState extends State<LibraryPage> {
     model.addListener(_changed);
     _selectedMedia.clear();
     _selecting = false;
-    _mediaRevision = null;
+    _snapshotCancel?.cancel();
+    _snapshot = null;
+    _snapshotVersion = _requestedSnapshotVersion = null;
+    _libraryNeedsRefresh = true;
+    _media = _recent = const [];
+    _posters = _filesByGroup = const [];
+    _libraryDataKey = _chromeKey = null;
     _libraryContent = null;
+    _sourcesContent = _settingsContent = null;
+    _sourcesContentKey = _settingsContentKey = null;
     _hideNavigationOnScroll = model.preferences.hideNavigationOnScroll;
+    _loadLibrarySnapshot();
   }
 
   @override
   void dispose() {
     model.removeListener(_changed);
+    _snapshotCancel?.cancel();
     _pages.dispose();
     _sources.dispose();
     _navigationHidden.dispose();
@@ -478,54 +577,14 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   Widget _library(BuildContext context, bool desktop) {
+    _libraryDataKey = _libraryVersion;
     final mobile = switch (Theme.of(context).platform) {
       TargetPlatform.android || TargetPlatform.iOS => true,
       _ => false,
     };
-    final mediaRevision = model.store.recordsRevision('media');
-    if (_mediaRevision != mediaRevision) {
-      _media = model.media;
-      _selectedMedia.retainAll(_media.map((item) => item.id));
-      _mediaRevision = mediaRevision;
-      _groupQuery = null;
-      _recentProgressRevision = null;
-    }
     final media = _media;
-    final search = query.toLowerCase();
-    if (_groupQuery != search) {
-      final groups = <String, List<SyncRecord>>{};
-      for (final item in media) {
-        final series = '${item.data['series']}';
-        if (search.isEmpty ||
-            series.toLowerCase().contains(search) ||
-            '${item.data['title']}'.toLowerCase().contains(search)) {
-          final identifiable =
-              (item.data['episode'] as String? ?? '').isNotEmpty ||
-              item.data['bangumiId'] != null ||
-              item.data['tmdbId'] != null;
-          final key = identifiable && series != '未分类' && series.isNotEmpty
-              ? mediaSeriesKey(item)
-              : 'file:${item.id}';
-          (groups[key] ??= []).add(item);
-        }
-      }
-      _posters = [];
-      _filesByGroup = [];
-      for (final entry in groups.entries) {
-        (_hasPoster(entry.value) ? _posters : _filesByGroup).add(entry);
-      }
-      _groupQuery = search;
-    }
     final posters = _posters, files = _filesByGroup;
     final groupCount = posters.length + files.length;
-    final progressRevision = model.store.recordsRevision('progress');
-    final locationRevision = model.store.locationRevision;
-    if (_recentProgressRevision != progressRevision ||
-        _recentLocationRevision != locationRevision) {
-      _recent = model.recentMedia(items: media);
-      _recentProgressRevision = progressRevision;
-      _recentLocationRevision = locationRevision;
-    }
     final recent = _recent;
     final inset = desktop ? 20.0 : 12.0;
     final scale = MediaQuery.textScalerOf(context).scale(1);
@@ -547,10 +606,13 @@ class _LibraryPageState extends State<LibraryPage> {
               SearchHeader(
                 title: '我的影视库',
                 hint: '搜索作品或文件名',
-                onChanged: (v) => setState(() {
-                  query = v;
-                  _libraryContent = null;
-                }),
+                onChanged: (v) {
+                  setState(() {
+                    query = v;
+                    _libraryContent = null;
+                  });
+                  _loadLibrarySnapshot();
+                },
                 subtitle: mobile ? null : '${media.length} 个视频',
                 trailing: FilledButton.icon(
                   onPressed: importing ? null : _files,
@@ -561,13 +623,12 @@ class _LibraryPageState extends State<LibraryPage> {
                   label: const Text('导入视频'),
                 ),
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: 8),
               if (!mobile && (importing || model.scanning)) ...[
                 const LinearProgressIndicator(),
-                const SizedBox(height: 16),
+                const SizedBox(height: 8),
               ],
               if (recent.isNotEmpty && query.isEmpty) ...[
-                const SizedBox(height: 18),
                 _ContinueWatchingCarousel(
                   onOpenHistory: _history,
                   itemCount: recent.length.clamp(0, 10),
@@ -586,7 +647,7 @@ class _LibraryPageState extends State<LibraryPage> {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  TextButton(
+                  TextButton.icon(
                     onPressed:
                         _removingSelection || (!_selecting && groupCount == 0)
                         ? null
@@ -594,7 +655,10 @@ class _LibraryPageState extends State<LibraryPage> {
                             _selecting = !_selecting;
                             _selectedMedia.clear();
                           }),
-                    child: Text(_selecting ? '完成' : '批量删除'),
+                    icon: Icon(
+                      _selecting ? Icons.done_rounded : Icons.checklist_rounded,
+                    ),
+                    label: Text(_selecting ? '完成' : '多选'),
                   ),
                 ],
               ),
@@ -643,7 +707,12 @@ class _LibraryPageState extends State<LibraryPage> {
             ],
           ),
         ),
-        if (groupCount == 0)
+        if (_snapshot == null)
+          const SliverFillRemaining(
+            hasScrollBody: false,
+            child: Center(child: CircularProgressIndicator()),
+          )
+        else if (groupCount == 0)
           SliverPadding(
             padding: EdgeInsets.fromLTRB(inset, 12, inset, 32),
             sliver: SliverToBoxAdapter(
@@ -725,9 +794,6 @@ class _LibraryPageState extends State<LibraryPage> {
     ],
   );
 
-  bool _hasPoster(List<SyncRecord> items) =>
-      items.any((m) => '${m.data['poster'] ?? ''}'.isNotEmpty);
-
   void _requestPreview(SyncRecord media) {
     // The history carousel and grid can show the same media in one frame.
     // MediaArtwork has already deferred this callback until scrolling settles.
@@ -744,48 +810,59 @@ class _LibraryPageState extends State<LibraryPage> {
             appBar: AppBar(title: const Text('观看历史')),
             body: ListenableBuilder(
               listenable: model,
-              builder: (context, _) {
-                final items = model.recentMedia();
-                if (items.isEmpty) {
-                  return const Center(child: Text('暂无观看历史'));
-                }
-                return Align(
-                  alignment: Alignment.topCenter,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 1600),
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final scale = MediaQuery.textScalerOf(context).scale(1);
-                        final inset = constraints.maxWidth >= 700 ? 24.0 : 12.0;
-                        const gap = 16.0;
-                        final width = constraints.maxWidth - inset * 2;
-                        final minCardWidth = scale > 1.3 ? 360.0 : 300.0;
-                        final columns = ((width + gap) / (minCardWidth + gap))
-                            .floor()
-                            .clamp(1, 5);
-                        final cardWidth =
-                            (width - (columns - 1) * gap) / columns;
-                        return GridView.builder(
-                          key: const PageStorageKey('library-history-grid'),
-                          padding: EdgeInsets.all(inset),
-                          gridDelegate:
-                              SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: columns,
-                                mainAxisExtent:
-                                    (cardWidth * 9 / 16).clamp(176.0, 250.0) +
-                                    (scale - 1).clamp(0, 2) * 60,
-                                crossAxisSpacing: gap,
-                                mainAxisSpacing: gap,
-                              ),
-                          itemCount: items.length,
-                          itemBuilder: (_, index) =>
-                              _continueCard(items[index]),
-                        );
-                      },
+              builder: (context, _) => FutureBuilder<LibrarySnapshot>(
+                future: model.loadLibrarySnapshot(),
+                initialData: _snapshot,
+                builder: (context, snapshot) {
+                  final items = snapshot.data?.recent;
+                  if (items == null) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  if (items.isEmpty) {
+                    return const Center(child: Text('暂无观看历史'));
+                  }
+                  return Align(
+                    alignment: Alignment.topCenter,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 1600),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final scale = MediaQuery.textScalerOf(
+                            context,
+                          ).scale(1);
+                          final inset = constraints.maxWidth >= 700
+                              ? 24.0
+                              : 12.0;
+                          const gap = 16.0;
+                          final width = constraints.maxWidth - inset * 2;
+                          final minCardWidth = scale > 1.3 ? 360.0 : 300.0;
+                          final columns = ((width + gap) / (minCardWidth + gap))
+                              .floor()
+                              .clamp(1, 5);
+                          final cardWidth =
+                              (width - (columns - 1) * gap) / columns;
+                          return GridView.builder(
+                            key: const PageStorageKey('library-history-grid'),
+                            padding: EdgeInsets.all(inset),
+                            gridDelegate:
+                                SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: columns,
+                                  mainAxisExtent:
+                                      (cardWidth * 9 / 16).clamp(176.0, 250.0) +
+                                      (scale - 1).clamp(0, 2) * 60,
+                                  crossAxisSpacing: gap,
+                                  mainAxisSpacing: gap,
+                                ),
+                            itemCount: items.length,
+                            itemBuilder: (_, index) =>
+                                _continueCard(items[index]),
+                          );
+                        },
+                      ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
           ),
         ),
@@ -943,25 +1020,6 @@ class _LibraryPageState extends State<LibraryPage> {
     final title = items.length == 1
         ? model.displayTitle(media)
         : model.seriesTitle(media);
-    final tile = Semantics(
-      key: ValueKey(key),
-      button: true,
-      label: '$title，${items.length} 个视频',
-      child: _PosterTile(
-        cache: model.posterCache,
-        title: title,
-        poster: poster,
-        thumbnail: model.thumbnailPath(media.id),
-        count: items.length,
-        duration: model.mediaDuration(media),
-        mediaId: media.id,
-        onTap: () => items.length == 1 ? _play(media) : _details(title, items),
-        onDetails: () => _details(title, items),
-        onRemove: () => _removeItems(items),
-        onRequestPreview: () => _requestPreview(media),
-      ),
-    );
-    if (!_selecting) return tile;
     final selected = items.every((item) => _selectedMedia.contains(item.id));
     void toggle() => _updateSelection(() {
       final ids = items.map((item) => item.id);
@@ -972,36 +1030,31 @@ class _LibraryPageState extends State<LibraryPage> {
       }
     });
     return Semantics(
+      key: ValueKey(key),
+      button: true,
       label: '$title，${items.length} 个视频',
-      checked: selected,
-      child: Stack(
-        children: [
-          Positioned.fill(
-            child: ExcludeSemantics(child: AbsorbPointer(child: tile)),
-          ),
-          Positioned.fill(
-            child: Material(
-              color: selected
-                  ? Theme.of(context).colorScheme.primary.withValues(alpha: .15)
-                  : Colors.transparent,
-              borderRadius: LibraryStyles.posterRadius,
-              child: InkWell(
-                key: ValueKey('select:${media.id}'),
-                borderRadius: LibraryStyles.posterRadius,
-                hoverColor: Colors.transparent,
-                onTap: _removingSelection ? null : toggle,
-              ),
-            ),
-          ),
-          Positioned(
-            top: 4,
-            right: 4,
-            child: Checkbox(
-              value: selected,
-              onChanged: _removingSelection ? null : (_) => toggle(),
-            ),
-          ),
-        ],
+      checked: _selecting ? selected : null,
+      child: _PosterTile(
+        cache: model.posterCache,
+        title: title,
+        poster: poster,
+        thumbnail: model.thumbnailPath(media.id),
+        count: items.length,
+        duration: model.mediaDuration(media),
+        mediaId: media.id,
+        selecting: _selecting,
+        selected: selected,
+        enabled: !_removingSelection,
+        onTap: _selecting
+            ? toggle
+            : () => items.length == 1 ? _play(media) : _details(title, items),
+        onSelect: () => _updateSelection(() {
+          _selecting = true;
+          _selectedMedia.addAll(items.map((item) => item.id));
+        }),
+        onDetails: () => _details(title, items),
+        onRemove: () => _removeItems(items),
+        onRequestPreview: () => _requestPreview(media),
       ),
     );
   }
@@ -1252,10 +1305,35 @@ class _LibraryPageState extends State<LibraryPage> {
 
   @override
   Widget build(BuildContext context) {
+    _chromeKey = _chromeVersion;
     final desktop = MediaQuery.sizeOf(context).width >= 1000;
     if (_libraryDesktop != desktop) {
       _libraryDesktop = desktop;
       _libraryContent = null;
+    }
+    // Retaining a tab's State does not stop its parent from rebuilding it.
+    // Reuse the actual widgets between tab/activity changes; each page listens
+    // to its own relevant model revisions and preserves unsaved form fields.
+    final sourcesKey = (model, page == 1);
+    if (_sourcesContentKey != sourcesKey) {
+      _sourcesContentKey = sourcesKey;
+      _sourcesContent = SourcesPage(
+        controller: _sources,
+        model: model,
+        active: page == 1,
+        onImport: _files,
+        onPlay: _play,
+      );
+    }
+    final settingsKey = (model, page == 2);
+    if (_settingsContentKey != settingsKey) {
+      _settingsContentKey = settingsKey;
+      _settingsContent = SafeArea(
+        left: false,
+        right: false,
+        bottom: false,
+        child: SettingsPage(model: model, active: page == 2),
+      );
     }
     return GlassBackground(
       onScrollActivityChanged: _onLibraryActivityChanged,
@@ -1305,36 +1383,28 @@ class _LibraryPageState extends State<LibraryPage> {
                       onNotification: _onScroll,
                       child: PageView(
                         controller: _pages,
-                        onPageChanged: (value) => setState(() {
-                          page = value;
-                          if (value == 0 && _libraryNeedsRefresh) {
-                            _libraryContent = null;
-                            _libraryNeedsRefresh = false;
-                          }
-                          _navigationHidden.value = false;
-                          _scrollTravel = 0;
-                        }),
+                        onPageChanged: (value) {
+                          setState(() {
+                            page = value;
+                            _navigationHidden.value = false;
+                            _scrollTravel = 0;
+                          });
+                          if (value == 0) _refreshUncoveredLibrary();
+                        },
                         children: [
                           _RetainedTab(
+                            active: page == 0,
                             child: _libraryContent ??= Builder(
                               builder: (context) => _library(context, desktop),
                             ),
                           ),
                           _RetainedTab(
-                            child: SourcesPage(
-                              controller: _sources,
-                              model: model,
-                              onImport: _files,
-                              onPlay: _play,
-                            ),
+                            active: page == 1,
+                            child: _sourcesContent!,
                           ),
                           _RetainedTab(
-                            child: SafeArea(
-                              left: false,
-                              right: false,
-                              bottom: false,
-                              child: SettingsPage(model: model),
-                            ),
+                            active: page == 2,
+                            child: _settingsContent!,
                           ),
                         ],
                       ),
@@ -1599,13 +1669,21 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
   }
 }
 
+enum _PosterAction { select, remove }
+
+const _posterActions = [
+  PopupMenuItem(value: _PosterAction.select, child: Text('多选')),
+  PopupMenuItem(value: _PosterAction.remove, child: Text('删除')),
+];
+
 class _PosterTile extends StatefulWidget {
   final PosterCache cache;
   final String title, poster, mediaId;
   final String? thumbnail;
   final int count;
   final double duration;
-  final VoidCallback onTap, onDetails, onRequestPreview;
+  final bool selecting, selected, enabled;
+  final VoidCallback onTap, onDetails, onRequestPreview, onSelect;
   final VoidCallback? onRemove;
   const _PosterTile({
     required this.cache,
@@ -1615,7 +1693,11 @@ class _PosterTile extends StatefulWidget {
     required this.count,
     required this.duration,
     required this.mediaId,
+    required this.selecting,
+    required this.selected,
+    required this.enabled,
     required this.onTap,
+    required this.onSelect,
     required this.onDetails,
     this.onRemove,
     required this.onRequestPreview,
@@ -1625,14 +1707,38 @@ class _PosterTile extends StatefulWidget {
 }
 
 class _PosterTileState extends State<_PosterTile> {
-  bool hovered = false, pressed = false;
   final _scale = ValueNotifier(1.0);
 
-  void _interaction({bool? hover, bool? press}) {
-    if (hover != null) hovered = hover;
-    if (press != null) pressed = press;
-    _scale.value = pressed ? .985 : (hovered ? 1.012 : 1);
+  void _runAction(_PosterAction action) {
+    if (!widget.enabled) return;
+    switch (action) {
+      case _PosterAction.select:
+        widget.onSelect();
+      case _PosterAction.remove:
+        widget.onRemove?.call();
+    }
   }
+
+  Future<void> _showActions([Offset? position]) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject()! as RenderBox;
+    final box = context.findRenderObject()! as RenderBox;
+    final anchor = overlay.globalToLocal(
+      position ?? box.localToGlobal(box.size.center(Offset.zero)),
+    );
+    final action = await showMenu<_PosterAction>(
+      context: context,
+      position: RelativeRect.fromRect(
+        anchor & Size.zero,
+        Offset.zero & overlay.size,
+      ),
+      items: _posterActions,
+    );
+    if (mounted && action != null) _runAction(action);
+  }
+
+  // Scrolling under a stationary mouse must not start animations on every tile.
+  void _press(bool pressed) => _scale.value = pressed ? .985 : 1;
 
   @override
   void dispose() {
@@ -1654,20 +1760,23 @@ class _PosterTileState extends State<_PosterTile> {
       child: RepaintBoundary(
         child: MouseRegion(
           cursor: SystemMouseCursors.click,
-          onEnter: (_) => _interaction(hover: true),
-          onExit: (_) => _interaction(hover: false),
           child: Material(
             color: Colors.transparent,
             child: InkWell(
               key: ValueKey('play:${widget.mediaId}'),
-              onTap: widget.onTap,
-              onLongPress: widget.onRemove,
-              onSecondaryTap: widget.onRemove,
-              onTapDown: (_) => _interaction(press: true),
-              onTapUp: (_) => _interaction(press: false),
-              onTapCancel: () => _interaction(press: false),
+              onTap: widget.enabled ? widget.onTap : null,
+              onLongPress: widget.enabled ? _showActions : null,
+              onSecondaryTapUp: widget.enabled
+                  ? (details) => _showActions(details.globalPosition)
+                  : null,
+              onTapDown: (_) => _press(true),
+              onTapUp: (_) => _press(false),
+              onTapCancel: () => _press(false),
               borderRadius: LibraryStyles.posterRadius,
               hoverColor: Colors.transparent,
+              highlightColor: Colors.transparent,
+              splashColor: Colors.transparent,
+              splashFactory: NoSplash.splashFactory,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -1683,40 +1792,58 @@ class _PosterTileState extends State<_PosterTile> {
                             thumbnail: widget.thumbnail,
                             onRequestPreview: widget.onRequestPreview,
                           ),
+                          if (widget.selecting && widget.selected)
+                            ColoredBox(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.primary.withValues(alpha: .2),
+                            ),
                           Positioned(
                             top: 4,
                             right: 4,
-                            child: SizedBox(
-                              width: 36,
-                              height: 36,
-                              child: Material(
-                                color: Colors.transparent,
-                                child: IconButton(
-                                  key: ValueKey('details:${widget.mediaId}'),
-                                  tooltip: '查看详情',
-                                  onPressed: widget.onDetails,
-                                  padding: EdgeInsets.zero,
-                                  icon: Icon(
-                                    Icons.info_outline_rounded,
-                                    color: c.onMedia,
-                                    shadows: LibraryStyles.of(
-                                      context,
-                                    ).posterIconShadows,
-                                    size: LibraryStyles.iconButton,
+                            child: widget.selecting
+                                ? Checkbox(
+                                    key: ValueKey('select:${widget.mediaId}'),
+                                    semanticLabel: widget.title,
+                                    value: widget.selected,
+                                    onChanged: widget.enabled
+                                        ? (_) => widget.onTap()
+                                        : null,
+                                  )
+                                : SizedBox(
+                                    width: 36,
+                                    height: 36,
+                                    child: Material(
+                                      color: Colors.transparent,
+                                      child: IconButton(
+                                        key: ValueKey(
+                                          'details:${widget.mediaId}',
+                                        ),
+                                        tooltip: '查看详情',
+                                        onPressed: widget.onDetails,
+                                        padding: EdgeInsets.zero,
+                                        icon: Icon(
+                                          Icons.info_outline_rounded,
+                                          color: c.onMedia,
+                                          shadows: LibraryStyles.of(
+                                            context,
+                                          ).posterIconShadows,
+                                          size: LibraryStyles.iconButton,
+                                        ),
+                                      ),
+                                    ),
                                   ),
-                                ),
-                              ),
-                            ),
                           ),
                           if (widget.onRemove != null)
                             Positioned(
                               top: 4,
                               left: 4,
-                              child: PopupMenuButton<String>(
+                              child: PopupMenuButton<_PosterAction>(
                                 key: ValueKey(
                                   'media-actions:${widget.mediaId}',
                                 ),
                                 tooltip: '视频操作',
+                                enabled: widget.enabled,
                                 padding: EdgeInsets.zero,
                                 icon: Icon(
                                   Icons.more_horiz_rounded,
@@ -1725,13 +1852,8 @@ class _PosterTileState extends State<_PosterTile> {
                                     context,
                                   ).posterIconShadows,
                                 ),
-                                onSelected: (_) => widget.onRemove!(),
-                                itemBuilder: (_) => const [
-                                  PopupMenuItem(
-                                    value: 'remove',
-                                    child: Text('从影视库移除'),
-                                  ),
-                                ],
+                                onSelected: _runAction,
+                                itemBuilder: (_) => _posterActions,
                               ),
                             ),
                           if (widget.count > 1)
@@ -1798,6 +1920,10 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   Animation<double>? _entrance;
   bool _scheduled = false;
   bool _metadataNotified = false;
+  bool _loadStarted = false, _refreshScheduled = false, _refreshing = false;
+  bool _routeCurrent = true;
+  late (int, int) _recordsVersion;
+  late int _episodeTitleRevision;
   late int _titleRevision;
   late String _sortFingerprint;
   String get _sortKey =>
@@ -1805,6 +1931,14 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   String get _currentSort =>
       model.directorySorting(_sortKey).toJson().toString();
   AppModel get model => widget.model;
+  (int, int) get _currentRecordsVersion =>
+      (model.store.recordsRevision('media'), model.store.locationRevision);
+  bool get _needsMetadataRefresh =>
+      _recordsVersion != _currentRecordsVersion ||
+      _episodeTitleRevision !=
+          model.store.localPrefixRevision('episodeTitle:') ||
+      _titleRevision != model.titleTranslations.revision ||
+      _sortFingerprint != _currentSort;
 
   @override
   void initState() {
@@ -1812,18 +1946,30 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
     _setEpisodes(widget.episodes);
     _sortEpisodes();
     _sortFingerprint = _currentSort;
+    _recordsVersion = _currentRecordsVersion;
+    _episodeTitleRevision = model.store.localPrefixRevision('episodeTitle:');
     _titleRevision = model.titleTranslations.revision;
     _updateHeader();
     model.addListener(_metadataChanged);
   }
 
-  void _setEpisodes(List<SyncRecord> records) {
+  void _setEpisodes(
+    List<SyncRecord> records, {
+    Map<String, Map<String, dynamic>>? locations,
+  }) {
     _allEpisodes = records;
-    final locations = model.store.localEntries('location:');
+    final available = <String, bool>{};
     _versions = groupMediaEpisodes(records);
     _episodes = uniqueMediaEpisodes(
       records,
-      playable: (item) => locations.containsKey('location:${item.id}'),
+      // Only duplicate versions need an availability tie-break. A details
+      // refresh must never materialize the entire library's location table.
+      playable: (item) => available.putIfAbsent(
+        item.id,
+        () =>
+            locations?.containsKey(item.id) ??
+            model.store.local('location:${item.id}') != null,
+      ),
     )..sort(compareMediaEpisodes);
   }
 
@@ -1860,14 +2006,85 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
 
   void _metadataChanged() {
     _metadataNotified = true;
-    final sortingChanged = _sortFingerprint != _currentSort;
-    if (sortingChanged) {
-      _sortEpisodes();
-      _sortFingerprint = _currentSort;
+    _scheduleMetadataRefresh();
+  }
+
+  void _scheduleMetadataRefresh() {
+    if (!mounted ||
+        !_routeCurrent ||
+        !_loadStarted ||
+        _refreshScheduled ||
+        _refreshing ||
+        !_needsMetadataRefresh) {
+      return;
     }
-    if (sortingChanged || _titleRevision != model.titleTranslations.revision) {
+    _refreshScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _refreshScheduled = false;
+      if (mounted && _routeCurrent) unawaited(_refreshMetadata());
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  bool _sameEpisodes(List<SyncRecord> records) {
+    if (records.length != _allEpisodes.length) return false;
+    for (var index = 0; index < records.length; index++) {
+      final before = _allEpisodes[index], after = records[index];
+      if (before.id != after.id ||
+          before.revision != after.revision ||
+          before.version != after.version) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Future<void> _refreshMetadata() async {
+    if (_refreshing || !_needsMetadataRefresh) return;
+    _refreshing = true;
+    final version = _currentRecordsVersion;
+    var completed = false;
+    try {
+      LibrarySnapshot? snapshot;
+      var records = _allEpisodes;
+      if (version != _recordsVersion) {
+        snapshot = await model.loadLibrarySnapshot(cancel: _cancel);
+        if (!mounted || !_routeCurrent) return;
+        if (version != _currentRecordsVersion) {
+          completed = true;
+          return;
+        }
+        final anchor =
+            snapshot.byId[_allEpisodes.first.id] ?? _allEpisodes.first;
+        records = snapshot.series[mediaSeriesKey(anchor)] ?? const [];
+      }
+      final recordsChanged = records.isNotEmpty && !_sameEpisodes(records);
+      final sortingChanged = _sortFingerprint != _currentSort;
+      final namesRevision = model.store.localPrefixRevision('episodeTitle:');
+      final titlesChanged =
+          _episodeTitleRevision != namesRevision ||
+          _titleRevision != model.titleTranslations.revision;
+      _recordsVersion = version;
+      _episodeTitleRevision = namesRevision;
       _titleRevision = model.titleTranslations.revision;
-      if (mounted) setState(() {});
+      if (recordsChanged || sortingChanged || titlesChanged) {
+        setState(() {
+          if (recordsChanged) {
+            _setEpisodes(records, locations: snapshot?.locations);
+          }
+          if (recordsChanged || sortingChanged) _sortEpisodes();
+          _sortFingerprint = _currentSort;
+          _updateHeader();
+        });
+      }
+      completed = true;
+    } on Cancelled {
+      // The details route was disposed while its shared snapshot was pending.
+    } catch (_) {
+      // Keep the current details usable; a later update may retry the snapshot.
+    } finally {
+      _refreshing = false;
+      if (completed) _scheduleMetadataRefresh();
     }
   }
 
@@ -1905,10 +2122,14 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   );
 
   void _updateHeader() {
-    _header = MediaDetailsHeader(
+    _header = MediaDetailsOverview(
       model: model,
       details: MediaCollectionDetails.fromRecords(_allEpisodes),
       records: _allEpisodes,
+      latest: widget.latest,
+      onPlay: widget.onPlay,
+      onSort: _sortMenu,
+      loading: _loading,
       onMatch: () => widget.onMatch(_allEpisodes),
     );
   }
@@ -1916,6 +2137,8 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _routeCurrent = ModalRoute.isCurrentOf(context) ?? true;
+    if (_routeCurrent) _scheduleMetadataRefresh();
     if (_scheduled) return;
     final animation = ModalRoute.of(context)?.animation;
     if (animation == null || animation.status == AnimationStatus.completed) {
@@ -1944,13 +2167,14 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   }
 
   Future<void> _load() async {
+    _loadStarted = true;
     _loading.value = true;
     try {
       final episodes = await model.loadSeriesEpisodes(
         _episodes.first,
         cancel: _cancel,
       );
-      if (!mounted || episodes.isEmpty) return;
+      if (!mounted || episodes.isEmpty || !_routeCurrent) return;
       if (!_metadataNotified && episodes.length == _episodes.length) {
         var unchanged = true;
         for (var index = 0; index < episodes.length; index++) {
@@ -1967,12 +2191,21 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
       setState(() {
         _setEpisodes(episodes);
         _sortEpisodes();
+        _recordsVersion = _currentRecordsVersion;
+        _episodeTitleRevision = model.store.localPrefixRevision(
+          'episodeTitle:',
+        );
+        _titleRevision = model.titleTranslations.revision;
+        _sortFingerprint = _currentSort;
         _updateHeader();
       });
     } catch (_) {
       // Existing metadata and episodes stay usable while a source is offline.
     } finally {
-      if (mounted) _loading.value = false;
+      if (mounted) {
+        _loading.value = false;
+        _scheduleMetadataRefresh();
+      }
     }
   }
 
@@ -1992,87 +2225,17 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
     builder: (_, scroll) => ListView.builder(
       key: const ValueKey('series-details-list'),
       controller: scroll,
-      padding: const EdgeInsets.all(16),
-      itemCount: _episodes.length + 3,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      itemCount: _episodes.length + 1,
       itemBuilder: (_, index) {
-        if (index == 0) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              SizedBox(
-                height: 14,
-                child: Align(
-                  alignment: Alignment.topCenter,
-                  child: ValueListenableBuilder<bool>(
-                    valueListenable: _loading,
-                    builder: (_, loading, _) => loading
-                        ? const LinearProgressIndicator(
-                            minHeight: LibraryStyles.progressHeight,
-                          )
-                        : const SizedBox(height: 2),
-                  ),
-                ),
-              ),
-              _header,
-            ],
-          );
-        }
-        if (index == 1) {
-          final latest = widget.latest;
-          if (latest == null) return const SizedBox.shrink();
-          final label = model.episodeLabel(latest);
-          return Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: FilledButton.icon(
-              key: const ValueKey('series-continue'),
-              onPressed: () => widget.onPlay(latest),
-              icon: const Icon(Icons.play_arrow_rounded),
-              label: Text(
-                '继续观看 · ${label.isEmpty ? playbackTime((model.progressFor(latest)?['position'] as num?)?.toDouble() ?? 0) : label}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          );
-        }
-        if (index == 2) {
-          return Padding(
-            padding: const EdgeInsets.only(top: 8, bottom: 4),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text('播放列表', style: AppStyles.of(context).strong),
-                ),
-                IconButton(
-                  tooltip: '排序与显示',
-                  onPressed: _sortMenu,
-                  icon: const Icon(Icons.sort_rounded),
-                ),
-              ],
-            ),
-          );
-        }
-        final item = _episodes[index - 3];
-        final label = model.episodeLabel(item);
-        return ListTile(
+        if (index == 0) return _header;
+        final item = _episodes[index - 1];
+        return MediaDetailsEpisodeTile(
           key: ValueKey('series-episode:${item.id}'),
-          dense: true,
-          visualDensity: const VisualDensity(vertical: -1),
-          leading: Icon(
-            model.store
-                        .get('watched', model.watchedKey(item))
-                        ?.data['watched'] ==
-                    true
-                ? Icons.check_circle
-                : Icons.play_circle_outline,
-          ),
-          title: Text(
-            label.isEmpty ? model.displayTitle(item) : label,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          subtitle: _episodeProgress(item),
-          onTap: () => widget.onPlay(item),
+          model: model,
+          item: item,
+          showTechnical: _allEpisodes.length != 1,
+          onPlay: () => widget.onPlay(item),
           trailing: PopupMenuButton<String>(
             onSelected: (action) => action == 'versions'
                 ? _chooseVersion(item)
@@ -2090,67 +2253,80 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
       },
     ),
   );
-
-  Widget? _episodeProgress(SyncRecord item) {
-    final progress = model.progressFor(item);
-    final duration =
-        (progress?['duration'] as num?)?.toDouble() ??
-        model.mediaDuration(item);
-    final label = playbackProgressLabel(progress, duration: duration);
-    final technical = _allEpisodes.length == 1
-        ? ''
-        : MediaTechnicalInfo.forRecord(
-            model.store,
-            item,
-            dimensions: model.mediaDimensions(item),
-            duration: duration,
-          ).label;
-    if (label.isEmpty && technical.isEmpty) return null;
-    final position = (progress?['position'] as num?)?.toDouble() ?? 0;
-    final updated = DateTime.tryParse(
-      '${progress?['updatedAt'] ?? ''}',
-    )?.toLocal();
-    return Padding(
-      padding: const EdgeInsets.only(top: 3),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (technical.isNotEmpty)
-            Text(technical, style: AppStyles.of(context).micro),
-          if (label.isNotEmpty)
-            Text(
-              '$label${updated == null ? '' : ' · ${updated.month}/${updated.day} ${updated.hour.toString().padLeft(2, '0')}:${updated.minute.toString().padLeft(2, '0')}'}',
-              style: LibraryStyles.of(context).episodeProgress,
-            ),
-          if (label.isNotEmpty && duration > 0)
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: LinearProgressIndicator(
-                value: (position / duration).clamp(0, 1),
-                minHeight: LibraryStyles.progressHeight,
-                borderRadius: LibraryStyles.progressRadius,
-              ),
-            ),
-        ],
-      ),
-    );
-  }
 }
 
 class _RetainedTab extends StatefulWidget {
   final Widget child;
-  const _RetainedTab({required this.child});
+  final bool active;
+  const _RetainedTab({required this.child, required this.active});
   @override
   State<_RetainedTab> createState() => _RetainedTabState();
 }
 
 class _RetainedTabState extends State<_RetainedTab>
     with AutomaticKeepAliveClientMixin {
+  final _scrolling = <ScrollableState>{};
+  bool _stopScheduled = false;
+
+  void _stopHiddenScrolls() {
+    if (_stopScheduled) return;
+    _stopScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _stopScheduled = false;
+      if (!mounted || widget.active) return;
+      // Muting a scroll ticker alone leaves isScrollingNotifier true forever,
+      // keeping shared artwork/background refresh scopes permanently busy.
+      for (final scrollable in _scrolling.toList()) {
+        if (!scrollable.mounted) continue;
+        final position = scrollable.position;
+        if (position.hasContentDimensions &&
+            position.isScrollingNotifier.value) {
+          position.jumpTo(
+            position.pixels.clamp(
+              position.minScrollExtent,
+              position.maxScrollExtent,
+            ),
+          );
+        }
+      }
+      _scrolling.clear();
+    });
+  }
+
+  bool _onScrollActivity(ScrollNotification notification) {
+    if (notification is! ScrollStartNotification &&
+        notification is! ScrollEndNotification) {
+      return false;
+    }
+    final scrollable = notification.context
+        ?.findAncestorStateOfType<ScrollableState>();
+    if (scrollable == null) return false;
+    if (notification is ScrollEndNotification) {
+      _scrolling.remove(scrollable);
+    } else {
+      _scrolling.add(scrollable);
+      if (!widget.active) _stopHiddenScrolls();
+    }
+    return false;
+  }
+
+  @override
+  void didUpdateWidget(_RetainedTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!widget.active && oldWidget.active) _stopHiddenScrolls();
+  }
+
   @override
   bool get wantKeepAlive => true;
   @override
   Widget build(BuildContext context) {
     super.build(context);
-    return RepaintBoundary(child: widget.child);
+    return TickerMode(
+      enabled: widget.active,
+      child: NotificationListener<ScrollNotification>(
+        onNotification: _onScrollActivity,
+        child: RepaintBoundary(child: widget.child),
+      ),
+    );
   }
 }

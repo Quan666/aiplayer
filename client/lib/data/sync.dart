@@ -1,13 +1,21 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:isolate';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../core/network.dart';
+import '../core/logger.dart';
+import 'credential_storage.dart';
+import 'poster_cache.dart';
 import 'store.dart';
 import 'record_keys.dart';
+import 'sync_artwork.dart';
 import 'sync_profile.dart';
+
+part 'sync_worker.dart';
 
 class SyncClient {
   static const _pendingProfileKey = 'syncProfile:pendingApply';
@@ -20,6 +28,11 @@ class SyncClient {
   int _queued = 0;
   int profileRevision = 0;
   bool _deviceRead = false;
+  String? _workerDeviceName;
+  _SyncWorkerSession? _worker;
+  bool _disposed = false;
+  @visibleForTesting
+  int backgroundWorkerStarts = 0;
   SyncClient(this.store, {JsonTransport? transport, this.profile})
     : transport = transport ?? IoJsonTransport(),
       _useWorker = transport == null && store.path != ':memory:';
@@ -40,6 +53,7 @@ class SyncClient {
     _queued++;
     try {
       await previous;
+      if (_disposed) throw const Cancelled();
       cancel?.check();
       await _synchronize(
         address,
@@ -120,6 +134,52 @@ class SyncClient {
       }
       return;
     }
+    if (_useWorker &&
+        (profile == null || identical(profile!.watchedKey, mediaWatchedKey))) {
+      if (!_deviceRead) {
+        _workerDeviceName = await _nativeDeviceName();
+        _deviceRead = true;
+      }
+      cancel?.check();
+      if (_disposed) throw const Cancelled();
+      _running = true;
+      try {
+        if (_worker == null || _worker!.closed) {
+          _worker = _SyncWorkerSession(
+            profile?.secrets,
+            onPosterChanged: profile?.artwork?.posterCache.fileChanged,
+          );
+          backgroundWorkerStarts++;
+        }
+        profileRevision += await _worker!.run(
+          _SyncWorkerRequest(
+            path: store.path,
+            address: address,
+            token: token,
+            withProfile: profile != null,
+            sharedOnly: sharedOnly,
+            artworkIds: artworkIds,
+            deferProfile: deferProfile,
+            recoverMissingCredentials:
+                profile?.recoverMissingCredentials ?? false,
+            localCredentialDocuments: profile?.secrets is LocalCredentialStorage
+                ? (profile!.secrets as LocalCredentialStorage)
+                      .directory
+                      .parent
+                      .path
+                : null,
+            artworkDocuments: profile?.artwork?.documents.path,
+            artworkCache: profile?.artwork?.posterCache.directory.path,
+            deviceName: _workerDeviceName,
+          ),
+          cancel,
+        );
+        _workerDeviceName = null;
+      } finally {
+        _running = false;
+      }
+      return;
+    }
     final uri = _address(address, token);
     if (store.local('syncOrigin') != uri.origin) {
       store.setLocal('syncOrigin', uri.origin);
@@ -152,7 +212,7 @@ class SyncClient {
       cancel?.check();
       // Progress ticks must not read/decode pending encrypted artwork just to
       // discard it. Filter those potentially large rows before SQLite returns.
-      Future<void> uploadPending() async {
+      Future<void> uploadPending({bool downloaded = false}) async {
         var pending = store.pendingRecords(includeVault: !sharedOnly);
         final mediaIds = {
           for (final record in pending)
@@ -207,6 +267,14 @@ class SyncClient {
         for (final initial in pending) {
           var record = initial;
           if (profile?.shouldUpload(record) == false) continue;
+          // Restore existing remote bindings before publishing a new local
+          // catalogue, including after an interrupted full synchronization.
+          if ((!downloaded || (profile != null && deferProfile)) &&
+              record.kind == 'media' &&
+              record.version == 0 &&
+              store.isCatalogMedia(record.id)) {
+            continue;
+          }
           if (profile != null && record.kind == 'media' && !record.deleted) {
             final mediaDependencies = dependencies[record.id];
             if (mediaDependencies == null ||
@@ -227,7 +295,7 @@ class SyncClient {
               response = await transport.send(
                 uri.resolve('/v1/records'),
                 method: 'PUT',
-                body: record.toJson(),
+                body: store.syncPayload(record),
                 headers: headers,
                 cancel: cancel,
               );
@@ -313,11 +381,16 @@ class SyncClient {
         store.removeLocal(_pendingProfileKey);
         profileRevision++;
       }
-      await uploadPending();
+      await uploadPending(downloaded: true);
       store.setLocal('lastSync', DateTime.now().toUtc().toIso8601String());
     } finally {
       _running = false;
     }
+  }
+
+  Future<void> dispose() async {
+    _disposed = true;
+    await _worker?.close();
   }
 
   /// Playback publishes progress and watched state only. Incoming catalogues,
@@ -405,6 +478,11 @@ class SyncClient {
   Future<void> readDeviceInfo() async {
     if (_deviceRead) return;
     _deviceRead = true;
+    final name = await _nativeDeviceName();
+    if (name != null) _applyDeviceName(store, name);
+  }
+
+  Future<String?> _nativeDeviceName() async {
     for (final name in [
       'app.aiplayer/desktop_player',
       'app.aiplayer/device_info',
@@ -417,30 +495,21 @@ class SyncClient {
         final platform = info?['platform'];
         final model = info?['model'];
         if (deviceName is String && deviceName.trim().isNotEmpty) {
-          store.setLocal(
-            'syncDevice:name',
-            [
-              deviceName.trim(),
-              if (model is String &&
-                  model.isNotEmpty &&
-                  !deviceName.contains(model))
-                model,
-              if (platform is String && platform.isNotEmpty) platform,
-            ].join(' · '),
-          );
-          // Offline edits may have been staged before native device details
-          // were available. Attach the real name without changing edit time.
-          store.db.execute(
-            'UPDATE records SET device_name=? WHERE dirty=1 AND device_id=?',
-            [store.deviceName, store.deviceId],
-          );
-          return;
+          return [
+            deviceName.trim(),
+            if (model is String &&
+                model.isNotEmpty &&
+                !deviceName.contains(model))
+              model,
+            if (platform is String && platform.isNotEmpty) platform,
+          ].join(' · ');
         }
       } catch (_) {
         // Tests, older native shells and headless engines retain the OS host
         // name; no serial number, network address or hardware ID is collected.
       }
     }
+    return null;
   }
 
   Future<void> resolve(

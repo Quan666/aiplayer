@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
@@ -11,6 +13,7 @@ import '../subtitles/ai.dart';
 import 'glass.dart';
 import 'theme/library_styles.dart';
 import 'media_artwork.dart';
+import 'media_poster_viewer.dart';
 
 /// One presentation for library details and a source directory's introduction.
 class MediaDetailsHeader extends StatelessWidget {
@@ -49,7 +52,12 @@ class MediaDetailsHeader extends StatelessWidget {
             Icon(icon, size: LibraryStyles.iconSmall, color: color),
             const SizedBox(width: 4),
           ],
-          Text(label, style: LibraryStyles.of(context).badgeLabel(color)),
+          Flexible(
+            child: Text(
+              label,
+              style: LibraryStyles.of(context).badgeLabel(color),
+            ),
+          ),
         ],
       ),
     );
@@ -57,101 +65,117 @@ class MediaDetailsHeader extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          _DetailsIntro(
+            textDirection: Directionality.of(context),
             children: [
-              if (details.poster.isNotEmpty) ...[
+              if (details.poster.isNotEmpty)
                 SizedBox(
                   width: 82,
                   height: 122,
-                  child: ClipRRect(
+                  child: Material(
+                    type: MaterialType.transparency,
                     borderRadius: LibraryStyles.posterRadius,
-                    child: MediaArtwork(
-                      poster: details.poster,
-                      cache: model.posterCache,
+                    clipBehavior: Clip.antiAlias,
+                    child: InkWell(
+                      key: const ValueKey('details-poster'),
+                      onTap: () => showMediaPosterViewer(
+                        context,
+                        cache: model.posterCache,
+                        poster: details.poster,
+                        title: details.title,
+                      ),
+                      child: Semantics(
+                        label: '放大查看封面',
+                        image: true,
+                        child: MediaArtwork(
+                          poster: details.poster,
+                          cache: model.posterCache,
+                        ),
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 14),
-              ],
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    AnimatedBuilder(
+                )
+              else
+                const SizedBox.shrink(),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: AnimatedBuilder(
                       animation: model,
                       builder: (context, _) => Text(
-                        single != null
-                            ? model.displayTitle(single)
-                            : model.titleTranslations.display(
-                                records.isEmpty
-                                    ? 'title:${details.title}'
-                                    : mediaSeriesKey(records.first),
-                                details.title,
-                              ),
+                        model.titleTranslations.display(
+                          records.isEmpty
+                              ? 'title:${details.title}'
+                              : mediaSeriesKey(records.first),
+                          details.title,
+                        ),
                         style: LibraryStyles.of(context).detailsTitle,
                       ),
                     ),
-                    const SizedBox(height: 10),
-                    Wrap(
-                      spacing: 6,
-                      runSpacing: 6,
-                      children: [
-                        if (score != null && score > 0)
-                          badge(
-                            '评分 ${score.toStringAsFixed(1)}',
-                            LibraryStyles.of(context).ratingColor(score),
-                            icon: Icons.star_rounded,
-                          ),
-                        if (single == null && details.seasonLabel.isNotEmpty)
-                          badge(details.seasonLabel, palette.accent),
-                        if ((details.totalEpisodes ?? 0) > 0)
-                          badge('共 ${details.totalEpisodes} 集', palette.accent),
-                        if (details.year.isNotEmpty)
-                          badge(details.year, palette.muted),
-                        for (final genre in details.genres)
-                          badge(genre, palette.muted),
-                      ],
+                  ),
+                  if (onMatch != null)
+                    IconButton(
+                      tooltip: '匹配海报与简介',
+                      onPressed: onMatch,
+                      icon: const Icon(Icons.manage_search_rounded),
                     ),
-                    const SizedBox(height: 8),
-                    Text(
-                      details.availability,
-                      style: LibraryStyles.of(context).availability,
-                    ),
-                    if (technical.isNotEmpty)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: Text(
-                          technical,
-                          style: AppStyles.of(context).caption,
-                        ),
-                      ),
-                  ],
-                ),
+                ],
               ),
-              if (onMatch != null)
-                IconButton(
-                  tooltip: '匹配海报与简介',
-                  onPressed: onMatch,
-                  icon: const Icon(Icons.manage_search_rounded),
+              if (score != null && score > 0)
+                badge(
+                  '评分 ${score.toStringAsFixed(1)}',
+                  LibraryStyles.of(context).ratingColor(score),
+                  icon: Icons.star_rounded,
                 ),
+              if (single == null && details.seasonLabel.isNotEmpty)
+                badge(details.seasonLabel, palette.accent),
+              if ((details.totalEpisodes ?? 0) > 0)
+                badge('共 ${details.totalEpisodes} 集', palette.accent),
+              if (details.year.isNotEmpty) badge(details.year, palette.muted),
+              for (final genre in details.genres) badge(genre, palette.muted),
+              Text(
+                details.availability,
+                style: LibraryStyles.of(context).availability,
+              ),
             ],
           ),
+          if (technical.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(technical, style: AppStyles.of(context).caption),
+            ),
           Padding(
-            padding: const EdgeInsets.only(top: 12),
-            child: MediaSummary(
-              model: model,
-              summary: details.summary,
-              titleAction: MediaTitleTranslation(
+            padding: const EdgeInsets.only(top: 8),
+            child: TextButtonTheme(
+              data: TextButtonThemeData(
+                style:
+                    (TextButtonTheme.of(context).style ?? const ButtonStyle())
+                        .copyWith(
+                          minimumSize: const WidgetStatePropertyAll(
+                            Size(0, 44),
+                          ),
+                          padding: const WidgetStatePropertyAll(
+                            EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                          ),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          visualDensity: VisualDensity.standard,
+                        ),
+              ),
+              child: MediaSummary(
                 model: model,
-                title: details.title,
-                records: records,
+                summary: details.summary,
+                titleAction: MediaTitleTranslation(
+                  model: model,
+                  title: details.title,
+                  records: records,
+                ),
               ),
             ),
           ),
           if (details.provider == 'tmdb')
             Padding(
-              padding: const EdgeInsets.only(top: 10),
+              padding: const EdgeInsets.only(top: 4),
               child: Text(
                 '资料来源：TMDB\nThis product uses the TMDB API but is not endorsed or certified by TMDB.',
                 style: AppStyles.of(context).tiny,
@@ -161,6 +185,136 @@ class MediaDetailsHeader extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Flow a small set of catalogue facts beside the cover, then across the full
+/// width below it. Layout uses actual child sizes, including translated titles
+/// and accessibility text scales, without intrinsic passes or frame callbacks.
+class _DetailsIntro extends MultiChildRenderObjectWidget {
+  final TextDirection textDirection;
+
+  const _DetailsIntro({required this.textDirection, required super.children});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderDetailsIntro(textDirection);
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _RenderDetailsIntro renderObject,
+  ) {
+    renderObject.textDirection = textDirection;
+  }
+}
+
+class _DetailsIntroParentData extends ContainerBoxParentData<RenderBox> {}
+
+class _RenderDetailsIntro extends RenderBox
+    with
+        ContainerRenderObjectMixin<RenderBox, _DetailsIntroParentData>,
+        RenderBoxContainerDefaultsMixin<RenderBox, _DetailsIntroParentData> {
+  _RenderDetailsIntro(this._textDirection);
+
+  TextDirection _textDirection;
+  set textDirection(TextDirection value) {
+    if (_textDirection == value) return;
+    _textDirection = value;
+    markNeedsLayout();
+  }
+
+  @override
+  void setupParentData(RenderBox child) {
+    if (child.parentData is! _DetailsIntroParentData) {
+      child.parentData = _DetailsIntroParentData();
+    }
+  }
+
+  Size _arrange(BoxConstraints constraints, {required bool dry}) {
+    final children = getChildrenAsList();
+    final width = constraints.maxWidth;
+    Size measure(RenderBox child, double maxWidth, {bool fill = false}) {
+      final bounds = BoxConstraints(
+        minWidth: fill ? maxWidth : 0,
+        maxWidth: maxWidth,
+      );
+      if (dry) return child.getDryLayout(bounds);
+      child.layout(bounds, parentUsesSize: true);
+      return child.size;
+    }
+
+    void place(RenderBox child, Size size, double x, double y) {
+      if (dry) return;
+      (child.parentData! as _DetailsIntroParentData).offset = Offset(
+        _textDirection == TextDirection.ltr ? x : width - x - size.width,
+        y,
+      );
+    }
+
+    final cover = children[0];
+    final coverSize = measure(cover, width);
+    place(cover, coverSize, 0, 0);
+    final inset = coverSize.width == 0 ? 0.0 : coverSize.width + 12;
+    final title = children[1];
+    final titleSize = measure(title, math.max(0, width - inset), fill: true);
+    place(title, titleSize, inset, 0);
+
+    const gap = 6.0;
+    var y = titleSize.height + gap;
+    var beside = inset > 0 && y < coverSize.height;
+    var x = 0.0, rowHeight = 0.0;
+    for (final child in children.skip(2).take(children.length - 3)) {
+      var available = beside ? width - inset : width;
+      var childSize = measure(child, available);
+      if (x > 0 &&
+          (x + childSize.width > available ||
+              (beside && y + childSize.height > coverSize.height))) {
+        y += rowHeight + gap;
+        x = rowHeight = 0;
+      }
+      if (beside && y + childSize.height > coverSize.height) {
+        beside = false;
+        y = math.max(y, coverSize.height + gap);
+        available = width;
+        childSize = measure(child, available);
+      }
+      place(child, childSize, (beside ? inset : 0) + x, y);
+      x += childSize.width + gap;
+      rowHeight = math.max(rowHeight, childSize.height);
+    }
+    if (rowHeight > 0) y += rowHeight + gap;
+
+    final availability = children.last;
+    var availabilitySize = measure(
+      availability,
+      beside ? width - inset : width,
+      fill: true,
+    );
+    if (beside && y + availabilitySize.height > coverSize.height) {
+      beside = false;
+      y = math.max(y, coverSize.height + gap);
+      availabilitySize = measure(availability, width, fill: true);
+    }
+    place(availability, availabilitySize, beside ? inset : 0, y);
+    return constraints.constrain(
+      Size(width, math.max(coverSize.height, y + availabilitySize.height)),
+    );
+  }
+
+  @override
+  void performLayout() => size = _arrange(constraints, dry: false);
+
+  @override
+  Size computeDryLayout(BoxConstraints constraints) =>
+      _arrange(constraints, dry: true);
+
+  @override
+  void paint(PaintingContext context, Offset offset) =>
+      defaultPaint(context, offset);
+
+  @override
+  bool hitTestChildren(BoxHitTestResult result, {required Offset position}) =>
+      defaultHitTestChildren(result, position: position);
 }
 
 /// The same action translates the work title and named episodes. Numeric season
@@ -480,7 +634,7 @@ class _MediaSummaryState extends State<MediaSummary> {
           style: LibraryStyles.of(context).summary,
         ),
       Wrap(
-        spacing: 8,
+        spacing: 4,
         children: [
           if (widget.summary.isNotEmpty)
             TextButton(

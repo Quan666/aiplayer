@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/main.dart';
+import 'package:aiplayer/ui/media_artwork.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -44,7 +46,7 @@ void main() {
       try {
         await tester.pumpWidget(AIPlayerApp(model: model));
         await tester.pumpAndSettle();
-        await tester.tap(find.text('批量删除'));
+        await tester.tap(find.text('多选'));
         await tester.pumpAndSettle();
         expect(
           tester
@@ -118,7 +120,7 @@ void main() {
       final menu = find.byKey(const ValueKey('media-actions:1'));
       await tester.tap(menu);
       await tester.pumpAndSettle();
-      await tester.tap(find.text('从影视库移除'));
+      await tester.tap(find.text('删除'));
       await tester.pumpAndSettle();
       expect(find.text('移除这 3 个视频？'), findsOneWidget);
       expect(find.text('仅移除影视库记录，原位置的视频文件会保留。'), findsOneWidget);
@@ -128,7 +130,7 @@ void main() {
       expect(model.removed, isEmpty);
       await tester.tap(menu);
       await tester.pumpAndSettle();
-      await tester.tap(find.text('从影视库移除'));
+      await tester.tap(find.text('删除'));
       await tester.pumpAndSettle();
       await tester.tap(find.widgetWithText(FilledButton, '移除'));
       await tester.pumpAndSettle();
@@ -143,6 +145,77 @@ void main() {
       root.deleteSync(recursive: true);
     }
   });
+
+  for (final secondaryClick in [true, false]) {
+    testWidgets(
+      '${secondaryClick ? 'right click' : 'long press'} opens selection and deletion menu without replacing artwork',
+      (tester) async {
+        FlutterSecureStorage.setMockInitialValues({});
+        final root = Directory.systemTemp.createTempSync('aiplayer-menu-');
+        final store = AppStore(':memory:');
+        final model = _RemovalModel(store, root, managed: false);
+        for (final id in ['1', '2', '3']) {
+          store.save('media', id, {
+            'title': '视频$id.mp4',
+            'series': id == '3' ? '其他' : '作品',
+            'season': '1',
+            'episode': id,
+            'size': 100,
+          });
+        }
+        final tile = find.byKey(const ValueKey('play:1'));
+        Future<void> openMenu() async {
+          if (secondaryClick) {
+            await tester.tap(tile, buttons: kSecondaryMouseButton);
+          } else {
+            await tester.longPress(tile);
+          }
+          await tester.pumpAndSettle();
+        }
+
+        try {
+          await tester.pumpWidget(AIPlayerApp(model: model));
+          await tester.pumpAndSettle();
+          final artwork = find.descendant(
+            of: tile,
+            matching: find.byType(MediaArtwork),
+          );
+          final originalArtwork = tester.state(artwork);
+          await openMenu();
+          expect(find.text('删除'), findsOneWidget);
+          expect(find.byType(AlertDialog), findsNothing);
+          expect(model.removed, isEmpty);
+          await tester.tap(find.text('多选').last);
+          await tester.pumpAndSettle();
+          expect(find.text('已选 2 个视频'), findsOneWidget);
+          expect(tester.state(artwork), same(originalArtwork));
+          await tester.tap(find.byKey(const ValueKey('play:3')));
+          await tester.pumpAndSettle();
+          expect(find.text('已选 3 个视频'), findsOneWidget);
+          expect(find.byType(AlertDialog), findsNothing);
+
+          await openMenu();
+          await tester.tap(find.text('删除'));
+          await tester.pumpAndSettle();
+          expect(find.text('移除这 2 个视频？'), findsOneWidget);
+          await tester.tap(find.widgetWithText(TextButton, '取消'));
+          await tester.pumpAndSettle();
+          expect(model.removed, isEmpty);
+          expect(find.text('已选 3 个视频'), findsOneWidget);
+          await tester.tap(find.text('完成'));
+          await tester.pumpAndSettle();
+          expect(find.byType(Checkbox), findsNothing);
+          expect(tester.state(artwork), same(originalArtwork));
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox());
+          model.dispose();
+          store.dispose();
+          root.deleteSync(recursive: true);
+        }
+      },
+    );
+  }
 
   for (final managed in [true, false]) {
     testWidgets(

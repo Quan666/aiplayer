@@ -6,12 +6,65 @@ import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/sources/favorites.dart';
 import 'package:aiplayer/ui/glass.dart';
+import 'package:aiplayer/ui/media_details_content.dart';
 import 'package:aiplayer/ui/sources_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets(
+    'folder menu starts recursive recognition for the current directory',
+    (tester) async {
+      FlutterSecureStorage.setMockInitialValues({});
+      final directory = Directory.systemTemp.createTempSync(
+        'source-recognition-entry-',
+      );
+      final store = AppStore('${directory.path}/library.db')
+        ..setLocal('settings', {
+          'metadataStrategy': 'off',
+          'autoDiscover': false,
+        });
+      final model = _RecognitionBrowserModel(store, directory);
+      try {
+        await tester.runAsync(() => model.loadLibrarySnapshot());
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: GlassPalette.theme(),
+            home: SourceBrowser(
+              model: model,
+              source: const {'id': 'local', 'kind': 'local', 'label': 'Local'},
+              initialPath: directory.path,
+              initialName: '当前文件夹',
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip('文件夹选项'));
+        await tester.pumpAndSettle();
+        expect(find.text('识别此文件夹及子文件夹'), findsOneWidget);
+        await tester.tap(find.text('识别此文件夹及子文件夹'));
+        await tester.pumpAndSettle();
+        for (var i = 0; i < 500 && model.recognizingDirectory; i++) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        await tester.pumpAndSettle();
+        expect(model.recognizingDirectory, false);
+        expect(model.status, '此文件夹及子文件夹中没有视频。');
+        expect(model.directoryRecognitionProgress.folders, 1);
+        expect(tester.takeException(), isNull);
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        model.dispose();
+        store.dispose();
+        directory.deleteSync(recursive: true);
+      }
+    },
+  );
+
   testWidgets(
     'folder and video menus keep AI inside the manual matching sheet',
     (tester) async {
@@ -140,6 +193,12 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
+        expect(find.byType(MediaDetailsOverview), findsOneWidget);
+        expect(find.byType(MediaDetailsContinue), findsOneWidget);
+        expect(find.byType(MediaDetailsPlaylistHeader), findsOneWidget);
+        expect(find.byType(MediaDetailsEpisodeTile), findsNWidgets(ids.length));
+        expect(find.text('播放列表'), findsOneWidget);
+        expect(find.byTooltip('排序与显示'), findsOneWidget);
         for (var index = 0; index < ids.length; index++) {
           final row = find.byKey(ValueKey(_SeriesAdapter.entries[index].path));
           expect(
@@ -157,13 +216,17 @@ void main() {
           );
         }
         expect(find.textContaining('第 2 集'), findsAtLeastNWidgets(1));
-        await tester.tap(find.text('继续观看'));
+        await tester.tap(find.byKey(const ValueKey('series-continue')));
         await tester.pumpAndSettle();
         expect(played, ids.last);
         expect(
           (model.progressFor(store.get('media', ids.first)!)?['position']),
           20,
         );
+        await tester.tap(find.byTooltip('视频选项').first);
+        await tester.pumpAndSettle();
+        expect(find.text('重新识别影视资料'), findsOneWidget);
+        expect(find.text('手动搜索影视资料'), findsOneWidget);
         expect(tester.takeException(), isNull);
       } finally {
         await tester.pumpWidget(const SizedBox());
@@ -743,6 +806,13 @@ void main() {
 
 class _FolderModel extends AppModel {
   _FolderModel(super.store, super.documents);
+  @override
+  Future<SourceAdapter> adapter(String id) async => _DirectoryAdapter();
+}
+
+class _RecognitionBrowserModel extends AppModel {
+  _RecognitionBrowserModel(super.store, super.documents)
+    : super(backgroundWork: false);
   @override
   Future<SourceAdapter> adapter(String id) async => _DirectoryAdapter();
 }

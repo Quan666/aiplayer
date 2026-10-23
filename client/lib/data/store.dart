@@ -68,6 +68,9 @@ class AppStore {
   final Database db;
   final _statements = <String, PreparedStatement>{};
   final _localKeyRevisions = <String, int>{};
+  final _localPrefixRevisions = <String, int>{};
+  int? _catalogMediaRevision;
+  Set<String> _catalogMedia = {};
   Map<String, Map<String, dynamic>>? _locationIndex;
   final Map<String, String> _locationKeys = {};
   final Map<String, int> _recordRevisions = {};
@@ -199,6 +202,14 @@ class AppStore {
     return own > _unknownRevision ? own : _unknownRevision;
   }
 
+  /// Register only prefixes used by visible snapshots, without reading their
+  /// JSON values or invalidating them for unrelated local writes.
+  int localPrefixRevision(String prefix) {
+    _checkChanges();
+    final own = _localPrefixRevisions.putIfAbsent(prefix, () => 0);
+    return own > _unknownRevision ? own : _unknownRevision;
+  }
+
   /// Cheap invalidation for view snapshots. Known writes only invalidate their
   /// own kind. Playback worker commits invalidate progress, while unrelated
   /// external edits still invalidate every snapshot. No record JSON is read.
@@ -246,6 +257,13 @@ class AppStore {
                 _localKeyRevisions[key] = revision;
               }
             }
+            for (final prefix in _localPrefixRevisions.keys) {
+              if (prefix.startsWith('sync') ||
+                  'sync'.startsWith(prefix) ||
+                  'lastSync'.startsWith(prefix)) {
+                _localPrefixRevisions[prefix] = revision;
+              }
+            }
           } else {
             _recordRevisions[scope] = revision;
           }
@@ -284,6 +302,11 @@ class AppStore {
       _localRevision = revision;
       if (_localKeyRevisions.containsKey(localKey)) {
         _localKeyRevisions[localKey] = revision;
+      }
+      for (final prefix in _localPrefixRevisions.keys) {
+        if (localKey.startsWith(prefix)) {
+          _localPrefixRevisions[prefix] = revision;
+        }
       }
       if (localKey.startsWith('location:')) _locationRevision = revision;
     }
@@ -363,6 +386,56 @@ class AppStore {
   String get deviceId => local('syncDevice:id') as String;
   String get deviceName => local('syncDevice:name') as String;
 
+  static const catalogMediaKey = 'syncProfile:catalogMedia';
+
+  /// These records share catalogue metadata while their file locations and
+  /// playback state remain private to this device.
+  bool isCatalogMedia(String id) {
+    final revision = localKeyRevision(catalogMediaKey);
+    if (_catalogMediaRevision != revision) {
+      _catalogMedia = (local(catalogMediaKey) as List? ?? [])
+          .cast<String>()
+          .toSet();
+      _catalogMediaRevision = revision;
+    }
+    return _catalogMedia.contains(id);
+  }
+
+  Map<String, dynamic> syncPayload(SyncRecord record) {
+    if (record.kind != 'media' || !isCatalogMedia(record.id)) {
+      return record.toJson();
+    }
+    return {
+      ...record.toJson(),
+      'data': {
+        for (final key in const [
+          'title',
+          'series',
+          'season',
+          'episode',
+          'episodeTitle',
+          'bangumiId',
+          'poster',
+          'summary',
+          'fileName',
+          'size',
+          'duration',
+          'metadataProvider',
+          'tmdbId',
+          'metadataTitle',
+          'rating',
+          'ratingCount',
+          'airDate',
+          'totalEpisodes',
+          'totalSeasons',
+          'genres',
+          'metadataType',
+        ])
+          if (record.data.containsKey(key)) key: record.data[key],
+      },
+    };
+  }
+
   bool isPrivateMedia(String id) {
     final data = get('media', id)?.data;
     return data?['localOnly'] == true ||
@@ -373,6 +446,10 @@ class AppStore {
 
   /// Applies even when lightweight synchronization has no profile adapter.
   bool shouldSyncRecord(SyncRecord record) {
+    if (record.kind == 'media' && isCatalogMedia(record.id)) {
+      return record.data['transient'] != true &&
+          get('media', record.id)?.data['transient'] != true;
+    }
     if (record.data['localOnly'] == true || record.data['transient'] == true) {
       return false;
     }
@@ -415,6 +492,57 @@ class AppStore {
       onError: (Object _, StackTrace _) {},
     );
     return pending;
+  }
+
+  /// Persist a probed size without blocking the UI on SQLite's writer lock.
+  /// Re-read the association after acquiring the lock: a scan or user edit may
+  /// have moved or removed it while the playback request was in flight.
+  Future<bool> updatePlaybackLocationSize(
+    String mediaId, {
+    required String sourceId,
+    required String path,
+    required int size,
+  }) async {
+    if (this.path == ':memory:') {
+      return _updatePlaybackLocationSize(mediaId, sourceId, path, size);
+    }
+    final databasePath = this.path;
+    final pending = _playbackWrites.then(
+      (_) => _updatePlaybackLocationSizeInWorker(
+        databasePath,
+        mediaId,
+        sourceId,
+        path,
+        size,
+      ),
+    );
+    _playbackWrites = pending.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return pending;
+  }
+
+  bool _updatePlaybackLocationSize(
+    String mediaId,
+    String sourceId,
+    String path,
+    int size,
+  ) {
+    var changed = false;
+    transaction(() {
+      final key = 'location:$mediaId';
+      final current = local(key);
+      if (current is! Map ||
+          current['source'] != sourceId ||
+          current['path'] != path ||
+          current['size'] == size) {
+        return;
+      }
+      setLocal(key, {...current, 'size': size});
+      changed = true;
+    });
+    return changed;
   }
 
   bool _savePlaybackProgress(
@@ -710,6 +838,7 @@ class AppStore {
   }
 
   Map<String, dynamic>? locationFor(String sourceId, String path) {
+    _checkChanges();
     if (_locationIndex == null) {
       _locationIndex = {};
       _locationKeys.clear();
@@ -792,6 +921,23 @@ Future<bool> _savePlaybackProgressInWorker(
         jsonDecode(snapshot),
         watchedId,
       ),
+    );
+  } finally {
+    store.dispose();
+  }
+});
+
+Future<bool> _updatePlaybackLocationSizeInWorker(
+  String databasePath,
+  String mediaId,
+  String sourceId,
+  String path,
+  int size,
+) => Isolate.run(() async {
+  final store = await retryStoreBusy(() => AppStore.openExisting(databasePath));
+  try {
+    return await retryStoreBusy(
+      () => store._updatePlaybackLocationSize(mediaId, sourceId, path, size),
     );
   } finally {
     store.dispose();

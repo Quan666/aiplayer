@@ -6,16 +6,18 @@ import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/media_presentation.dart';
 import 'package:aiplayer/data/store.dart';
+import 'package:aiplayer/data/library_snapshot.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/library_page.dart';
 import 'package:aiplayer/ui/media_details_header.dart';
+import 'package:aiplayer/ui/media_details_content.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _DeferredDetailsModel extends AppModel {
-  int loads = 0, libraryReads = 0, episodeLabels = 0;
+  int loads = 0, libraryReads = 0, episodeLabels = 0, snapshotReads = 0;
   CancelToken? detailsCancel;
   Completer<List<SyncRecord>>? _loaded;
   Completer<List<SyncRecord>> get loaded =>
@@ -25,6 +27,15 @@ class _DeferredDetailsModel extends AppModel {
   List<SyncRecord> get media {
     libraryReads++;
     return super.media;
+  }
+
+  @override
+  Future<LibrarySnapshot> loadLibrarySnapshot({
+    String query = '',
+    CancelToken? cancel,
+  }) {
+    snapshotReads++;
+    return super.loadLibrarySnapshot(query: query, cancel: cancel);
   }
 
   @override
@@ -89,12 +100,13 @@ void main() {
         episode(i);
       }
       await library(tester);
-      model.libraryReads = 0;
+      model.libraryReads = model.snapshotReads = 0;
       model.episodeLabels = 0;
       await tester.tap(find.byKey(const ValueKey('details:episode-1')));
       expect(model.loads, 0);
       await tester.pump();
       expect(find.byKey(const ValueKey('series-details-list')), findsOneWidget);
+      expect(find.byType(MediaDetailsOverview), findsOneWidget);
       expect(find.textContaining('已收录 200 集'), findsOneWidget);
       expect(model.loads, 0);
       expect(
@@ -149,7 +161,8 @@ void main() {
         reason: 'closing animation must also avoid a full-library rebuild',
       );
       await tester.pumpAndSettle();
-      expect(model.libraryReads, greaterThan(0));
+      expect(model.libraryReads, 0);
+      expect(model.snapshotReads, 1);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
     },
@@ -168,6 +181,118 @@ void main() {
       model.loaded.complete(store.all('media'));
       await tester.pumpAndSettle();
       expect(model.episodeLabels, rendered);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'open details refresh new episodes and metadata once after background updates',
+    (tester) async {
+      episode(1);
+      episode(2);
+      await library(tester);
+      await tester.tap(find.byKey(const ValueKey('details:episode-1')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      model.loaded.complete(store.all('media'));
+      await tester.pumpAndSettle();
+      model.libraryReads = model.snapshotReads = 0;
+
+      final first = store.get('media', 'episode-1')!;
+      store.save('media', first.id, {
+        ...first.data,
+        'summary': '后台补齐的作品简介',
+        'totalEpisodes': 12,
+      });
+      episode(3);
+      store.setLocal('episodeTitle:episode-2', '新的相遇');
+      for (var index = 0; index < 20; index++) {
+        model.changed();
+      }
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('已收录 3 集'), findsOneWidget);
+      expect(find.text('后台补齐的作品简介'), findsOneWidget);
+      expect(find.text('共 12 集'), findsOneWidget);
+      expect(find.textContaining('新的相遇'), findsOneWidget);
+      expect(model.snapshotReads, 1);
+      expect(model.libraryReads, 0);
+      expect(
+        model.loads,
+        1,
+        reason: 'metadata refresh must not relist sources',
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'episode name updates refresh details without reading another library snapshot',
+    (tester) async {
+      episode(1);
+      episode(2);
+      await library(tester);
+      await tester.tap(find.byKey(const ValueKey('details:episode-1')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      model.loaded.complete(store.all('media'));
+      await tester.pumpAndSettle();
+      model.libraryReads = model.snapshotReads = 0;
+
+      store.setLocal('episodeTitle:episode-2', '随后到达的集名');
+      model.changed();
+      await tester.pumpAndSettle();
+      expect(find.textContaining('随后到达的集名'), findsOneWidget);
+      expect(model.snapshotReads, 0);
+      final labels = model.episodeLabels;
+      for (var index = 0; index < 20; index++) {
+        model.changed();
+      }
+      await tester.pumpAndSettle();
+      expect(model.episodeLabels, labels);
+      expect(model.snapshotReads, 0);
+      expect(model.libraryReads, 0);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'covered details defer metadata work and refresh once when visible again',
+    (tester) async {
+      episode(1);
+      episode(2);
+      await library(tester);
+      await tester.tap(find.byKey(const ValueKey('details:episode-1')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      model.loaded.complete(store.all('media'));
+      await tester.pumpAndSettle();
+      final navigator = Navigator.of(tester.element(find.byType(BottomSheet)));
+      unawaited(
+        navigator.push<void>(
+          MaterialPageRoute(builder: (_) => const Scaffold(body: Text('覆盖页'))),
+        ),
+      );
+      await tester.pumpAndSettle();
+      model.libraryReads = model.snapshotReads = 0;
+      for (var number = 3; number <= 6; number++) {
+        episode(number);
+        model.changed();
+        await tester.pump();
+      }
+      await tester.pumpAndSettle();
+      expect(model.snapshotReads, 0);
+      expect(model.libraryReads, 0);
+
+      navigator.pop();
+      await tester.pumpAndSettle();
+      expect(find.textContaining('已收录 6 集'), findsOneWidget);
+      expect(model.snapshotReads, 1);
+      expect(model.libraryReads, 0);
+      expect(model.loads, 1);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
     },

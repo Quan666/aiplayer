@@ -1,8 +1,26 @@
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/sources/configuration.dart';
+import 'package:aiplayer/sources/source.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('SMB server adapter opens without a discovery connection', () async {
+    // No SMB service or native library is needed to construct an adapter for a
+    // known share path. Root enumeration connects when it is actually requested.
+    final adapter = await connectSource({
+      'kind': 'smb',
+      'host': '127.0.0.1',
+      'port': 1,
+      'share': '',
+    });
+    try {
+      expect(adapter, isA<SmbServerSource>());
+      expect((adapter as SmbServerSource).dialect, 0);
+    } finally {
+      await adapter.close();
+    }
+  });
+
   test(
     'SMB server configuration does not require a share and keeps security mode',
     () {

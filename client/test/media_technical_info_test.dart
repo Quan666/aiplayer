@@ -6,6 +6,7 @@ import 'package:aiplayer/data/media_technical_info.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/main.dart';
 import 'package:aiplayer/ui/glass.dart';
+import 'package:aiplayer/ui/media_details_content.dart';
 import 'package:aiplayer/ui/media_details_header.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -273,7 +274,7 @@ void main() {
         await tester.pumpAndSettle();
         final rows = find.byWidgetPredicate(
           (widget) =>
-              widget is ListTile &&
+              widget is MediaDetailsEpisodeTile &&
               widget.key is ValueKey<String> &&
               (widget.key! as ValueKey<String>).value.startsWith(
                 'series-episode:',
