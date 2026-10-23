@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:async';
+import 'dart:isolate';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import '../core/network.dart';
@@ -41,6 +42,53 @@ ReleaseName subjectIdentity(String name) {
     );
   }
   return parseReleaseName(value);
+}
+
+/// A season directory carries the season, while its parent carries the title.
+/// This evidence is available before any file has been played or identified.
+ReleaseName directoryIdentity(String path, {String rootPath = ''}) {
+  final relative = path.replaceAll('\\', '/');
+  final fullPath = p.posix.normalize(
+    rootPath.isEmpty
+        ? relative
+        : p.posix.join(rootPath, relative.replaceFirst(RegExp(r'^/+'), '')),
+  );
+  final name = p.posix.basename(fullPath);
+  if (name == '.' || name == '/' || name.isEmpty) return const ReleaseName('');
+  final parsed = parseReleaseName(name);
+  if (parsed.anime.isNotEmpty || parsed.season.isEmpty) {
+    return subjectIdentity(name);
+  }
+  final parent = p.posix.dirname(fullPath);
+  if (parent == '.' || parent == '/' || parent == fullPath) return parsed;
+  final parentName = p.posix.basename(parent);
+  final parentIdentity = parseReleaseName(parentName);
+  if (parentIdentity.anime.isEmpty) return parsed;
+  return ReleaseName(subjectIdentity(parentName).anime, parsed.season);
+}
+
+/// Called on the directory worker (or an in-memory test store). A WebDAV root
+/// listing uses relative paths, so recover its directory name from the source
+/// URL without changing file locations, cache keys or navigation paths.
+ReleaseName sourceDirectoryIdentity(
+  AppStore store,
+  String sourceId,
+  String path,
+) {
+  final sources = store.local('sources');
+  final source = sources is List
+      ? sources
+            .whereType<Map>()
+            .where((value) => value['id'] == sourceId)
+            .firstOrNull
+      : null;
+  final uri = source?['kind'] == 'webdav'
+      ? Uri.tryParse('${source?['url'] ?? ''}')
+      : null;
+  return directoryIdentity(
+    path,
+    rootPath: uri == null ? '' : '/${uri.pathSegments.join('/')}',
+  );
 }
 
 bool subjectMatchesSeason(
@@ -85,6 +133,11 @@ class DirectoryCollection {
   final Map<String, ReleaseName> identities;
   final Map<String, dynamic>? subject;
   final Map<String, String> episodeTitles;
+
+  /// False when a transient catalogue failure left only partial metadata.
+  /// The available subject can be shown while the missing stage is retried.
+  final bool metadataComplete;
+  final int? _preparedEpisodeCount;
   const DirectoryCollection({
     required this.title,
     required this.season,
@@ -92,17 +145,21 @@ class DirectoryCollection {
     required this.identities,
     this.subject,
     this.episodeTitles = const {},
-  });
+    this.metadataComplete = true,
+    int? episodeCount,
+  }) : _preparedEpisodeCount = episodeCount;
   String get displayName =>
       '${subject?['name_cn']?.toString().isNotEmpty == true ? subject!['name_cn'] : subject?['name'] ?? title}';
   String get poster =>
       '${subject?['images']?['large'] ?? subject?['images']?['common'] ?? ''}';
   String get summary => '${subject?['summary'] ?? ''}';
-  int get episodeCount => identities.values
-      .map((item) => item.episode)
-      .where((episode) => episode.isNotEmpty)
-      .toSet()
-      .length;
+  int get episodeCount =>
+      _preparedEpisodeCount ??
+      identities.values
+          .map((item) => item.episode)
+          .where((episode) => episode.isNotEmpty)
+          .toSet()
+          .length;
   String get seasonLabel =>
       mediaSeasonLabel(season, totalSeasons: subject?['total_seasons']);
   List<String> get metadataLabels {
@@ -134,15 +191,33 @@ class DirectoryCollection {
 
   DirectoryCollection withMetadata(
     Map<String, dynamic>? value,
-    Map<String, String> names,
-  ) => DirectoryCollection(
+    Map<String, String> names, {
+    bool metadataComplete = true,
+  }) => DirectoryCollection(
     title: title,
     season: season,
     videos: videos,
     identities: identities,
     subject: value,
     episodeTitles: names,
+    metadataComplete: metadataComplete,
+    episodeCount: _preparedEpisodeCount,
   );
+}
+
+/// Run on the directory worker when checking a production collection. Numeric
+/// episode keys, rather than map size, detect gaps and alternate encodes.
+bool directoryEpisodeNamesCovered(
+  Map<String, ReleaseName> identities,
+  Map<String, String> names,
+) {
+  for (final identity in identities.values) {
+    final number = int.tryParse(identity.episode);
+    if (number != null && (names['$number'] ?? '').trim().isEmpty) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /// A short-lived directory preview can be rendered synchronously when a browser
@@ -150,55 +225,266 @@ class DirectoryCollection {
 class DirectoryPreview {
   final DirectoryCollection? collection;
   final String context, fingerprint;
-  final int updatedAt, modified;
+  final int updatedAt, modified, cacheEpoch, sourceEpoch;
+  final bool complete;
   const DirectoryPreview({
     required this.collection,
     required this.context,
     required this.fingerprint,
     required this.updatedAt,
     required this.modified,
+    this.cacheEpoch = 0,
+    this.sourceEpoch = 0,
+    this.complete = true,
   });
 }
 
-DirectoryCollection? identifyDirectory(String path, List<SourceEntry> entries) {
-  final videos = entries
-      .where((entry) => !entry.directory && isVideo(entry.name))
-      .toList();
-  if (videos.length < 2 || videos.length > 1000) return null;
-  final folder = subjectIdentity(p.posix.basename(path.replaceAll('\\', '/')));
-  final identities = <String, ReleaseName>{};
-  String? title, season;
-  final episodes = <String>{};
-  for (final video in videos) {
-    var parsed = parseReleaseName(video.name);
-    if (parsed.episode.isEmpty) {
-      final bare = RegExp(
-        r'^(?:EP?)?(\d{1,4})(?:[ ._-].*)?$',
-        caseSensitive: false,
-      ).firstMatch(p.basenameWithoutExtension(video.name));
-      if (bare == null || folder.anime.isEmpty) return null;
-      parsed = ReleaseName(
-        folder.anime,
-        folder.season,
-        '${int.parse(bare[1]!)}',
+String _directoryPreviewKey(String sourceId, String path) =>
+    'directory-preview:${sha256.convert(utf8.encode(jsonEncode([sourceId, p.posix.normalize(path.replaceAll('\\', '/'))])))}';
+
+String _directoryEnvelopeKey(String key) =>
+    key.replaceFirst('directory-preview:', 'directory-preview-envelope:');
+
+int _directoryPreviewEpoch(AppStore store) =>
+    (store.local('directoryPreviewEpoch') as num?)?.toInt() ?? 0;
+
+int _directorySourceEpoch(AppStore store, String sourceId) =>
+    (store.local('directoryPreviewSourceEpoch:$sourceId') as num?)?.toInt() ??
+    0;
+
+/// Called by the directory worker so a large cached collection never encodes
+/// JSON or waits for the SQLite write lock on the UI isolate.
+void persistDirectoryPreview(
+  AppStore store,
+  String sourceId,
+  String path,
+  DirectoryPreview preview,
+) {
+  store.transaction(() {
+    // An explicit cache refresh can happen while this write is queued.
+    if (preview.cacheEpoch != _directoryPreviewEpoch(store) ||
+        preview.sourceEpoch != _directorySourceEpoch(store, sourceId)) {
+      return;
+    }
+    final collection = preview.collection;
+    final key = _directoryPreviewKey(sourceId, path);
+    final data = <String, dynamic>{
+      'sourceId': sourceId,
+      'context': preview.context,
+      'fingerprint': preview.fingerprint,
+      'at': preview.updatedAt,
+      'modified': preview.modified,
+      'epoch': preview.cacheEpoch,
+      'sourceEpoch': preview.sourceEpoch,
+      'collection': collection == null
+          ? null
+          : {
+              'title': collection.title,
+              'season': collection.season,
+              'episodeCount': collection.episodeCount,
+              'videos': [
+                for (final entry in collection.videos)
+                  {
+                    'name': entry.name,
+                    'path': entry.path,
+                    'size': entry.size,
+                    'modified': entry.modified,
+                    'hidden': entry.hidden,
+                  },
+              ],
+              'identities': {
+                for (final entry in collection.identities.entries)
+                  entry.key: [
+                    entry.value.anime,
+                    entry.value.season,
+                    entry.value.episode,
+                  ],
+              },
+              'subject': collection.subject,
+              'episodeTitles': collection.episodeTitles,
+              'metadataComplete': collection.metadataComplete,
+            },
+    };
+    store.setLocal(key, data);
+    store.setLocal(_directoryEnvelopeKey(key), {
+      ...data,
+      'complete': false,
+      'collection': collection == null
+          ? null
+          : {
+              ...(data['collection'] as Map),
+              'videos': const [],
+              'identities': const {},
+              'episodeTitles': const {},
+            },
+    });
+  });
+}
+
+DirectoryPreview? _decodeDirectoryPreview(dynamic json) {
+  if (json is! Map) return null;
+  try {
+    final raw = json['collection'];
+    DirectoryCollection? collection;
+    if (raw is Map) {
+      collection = DirectoryCollection(
+        title: raw['title'],
+        season: raw['season'],
+        videos: [
+          for (final item in raw['videos'] as List)
+            SourceEntry(
+              name: item['name'],
+              path: item['path'],
+              size: item['size'],
+              modified: item['modified'],
+              hidden: item['hidden'] == true,
+            ),
+        ],
+        identities: {
+          for (final item in (raw['identities'] as Map).entries)
+            item.key: ReleaseName(item.value[0], item.value[1], item.value[2]),
+        },
+        subject: raw['subject'] == null
+            ? null
+            : Map<String, dynamic>.from(raw['subject']),
+        episodeTitles: Map<String, String>.from(raw['episodeTitles']),
+        metadataComplete: raw['metadataComplete'] != false,
+        episodeCount:
+            (raw['episodeCount'] as num?)?.toInt() ??
+            (raw['identities'] as Map).values
+                .map((value) => value[2])
+                .whereType<String>()
+                .where((value) => value.isNotEmpty)
+                .toSet()
+                .length,
       );
     }
-    final name = parsed.anime.isEmpty ? folder.anime : parsed.anime;
+    return DirectoryPreview(
+      collection: collection,
+      context: json['context'],
+      fingerprint: json['fingerprint'],
+      updatedAt: json['at'],
+      modified: json['modified'],
+      cacheEpoch: (json['epoch'] as num?)?.toInt() ?? 0,
+      sourceEpoch: (json['sourceEpoch'] as num?)?.toInt() ?? 0,
+      complete: json['complete'] != false,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+DirectoryPreview? readDirectoryPreview(
+  AppStore store,
+  String sourceId,
+  String path,
+) => _decodeDirectoryPreview(store.local(_directoryPreviewKey(sourceId, path)));
+
+DirectoryCollection? identifyDirectory(
+  String path,
+  List<SourceEntry> entries, {
+  ReleaseName? folderIdentity,
+}) {
+  final videos = <SourceEntry>[];
+  final folder = folderIdentity ?? directoryIdentity(path);
+  final identities = <String, ReleaseName>{};
+  final parsedVideos = <(SourceEntry, ReleaseName)>[];
+  final bareEpisode = RegExp(
+    r'^(?:EP?)?(\d{1,4})(?:[ ._-].*)?$',
+    caseSensitive: false,
+  );
+  String? explicitTitle, explicitSeason;
+  String? title, season;
+  String seasonKey(String value) => value.isEmpty ? '1' : value;
+  for (final video in entries) {
+    if (video.directory || !isVideo(video.name)) continue;
+    var parsed = parseReleaseName(video.name);
+    if (parsed.episode.isEmpty) {
+      final bare = bareEpisode.firstMatch(
+        p.basenameWithoutExtension(video.name),
+      );
+      // Extras without episode evidence do not prevent the actual series from
+      // opening its details. Distinct episodic titles still make it ambiguous.
+      if (bare == null) continue;
+      parsed = ReleaseName('', parsed.season, '${int.parse(bare[1]!)}');
+    }
+    if (parsed.anime.isNotEmpty) {
+      if (explicitTitle != null &&
+          normalizedSeries(explicitTitle) != normalizedSeries(parsed.anime)) {
+        return null;
+      }
+      explicitTitle = parsed.anime;
+    }
+    if (parsed.season.isNotEmpty) {
+      if (explicitSeason != null && explicitSeason != parsed.season) {
+        return null;
+      }
+      explicitSeason = parsed.season;
+    }
+    parsedVideos.add((video, parsed));
+  }
+  // Read all explicit filename evidence before resolving numeric siblings.
+  // Their title must not depend on listing order or a renamed folder. A folder
+  // season still constrains files without a season, so conflicting markers do
+  // not silently move numeric episodes into a different season.
+  final fallbackTitle = explicitTitle ?? folder.anime;
+  final fallbackSeason = folder.season.isNotEmpty
+      ? folder.season
+      : explicitSeason ?? '';
+  for (final (video, parsed) in parsedVideos) {
+    final name = parsed.anime.isEmpty ? fallbackTitle : parsed.anime;
     final resolvedSeason = parsed.season.isNotEmpty
         ? parsed.season
-        : folder.season;
+        : fallbackSeason;
     if (name.isEmpty || normalizedSeries(name).isEmpty) return null;
     if (title != null && normalizedSeries(title) != normalizedSeries(name)) {
       return null;
     }
-    if (season != null && season != resolvedSeason) return null;
-    // Duplicate episode encodes are still one series, but not two distinct episodes.
-    episodes.add(parsed.episode);
+    if (season != null && seasonKey(season) != seasonKey(resolvedSeason)) {
+      return null;
+    }
     title = name;
-    season = resolvedSeason;
+    if (season == null || resolvedSeason.isNotEmpty) season = resolvedSeason;
+    videos.add(video);
     identities[video.path] = ReleaseName(name, resolvedSeason, parsed.episode);
   }
-  if (episodes.length < 2) return null;
+  if (videos.isEmpty) {
+    final single = entries
+        .where((entry) => !entry.directory && isVideo(entry.name))
+        .singleOrNull;
+    if (single == null || folder.anime.isEmpty) return null;
+    final identity = parseReleaseName(single.name);
+    // A folder and its single title-only file agree on the title. Make that
+    // file's details available before lookup/playback without inventing an
+    // episode number or treating unrelated personal videos as one series.
+    if (identity.episode.isNotEmpty ||
+        normalizedSeries(identity.anime) != normalizedSeries(folder.anime) ||
+        (identity.season.isNotEmpty &&
+            folder.season.isNotEmpty &&
+            identity.season != folder.season)) {
+      return null;
+    }
+    final singleSeason = identity.season.isEmpty
+        ? folder.season
+        : identity.season;
+    return DirectoryCollection(
+      title: folder.anime,
+      season: singleSeason,
+      videos: [single],
+      identities: {single.path: ReleaseName(folder.anime, singleSeason)},
+      episodeCount: 0,
+    );
+  }
+  // A single released episode (including alternate encodes) is already a
+  // series shortcut. Normalize omitted first-season markers across its files.
+  for (final video in videos) {
+    final identity = identities[video.path]!;
+    identities[video.path] = ReleaseName(
+      title!,
+      season ?? '',
+      identity.episode,
+    );
+  }
   videos.sort((a, b) {
     final x = double.tryParse(identities[a.path]!.episode),
         y = double.tryParse(identities[b.path]!.episode);
@@ -209,6 +495,60 @@ DirectoryCollection? identifyDirectory(String path, List<SourceEntry> entries) {
     season: season ?? '',
     videos: videos,
     identities: identities,
+    episodeCount: identities.values
+        .map((identity) => identity.episode)
+        .toSet()
+        .length,
+  );
+}
+
+/// Directory fingerprinting and filename parsing are prepared together on the
+/// model's existing directory worker. Only the resulting collection crosses
+/// back to the UI; callers already running on a worker use this directly.
+class DirectoryInspection {
+  final String fingerprint;
+  final DirectoryCollection? collection;
+  final int preparationIsolate;
+  const DirectoryInspection(
+    this.fingerprint,
+    this.collection,
+    this.preparationIsolate,
+  );
+}
+
+DirectoryInspection prepareDirectoryInspection(
+  String sourceId,
+  String path,
+  String context,
+  List<SourceEntry> entries, {
+  ReleaseName? folderIdentity,
+}) {
+  final folder = folderIdentity ?? directoryIdentity(path);
+  return DirectoryInspection(
+    sha256
+        .convert(
+          utf8.encode(
+            jsonEncode([
+              sourceId,
+              path,
+              context,
+              folder.anime,
+              folder.season,
+              for (final entry in entries)
+                [
+                  entry.name,
+                  entry.path,
+                  entry.size,
+                  entry.modified,
+                  entry.directory,
+                  entry.hidden,
+                ],
+            ]),
+          ),
+        )
+        .toString(),
+    identifyDirectory(path, entries, folderIdentity: folder),
+    Isolate.current.hashCode,
   );
 }
 
@@ -298,10 +638,64 @@ class LibraryCatalog {
   aiFallback;
   final String Function() aiContext;
   final void Function(String)? onPoster;
+  final Future<DirectoryInspection> Function(
+    String sourceId,
+    String path,
+    String context,
+    List<SourceEntry> entries,
+    CancelToken? cancel,
+  )?
+  prepareDirectory;
+  final Future<void> Function(
+    String sourceId,
+    String path,
+    DirectoryPreview preview,
+    CancelToken? cancel,
+  )?
+  persistDirectory;
+  final Future<DirectoryPreview?> Function(
+    String sourceId,
+    String path,
+    CancelToken? cancel,
+  )?
+  readDirectory;
+  final Future<bool> Function(
+    Map<String, ReleaseName> identities,
+    Map<String, String> names,
+    CancelToken? cancel,
+  )?
+  episodeNamesCovered;
   final _pending = <String, Future<DirectoryCollection?>>{};
   final _directories = <String, DirectoryPreview>{};
+  final _directoryStamps = <String, (int, int)>{};
   late final _cache = CatalogCache(store);
+  final _episodeRefreshes = CatalogCache(null);
+  final _episodeRefreshRetries = <String, ({DateTime after, int failures})>{};
+  final DateTime Function() _now;
   int _cacheRevision = 0;
+  int _episodeFetchRevision = 0;
+  final _episodeFetchRevisions = <String, int>{};
+  Object get episodeNamesRevision =>
+      (_episodeFetchRevision, tmdb.seasonFetchRevision);
+
+  bool episodeNamesFetchedSince(
+    Object revision,
+    Map<String, dynamic> subject, {
+    String season = '',
+  }) {
+    if (revision case (final int bangumiRevision, final int tmdbRevision)) {
+      if (subject['provider'] == 'tmdb') {
+        return tmdb.seasonFetchedSince(tmdbRevision, {
+          ...subject,
+          if ('${subject['season'] ?? ''}'.isEmpty) 'season': season,
+        });
+      }
+      return (_episodeFetchRevisions['${subject['id']}'] ?? 0) >
+          bangumiRevision;
+    }
+    return false;
+  }
+
   LibraryCatalog(
     this.store, {
     JsonTransport? transport,
@@ -311,8 +705,14 @@ class LibraryCatalog {
     Future<String> Function()? tmdbCredential,
     this.aiFallback,
     this.onPoster,
+    this.prepareDirectory,
+    this.persistDirectory,
+    this.readDirectory,
+    this.episodeNamesCovered,
+    DateTime Function()? now,
     String Function()? aiContext,
-  }) : transport = transport ?? IoJsonTransport(),
+  }) : _now = now ?? DateTime.now,
+       transport = transport ?? IoJsonTransport(),
        provider = provider ?? (() => 'bangumi'),
        strategy = strategy ?? (() => 'conservative'),
        tmdbNameAssist = tmdbNameAssist ?? (() => true),
@@ -325,7 +725,24 @@ class LibraryCatalog {
   };
 
   String _directoryKey(String sourceId, String path) =>
-      'directory-preview:${sha256.convert(utf8.encode(jsonEncode([sourceId, p.posix.normalize(path.replaceAll('\\', '/'))])))}';
+      _directoryPreviewKey(sourceId, path);
+
+  /// A compact revision for browser completion checks, independent of file
+  /// membership. Reading it does not hash or parse a directory on the UI isolate.
+  Object directoryInspectionRevision(String sourceId) => (
+    strategy(),
+    provider(),
+    tmdbNameAssist(),
+    aiContext(),
+    _cacheRevision,
+    _directoryPreviewEpoch(store),
+    _directorySourceEpoch(store, sourceId),
+  );
+
+  (int, int) _directoryStamp(String key) => (
+    store.localKeyRevision(key),
+    store.localKeyRevision(_directoryEnvelopeKey(key)),
+  );
 
   String _directoryContext(String sourceId) {
     final sources = (store.local('sources') as List? ?? []).whereType<Map>();
@@ -348,105 +765,132 @@ class LibraryCatalog {
     bool allowStale = false,
   }) {
     final key = _directoryKey(sourceId, path);
+    final stamp = _directoryStamp(key);
+    if (_directoryStamps[key] != stamp) _directories.remove(key);
     var value = _directories[key];
     if (value == null) {
-      final json = store.local(key);
-      if (json is! Map) return null;
-      try {
-        final raw = json['collection'];
-        DirectoryCollection? collection;
-        if (raw is Map) {
-          final videos = [
-            for (final item in raw['videos'] as List)
-              SourceEntry(
-                name: item['name'],
-                path: item['path'],
-                size: item['size'],
-                modified: item['modified'],
-                hidden: item['hidden'] == true,
-              ),
-          ];
-          collection = DirectoryCollection(
-            title: raw['title'],
-            season: raw['season'],
-            videos: videos,
-            identities: {
-              for (final item in (raw['identities'] as Map).entries)
-                item.key: ReleaseName(
-                  item.value[0],
-                  item.value[1],
-                  item.value[2],
-                ),
-            },
-            subject: raw['subject'] == null
-                ? null
-                : Map<String, dynamic>.from(raw['subject']),
-            episodeTitles: Map<String, String>.from(raw['episodeTitles']),
-          );
-        }
-        value = DirectoryPreview(
-          collection: collection,
-          context: json['context'],
-          fingerprint: json['fingerprint'],
-          updatedAt: json['at'],
-          modified: json['modified'],
-        );
-        _directories[key] = value;
-      } catch (_) {
-        store.removeLocal(key);
-        return null;
-      }
+      value = _decodeDirectoryPreview(
+        store.local(readDirectory == null ? key : _directoryEnvelopeKey(key)),
+      );
+      if (value == null) return null;
+      _directories[key] = value;
+      _directoryStamps[key] = stamp;
     }
-    if (value.context != _directoryContext(sourceId) ||
-        (modified != null && modified != value.modified)) {
+    if (!_validDirectoryPreview(sourceId, value, modified)) {
       _directories.remove(key);
       return null;
     }
     return value;
   }
 
+  bool _validDirectoryPreview(
+    String sourceId,
+    DirectoryPreview value,
+    int? modified,
+  ) =>
+      value.cacheEpoch == _directoryPreviewEpoch(store) &&
+      value.sourceEpoch == _directorySourceEpoch(store, sourceId) &&
+      value.context == _directoryContext(sourceId) &&
+      (modified == null || modified == value.modified);
+
+  /// Full cached membership is decoded on the same bounded worker as listing
+  /// preparation. Lazy artwork reads only the compact synchronous envelope.
+  Future<DirectoryPreview?> loadDirectoryPreview(
+    String sourceId,
+    String path, {
+    int? modified,
+    CancelToken? cancel,
+  }) async {
+    while (true) {
+      cancel?.check();
+      final cached = directoryPreview(sourceId, path, modified: modified);
+      if (readDirectory == null || cached?.complete == true) return cached;
+      final key = _directoryKey(sourceId, path);
+      final stamp = _directoryStamp(key);
+      final value = await readDirectory!(sourceId, path, cancel);
+      cancel?.check();
+      if (value == null || !_validDirectoryPreview(sourceId, value, modified)) {
+        return null;
+      }
+      if (stamp != _directoryStamp(key)) continue;
+      _directories[key] = value;
+      _directoryStamps[key] = stamp;
+      return value;
+    }
+  }
+
   /// Explicit user refresh only. Ordinary recognition, including force=true,
   /// reuses successful data. In-flight obsolete requests cannot refill it.
   void invalidateMetadataCaches() {
     _cacheRevision++;
+    store.setLocal('directoryPreviewEpoch', _directoryPreviewEpoch(store) + 1);
     _pending.clear();
     _cache.invalidate();
+    _episodeRefreshes.invalidate();
+    _episodeRefreshRetries.clear();
     tmdb.invalidateCache();
     for (final prefix in [
       'catalog-v1:',
       'subject-v5:',
       'episode-names:',
-      'directory-preview:',
+      if (readDirectory == null) 'directory-preview:',
+      'directory-preview-envelope:',
     ]) {
       for (final key in store.localEntries(prefix).keys) {
+        if (prefix == 'directory-preview-envelope:') {
+          store.removeLocal(
+            key.replaceFirst(
+              'directory-preview-envelope:',
+              'directory-preview:',
+            ),
+          );
+        }
         store.removeLocal(key);
       }
     }
     _directories.clear();
+    _directoryStamps.clear();
   }
 
   /// Synchronization can replace persistent directory results while the
   /// current catalogue is alive. Reread them on the next UI refresh.
-  void reloadSyncedDirectoryPreviews() => _directories.clear();
+  void reloadSyncedDirectoryPreviews() {
+    _directories.clear();
+    _directoryStamps.clear();
+  }
 
   void invalidateDirectoryPreviews(String sourceId) {
+    store.setLocal(
+      'directoryPreviewSourceEpoch:$sourceId',
+      _directorySourceEpoch(store, sourceId) + 1,
+    );
     // The source configuration participates in each preview's context; an
     // explicit refresh also drops unchanged-parent previews for this source.
-    for (final entry in store.localEntries('directory-preview:').entries) {
+    final prefix = readDirectory == null
+        ? 'directory-preview:'
+        : 'directory-preview-envelope:';
+    for (final entry in store.localEntries(prefix).entries) {
       if (entry.value is Map && entry.value['sourceId'] == sourceId) {
-        store.removeLocal(entry.key);
-        _directories.remove(entry.key);
+        final key = entry.key.replaceFirst(
+          'directory-preview-envelope:',
+          'directory-preview:',
+        );
+        store.removeLocal(key);
+        store.removeLocal(_directoryEnvelopeKey(key));
+        _directories.remove(key);
+        _directoryStamps.remove(key);
       }
     }
   }
 
-  void _rememberDirectory(
+  Future<void> _rememberDirectory(
     String sourceId,
     String path,
     String fingerprint,
     int? modified,
     DirectoryCollection? collection,
-  ) {
+    CancelToken? cancel,
+  ) async {
     final key = _directoryKey(sourceId, path);
     final value = DirectoryPreview(
       collection: collection,
@@ -454,41 +898,22 @@ class LibraryCatalog {
       fingerprint: fingerprint,
       updatedAt: DateTime.now().millisecondsSinceEpoch,
       modified: modified ?? _directories[key]?.modified ?? 0,
+      cacheEpoch: _directoryPreviewEpoch(store),
+      sourceEpoch: _directorySourceEpoch(store, sourceId),
     );
+    if (persistDirectory == null) {
+      persistDirectoryPreview(store, sourceId, path, value);
+    } else {
+      await persistDirectory!(sourceId, path, value, cancel);
+    }
+    cancel?.check();
+    if (value.cacheEpoch != _directoryPreviewEpoch(store) ||
+        value.sourceEpoch != _directorySourceEpoch(store, sourceId) ||
+        value.context != _directoryContext(sourceId)) {
+      return;
+    }
     _directories[key] = value;
-    store.setLocal(key, {
-      'sourceId': sourceId,
-      'context': value.context,
-      'fingerprint': fingerprint,
-      'at': value.updatedAt,
-      'modified': value.modified,
-      'collection': collection == null
-          ? null
-          : {
-              'title': collection.title,
-              'season': collection.season,
-              'videos': [
-                for (final entry in collection.videos)
-                  {
-                    'name': entry.name,
-                    'path': entry.path,
-                    'size': entry.size,
-                    'modified': entry.modified,
-                    'hidden': entry.hidden,
-                  },
-              ],
-              'identities': {
-                for (final entry in collection.identities.entries)
-                  entry.key: [
-                    entry.value.anime,
-                    entry.value.season,
-                    entry.value.episode,
-                  ],
-              },
-              'subject': collection.subject,
-              'episodeTitles': collection.episodeTitles,
-            },
-    });
+    _directoryStamps[key] = _directoryStamp(key);
     if (collection != null) onPoster?.call(collection.poster);
   }
 
@@ -954,6 +1379,14 @@ class LibraryCatalog {
     if (subject?['provider'] == 'tmdb') {
       return tmdb.episodeNames(subject!, cancel: cancel);
     }
+    return _bangumiEpisodeNames(subjectId, cancel: cancel);
+  }
+
+  Future<Map<String, String>> _bangumiEpisodeNames(
+    String subjectId, {
+    CancelToken? cancel,
+    bool refresh = false,
+  }) async {
     final key = 'catalog-v1:bangumi:episodes:$subjectId';
     final legacy = store.local('episode-names:$subjectId');
     if (store.local(key) == null &&
@@ -989,11 +1422,139 @@ class LibraryCatalog {
           }
           if (entries.length < 100) break;
         }
+        if (_episodeFetchRevisions.length >= 128 &&
+            !_episodeFetchRevisions.containsKey(subjectId)) {
+          _episodeFetchRevisions.remove(_episodeFetchRevisions.keys.first);
+        }
+        _episodeFetchRevisions[subjectId] = ++_episodeFetchRevision;
         return names;
       },
       decode: (value) => Map<String, String>.from(value as Map),
       keep: (value) => value.isNotEmpty,
       cancel: cancel,
+      refresh: refresh,
+      merge: (previous, refreshed) => previous.length + refreshed.length < 256
+          ? {...previous, ...refreshed}
+          : Isolate.run(() => <String, String>{...previous, ...refreshed}),
+    );
+  }
+
+  Future<bool> collectionEpisodeNamesCovered(
+    DirectoryCollection collection,
+    Map<String, String> names, {
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    final result = episodeNamesCovered == null
+        ? directoryEpisodeNamesCovered(collection.identities, names)
+        : await episodeNamesCovered!(collection.identities, names, cancel);
+    cancel?.check();
+    return result;
+  }
+
+  /// Refresh only an incomplete subject/season cache. The public episodeNames
+  /// hook remains the first lookup so custom catalogues retain their behavior.
+  Future<Map<String, String>> collectionEpisodeNames(
+    DirectoryCollection collection,
+    Map<String, dynamic> subject, {
+    CancelToken? cancel,
+    bool refreshCached = true,
+  }) async {
+    if (subject['provider'] == 'tmdb' && '${subject['season'] ?? ''}'.isEmpty) {
+      subject = {...subject, 'season': collection.season};
+    }
+    final key =
+        '${subject['provider'] ?? 'bangumi'}:${subject['id']}:'
+        '${subject['season'] ?? collection.season}:'
+        '${store.local('metadataCredentialsRevision') ?? ''}';
+    final retry = _episodeRefreshRetries[key];
+    void backoff() {
+      final failures = (retry?.failures ?? 0).clamp(0, 4);
+      if (_episodeRefreshRetries.length >= 128 &&
+          !_episodeRefreshRetries.containsKey(key)) {
+        _episodeRefreshRetries.remove(_episodeRefreshRetries.keys.first);
+      }
+      _episodeRefreshRetries[key] = (
+        after: _now().add(
+          Duration(minutes: (5 * (1 << failures)).clamp(5, 60)),
+        ),
+        failures: failures + 1,
+      );
+    }
+
+    final cached = subject['provider'] == 'tmdb'
+        ? await tmdb.cachedEpisodeNames(subject, cancel: cancel)
+        : _cache.readCached<Map<String, String>>(
+            'catalog-v1:bangumi:episodes:${subject['id']}',
+            (value) => Map<String, String>.from(value as Map),
+          );
+    final coolingDown = retry != null && _now().isBefore(retry.after);
+    if (cached == null && coolingDown && !_episodeRefreshes.isPending(key)) {
+      return Map.of(collection.episodeTitles);
+    }
+    final revision = episodeNamesRevision;
+    final names = await episodeNames(
+      '${subject['id']}',
+      subject: subject,
+      cancel: cancel,
+    );
+    cancel?.check();
+    if (subject['mediaType'] == 'movie' ||
+        await collectionEpisodeNamesCovered(
+          collection,
+          names,
+          cancel: cancel,
+        )) {
+      return names;
+    }
+    if (!_episodeRefreshes.isPending(key) && coolingDown) {
+      return names;
+    }
+    if (!refreshCached ||
+        episodeNamesFetchedSince(revision, subject) ||
+        cached == null ||
+        names.isEmpty) {
+      // This attempt already fetched the provider, or a custom catalogue
+      // supplied names without a provider cache. Do not repeat that request.
+      backoff();
+      return names;
+    }
+    return _episodeRefreshes.load<Map<String, String>>(
+      key,
+      refresh: true,
+      cancel: cancel,
+      keep: (_) => false,
+      decode: (value) => Map<String, String>.from(value as Map),
+      fetch: (token) async {
+        try {
+          final refreshed = subject['provider'] == 'tmdb'
+              ? await tmdb.episodeNames(subject, cancel: token, refresh: true)
+              : await _bangumiEpisodeNames(
+                  '${subject['id']}',
+                  cancel: token,
+                  refresh: true,
+                );
+          token.check();
+          // Retain previously known titles if the provider temporarily returns
+          // fewer names. A still-incomplete response observes the same backoff.
+          final result = refreshed.isEmpty ? names : refreshed;
+          if (await collectionEpisodeNamesCovered(
+            collection,
+            result,
+            cancel: token,
+          )) {
+            _episodeRefreshRetries.remove(key);
+          } else {
+            backoff();
+          }
+          return result;
+        } on Cancelled {
+          rethrow;
+        } catch (_) {
+          backoff();
+          rethrow;
+        }
+      },
     );
   }
 
@@ -1007,49 +1568,77 @@ class LibraryCatalog {
     cancel?.check();
     final context = _directoryContext(sourceId);
     final revision = _cacheRevision;
-    final key = sha256
-        .convert(
-          utf8.encode(
-            jsonEncode([
-              sourceId,
-              path,
-              context,
-              for (final e in entries)
-                [e.name, e.path, e.size, e.modified, e.directory, e.hidden],
-            ]),
-          ),
-        )
-        .toString();
-    final cached = directoryPreview(
+    final sourceEpoch = _directorySourceEpoch(store, sourceId);
+    final prepared = prepareDirectory == null
+        ? prepareDirectoryInspection(
+            sourceId,
+            path,
+            context,
+            entries,
+            folderIdentity: sourceDirectoryIdentity(store, sourceId, path),
+          )
+        : await prepareDirectory!(sourceId, path, context, entries, cancel);
+    cancel?.check();
+    final key = prepared.fingerprint;
+    final cached = await loadDirectoryPreview(
       sourceId,
       path,
       modified: directoryModified,
+      cancel: cancel,
     );
     if (cached != null &&
         cached.fingerprint == key &&
-        cached.collection?.subject != null) {
+        cached.collection?.subject != null &&
+        await collectionEpisodeNamesCovered(
+          cached.collection!,
+          cached.collection!.episodeTitles,
+          cancel: cancel,
+        )) {
       cancel?.check();
       onPoster?.call(cached.collection!.poster);
       return cached.collection;
     }
     Future<DirectoryCollection?> inspectFresh() async {
-      final collection = identifyDirectory(path, entries);
+      final collection = prepared.collection;
       var result = collection;
       if (collection != null && strategy() != 'off') {
         try {
+          final episodeRevision = episodeNamesRevision;
           final subject = await resolve(
             collection.title,
             collection.season,
             cancel: cancel,
           );
+          // Keep the resolved work visible if episode-title loading fails.
+          result = collection.withMetadata(
+            subject,
+            const {},
+            metadataComplete: subject == null,
+          );
           final names = subject == null
               ? <String, String>{}
-              : await episodeNames(
-                  '${subject['id']}',
-                  subject: subject,
+              : await collectionEpisodeNames(
+                  collection,
+                  subject,
                   cancel: cancel,
+                  refreshCached: !episodeNamesFetchedSince(
+                    episodeRevision,
+                    subject,
+                    season: collection.season,
+                  ),
                 );
-          result = collection.withMetadata(subject, names);
+          result = collection.withMetadata(
+            subject,
+            names,
+            metadataComplete:
+                subject == null ||
+                subject['mediaType'] == 'movie' ||
+                await collectionEpisodeNamesCovered(
+                  collection,
+                  names,
+                  cancel: cancel,
+                ),
+          );
         } on Cancelled {
           rethrow;
         } catch (_) {
@@ -1058,14 +1647,48 @@ class LibraryCatalog {
       }
       cancel?.check();
       if (context != _directoryContext(sourceId) ||
-          revision != _cacheRevision) {
+          revision != _cacheRevision ||
+          sourceEpoch != _directorySourceEpoch(store, sourceId)) {
         return collection;
       }
       if (result?.subject == null &&
           strategy() != 'off' &&
           aiFallback != null) {
         try {
+          final episodeRevision = episodeNamesRevision;
           result = await aiFallback!(sourceId, path, entries, cancel) ?? result;
+          if (result?.subject != null &&
+              result!.subject!['mediaType'] != 'movie' &&
+              !await collectionEpisodeNamesCovered(
+                result,
+                result.episodeTitles,
+                cancel: cancel,
+              )) {
+            result = result.withMetadata(
+              result.subject,
+              result.episodeTitles,
+              metadataComplete: false,
+            );
+            final names = await collectionEpisodeNames(
+              result,
+              result.subject!,
+              cancel: cancel,
+              refreshCached: !episodeNamesFetchedSince(
+                episodeRevision,
+                result.subject!,
+                season: result.season,
+              ),
+            );
+            result = result.withMetadata(
+              result.subject,
+              names,
+              metadataComplete: await collectionEpisodeNamesCovered(
+                result,
+                names,
+                cancel: cancel,
+              ),
+            );
+          }
         } on Cancelled {
           rethrow;
         } catch (_) {
@@ -1074,24 +1697,38 @@ class LibraryCatalog {
       }
       cancel?.check();
       if (context != _directoryContext(sourceId) ||
-          revision != _cacheRevision) {
+          revision != _cacheRevision ||
+          sourceEpoch != _directorySourceEpoch(store, sourceId)) {
         return collection;
       }
       if (result?.subject != null) {
-        _rememberDirectory(sourceId, path, key, directoryModified, result);
+        await _rememberDirectory(
+          sourceId,
+          path,
+          key,
+          directoryModified,
+          result,
+          cancel,
+        );
+        if (context != _directoryContext(sourceId) ||
+            revision != _cacheRevision ||
+            sourceEpoch != _directorySourceEpoch(store, sourceId)) {
+          return collection;
+        }
       }
       return result;
     }
 
     // A cancelled browser must not cancel another browser's shared lookup.
     if (cancel != null) return inspectFresh();
-    final existing = _pending[key];
+    final pendingKey = '$key:$sourceEpoch';
+    final existing = _pending[pendingKey];
     if (existing != null) return existing;
     late final Future<DirectoryCollection?> request;
     request = inspectFresh().whenComplete(() {
-      if (identical(_pending[key], request)) _pending.remove(key);
+      if (identical(_pending[pendingKey], request)) _pending.remove(pendingKey);
     });
-    _pending[key] = request;
+    _pending[pendingKey] = request;
     return request;
   }
 }

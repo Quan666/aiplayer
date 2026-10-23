@@ -77,11 +77,20 @@ ReleaseName parseReleaseName(String filename) {
     r'第\s*(\d{1,4})\s*[话話集]',
     r'\s-\s*(\d{1,4})(?:v\d+)?(?=$|[\s.\](_-])',
     r'[\[(](\d{1,3})(?:v\d+)?[\])]',
-    r'\s+(\d{1,3})(?:v\d+)?(?=$|\s*\[[^\]]+\]$)',
+    r'(?:\s+|(?<!\d)\.)(\d{1,3})(?:v\d+)?(?=$|\s*\[[^\]]+\]$)',
   ];
   for (var i = 0; i < patterns.length; i++) {
     final m = RegExp(patterns[i], caseSensitive: false).firstMatch(title);
     if (m == null) continue;
+    // The trailing number in H.264 / H.265 describes the codec, not an episode.
+    if (i == patterns.length - 1 &&
+        (m[1] == '264' || m[1] == '265') &&
+        RegExp(
+          r'\bH$',
+          caseSensitive: false,
+        ).hasMatch(title.substring(0, m.start))) {
+      continue;
+    }
     if (i < 2) season = '${int.parse(m[1]!)}';
     episode = '${int.parse(m[i < 2 ? 2 : 1]!)}';
     title = title.substring(0, m.start);

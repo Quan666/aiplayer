@@ -250,7 +250,7 @@ void main() {
           expect(availability.left, header.left);
         }
         for (final content in [
-          find.textContaining('MP4 / MOV · H.264 · 1920 × 1080'),
+          find.textContaining('MP4 · H.264 · 1920 × 1080'),
           find.text(story.summary),
         ]) {
           expect(tester.getRect(content).left, header.left);

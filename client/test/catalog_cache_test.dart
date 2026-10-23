@@ -256,7 +256,18 @@ void main() {
   test(
     'directory metadata keeps more than 256 previews and unresolved previews retry',
     () async {
-      final model = catalog(_Transport(_reply));
+      final model = catalog(
+        _Transport(
+          (uri) => uri.path == '/v0/episodes'
+              ? {
+                  'data': [
+                    {'sort': 1, 'name_cn': 'Start'},
+                    {'sort': 2, 'name_cn': 'Second'},
+                  ],
+                }
+              : _reply(uri),
+        ),
+      );
       List<SourceEntry> entries(String path) => [
         for (var episode = 1; episode <= 2; episode++)
           SourceEntry(

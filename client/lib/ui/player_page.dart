@@ -97,6 +97,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   int _handledCompletionRevision = 0;
   bool? _fullscreenLandscape;
   bool _leaving = false, _nativeFullscreen = false, _disposed = false;
+  bool _backgrounded = false;
   final _fullscreenTransitions = FullscreenTransition();
   final _mediaTransitions = FullscreenTransition();
   late final _backgroundGuard = PlaybackBackgroundGuard(
@@ -126,6 +127,10 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     super.initState();
     widget.controller?._select = selectMedia;
     WidgetsBinding.instance.addObserver(this);
+    _backgrounded = playbackIsBackgrounded(
+      WidgetsBinding.instance.lifecycleState,
+    );
+    _syncBackgroundPlayback();
     session.addListener(_changed);
     windowMode.bindSession(session);
     windowMode.addListener(_windowChanged);
@@ -257,6 +262,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   void _modelChanged() {
+    _syncBackgroundPlayback();
     _scheduleNextEpisode();
     if (_modelChanges.update(widget.model, session.media)) _refreshControls();
   }
@@ -272,6 +278,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     }
     _handledCompletionRevision = session.completionRevision;
     if (!widget.model.preferences.autoNextEpisode ||
+        session.backgroundPlaybackBlocked ||
         session.remotePlayback ||
         session.error.isNotEmpty) {
       return;
@@ -279,6 +286,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     final completed = session;
     final completionRevision = completed.completionRevision;
     final timelineRevision = completed.timelineRevision;
+    final backgroundPauseRevision = completed.backgroundPauseRevision;
     // Session notifications also rebuild the controls. Let those notifications
     // finish before replacing their session or touching the native player.
     scheduleMicrotask(() async {
@@ -288,6 +296,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
           _switchingMedia ||
           !identical(session, completed) ||
           completed.closed ||
+          completed.backgroundPlaybackBlocked ||
+          completed.backgroundPauseRevision != backgroundPauseRevision ||
           completed.remotePlayback ||
           completed.error.isNotEmpty ||
           !completed.player.state.completed ||
@@ -344,12 +354,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   void _windowChanged() {
     final state = WidgetsBinding.instance.lifecycleState;
-    if (!session.closed &&
-        !windowMode.active &&
-        playbackIsBackgrounded(state) &&
-        widget.model.preferences.pauseOnBackground) {
-      session.player.pause();
-    }
+    if (playbackIsBackgrounded(state)) _backgrounded = true;
+    _syncBackgroundPlayback();
     _refreshControls();
   }
 
@@ -453,15 +459,24 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!playbackIsBackgrounded(state)) {
+      _backgrounded = false;
+      _syncBackgroundPlayback();
+    }
     _backgroundGuard.update(state);
   }
 
+  void _syncBackgroundPlayback() => session.setBackgroundPlaybackBlocked(
+    _backgrounded &&
+        widget.model.preferences.pauseOnBackground &&
+        !windowMode.active,
+  );
+
   void _saveBackgroundState() {
+    _backgrounded = true;
+    _syncBackgroundPlayback();
     if (session.closed) return;
     session.checkpoint();
-    if (widget.model.preferences.pauseOnBackground && !windowMode.active) {
-      session.player.pause();
-    }
     unawaited(display.restoreBrightness());
   }
 
@@ -494,25 +509,45 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> selectMedia(SyncRecord media, {bool autoAdvance = false}) =>
-      _mediaTransitions.run(
-        () => _selectMedia(media, autoAdvance: autoAdvance),
+  Future<void> selectMedia(SyncRecord media, {bool autoAdvance = false}) {
+    // Capture before queuing: another selection or a background/resume cycle
+    // can finish while this request waits for an earlier native transition.
+    final expectedSession = session;
+    final expectedPauseRevision = session.backgroundPauseRevision;
+    bool requestIsCurrent() =>
+        !autoAdvance ||
+        (identical(session, expectedSession) &&
+            session.backgroundPauseRevision == expectedPauseRevision &&
+            !session.backgroundPlaybackBlocked);
+    return _mediaTransitions.run(() async {
+      if (!requestIsCurrent()) return;
+      await _selectMedia(
+        media,
+        autoAdvance: autoAdvance,
+        requestIsCurrent: requestIsCurrent,
       );
+    });
+  }
 
   Future<void> _selectMedia(
     SyncRecord media, {
     bool autoAdvance = false,
+    required bool Function() requestIsCurrent,
   }) async {
-    if (!mounted || _disposed || _leaving || media.id == session.media.id) {
+    if (!mounted ||
+        _disposed ||
+        _leaving ||
+        media.id == session.media.id ||
+        !requestIsCurrent()) {
       return;
     }
     _switchingMedia = true;
     final previous = session;
     try {
       if (windowMode.active) await windowMode.exit();
-      if (!mounted || _disposed || _leaving) return;
+      if (!mounted || _disposed || _leaving || !requestIsCurrent()) return;
       await previous.player.pause();
-      if (!mounted || _disposed || _leaving) return;
+      if (!mounted || _disposed || _leaving || !requestIsCurrent()) return;
       if (_retiringSession == null && _framePresented) {
         _retiringSession = previous;
         _retiringSurface = _videoSurface;
@@ -529,6 +564,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         _framePresented = false;
         _surfaceState = null;
       });
+      _syncBackgroundPlayback();
       if (_nativeFullscreen) {
         unawaited(_fullscreenTransitions.run(_syncVideoOrientation));
       }

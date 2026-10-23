@@ -302,6 +302,7 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
               children: [
                 MediaArtwork(
                   thumbnail: _view.thumbnail,
+                  loadWhileScrolling: true,
                   placeholder: ColoredBox(
                     color: GlassPalette.of(context).field,
                     child: Center(

@@ -11,16 +11,19 @@ String _number(Object? value, {String fallback = ''}) {
 
 /// A season/episode is one navigation destination. Alternate files remain in
 /// the group, with their own IDs, technical information and watch progress.
-String mediaEpisodeKey(SyncRecord media) {
+String mediaEpisodeKey(SyncRecord media, {String? seriesKey}) {
   final episode = _number(media.data['episode']);
   if (episode.isEmpty) return 'file:${media.id}';
-  return '${mediaSeriesKey(media)}:${_number(media.data['season'], fallback: '1')}:$episode';
+  return '${seriesKey ?? mediaSeriesKey(media)}:${_number(media.data['season'], fallback: '1')}:$episode';
 }
 
-Map<String, List<SyncRecord>> groupMediaEpisodes(Iterable<SyncRecord> media) {
+Map<String, List<SyncRecord>> groupMediaEpisodes(
+  Iterable<SyncRecord> media, {
+  String? seriesKey,
+}) {
   final groups = <String, List<SyncRecord>>{};
   for (final item in media) {
-    (groups[mediaEpisodeKey(item)] ??= []).add(item);
+    (groups[mediaEpisodeKey(item, seriesKey: seriesKey)] ??= []).add(item);
   }
   return groups;
 }
@@ -28,9 +31,10 @@ Map<String, List<SyncRecord>> groupMediaEpisodes(Iterable<SyncRecord> media) {
 List<SyncRecord> uniqueMediaEpisodes(
   Iterable<SyncRecord> media, {
   String? preferredId,
+  String? seriesKey,
   bool Function(SyncRecord)? playable,
 }) => [
-  for (final versions in groupMediaEpisodes(media).values)
+  for (final versions in groupMediaEpisodes(media, seriesKey: seriesKey).values)
     (List<SyncRecord>.of(versions)..sort((a, b) {
           if (a.id == preferredId) return -1;
           if (b.id == preferredId) return 1;

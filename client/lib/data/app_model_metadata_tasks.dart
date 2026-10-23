@@ -9,11 +9,15 @@ class MetadataTask extends ChangeNotifier {
   final String _selectionSeason;
   final AiMediaIdentity? _identity;
   final _cancel = CancelToken();
+  CancelToken? _attemptCancel;
+  CancelToken get _workCancel => _attemptCancel ?? _cancel;
   final _done = Completer<void>();
   Timer? _progressTimer;
   DateTime _lastProgress = DateTime.fromMillisecondsSinceEpoch(0);
   final Map<String, AiMetadataMatch> results = {};
   final Set<String> _completedIds = {};
+  final Map<String, (SyncRecord, Map<String, dynamic>)> _pendingEpisodeNames =
+      {};
   int matched = 0, failed = 0;
   bool running = true, cancelled = false, _started = false;
   String status = '等待识别', error = '';
@@ -33,8 +37,40 @@ class MetadataTask extends ChangeNotifier {
   int get total => _records.length;
   int get completed => _completedIds.length;
   Future<void> get done => _done.future;
+  List<Map<String, dynamic>> get _savedEpisodeNames {
+    final grouped = <String, Map<String, dynamic>>{};
+    for (final pending in _pendingEpisodeNames.values) {
+      final record = pending.$1, subject = pending.$2;
+      final key = _taskEpisodeNamesKey(subject, record);
+      final group = grouped.putIfAbsent(
+        key,
+        () => {'subject': subject, 'records': <Map<String, Object>>[]},
+      );
+      (group['records'] as List).add({
+        'id': record.id,
+        'revision': record.revision,
+      });
+    }
+    return grouped.values.toList();
+  }
+
   void _changed() => notifyListeners();
 }
+
+String _taskEpisodeNamesKey(Map<String, dynamic> subject, SyncRecord record) =>
+    '${subject['provider']}:${subject['mediaType']}:${subject['id']}:${record.data['season']}';
+
+Map<String, dynamic> _taskEpisodeNamesSubject(Map<String, dynamic> subject) => {
+  for (final key in const [
+    'provider',
+    'id',
+    'mediaType',
+    'season',
+    'season_episodes',
+    'episodeNames',
+  ])
+    if (subject.containsKey(key)) key: subject[key],
+};
 
 class _MetadataPaused implements Exception {
   const _MetadataPaused();
@@ -152,6 +188,7 @@ extension MetadataBackgroundTasks on AppModel {
     task.running = false;
     task.status = '已取消';
     task._cancel.cancel();
+    task._attemptCancel?.cancel();
     if (!task._done.isCompleted) task._done.complete();
     _taskChanged(task);
   }
@@ -170,6 +207,8 @@ extension MetadataBackgroundTasks on AppModel {
               if (!task._completedIds.contains(r.id))
                 {'id': r.id, 'revision': r.revision},
           ],
+          if (task._pendingEpisodeNames.isNotEmpty)
+            'episodeNames': task._savedEpisodeNames,
           if (task._selection != null) 'selection': task._selection,
           'season': task._selectionSeason,
           // The parsed identity is already cached by basename. Its presence
@@ -186,6 +225,8 @@ extension MetadataBackgroundTasks on AppModel {
     if (saved is! List || _metadataTasks.isNotEmpty) return;
     for (final row in saved.whereType<Map>()) {
       final records = <SyncRecord>[];
+      final recordIds = <String>{};
+      final pendingNames = <String, (SyncRecord, Map<String, dynamic>)>{};
       for (final item
           in (row['records'] as List? ?? const []).whereType<Map>()) {
         final record = store.get('media', '${item['id']}');
@@ -193,6 +234,22 @@ extension MetadataBackgroundTasks on AppModel {
             !record.deleted &&
             record.revision == item['revision']) {
           records.add(record);
+          recordIds.add(record.id);
+        }
+      }
+      for (final group
+          in (row['episodeNames'] as List? ?? const []).whereType<Map>()) {
+        if (group['subject'] is! Map) continue;
+        final subject = Map<String, dynamic>.from(group['subject']);
+        for (final item
+            in (group['records'] as List? ?? const []).whereType<Map>()) {
+          final record = store.get('media', '${item['id']}');
+          if (record != null &&
+              !record.deleted &&
+              record.revision == item['revision']) {
+            pendingNames[record.id] = (record, subject);
+            if (recordIds.add(record.id)) records.add(record);
+          }
         }
       }
       if (records.isEmpty ||
@@ -201,19 +258,22 @@ extension MetadataBackgroundTasks on AppModel {
       }
       _metadataTasks.add(
         MetadataTask._(
-          '${row['id']}',
-          '${row['label']}',
-          records,
-          ai: row['ai'] == true,
-          manual: row['manual'] == true,
-          selection: row['selection'] is Map
-              ? Map<String, dynamic>.from(row['selection'])
-              : null,
-          selectionSeason: '${row['season'] ?? ''}',
-          identity: row['analyzeSelection'] == true
-              ? const AiMediaIdentity(name: '')
-              : null,
-        ),
+            '${row['id']}',
+            '${row['label']}',
+            records,
+            ai: row['ai'] == true,
+            manual: row['manual'] == true,
+            selection: row['selection'] is Map
+                ? Map<String, dynamic>.from(row['selection'])
+                : null,
+            selectionSeason: '${row['season'] ?? ''}',
+            identity: row['analyzeSelection'] == true
+                ? const AiMediaIdentity(name: '')
+                : null,
+          )
+          .._pendingEpisodeNames.addAll(pendingNames)
+          .._completedIds.addAll(pendingNames.keys)
+          ..matched = pendingNames.length,
       );
     }
     _persistMetadataTasks();
@@ -258,6 +318,7 @@ extension MetadataBackgroundTasks on AppModel {
     final current = store.get('media', record.id);
     if (_disposed ||
         task._cancel.cancelled ||
+        task._workCancel.cancelled ||
         current == null ||
         current.deleted ||
         current.revision != record.revision) {
@@ -276,6 +337,22 @@ extension MetadataBackgroundTasks on AppModel {
     if (!task.manual && (!_foreground || activePlaybackMediaId != null)) {
       throw const _MetadataPaused();
     }
+    task._workCancel.check();
+  }
+
+  void _pauseAutomaticMetadataTasks() {
+    // A batch parser owns its own bounded request queue. Cancel the current
+    // attempt so that it also stops admitting queued HTTP work while hidden.
+    // The permanent task token remains live for foreground resumption.
+    var paused = false;
+    for (final task in _metadataTasks) {
+      final attempt = task._attemptCancel;
+      if (!task.manual && task.running && attempt?.cancelled == false) {
+        attempt!.cancel();
+        paused = true;
+      }
+    }
+    if (paused) _persistMetadataTasks();
   }
 
   Future<void> _drainMetadataTasks() async {
@@ -284,13 +361,17 @@ extension MetadataBackgroundTasks on AppModel {
     try {
       while (!_disposed) {
         final task = _metadataTasks
-            .where((t) =>
-                t.running &&
-                !t._started &&
-                (t.manual || (_foreground && activePlaybackMediaId == null)))
+            .where(
+              (t) =>
+                  t.running &&
+                  !t._started &&
+                  (t.manual || (_foreground && activePlaybackMediaId == null)),
+            )
             .firstOrNull;
         if (task == null) break;
         task._started = true;
+        final attempt = task.manual ? null : CancelToken();
+        task._attemptCancel = attempt;
         var paused = false;
         try {
           await _runMetadataTask(task);
@@ -300,7 +381,14 @@ extension MetadataBackgroundTasks on AppModel {
           task.status = '等待空闲';
           _taskChanged(task);
         } on Cancelled {
-          if (!_disposed) {
+          if (!_disposed &&
+              !task._cancel.cancelled &&
+              attempt?.cancelled == true) {
+            paused = true;
+            task._started = false;
+            task.status = '等待空闲';
+            _taskChanged(task);
+          } else if (!_disposed) {
             task.cancelled = true;
             task.status = '已取消';
           }
@@ -310,6 +398,7 @@ extension MetadataBackgroundTasks on AppModel {
             task.status = '识别未完成';
           }
         } finally {
+          task._attemptCancel = null;
           if (!paused && !_disposed) {
             task.running = false;
             if (task.matched == task.total) task.error = '';
@@ -329,8 +418,13 @@ extension MetadataBackgroundTasks on AppModel {
   }
 
   Future<void> _runMetadataTask(MetadataTask task) async {
-    final token = task._cancel;
+    final token = task._workCancel;
     _checkTaskReady(task);
+    await _fillPendingTaskEpisodeNames(task);
+    if (task.completed == task.total) {
+      await _fillTaskEpisodeNames(task);
+      return;
+    }
     if (task._selection != null) {
       await _runMetadataSelection(task);
       return;
@@ -365,6 +459,10 @@ extension MetadataBackgroundTasks on AppModel {
               task.error = safeFailure(error).message;
             }
             token.check();
+            // A lookup may have started in the foreground and returned after
+            // the app was hidden. Resume from the cached result when visible,
+            // without starting episode requests or writes while suspended.
+            _checkTaskReady(task);
             if (subject == null) {
               remaining.addAll(records);
               return;
@@ -379,13 +477,35 @@ extension MetadataBackgroundTasks on AppModel {
                 manual: task.manual,
                 mediaIds: allowed.map((r) => r.id).toSet(),
               );
+              if (!task.manual) {
+                // Identity is committed before optional episode lookup. A
+                // background pause must not retry its now-obsolete revision
+                // and count an already matched record as a failed attempt.
+                final namesSubject = _taskEpisodeNamesSubject(subject);
+                for (final record in allowed) {
+                  task._pendingEpisodeNames[record.id] = (
+                    store.get('media', record.id)!,
+                    namesSubject,
+                  );
+                }
+                for (final record in records) {
+                  _taskCompleteRecord(task, record, allowed.contains(record));
+                }
+              }
               try {
-                await fillEpisodeNames(
-                  '${first.data['series']}',
-                  subject,
-                  mediaIds: allowed.map((r) => r.id).toSet(),
-                  cancel: token,
-                );
+                if (task.manual) {
+                  await fillEpisodeNames(
+                    '${first.data['series']}',
+                    subject,
+                    mediaIds: allowed.map((r) => r.id).toSet(),
+                    cancel: token,
+                  );
+                } else {
+                  await _fillPendingTaskEpisodeNames(
+                    task,
+                    mediaIds: allowed.map((r) => r.id).toSet(),
+                  );
+                }
               } on Cancelled {
                 rethrow;
               } catch (_) {
@@ -423,14 +543,15 @@ extension MetadataBackgroundTasks on AppModel {
     final matches = await searchMetadataBatchWithAi(
       eligible.map(metadataFileName).toList(),
       cancel: token,
+      checkReady: () => _checkTaskReady(task),
       onProgress: (message) {
         task.status = message;
         _taskChanged(task);
       },
     );
+    _checkTaskReady(task);
     for (final record in remaining) {
-      token.check();
-      if (_disposed) throw const Cancelled();
+      _checkTaskReady(task);
       final match =
           matches[MediaAiRecognition.filenameOnly(metadataFileName(record))];
       if (match != null) task.results[record.id] = match;
@@ -446,6 +567,12 @@ extension MetadataBackgroundTasks on AppModel {
           fillNames: false,
           notify: false,
         );
+        if (applied && !task.manual) {
+          task._pendingEpisodeNames[record.id] = (
+            store.get('media', record.id)!,
+            _taskEpisodeNamesSubject(match!.subject!),
+          );
+        }
       }
       _taskCompleteRecord(task, record, applied);
     }
@@ -453,7 +580,7 @@ extension MetadataBackgroundTasks on AppModel {
   }
 
   Future<void> _runMetadataSelection(MetadataTask task) async {
-    final token = task._cancel;
+    final token = task._workCancel;
     task.status = '正在读取作品资料…';
     _taskChanged(task);
     final full = await catalog.details(
@@ -526,6 +653,10 @@ extension MetadataBackgroundTasks on AppModel {
   }
 
   Future<void> _fillTaskEpisodeNames(MetadataTask task) async {
+    if (!task.manual) {
+      await _fillPendingTaskEpisodeNames(task);
+      return;
+    }
     final grouped = <String, (Map<String, dynamic>, Set<String>)>{};
     for (final entry in task.results.entries) {
       final subject = entry.value.subject;
@@ -536,18 +667,58 @@ extension MetadataBackgroundTasks on AppModel {
       group.$2.add(entry.key);
     }
     for (final group in grouped.values) {
-      task._cancel.check();
+      _checkTaskReady(task);
       try {
         await fillEpisodeNames(
           '',
           group.$1,
           mediaIds: group.$2,
-          cancel: task._cancel,
+          cancel: task._workCancel,
         );
       } on Cancelled {
         rethrow;
       } catch (_) {
         /* optional names */
+      }
+    }
+  }
+
+  Future<void> _fillPendingTaskEpisodeNames(
+    MetadataTask task, {
+    Set<String>? mediaIds,
+  }) async {
+    final grouped = <String, (Map<String, dynamic>, Set<String>)>{};
+    for (final pending in task._pendingEpisodeNames.values.toList()) {
+      final record = pending.$1;
+      if (mediaIds != null && !mediaIds.contains(record.id)) continue;
+      final current = store.get('media', record.id);
+      if (current == null ||
+          current.deleted ||
+          current.revision != record.revision) {
+        task._pendingEpisodeNames.remove(record.id);
+        continue;
+      }
+      final subject = pending.$2;
+      final key = _taskEpisodeNamesKey(subject, record);
+      final group = grouped.putIfAbsent(key, () => (subject, <String>{}));
+      group.$2.add(record.id);
+    }
+    for (final group in grouped.values) {
+      _checkTaskReady(task);
+      try {
+        await fillEpisodeNames(
+          '',
+          group.$1,
+          mediaIds: group.$2,
+          cancel: task._workCancel,
+        );
+      } on Cancelled {
+        rethrow;
+      } catch (_) {
+        /* optional names */
+      }
+      for (final id in group.$2) {
+        task._pendingEpisodeNames.remove(id);
       }
     }
   }

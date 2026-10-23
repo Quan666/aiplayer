@@ -29,9 +29,12 @@ void main() {
         {'id': 'nas', 'kind': 'smb'},
         {'id': 'web', 'kind': 'webdav'},
       ]);
-      store.setLocal('directory-preview:nas', {'sourceId': 'nas'});
-      store.setLocal('directory-preview:web', {'sourceId': 'web'});
-      store.setLocal('directory-preview:other', {'sourceId': 'other'});
+      for (final sourceId in ['nas', 'web', 'other']) {
+        store.setLocal('directory-preview:$sourceId', {'sourceId': sourceId});
+        store.setLocal('directory-preview-envelope:$sourceId', {
+          'sourceId': sourceId,
+        });
+      }
       final model = AppModel(store, root);
       try {
         await tester.pumpWidget(

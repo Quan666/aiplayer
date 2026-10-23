@@ -179,6 +179,22 @@ void main() {
           },
         );
       }
+      final elsewhere = model.addMedia(
+        'one',
+        const SourceEntry(
+          name: '示例动画 S01E03.mkv',
+          path: '其他目录/示例动画 S01E03.mkv',
+        ),
+      );
+      store.save(
+        'progress',
+        model.progressKey(store.get('media', elsewhere)!),
+        {
+          'position': 70,
+          'duration': 100,
+          'updatedAt': '2026-10-22T12:00:00.000Z',
+        },
+      );
       String? played;
       try {
         await tester.pumpWidget(
@@ -227,6 +243,14 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('重新识别影视资料'), findsOneWidget);
         expect(find.text('手动搜索影视资料'), findsOneWidget);
+        Navigator.of(tester.element(find.text('重新识别影视资料'))).pop();
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip('匹配海报与简介'));
+        await tester.pumpAndSettle();
+        expect(find.text('2 个视频'), findsOneWidget);
+        expect(find.text('3 个视频'), findsNothing);
+        await tester.tap(find.text('关闭'));
+        await tester.pumpAndSettle();
         expect(tester.takeException(), isNull);
       } finally {
         await tester.pumpWidget(const SizedBox());

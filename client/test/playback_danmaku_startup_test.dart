@@ -16,6 +16,160 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 void main() {
+  for (final pausePlayback in [true, false]) {
+    test('invisible startup stops first-frame polling '
+        '(pause playback: $pausePlayback)', () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      await session.open();
+      session.player.state = session.player.state.copyWith(
+        videoParams: const VideoParams(w: 640, h: 360),
+      );
+      session.video.rect.value = const Rect.fromLTWH(0, 0, 640, 360);
+      session.video.firstFrame.complete();
+      await session.player.platform.frameReadStarted.future;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(session.player.platform.frameReads, greaterThan(1));
+      if (pausePlayback) {
+        session.setBackgroundPlaybackBlocked(true);
+      } else {
+        session.setDanmakuPresentationActive(false);
+      }
+      final reads = session.player.platform.frameReads;
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(session.player.platform.frameReads, reads);
+      expect(session.firstFrameRendered, isFalse);
+      expect(session.player.state.playing, !pausePlayback);
+
+      session.player.platform.frame = '{"picture-type":"I"}';
+      session.setBackgroundPlaybackBlocked(false);
+      session.setDanmakuPresentationActive(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.firstFrameRendered, isTrue);
+      expect(session.player.state.playing, !pausePlayback);
+    });
+  }
+
+  test(
+    'a late first-frame result cannot restart hidden startup polling',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      await session.open();
+      final pending = session.player.platform.frameReadGate =
+          Completer<String>();
+      session.player.state = session.player.state.copyWith(
+        videoParams: const VideoParams(w: 640, h: 360),
+      );
+      session.video.rect.value = const Rect.fromLTWH(0, 0, 640, 360);
+      session.video.firstFrame.complete();
+      await session.player.platform.frameReadStarted.future;
+      session.setDanmakuPresentationActive(false);
+      pending.complete('');
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(session.player.platform.frameReads, 1);
+      expect(session.firstFrameRendered, isFalse);
+      session.player.platform.frameReadGate = null;
+      session.player.platform.frame = '{"picture-type":"I"}';
+      session.setDanmakuPresentationActive(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.platform.frameReads, 2);
+      expect(session.firstFrameRendered, isTrue);
+    },
+  );
+
+  for (final foregroundBeforeOpen in [false, true]) {
+    test('backgrounding during source preparation suppresses autoplay '
+        '(foreground before open: $foregroundBeforeOpen)', () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      final opening = session.open(play: true);
+      session.setBackgroundPlaybackBlocked(true);
+      if (foregroundBeforeOpen) {
+        session.setBackgroundPlaybackBlocked(false);
+      }
+      model.source.complete(_Source());
+      await opening.timeout(const Duration(seconds: 2));
+      expect(session.ready, isTrue);
+      expect(session.player.playRequests, [false]);
+      expect(session.player.state.playing, isFalse);
+      session.setBackgroundPlaybackBlocked(false);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+      expect(session.player.playRequests, [false]);
+    });
+  }
+
+  for (final foregroundBeforeOpen in [false, true]) {
+    test('a late native open cannot undo a background pause '
+        '(foreground before completion: $foregroundBeforeOpen)', () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      final gate = session.player.openGate = Completer<void>();
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      final opening = session.open(play: true);
+      await session.player.openStarted.future;
+      expect(session.player.playRequests, [true]);
+      session.setBackgroundPlaybackBlocked(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.pauses, 1);
+      if (foregroundBeforeOpen) {
+        session.setBackgroundPlaybackBlocked(false);
+      }
+      gate.complete();
+      await opening.timeout(const Duration(seconds: 2));
+      expect(session.player.state.playing, isFalse);
+      expect(session.player.pauses, greaterThanOrEqualTo(2));
+      session.setBackgroundPlaybackBlocked(false);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+    });
+  }
+
+  test(
+    'background gate also rejects a late playing event after startup',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      await session.open();
+      session.setBackgroundPlaybackBlocked(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+      session.player.emitPlaying(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+      session.setBackgroundPlaybackBlocked(false);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+    },
+  );
+
+  test('an allowed playback session retains requested autoplay', () async {
+    final model = _Model();
+    final session = _Session(model);
+    _cleanup(model, session);
+    model.credentials.complete(null);
+    model.source.complete(_Source());
+    session.setBackgroundPlaybackBlocked(false);
+    await session.open(play: true);
+    expect(session.player.playRequests, [true]);
+    expect(session.player.state.playing, isTrue);
+    expect(session.player.pauses, 0);
+  });
+
   test('closing during source connection disposes a late adapter', () async {
     final model = _Model();
     final session = _Session(model);
@@ -218,6 +372,28 @@ void main() {
     expect(session.notice, '无法读取弹幕配置，请在设置中重新保存。');
   });
 
+  test('a late danmaku session inherits hidden inline presentation', () async {
+    final model = _Model();
+    final session = _Session(model);
+    final api = _Api();
+    _cleanup(model, session);
+    session.setDanmakuPresentationActive(false);
+    model.source.complete(_Source());
+    final opening = session.open();
+    model.credentials.complete(api);
+    await opening;
+    await api.searchStarted.future;
+    final danmaku = session.danmaku!;
+    danmaku.episodeId = '42';
+    danmaku.configure(isPlaying: true);
+    expect(danmaku.visible, isTrue);
+    expect(danmaku.playing, isTrue);
+    expect(danmaku.active, isFalse);
+    session.setDanmakuPresentationActive(true);
+    expect(danmaku.active, isTrue);
+    session.setDanmakuPresentationActive(false);
+  });
+
   test(
     'showing danmaku restarts an initial match cancelled by hiding',
     () async {
@@ -413,9 +589,9 @@ class _Player implements Player {
   @override
   final _Native platform = _Native();
   @override
-  final stream = const PlayerStream(
-    Stream.empty(),
-    Stream.empty(),
+  late final stream = PlayerStream(
+    const Stream.empty(),
+    _playing.stream,
     Stream.empty(),
     Stream.empty(),
     Stream.empty(),
@@ -441,26 +617,59 @@ class _Player implements Player {
     Stream.empty(),
   );
   int opens = 0;
+  int pauses = 0;
+  final playRequests = <bool>[];
+  final _playing = StreamController<bool>.broadcast();
+  final openStarted = Completer<void>();
+  Completer<void>? openGate;
   bool disposed = false;
   @override
-  Future<void> open(Playable playable, {bool play = true}) async => opens++;
+  Future<void> open(Playable playable, {bool play = true}) async {
+    opens++;
+    playRequests.add(play);
+    openStarted.complete();
+    await openGate?.future;
+    emitPlaying(play);
+  }
+
+  void emitPlaying(bool value) {
+    state = state.copyWith(playing: value);
+    _playing.add(value);
+  }
+
   @override
   Future<void> setVolume(double value) async {}
   @override
   Future<void> setRate(double value) async {}
   @override
-  Future<void> pause() async {}
+  Future<void> pause() async {
+    pauses++;
+    emitPlaying(false);
+  }
+
   @override
-  Future<void> dispose() async => disposed = true;
+  Future<void> dispose() async {
+    disposed = true;
+    await _playing.close();
+  }
+
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _Native implements PlatformPlayer {
   String frame = '';
+  int frameReads = 0;
+  final frameReadStarted = Completer<void>();
+  Completer<String>? frameReadGate;
   Future<void> setProperty(String name, String value) async {}
-  Future<String> getProperty(String name) async =>
-      name == 'video-frame-info' ? frame : '';
+  Future<String> getProperty(String name) async {
+    if (name != 'video-frame-info') return '';
+    frameReads++;
+    if (!frameReadStarted.isCompleted) frameReadStarted.complete();
+    return frameReadGate?.future ?? frame;
+  }
+
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

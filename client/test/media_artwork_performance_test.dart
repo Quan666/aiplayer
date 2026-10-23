@@ -123,6 +123,90 @@ class _RenderTransformProbe extends RenderProxyBox {
 }
 
 void main() {
+  testWidgets('paused without a frame ignores poster capacity until resume', (
+    tester,
+  ) async {
+    final cache = _FullPosterCache();
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: 100,
+              height: 150,
+              child: MediaArtwork(poster: 'paused-cover', cache: cache),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(cache.requested, isEmpty);
+      expect(tester.binding.hasScheduledFrame, isFalse);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      cache.release();
+      cache.fileChanged('paused-cover');
+      await tester.idle();
+      expect(cache.requested, isEmpty);
+      expect(tester.binding.hasScheduledFrame, isFalse);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+      expect(cache.requested, ['paused-cover']);
+    } finally {
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpWidget(const SizedBox());
+      cache.close();
+    }
+  });
+
+  void endScroll(WidgetTester tester) {
+    final position = tester
+        .state<ScrollableState>(find.byType(Scrollable).first)
+        .position;
+    position
+        .drag(DragStartDetails(), () {})
+        .end(DragEndDetails(primaryVelocity: 0));
+  }
+
+  testWidgets('deferred covers wait for scroll events without retry timers', (
+    tester,
+  ) async {
+    final cache = _RecordingPosterCache();
+    var defer = true, retries = 0;
+    await runZoned(
+      () async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: ListView(
+              physics: _DeferredPhysics(() => defer),
+              children: [
+                SizedBox(
+                  height: 100,
+                  child: MediaArtwork(poster: 'deferred', cache: cache),
+                ),
+              ],
+            ),
+          ),
+        );
+        await tester.pump(const Duration(seconds: 3));
+        expect(cache.requested, isEmpty);
+        expect(retries, 0);
+        expect(tester.binding.hasScheduledFrame, isFalse);
+        defer = false;
+        endScroll(tester);
+        await tester.pump();
+        expect(cache.requested, ['deferred']);
+        await tester.pumpWidget(const SizedBox());
+      },
+      zoneSpecification: ZoneSpecification(
+        createTimer: (self, parent, zone, duration, callback) {
+          if (duration == const Duration(milliseconds: 80)) retries++;
+          return parent.createTimer(zone, duration, callback);
+        },
+      ),
+    );
+    cache.close();
+  });
+
   testWidgets('same-path replacement refreshes mounted and new covers', (
     tester,
   ) async {
@@ -704,7 +788,8 @@ void main() {
     expect(find.byType(Image), findsNothing);
 
     defer = false;
-    await tester.pump(const Duration(milliseconds: 80));
+    endScroll(tester);
+    await tester.pump();
     await tester.pump();
     expect(find.byType(Image), findsOneWidget);
     expect(cache.requests, 1);
@@ -916,7 +1001,8 @@ void main() {
     expect(cache.requested, isEmpty);
     await tester.pumpWidget(surface('current'));
     defer = false;
-    await tester.pump(const Duration(milliseconds: 80));
+    endScroll(tester);
+    await tester.pump();
     expect(cache.requested, ['current']);
     await tester.pumpWidget(surface('current'));
     await tester.pump(const Duration(milliseconds: 160));
@@ -981,7 +1067,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 160));
     expect(cache.requested, isEmpty);
     defer = false;
-    await tester.pump(const Duration(milliseconds: 80));
+    endScroll(tester);
+    await tester.pump();
     expect(cache.requested, ['nested']);
     await tester.pumpWidget(const SizedBox());
     cache.close();
@@ -1009,7 +1096,8 @@ void main() {
     expect(requested, isEmpty);
     await tester.pumpWidget(surface('visible'));
     defer = false;
-    await tester.pump(const Duration(milliseconds: 80));
+    endScroll(tester);
+    await tester.pump();
     expect(requested, ['visible']);
     await tester.pump(const Duration(milliseconds: 160));
     expect(requested, ['visible']);

@@ -3,7 +3,9 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:aiplayer_smb/aiplayer_smb.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 
@@ -26,6 +28,7 @@ import 'theme/settings_styles.dart';
 import 'player_page.dart';
 import 'navigation_reveal.dart';
 import 'media_details_content.dart';
+import 'media_file_details.dart';
 import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
 
@@ -213,17 +216,23 @@ typedef _KnownFolder = LibraryFolderSnapshot;
 
 class _KnownFolderIndex {
   Object? _key;
+  int _request = 0;
   Map<String, _KnownFolder> _folders = {};
   LibrarySnapshot? snapshot;
 
   Future<Map<String, _KnownFolder>> load(AppModel model) async {
-    final loaded = snapshot = await model.loadLibrarySnapshot();
-    _key = (
-      model.store,
-      model.store.recordsRevision('media'),
-      model.store.locationRevision,
-    );
-    return _folders = loaded.folders;
+    final request = ++_request;
+    final loaded = await model.loadLibrarySnapshot();
+    if (request == _request) {
+      snapshot = loaded;
+      _key = (
+        model.store,
+        model.store.recordsRevision('media'),
+        model.store.locationRevision,
+      );
+      _folders = loaded.folders;
+    }
+    return loaded.folders;
   }
 
   Map<String, _KnownFolder> read(AppModel model) {
@@ -276,6 +285,13 @@ DirectoryCollection? _knownCollection(
   DirectoryCollection? preview,
 }) {
   final folder = folders[_folderKey(sourceId, path)];
+  // Large directory recognition and donor reconciliation are prepared by the
+  // metadata worker. Lazy folder rows can reuse its preview without scanning
+  // the complete folder again on the UI isolate.
+  if ((folder?.entries.length ?? 0) >= 256 ||
+      (preview?.videos.length ?? 0) >= 256) {
+    return preview;
+  }
   final value =
       preview ??
       (folder == null
@@ -347,6 +363,7 @@ class _FolderArtwork extends StatelessWidget {
           poster: poster,
           cache: model.posterCache,
           thumbnail: frame,
+          loadWhileScrolling: true,
           placeholder: fallback(),
           onRequestPreview: onRequestPreview,
         ),
@@ -375,7 +392,7 @@ class SourcesPage extends StatefulWidget {
   State<SourcesPage> createState() => _SourcesPageState();
 }
 
-class _SourcesPageState extends State<SourcesPage> {
+class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   AppModel get model => widget.model;
   CancelToken? scan;
   bool localOpen = false;
@@ -389,10 +406,37 @@ class _SourcesPageState extends State<SourcesPage> {
   Object? _localEntriesKey;
   List<SourceEntry> _localEntriesSnapshot = const [];
   Map<String, SyncRecord> _localRecords = {};
+  bool _foreground = true, _visible = true;
+  Object? _renderedRevision;
+
+  Object get _rootRevision => (
+    model.store,
+    model.store.recordsRevision('media'),
+    model.store.locationRevision,
+    model.store.localKeyRevision('sources'),
+    model.store.localKeyRevision(SourceFavorites.storageKey),
+    model.store.localKeyRevision('settings'),
+    model.store.localPrefixRevision('browse:'),
+    localOpen
+        ? (
+            model.store.recordsRevision('progress'),
+            model.store.localPrefixRevision('preview:'),
+            model.store.localPrefixRevision('mediaMetadata:'),
+            model.store.localPrefixRevision('episodeTitle:'),
+            model.store.localPrefixRevision('media-title-display:'),
+            model.store.localPrefixRevision('directorySort:'),
+            model.scanning,
+            model.status,
+          )
+        : null,
+  );
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     widget.controller?.addListener(_showRoot);
     widget.model.addListener(_refreshRoot);
   }
@@ -413,8 +457,24 @@ class _SourcesPageState extends State<SourcesPage> {
   void _refreshRoot() {
     if (!mounted || opened != null) return;
     // A retained tab rebuilds with the latest snapshots on activation.
-    if (!widget.active) return;
+    if (!widget.active || !_visible || !_foreground) return;
+    if (_renderedRevision == _rootRevision) return;
     setState(() {});
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _visible =
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.isCurrentOf(context) ?? true);
+    _refreshRoot();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    if (_foreground) _refreshRoot();
   }
 
   void _showRoot() {
@@ -467,6 +527,7 @@ class _SourcesPageState extends State<SourcesPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     widget.controller?.removeListener(_showRoot);
     widget.model.removeListener(_refreshRoot);
     _rootScroll.dispose();
@@ -594,6 +655,7 @@ class _SourcesPageState extends State<SourcesPage> {
           child: CustomScrollView(
             key: const PageStorageKey('sources-scroll'),
             controller: _rootScroll,
+            scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
             slivers: [
               SliverPadding(
                 padding: EdgeInsets.only(
@@ -831,6 +893,11 @@ class _SourcesPageState extends State<SourcesPage> {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
+              leading: const Icon(Icons.description_outlined),
+              title: const Text('查看文件详情'),
+              onTap: () => Navigator.pop(context, 'file-details'),
+            ),
+            ListTile(
               leading: const Icon(Icons.auto_awesome_outlined),
               title: const Text('重新识别影视资料'),
               onTap: () => Navigator.pop(context, 'auto'),
@@ -845,6 +912,10 @@ class _SourcesPageState extends State<SourcesPage> {
       ),
     );
     if (action == null || !mounted) return;
+    if (action == 'file-details') {
+      await showMediaFileDetails(context, model: model, item: item);
+      return;
+    }
     await _matchSourceRecords(context, model, [
       item,
     ], automatic: action == 'auto');
@@ -946,6 +1017,7 @@ class _SourcesPageState extends State<SourcesPage> {
       poster: poster,
       cache: model.posterCache,
       thumbnail: path,
+      loadWhileScrolling: true,
       placeholder: fallback(),
       onRequestPreview: poster.isEmpty
           ? () => model.ensureMediaPreview(media.id)
@@ -959,6 +1031,7 @@ class _SourcesPageState extends State<SourcesPage> {
 
   @override
   Widget build(BuildContext context) {
+    _renderedRevision = _rootRevision;
     if (opened case final source?) {
       return SourceBrowser(
         key: ValueKey('${source['id']}:${source.hashCode}:$initialPath'),
@@ -1047,6 +1120,7 @@ class _ContentList extends StatelessWidget {
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) => ListView.builder(
+      scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
       padding: EdgeInsets.fromLTRB(
         constraints.maxWidth < 600 ? 12 : 24,
         GlassMetrics.pageTopPadding(context) +
@@ -1677,7 +1751,8 @@ class SourceBrowser extends StatefulWidget {
   State<SourceBrowser> createState() => _SourceBrowserState();
 }
 
-class _SourceBrowserState extends State<SourceBrowser> {
+class _SourceBrowserState extends State<SourceBrowser>
+    with WidgetsBindingObserver {
   SourceAdapter? adapter;
   List<SourceEntry> entries = [];
   final paths = <({String path, String name})>[];
@@ -1698,7 +1773,6 @@ class _SourceBrowserState extends State<SourceBrowser> {
   bool _hasCollectionHeader = false;
   List<SyncRecord>? _headerSeriesRecords;
   MediaCollectionDetails? _headerDetails;
-  Object? _headerProgressKey;
   SyncRecord? _headerLatest;
   final folderCollections = <String, DirectoryCollection?>{};
   final folderQueue = <({SourceEntry entry, String parent})>[];
@@ -1708,6 +1782,20 @@ class _SourceBrowserState extends State<SourceBrowser> {
   bool _modelDirty = false;
   Map<String, _KnownFolder> knownFolders = {};
   final _knownFolderIndex = _KnownFolderIndex();
+  final _listingFingerprints = <String, String>{};
+  final _completedInspections = <String, (String, Object)>{};
+  Object? _catalogRevision;
+  Timer? _refreshTimer;
+  CancelToken? _refreshCancel;
+  CancelToken? _loadCancel;
+  Future<void>? _refreshWork;
+  Future<void>? _inspectionWork;
+  bool _routeCurrent = true, _foreground = true;
+  bool _refreshPending = false, _refreshScheduled = false;
+  bool _openPending = false;
+  int _refreshFailures = 0;
+  bool get _canRefresh =>
+      mounted && widget.active && _routeCurrent && _foreground && !playing;
 
   // A favorite is a separate navigation entry point. Its stack must never
   // replace the ordinary source stack with a path missing its ancestors.
@@ -1762,6 +1850,9 @@ class _SourceBrowserState extends State<SourceBrowser> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     widget.model.addListener(_modelChanged);
     final stored = widget.model.store.local(_stateKey);
     if (stored is Map && widget.associateId == null) {
@@ -1801,18 +1892,29 @@ class _SourceBrowserState extends State<SourceBrowser> {
 
   void _modelChanged() {
     _modelDirty = true;
-    if (!widget.active) return;
+    final revision = widget.model.catalog.directoryInspectionRevision(
+      widget.source['id'],
+    );
+    if (_catalogRevision != revision) {
+      _catalogRevision = revision;
+      _completedInspections.clear();
+      _refreshFailures = 0;
+      _directoryCancel.cancel();
+      _queueRefresh();
+    }
+    if (!_canRefresh) return;
     if (!mounted || _modelRefreshScheduled) return;
     _modelRefreshScheduled = true;
     scheduleMicrotask(() async {
+      var applied = false;
       try {
-        if (!mounted || !widget.active) return;
+        if (!_canRefresh) return;
         _modelDirty = false;
         final ticket = generation;
         final sorted = busy ? null : await _visible(allEntries);
-        if (!mounted || !widget.active || ticket != generation) return;
+        if (!_canRefresh || ticket != generation) return;
         final known = await _knownFolderIndex.load(widget.model);
-        if (!mounted || !widget.active || ticket != generation) return;
+        if (!_canRefresh || ticket != generation) return;
         final metadataChanged = !identical(knownFolders, known);
         knownFolders = known;
         setState(() {
@@ -1840,11 +1942,17 @@ class _SourceBrowserState extends State<SourceBrowser> {
           }
           _prepareCollectionDetails();
         });
+        applied = true;
+      } on Cancelled {
+        // Snapshot work may finish after this browser/model was disposed.
       } on DirectorySortCancelled {
         // Navigation/disposal superseded this listing.
       } finally {
+        if (!applied) _modelDirty = true;
         _modelRefreshScheduled = false;
-        if (mounted && widget.active && _modelDirty) _modelChanged();
+        // Failed/cancelled reads stay dirty for the next notification/resume.
+        // Only a successful read may immediately consume a coalesced update.
+        if (applied && _canRefresh && _modelDirty) _modelChanged();
       }
     });
   }
@@ -1852,9 +1960,10 @@ class _SourceBrowserState extends State<SourceBrowser> {
   @override
   void didUpdateWidget(SourceBrowser oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.model != widget.model ||
-        oldWidget.source['id'] != widget.source['id']) {
+    final sourceChanged = !mapEquals(oldWidget.source, widget.source);
+    if (oldWidget.model != widget.model || sourceChanged) {
       _directoryCancel.cancel();
+      _refreshCancel?.cancel();
       oldWidget.model.cancelDirectoryRecognition();
     }
     if (oldWidget.model != widget.model) {
@@ -1865,39 +1974,279 @@ class _SourceBrowserState extends State<SourceBrowser> {
     if (widget.active &&
         (!oldWidget.active || oldWidget.model != widget.model)) {
       if (_modelDirty) _modelChanged();
+      _queueRefresh();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(_inspectNextFolder());
       });
     }
+    if (!widget.active) _pauseRefresh();
+    if (oldWidget.model != widget.model || sourceChanged) unawaited(_open());
   }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final wasCurrent = _routeCurrent;
+    _routeCurrent = ModalRoute.isCurrentOf(context) ?? true;
+    if (!_routeCurrent) {
+      _pauseRefresh();
+    } else if (!wasCurrent) {
+      _queueRefresh();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final wasForeground = _foreground;
+    _foreground = state == AppLifecycleState.resumed;
+    if (!_foreground) {
+      _pauseRefresh();
+    } else if (!wasForeground) {
+      _queueRefresh();
+    }
+  }
+
+  void _pauseRefresh() {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _refreshCancel?.cancel();
+    _loadCancel?.cancel();
+    _directoryCancel.cancel();
+    _refreshPending = true;
+  }
+
+  void _queueRefresh() {
+    if (_canRefresh && _openPending) {
+      unawaited(_open());
+      return;
+    }
+    if (_canRefresh && _directoryCancel.cancelled) {
+      _directoryCancel = CancelToken();
+    }
+    if (_canRefresh && _modelDirty) _modelChanged();
+    if (_canRefresh) unawaited(_inspectNextFolder());
+    if (widget.source['kind'] == 'http' || widget.associateId != null) return;
+    _refreshPending = true;
+    if (!_canRefresh ||
+        busy ||
+        _loadCancel != null ||
+        _refreshWork != null ||
+        _inspectionWork != null ||
+        _refreshScheduled) {
+      return;
+    }
+    _refreshScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _refreshScheduled = false;
+      if (_canRefresh &&
+          !busy &&
+          _loadCancel == null &&
+          _inspectionWork == null &&
+          _refreshWork == null &&
+          _refreshPending) {
+        _refreshPending = false;
+        final work = _refreshCurrent();
+        _refreshWork = work;
+        unawaited(
+          work.whenComplete(() {
+            if (identical(_refreshWork, work)) _refreshWork = null;
+            _scheduleRefresh();
+          }),
+        );
+      }
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  void _scheduleRefresh() {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    if (!_canRefresh ||
+        busy ||
+        _loadCancel != null ||
+        _refreshWork != null ||
+        _inspectionWork != null ||
+        widget.source['kind'] == 'http' ||
+        widget.associateId != null) {
+      return;
+    }
+    if (_refreshPending) {
+      _queueRefresh();
+      return;
+    }
+    _refreshTimer = Timer(
+      Duration(seconds: 30 * (1 << _refreshFailures.clamp(0, 3))),
+      _queueRefresh,
+    );
+  }
+
+  Future<List<SourceEntry>> _readDirectory(
+    String directory,
+    CancelToken token,
+  ) async {
+    // A refresh owns its connection. Cancelling a hidden page must not close
+    // the adapter used by the bounded folder preview queue.
+    SourceAdapter? connection;
+    final model = widget.model;
+    final sourceId = widget.source['id'] as String;
+    final direct = widget.source['kind'] == 'http';
+    Future<void>? closing;
+    Future<void> close() => closing ??= _closeSource(connection);
+    Future<List<SourceEntry>> read() async {
+      final next = await model.adapter(sourceId);
+      if (token.cancelled) {
+        await _closeSource(next);
+        throw const Cancelled();
+      }
+      connection = next;
+      return direct ? [await next.stat('')] : await next.list(directory);
+    }
+
+    try {
+      return await Future.any([
+        read(),
+        token.whenCancelled.then((_) async {
+          await close();
+          throw const Cancelled();
+        }),
+      ]);
+    } finally {
+      await close();
+    }
+  }
+
+  Future<String> _listingFingerprint(
+    String directory,
+    List<SourceEntry> found,
+    CancelToken token,
+  ) async {
+    token.check();
+    final prepare = widget.model.catalog.prepareDirectory;
+    final context = 'hideHidden:$hideHidden';
+    // Production AppModel binds this to its existing metadata worker. Memory
+    // stores in widget tests use the same deterministic preparation directly.
+    final prepared = prepare == null
+        ? prepareDirectoryInspection(
+            widget.source['id'],
+            directory,
+            context,
+            found,
+          )
+        : await prepare(widget.source['id'], directory, context, found, token);
+    token.check();
+    return prepared.fingerprint;
+  }
+
+  Future<void> _refreshCurrent() async {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    final ticket = generation;
+    final directory = current;
+    final token = _refreshCancel = CancelToken();
+    try {
+      final found = await _readDirectory(directory, token);
+      final fingerprint = await _listingFingerprint(directory, found, token);
+      if (!_canRefresh || ticket != generation || directory != current) return;
+      if (_listingFingerprints[directory] == fingerprint) {
+        if (_inspectionComplete(directory, fingerprint)) {
+          _refreshFailures = 0;
+          return;
+        }
+        _directoryCancel.cancel();
+        _directoryCancel = token;
+        await _inspectCurrent(
+          ticket,
+          directory,
+          found,
+          fingerprint: fingerprint,
+          reconcile: false,
+        );
+        return;
+      }
+      final visible = await _visible(found);
+      if (!_canRefresh || ticket != generation || directory != current) return;
+      if (cached.length >= 16 && !cached.containsKey(directory)) {
+        _completedInspections.remove(cached.keys.first);
+        _listingFingerprints.remove(cached.keys.first);
+        cached.remove(cached.keys.first);
+      }
+      cached[directory] = found;
+      allEntries = found;
+      // Retain the controller and its current offset when a server adds files.
+      setState(() {
+        error = '';
+        entries = visible;
+      });
+      _directoryCancel.cancel();
+      _directoryCancel = token;
+      await _inspectCurrent(ticket, directory, found, fingerprint: fingerprint);
+    } on Cancelled {
+      // Hidden/closed pages and newer directories own their next refresh.
+    } on DirectorySortCancelled {
+      // Navigation superseded the worker result.
+    } catch (_) {
+      if (_canRefresh && ticket == generation) {
+        _refreshFailures = (_refreshFailures + 1).clamp(0, 3);
+      }
+    } finally {
+      if (identical(_refreshCancel, token)) _refreshCancel = null;
+    }
+  }
+
+  bool _inspectionComplete(String directory, String fingerprint) =>
+      _completedInspections[directory] ==
+      (
+        fingerprint,
+        widget.model.catalog.directoryInspectionRevision(widget.source['id']),
+      );
 
   Future<void> _inspectCurrent(
     int ticket,
     String directory,
-    List<SourceEntry> found,
-  ) async {
+    List<SourceEntry> found, {
+    String? fingerprint,
+    bool reconcile = true,
+  }) async {
     if (widget.associateId != null) return;
     final token = _directoryCancel;
+    final revision = widget.model.catalog.directoryInspectionRevision(
+      widget.source['id'],
+    );
     try {
+      final prepared =
+          fingerprint ?? await _listingFingerprint(directory, found, token);
+      if (!_canRefresh || ticket != generation || current != directory) return;
       final visible = await _visible(found);
-      final initial = collection;
-      final resolved = initial == null
+      // Opening a folder establishes its complete episode list immediately.
+      // A cached poster may describe an older subset of files and must never
+      // substitute for the listing that was just opened.
+      final resolved = reconcile
           ? await widget.model.synchronizeDirectoryEntriesInBackground(
               widget.source['id'],
               directory,
               visible,
               cancel: token,
             )
-          : await widget.model.synchronizeCollectionInBackground(
-              widget.source['id'],
-              initial,
-              importMissing: true,
-              cancel: token,
-            );
-      if (resolved != null) {
-        if (!mounted || ticket != generation || current != directory) return;
+          : collection;
+      token.check();
+      if (!_canRefresh || ticket != generation || current != directory) return;
+      // File membership can be complete while optional metadata is still
+      // missing. Its retry must not reimport the same directory each time.
+      _listingFingerprints[directory] = prepared;
+      if (reconcile && resolved != null) {
+        if (!_canRefresh ||
+            token.cancelled ||
+            ticket != generation ||
+            current != directory) {
+          return;
+        }
         final known = await _knownFolderIndex.load(widget.model);
-        if (!mounted || ticket != generation || current != directory) return;
+        if (!_canRefresh ||
+            token.cancelled ||
+            ticket != generation ||
+            current != directory) {
+          return;
+        }
         knownFolders = known;
         setState(() => _setCollection(resolved));
       }
@@ -1907,23 +2256,78 @@ class _SourceBrowserState extends State<SourceBrowser> {
         visible,
         cancel: token,
       );
-      if (mounted && ticket == generation && current == directory) {
-        final resolved = value == null
-            ? collection
+      if (_canRefresh &&
+          !token.cancelled &&
+          ticket == generation &&
+          current == directory) {
+        // Catalogue caches supply presentation metadata. The current listing
+        // remains authoritative even if that cache knows fewer episode paths.
+        final enriched = value == null || value.subject == null
+            ? resolved ?? collection ?? value
+            : resolved?.withMetadata(value.subject, value.episodeTitles) ??
+                  value;
+        final updated = value == null || (!reconcile && value.subject == null)
+            ? enriched
             : await widget.model.synchronizeCollectionInBackground(
                 widget.source['id'],
-                value,
+                enriched!,
                 importMissing: true,
                 cancel: token,
               );
-        if (!mounted || ticket != generation || current != directory) return;
-        final known = await _knownFolderIndex.load(widget.model);
-        if (!mounted || ticket != generation || current != directory) return;
-        knownFolders = known;
-        setState(() {
-          _setCollection(resolved);
-          folderCollections[directory] = collection;
-        });
+        if (!_canRefresh ||
+            token.cancelled ||
+            ticket != generation ||
+            current != directory) {
+          return;
+        }
+        if (reconcile || !identical(updated, collection)) {
+          final known = await _knownFolderIndex.load(widget.model);
+          if (!_canRefresh ||
+              token.cancelled ||
+              ticket != generation ||
+              current != directory) {
+            return;
+          }
+          knownFolders = known;
+          setState(() {
+            _setCollection(updated);
+            folderCollections[directory] = collection;
+          });
+        }
+        if (revision !=
+            widget.model.catalog.directoryInspectionRevision(
+              widget.source['id'],
+            )) {
+          _refreshPending = true;
+          return;
+        }
+        var metadataComplete =
+            updated?.subject != null && value?.metadataComplete != false;
+        if (metadataComplete && value?.subject == null) {
+          // A failed lookup may leave the existing subject usable. It cannot
+          // mark an older subset of episode titles as fully loaded.
+          metadataComplete = await widget.model.catalog
+              .collectionEpisodeNamesCovered(
+                updated!,
+                updated.episodeTitles,
+                cancel: token,
+              );
+          token.check();
+          if (!_canRefresh || ticket != generation || current != directory) {
+            return;
+          }
+        }
+        if (widget.model.catalog.strategy() == 'off' ||
+            (value == null && resolved == null) ||
+            metadataComplete) {
+          _completedInspections[directory] = (prepared, revision);
+          _refreshFailures = 0;
+        } else {
+          // A temporary lookup failure must not permanently mark unchanged
+          // files as identified. Reuse the low-frequency directory scheduler
+          // with exponential backoff instead of another polling loop.
+          _refreshFailures = (_refreshFailures + 1).clamp(0, 3);
+        }
       }
     } on Cancelled {
       // Navigation/disposal cancels optional metadata work.
@@ -1934,6 +2338,11 @@ class _SourceBrowserState extends State<SourceBrowser> {
       // replace a usable file listing with a metadata error.
       if (mounted && ticket == generation) {
         AppLog.instance.warning('来源资料', safeFailure(failure).message);
+        _refreshFailures = (_refreshFailures + 1).clamp(0, 3);
+      }
+    } finally {
+      if (mounted && ticket == generation && !token.cancelled) {
+        _scheduleRefresh();
       }
     }
   }
@@ -1955,16 +2364,12 @@ class _SourceBrowserState extends State<SourceBrowser> {
   }
 
   Future<void> _inspectNextFolder() async {
-    if (inspectingFolder ||
-        busy ||
-        adapter == null ||
-        !mounted ||
-        !widget.active) {
+    if (inspectingFolder || busy || adapter == null || !_canRefresh) {
       return;
     }
     inspectingFolder = true;
     try {
-      while (folderQueue.isNotEmpty && mounted && !busy && widget.active) {
+      while (folderQueue.isNotEmpty && !busy && _canRefresh) {
         final ticket = generation;
         final token = _directoryCancel;
         final connection = adapter;
@@ -1978,19 +2383,18 @@ class _SourceBrowserState extends State<SourceBrowser> {
               return null;
             }
             try {
-              final preview = widget.model.catalog
-                  .directoryPreview(
-                    widget.source['id'],
-                    item.entry.path,
-                    modified: item.entry.modified,
-                  )
-                  ?.collection;
+              final preview = (await widget.model.catalog.loadDirectoryPreview(
+                widget.source['id'],
+                item.entry.path,
+                modified: item.entry.modified,
+                cancel: token,
+              ))?.collection;
               if (preview?.subject != null) {
                 final resolved = await widget.model
                     .synchronizeCollectionInBackground(
                       widget.source['id'],
                       preview!,
-                      importMissing: true,
+                      importMissing: false,
                       cancel: token,
                     );
                 if (!mounted ||
@@ -2008,7 +2412,11 @@ class _SourceBrowserState extends State<SourceBrowser> {
                   !identical(adapter, connection)) {
                 return null;
               }
-              if (cached.length >= 16) cached.remove(cached.keys.first);
+              if (cached.length >= 16 && !cached.containsKey(item.entry.path)) {
+                _completedInspections.remove(cached.keys.first);
+                _listingFingerprints.remove(cached.keys.first);
+                cached.remove(cached.keys.first);
+              }
               cached[item.entry.path] = found;
               final visible = await _visible(found);
               final value =
@@ -2019,11 +2427,13 @@ class _SourceBrowserState extends State<SourceBrowser> {
                     directoryModified: item.entry.modified,
                     cancel: token,
                   ) ??
-                  widget.model.collectionFromEntries(
-                    widget.source['id'],
-                    item.entry.path,
-                    visible,
-                  );
+                  (visible.length < 256
+                      ? widget.model.collectionFromEntries(
+                          widget.source['id'],
+                          item.entry.path,
+                          visible,
+                        )
+                      : null);
               if (!mounted ||
                   ticket != generation ||
                   item.parent != current ||
@@ -2037,7 +2447,7 @@ class _SourceBrowserState extends State<SourceBrowser> {
                     : await widget.model.synchronizeCollectionInBackground(
                         widget.source['id'],
                         value,
-                        importMissing: value.subject != null,
+                        importMissing: false,
                         cancel: token,
                       ),
               );
@@ -2053,13 +2463,27 @@ class _SourceBrowserState extends State<SourceBrowser> {
           }
           continue;
         }
+        if (token.cancelled) {
+          // These requests did not inspect their folders. Keep their place in
+          // the bounded visible-folder queue so resume retries the same batch.
+          folderQueue.insertAll(
+            0,
+            batch.where((item) => item.parent == current),
+          );
+          for (final item in batch) {
+            if (item.parent != current) {
+              inspectedFolders.remove(item.entry.path);
+            }
+          }
+          continue;
+        }
         void update() {
           for (final result in results.nonNulls) {
             folderCollections[result.path] = result.collection;
           }
         }
 
-        if (widget.active) {
+        if (_canRefresh) {
           setState(update);
         } else {
           update();
@@ -2122,8 +2546,8 @@ class _SourceBrowserState extends State<SourceBrowser> {
         knownFolders,
         preview: artwork?.collection,
       );
-      // Cached previews still need to import unplayed episodes. The artwork
-      // request queues that work after layout, with scrolling deferred.
+      // Preview lookup enriches existing records after layout. Only opening
+      // this folder adds its unplayed episodes to the library.
     }
     return folderCollections[entry.path];
   }
@@ -2152,71 +2576,53 @@ class _SourceBrowserState extends State<SourceBrowser> {
   void _prepareCollectionDetails() {
     final value = collection;
     final snapshot = _knownFolderIndex.snapshot;
-    final recordsKey = (
-      value,
-      snapshot?.media,
-      snapshot?.locations,
-      current,
-      allEntries,
-    );
-    if (_recordsKey != recordsKey) {
-      _recordsKey = recordsKey;
-      final folders = <String, Map<String, SyncRecord>>{};
-      _mediaByPath = {};
-      // Some adapters expose root files with paths relative to a physical
-      // subdirectory. Resolve the actual entry path rather than assuming every
-      // listed file has `current` as its parent. Only listed folders are read
-      // from the already prepared index; this never scans the entire library.
-      for (final entry in value?.videos ?? allEntries) {
-        if (entry.directory) continue;
-        final path = entry.path.replaceAll('\\', '/');
-        final folderKey = _folderKey(
-          widget.source['id'],
-          p.posix.dirname(path),
-        );
-        final records = folders.putIfAbsent(folderKey, () {
-          final folder = snapshot?.folders[folderKey];
-          return folder == null
-              ? const {}
-              : {
-                  for (var index = 0; index < folder.entries.length; index++)
-                    folder.entries[index].path: folder.records[index],
-                };
-        });
-        final record = records[path];
-        if (record != null) _mediaByPath[entry.path] = record;
-      }
-      _collectionRecords = value == null
-          ? const []
-          : [for (final entry in value.videos) ?_mediaByPath[entry.path]];
-      final first = _collectionRecords.firstOrNull;
-      final key = first == null ? null : mediaSeriesKey(first);
-      _hasCollectionHeader =
-          first != null &&
-          _collectionRecords.every((record) => mediaSeriesKey(record) == key);
-      _headerSeriesRecords = first == null
-          ? null
-          : snapshot?.series[key] ?? _collectionRecords;
-      _headerDetails = _headerSeriesRecords == null
-          ? null
-          : MediaCollectionDetails.fromRecords(_headerSeriesRecords!);
+    final sourceId = widget.source['id'] as String;
+    final recordsKey = (value, snapshot, current, sourceId);
+    if (_recordsKey == recordsKey) return;
+    _recordsKey = recordsKey;
+    _mediaByPath = snapshot?.recordsBySource[sourceId] ?? const {};
+    // Locate this collection in its physical folder, then select its own
+    // identity. Another imported series or old movie in that folder must not
+    // hide it. Alias conflicts were already excluded by the snapshot worker.
+    final firstEntry = value?.videos.firstOrNull;
+    final folder = firstEntry == null
+        ? null
+        : snapshot?.folders[_folderKey(
+            sourceId,
+            p.posix.dirname(firstEntry.path.replaceAll('\\', '/')),
+          )];
+    final identity = value == null
+        ? null
+        : mediaSeriesKey(
+            SyncRecord(
+              kind: 'media',
+              id: 'directory',
+              data: {
+                'series': value.title,
+                'season': value.season,
+                'episode': '1',
+                if (value.subject case final subject?)
+                  ...subjectMediaFields(subject),
+              },
+            ),
+          );
+    var seriesKey = folder?.seriesByIdentity[identity];
+    if (seriesKey == null &&
+        value?.subject == null &&
+        value?.videos.length == 1 &&
+        value?.identities[firstEntry?.path]?.episode.isEmpty == true) {
+      // A recognized single-file collection can use that file's prepared
+      // details without inventing episode numbers or merging unrelated files.
+      final item = _mediaByPath[firstEntry?.path.replaceAll('\\', '/')];
+      final key = item == null ? null : snapshot?.seriesKeyFor(item);
+      if (key?.startsWith('file:') == true) seriesKey = key;
     }
-    final progressKey = (_collectionRecords, snapshot?.progress);
-    if (_headerProgressKey == progressKey) return;
-    _headerProgressKey = progressKey;
-    _headerLatest = null;
-    var latestTime = '';
-    for (final record in _collectionRecords) {
-      final size =
-          snapshot?.locations[record.id]?['size'] ?? record.data['size'] ?? 0;
-      final progress = snapshot?.progress['${record.id}:$size'];
-      if (((progress?['position'] as num?) ?? 0) <= 0) continue;
-      final updated = '${progress?['updatedAt'] ?? ''}';
-      if (_headerLatest == null || updated.compareTo(latestTime) > 0) {
-        latestTime = updated;
-        _headerLatest = record;
-      }
-    }
+    _collectionRecords = folder?.series[seriesKey] ?? const [];
+    final first = _collectionRecords.firstOrNull;
+    _hasCollectionHeader = value != null && first != null;
+    _headerSeriesRecords = first == null ? null : snapshot?.seriesFor(first);
+    _headerDetails = first == null ? null : snapshot?.detailsFor(first);
+    _headerLatest = folder?.latestBySeries[seriesKey];
   }
 
   Widget _collectionHeader(
@@ -2246,16 +2652,27 @@ class _SourceBrowserState extends State<SourceBrowser> {
                   widget.source['id'],
                   value,
                   importMissing: true,
-                  cancel: _directoryCancel,
+                  cancel: cancel,
                 );
             if (mounted) setState(() => _setCollection(resolved));
           }
         },
         onPlay: (item) {
-          final entry = value.videos
-              .where((entry) => _mediaByPath[entry.path]?.id == item.id)
-              .firstOrNull;
-          if (entry != null) _select(entry);
+          final location = _knownFolderIndex.snapshot?.locations[item.id];
+          final path = location?['path'];
+          if (path is! String ||
+              location?['source'] != widget.source['id'] ||
+              !value.identities.containsKey(path)) {
+            return;
+          }
+          _select(
+            SourceEntry(
+              name: '${item.data['fileName'] ?? p.posix.basename(path)}',
+              path: path,
+              size: (location?['size'] as num?)?.toInt() ?? 0,
+              modified: (location?['modified'] as num?)?.toInt() ?? 0,
+            ),
+          );
         },
         onSort: _sortMenu,
       ),
@@ -2288,17 +2705,36 @@ class _SourceBrowserState extends State<SourceBrowser> {
   }, onApplyAll: widget.model.applyDirectorySortingToAll);
 
   Future<void> _open({bool refresh = false}) async {
+    _refreshTimer?.cancel();
+    _refreshCancel?.cancel();
+    _refreshPending = false;
     if (refresh) {
       widget.model.catalog.invalidateDirectoryPreviews(widget.source['id']);
     }
+    if (!_canRefresh) {
+      _openPending = true;
+      _refreshPending = true;
+      busy = false;
+      final previous = adapter;
+      adapter = null;
+      await _closeSource(previous);
+      return;
+    }
+    _openPending = false;
     cached.clear();
+    _listingFingerprints.clear();
+    _completedInspections.clear();
+    _catalogRevision = widget.model.catalog.directoryInspectionRevision(
+      widget.source['id'],
+    );
     inspectedFolders.clear();
     folderQueue.clear();
     folderCollections.clear();
     _setCollection(null);
     final ticket = ++generation;
     _directoryCancel.cancel();
-    _directoryCancel = CancelToken();
+    _inspectionWork = null;
+    final token = _directoryCancel = CancelToken();
     _sorter.cancelPending();
     setState(() {
       busy = true;
@@ -2310,13 +2746,39 @@ class _SourceBrowserState extends State<SourceBrowser> {
     try {
       await _closeSource(previous);
       if (!mounted || ticket != generation) return;
-      final next = await widget.model.adapter(widget.source['id']);
-      if (!mounted || ticket != generation) {
-        await next.close();
-        return;
+      token.check();
+      if (!_canRefresh) throw const Cancelled();
+      final opening = widget.model.adapter(widget.source['id']).then((
+        next,
+      ) async {
+        // A platform connection can complete after cancellation. Release the
+        // late adapter without waiting for it before foreground navigation.
+        if (token.cancelled ||
+            !mounted ||
+            ticket != generation ||
+            !_canRefresh) {
+          await _closeSource(next);
+          throw const Cancelled();
+        }
+        return next;
+      });
+      final next = await Future.any([
+        opening,
+        token.whenCancelled.then<SourceAdapter>((_) => throw const Cancelled()),
+      ]);
+      if (token.cancelled || !_canRefresh || ticket != generation) {
+        await _closeSource(next);
+        throw const Cancelled();
       }
       adapter = next;
       await _load();
+    } on Cancelled {
+      if (mounted && ticket == generation) {
+        _openPending = true;
+        _refreshPending = true;
+        setState(() => busy = false);
+        if (_canRefresh) _queueRefresh();
+      }
     } catch (failure) {
       if (mounted && ticket == generation) _failed(failure);
     }
@@ -2333,13 +2795,23 @@ class _SourceBrowserState extends State<SourceBrowser> {
   }
 
   Future<void> _load() async {
+    if (!_canRefresh) {
+      _refreshPending = true;
+      if (mounted) setState(() => busy = false);
+      return;
+    }
     if (adapter == null) {
       await _open();
       return;
     }
     final ticket = ++generation;
+    _refreshTimer?.cancel();
+    _refreshCancel?.cancel();
+    _refreshPending = false;
+    _refreshFailures = 0;
     _directoryCancel.cancel();
-    _directoryCancel = CancelToken();
+    _inspectionWork = null;
+    final token = _loadCancel = _directoryCancel = CancelToken();
     _sorter.cancelPending();
     setState(() {
       busy = true;
@@ -2349,13 +2821,39 @@ class _SourceBrowserState extends State<SourceBrowser> {
     });
     try {
       final directory = current;
-      final found =
-          cached[directory] ??
-          (widget.source['kind'] == 'http'
-              ? [await adapter!.stat('')]
-              : await adapter!.list(directory));
+      final previous = cached[directory];
+      if (previous != null) {
+        final visible = await _visible(previous);
+        if (!mounted || ticket != generation) return;
+        final known = await _knownFolderIndex.load(widget.model);
+        if (!mounted || ticket != generation) return;
+        knownFolders = known;
+        allEntries = previous;
+        setState(() {
+          entries = visible;
+          busy = false;
+          _setCollection(collection);
+        });
+        _restoreScroll(directory);
+      }
+      await _refreshWork;
+      token.check();
+      final found = await _readDirectory(directory, token);
+      token.check();
+      String? fingerprint;
+      if (previous != null) {
+        fingerprint = await _listingFingerprint(directory, found, token);
+        if (_listingFingerprints[directory] == fingerprint &&
+            _inspectionComplete(directory, fingerprint)) {
+          return;
+        }
+      }
       if (mounted && ticket == generation) {
-        if (cached.length >= 16) cached.remove(cached.keys.first);
+        if (cached.length >= 16 && !cached.containsKey(directory)) {
+          _completedInspections.remove(cached.keys.first);
+          _listingFingerprints.remove(cached.keys.first);
+          cached.remove(cached.keys.first);
+        }
         cached[directory] = found;
         allEntries = found;
         final visible = await _visible(found);
@@ -2370,18 +2868,40 @@ class _SourceBrowserState extends State<SourceBrowser> {
           _setCollection(collection);
         });
         _restoreScroll(directory);
-        unawaited(_inspectCurrent(ticket, directory, found));
+        final work = _inspectCurrent(
+          ticket,
+          directory,
+          found,
+          fingerprint: fingerprint,
+          reconcile:
+              fingerprint == null ||
+              _listingFingerprints[directory] != fingerprint,
+        );
+        _inspectionWork = work;
+        unawaited(
+          work.whenComplete(() {
+            if (identical(_inspectionWork, work)) {
+              _inspectionWork = null;
+              _scheduleRefresh();
+            }
+          }),
+        );
       }
     } on Cancelled {
       // A newer directory owns the listing and its metadata work.
     } on DirectorySortCancelled {
       // Keep a newer navigation or refresh in charge of the visible listing.
     } catch (failure) {
-      if (mounted && ticket == generation) _failed(failure);
-    } finally {
       if (mounted && ticket == generation) {
-        setState(() => busy = false);
+        _refreshFailures = (_refreshFailures + 1).clamp(0, 3);
+        if (entries.isEmpty) _failed(failure);
+      }
+    } finally {
+      if (identical(_loadCancel, token)) _loadCancel = null;
+      if (mounted && ticket == generation) {
+        if (busy) setState(() => busy = false);
         unawaited(_inspectNextFolder());
+        _scheduleRefresh();
       }
     }
   }
@@ -2411,6 +2931,7 @@ class _SourceBrowserState extends State<SourceBrowser> {
       return;
     }
     setState(() => playing = true);
+    _pauseRefresh();
     try {
       final id = widget.model.addMedia(
         widget.source['id'],
@@ -2443,7 +2964,10 @@ class _SourceBrowserState extends State<SourceBrowser> {
     } catch (failure) {
       if (mounted) await _sourceFailure(context, failure, '打开视频失败');
     } finally {
-      if (mounted) setState(() => playing = false);
+      if (mounted) {
+        setState(() => playing = false);
+        _queueRefresh();
+      }
     }
   }
 
@@ -2497,6 +3021,12 @@ class _SourceBrowserState extends State<SourceBrowser> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (!entry.directory)
+              ListTile(
+                leading: const Icon(Icons.description_outlined),
+                title: const Text('查看文件详情'),
+                onTap: () => Navigator.pop(context, 'file-details'),
+              ),
             ListTile(
               leading: const Icon(Icons.auto_awesome_outlined),
               title: const Text('重新识别影视资料'),
@@ -2526,6 +3056,16 @@ class _SourceBrowserState extends State<SourceBrowser> {
       ),
     );
     if (action == null || !mounted) return;
+    if (action == 'file-details') {
+      await showMediaFileDetails(
+        context,
+        model: widget.model,
+        sourceId: widget.source['id'] as String,
+        sourceName: '${widget.source['label'] ?? ''}',
+        entry: entry,
+      );
+      return;
+    }
     if (action == 'favorite') {
       _toggleFavorite(
         entry.path,
@@ -2602,6 +3142,9 @@ class _SourceBrowserState extends State<SourceBrowser> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _refreshTimer?.cancel();
+    _refreshCancel?.cancel();
     _remember();
     widget.model.removeListener(_modelChanged);
     _sorter.close();
@@ -2789,6 +3332,9 @@ class _SourceBrowserState extends State<SourceBrowser> {
                       )
                     : ListView.builder(
                         controller: scroll,
+                        scrollCacheExtent: const ScrollCacheExtent.viewport(
+                          .75,
+                        ),
                         padding: EdgeInsets.only(
                           bottom: 20 + MediaQuery.paddingOf(context).bottom,
                         ),
@@ -2809,7 +3355,7 @@ class _SourceBrowserState extends State<SourceBrowser> {
                               widget.source['kind'] == 'http';
                           final media = entry.directory
                               ? null
-                              : _mediaByPath[entry.path];
+                              : _mediaByPath[entry.path.replaceAll('\\', '/')];
                           if (hasCollectionHeader && isVideo(entry.name)) {
                             final savedEpisode = media == null
                                 ? ''

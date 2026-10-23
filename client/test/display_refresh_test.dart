@@ -10,10 +10,11 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('high refresh defaults on but respects saved opt-out', () {
-    expect(AppPreferences({}).highRefreshRate, true);
+  test('system refresh defaults on and respects explicit high refresh', () {
+    expect(AppPreferences({}).highRefreshRate, false);
     expect(AppPreferences({'highRefreshRate': false}).highRefreshRate, false);
-    expect(AppPreferences({'highRefreshRate': 'bad'}).highRefreshRate, true);
+    expect(AppPreferences({'highRefreshRate': true}).highRefreshRate, true);
+    expect(AppPreferences({'highRefreshRate': 'bad'}).highRefreshRate, false);
   });
 
   testWidgets(
@@ -41,16 +42,24 @@ void main() {
         await tester.pumpWidget(AIPlayerApp(model: model));
         await tester.pumpAndSettle();
         expect(find.text('我的影视库'), findsOneWidget);
-        expect(requests, [true]);
+        expect(requests, [false]);
         model.changed();
         await tester.pump();
-        expect(requests, [true]);
-        await model.updatePreferences({'highRefreshRate': false});
-        await tester.pump();
-        expect(requests, [true, false]);
+        expect(requests, [false]);
         await model.updatePreferences({'highRefreshRate': true});
         await tester.pump();
-        expect(requests, [true, false, true]);
+        expect(requests, [false, true]);
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+        await tester.pump();
+        expect(requests, [false, true, false]);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pump();
+        expect(requests, [false, true, false, true]);
+        await model.updatePreferences({'highRefreshRate': false});
+        await tester.pump();
+        expect(requests, [false, true, false, true, false]);
       } finally {
         await tester.pumpWidget(const SizedBox());
         model.dispose();

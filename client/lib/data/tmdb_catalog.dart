@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:isolate';
 import 'package:crypto/crypto.dart';
 import '../core/network.dart';
 import 'catalog_cache.dart';
@@ -11,15 +12,28 @@ class TmdbCatalog {
   final JsonTransport transport;
   final Future<String> Function() credential;
   final CatalogCache _cache;
+  int seasonFetchRevision = 0;
+  final _seasonFetchRevisions = <String, int>{};
+
+  bool seasonFetchedSince(int revision, Map<String, dynamic> subject) {
+    final season = '${subject['season'] ?? ''}';
+    final path = 'tv/${subject['id']}/season/${season.isEmpty ? '1' : season}';
+    return (_seasonFetchRevisions[path] ?? 0) > revision;
+  }
+
   TmdbCatalog(this.transport, this.credential, {AppStore? store})
     : _cache = CatalogCache(store);
 
   void invalidateCache() => _cache.invalidate();
 
+  String _requestKey(String secret, String path, Map<String, String> query) =>
+      'catalog-v1:tmdb:${sha256.convert(utf8.encode(jsonEncode([secret, path, query])))}';
+
   Future<Map<String, dynamic>> _get(
     String path, {
     Map<String, String> query = const {},
     CancelToken? cancel,
+    bool refresh = false,
   }) async {
     cancel?.check();
     final secret = (await credential()).trim();
@@ -28,19 +42,29 @@ class TmdbCatalog {
       throw const AppFailure('请先在设置 → 常规 → 作品资料中填写 TMDB API Key 或读取令牌。');
     }
     final isKey = RegExp(r'^[a-fA-F0-9]{32}$').hasMatch(secret);
-    final key =
-        'catalog-v1:tmdb:${sha256.convert(utf8.encode(jsonEncode([secret, path, query])))}';
+    final key = _requestKey(secret, path, query);
     final response = await _cache.load<Map<String, dynamic>>(
       key,
-      fetch: (token) => transport.send(
-        Uri.https('api.themoviedb.org', '/3/$path', {
-          'language': 'zh-CN',
-          ...query,
-          if (isKey) 'api_key': secret,
-        }),
-        headers: {if (!isKey) 'Authorization': 'Bearer $secret'},
-        cancel: token,
-      ),
+      fetch: (token) async {
+        final result = await transport.send(
+          Uri.https('api.themoviedb.org', '/3/$path', {
+            'language': 'zh-CN',
+            ...query,
+            if (isKey) 'api_key': secret,
+          }),
+          headers: {if (!isKey) 'Authorization': 'Bearer $secret'},
+          cancel: token,
+        );
+        token.check();
+        if (path.contains('/season/')) {
+          if (_seasonFetchRevisions.length >= 128 &&
+              !_seasonFetchRevisions.containsKey(path)) {
+            _seasonFetchRevisions.remove(_seasonFetchRevisions.keys.first);
+          }
+          _seasonFetchRevisions[path] = ++seasonFetchRevision;
+        }
+        return result;
+      },
       decode: (value) => Map<String, dynamic>.from(value as Map),
       keep: (value) {
         if (path.startsWith('search/')) {
@@ -55,6 +79,19 @@ class TmdbCatalog {
         return '${value['id']}' == path.split('/').last;
       },
       cancel: cancel,
+      refresh: refresh,
+      merge: path.contains('/season/')
+          ? (previous, refreshed) {
+              final size =
+                  (previous['episodes'] as List? ?? []).length +
+                  (refreshed['episodes'] as List? ?? []).length;
+              return size < 256
+                  ? _mergeSeasonEpisodes(previous, refreshed)
+                  : Isolate.run(
+                      () => _mergeSeasonEpisodes(previous, refreshed),
+                    );
+            }
+          : null,
     );
     cancel?.check();
     return response;
@@ -233,13 +270,18 @@ class TmdbCatalog {
     String id,
     String season, {
     CancelToken? cancel,
+    bool refresh = false,
   }) async {
     if (!RegExp(r'^\d+$').hasMatch(id)) throw const AppFailure('TMDB 作品编号无效。');
     final number = int.tryParse(season.isEmpty ? '1' : season);
     if (number == null || number < 0 || number > 10000) {
       throw const AppFailure('季度编号无效。');
     }
-    final seasonData = await _get('tv/$id/season/$number', cancel: cancel);
+    final seasonData = await _get(
+      'tv/$id/season/$number',
+      cancel: cancel,
+      refresh: refresh,
+    );
     if (seasonData['season_number'] != number) {
       throw const AppFailure('TMDB 返回的季度与所选季度不一致。');
     }
@@ -260,19 +302,23 @@ class TmdbCatalog {
   Future<Map<String, String>> episodeNames(
     Map<String, dynamic> subject, {
     CancelToken? cancel,
+    bool refresh = false,
   }) async {
     cancel?.check();
     if (subject['mediaType'] == 'movie') return {};
     final saved = Map<String, String>.from(subject['episodeNames'] ?? {});
     final count = (subject['season_episodes'] as num?)?.toInt();
-    if (saved.isNotEmpty && (count == null || saved.length >= count)) {
-      return saved;
+    if (!refresh &&
+        saved.isNotEmpty &&
+        (count == null || saved.length >= count)) {
+      return await cachedEpisodeNames(subject, cancel: cancel) ?? saved;
     }
     try {
       final season = await _season(
         '${subject['id']}',
         '${subject['season'] ?? ''}',
         cancel: cancel,
+        refresh: refresh,
       );
       return {...saved, ..._episodeNames(season)};
     } on Cancelled {
@@ -281,9 +327,31 @@ class TmdbCatalog {
       // A synced snapshot can outlive its raw season cache. Keep known titles
       // while offline; the failed request remains eligible for the next retry.
       cancel?.check();
-      if (saved.isEmpty) rethrow;
+      if (refresh || saved.isEmpty) rethrow;
       return saved;
     }
+  }
+
+  Future<Map<String, String>?> cachedEpisodeNames(
+    Map<String, dynamic> subject, {
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    final names = Map<String, String>.from(subject['episodeNames'] ?? {});
+    final secret = (await credential()).trim();
+    cancel?.check();
+    final season = '${subject['season'] ?? ''}';
+    final key = _requestKey(
+      secret,
+      'tv/${subject['id']}/season/${season.isEmpty ? '1' : season}',
+      const {},
+    );
+    final cached = _cache.readCached<Map<String, dynamic>>(
+      key,
+      (value) => Map<String, dynamic>.from(value as Map),
+    );
+    if (cached != null) names.addAll(_episodeNames(cached));
+    return names.isEmpty ? null : names;
   }
 
   List<String> names(Map<String, dynamic> subject) =>
@@ -320,4 +388,26 @@ class TmdbCatalog {
           wanted.length / normalized.length < 1.18;
     });
   }
+}
+
+Map<String, dynamic> _mergeSeasonEpisodes(
+  Map<String, dynamic> previous,
+  Map<String, dynamic> refreshed,
+) {
+  final episodes = <Object, Map>{};
+  for (final row in (previous['episodes'] as List? ?? []).whereType<Map>()) {
+    if (row['episode_number'] != null) episodes[row['episode_number']] = row;
+  }
+  for (final row in (refreshed['episodes'] as List? ?? []).whereType<Map>()) {
+    final number = row['episode_number'];
+    if (number == null) continue;
+    final old = episodes[number];
+    episodes[number] = {
+      ...?old,
+      ...row,
+      if ('${row['name'] ?? ''}'.trim().isEmpty && old?['name'] != null)
+        'name': old!['name'],
+    };
+  }
+  return {...previous, ...refreshed, 'episodes': episodes.values.toList()};
 }

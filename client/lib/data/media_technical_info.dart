@@ -71,10 +71,6 @@ class MediaTechnicalInfo {
         '${current.data['fileName'] ?? local['path'] ?? current.data['title'] ?? ''}';
     final width = _positive(data['width']) ?? dimensions?.width;
     final height = _positive(data['height']) ?? dimensions?.height;
-    final extension = p
-        .extension(name.split('?').first)
-        .replaceFirst('.', '')
-        .toUpperCase();
     final hint =
         RegExp(
           r'(?:^|[\s._\-\[\]()])(4320p|2160p|1440p|1080[pi]|720p|576[pi]|480p|4k|8k)(?=$|[\s._\-\[\]()])',
@@ -82,9 +78,10 @@ class MediaTechnicalInfo {
         ).firstMatch(p.basename(name))?[1] ??
         '';
     return MediaTechnicalInfo(
-      container: '${data['container'] ?? ''}'.isNotEmpty
-          ? '${data['container']}'
-          : extension,
+      container: videoContainerLabel(
+        '${data['container'] ?? ''}',
+        fileName: name,
+      ),
       codec: '${data['codec'] ?? ''}',
       width: width,
       height: height,
@@ -128,10 +125,6 @@ class MediaTechnicalInfo {
     if (codec.isNotEmpty) codec,
     if (width != null && height != null) '$width × $height',
     if (resolutionHint.isNotEmpty) '$resolutionHint（文件名标注）',
-    if (bitrate != null && bitrate! > 0)
-      bitrate! >= 1000000
-          ? '视频约 ${(bitrate! / 1000000).toStringAsFixed(1)} Mb/s'
-          : '视频约 ${(bitrate! / 1000).round()} kb/s',
     if (size != null && size! > 0) mediaFileSize(size!),
   ].join(' · ');
 }
@@ -157,12 +150,54 @@ String videoCodecLabel(String value) => switch (value.trim().toLowerCase()) {
   _ => value.trim(),
 };
 
-String videoContainerLabel(String value) {
-  final formats = value.toLowerCase().split(',');
-  if (formats.contains('matroska') || formats.contains('mkv')) {
-    return 'Matroska';
+/// Demuxer names describe families; the filename identifies the displayed format.
+String videoContainerLabel(String value, {String? fileName}) {
+  final name = fileName?.trim() ?? '';
+  final uri = Uri.tryParse(name);
+  final path = uri != null && uri.hasScheme ? uri.path : name;
+  final extension = p.extension(path).replaceFirst('.', '').toLowerCase();
+  if (const {
+    'mp4',
+    'mov',
+    'm4v',
+    'mkv',
+    'webm',
+    'avi',
+    'ts',
+    'mts',
+    'm2ts',
+    'mpeg',
+    'mpg',
+    'm2v',
+    'vob',
+    'wmv',
+    'asf',
+    'flv',
+    'f4v',
+    '3gp',
+    '3g2',
+    'ogv',
+    'ogg',
+    'rm',
+    'rmvb',
+    'divx',
+    'mj2',
+    'mxf',
+    'nut',
+    'm4a',
+  }.contains(extension)) {
+    return extension.toUpperCase();
   }
-  if (formats.contains('mp4') || formats.contains('mov')) return 'MP4 / MOV';
+  final formats = value
+      .toLowerCase()
+      .split(RegExp(r'[,/]'))
+      .map((format) => format.trim())
+      .toSet();
+  if (formats.contains('matroska') || formats.contains('mkv')) {
+    return 'MKV';
+  }
+  if (formats.contains('mp4')) return 'MP4';
+  if (formats.contains('mov')) return 'MOV';
   if (formats.contains('mpegts')) return 'MPEG-TS';
   return value.trim().toUpperCase();
 }

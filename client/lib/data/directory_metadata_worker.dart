@@ -266,6 +266,7 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
             ? {...mediaFieldsSubject(donor.data), ...value.subject!}
             : mediaFieldsSubject(donor.data),
         episodeTitles: names,
+        episodeCount: value.episodeCount,
       );
     } else if (keys.length > 1) {
       resolved = value.withMetadata(null, {});
@@ -392,18 +393,69 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
           !visible.any((entry) => entry.path == location['path']))) {
     return null;
   }
-  var collection = identifyDirectory(path, visible);
+  // A season-only directory (S01 / 第1季) contributes no series title. Once
+  // one file has been identified, its identity is evidence for the numeric
+  // siblings; requiring a title in every filename loses those episodes.
+  final folderIdentity = sourceDirectoryIdentity(store, sourceId, path);
+  final originalIdentity = parseReleaseName(
+    '${anchor?.data['fileName'] ?? anchor?.data['title'] ?? ''}',
+  );
+  final anchoredFolder =
+      folderIdentity.anime.isEmpty &&
+          anchor != null &&
+          anchor.data['metadataType'] != 'movie' &&
+          (anchor.data['tmdbId'] != null || anchor.data['bangumiId'] != null) &&
+          normalizedSeries('${anchor.data['series'] ?? ''}').isNotEmpty &&
+          anchor.data['series'] != '未分类'
+      ? ReleaseName(
+          originalIdentity.episode.isNotEmpty &&
+                  originalIdentity.anime.isNotEmpty
+              ? originalIdentity.anime
+              : '${anchor.data['series']}',
+          '${anchor.data['season'] ?? folderIdentity.season}',
+        )
+      : null;
+  final verifiedAnchor =
+      anchor?.data['tmdbId'] != null || anchor?.data['bangumiId'] != null;
+  // A named anchor can complete numeric siblings even when the folder was
+  // renamed or the source is rooted at S02. identifyDirectory can return just
+  // the named files in that case, so anchored details must inspect every file.
+  var collection = anchorId == null
+      ? identifyDirectory(path, visible, folderIdentity: folderIdentity)
+      : null;
   if (collection == null && anchorId != null) {
     if (anchor == null || anchor.deleted || location is! Map) return null;
-    final evidence = _mediaIdentity(
+    final originalEvidence = _mediaIdentity(
       SourceEntry(
         name: '${anchor.data['fileName'] ?? anchor.data['title'] ?? ''}',
         path: '${location['path']}',
       ),
+      fallback: anchoredFolder ?? folderIdentity,
+    );
+    final evidence = ReleaseName(
+      originalEvidence.anime,
+      originalEvidence.season.isNotEmpty
+          ? originalEvidence.season
+          : '${anchor.data['season'] ?? ''}',
+      originalEvidence.episode,
     );
     String season(String value) => value.isEmpty ? '1' : value;
     final key = normalizedSeries(evidence.anime);
-    if (key.isEmpty) return null;
+    if (key.isEmpty ||
+        (evidence.episode.isEmpty &&
+            '${anchor.data['episode'] ?? ''}'.isEmpty)) {
+      return null;
+    }
+    final titles = <String>{
+      key,
+      if (verifiedAnchor) normalizedSeries('${anchor.data['series'] ?? ''}'),
+      if (verifiedAnchor)
+        normalizedSeries('${anchor.data['metadataTitle'] ?? ''}'),
+    }..remove('');
+    final bareEpisode = RegExp(
+      r'^(?:EP?)?(\d{1,4})(?:[ ._-].*)?$',
+      caseSensitive: false,
+    );
     final videos = <SourceEntry>[];
     final identities = <String, ReleaseName>{};
     for (var index = 0; index < visible.length; index++) {
@@ -413,7 +465,6 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
       }
       final entry = visible[index];
       if (entry.directory || !isVideo(entry.name)) continue;
-      final identity = _mediaIdentity(entry);
       final existing = _sourceRecord(store, sourceId, entry.path);
       final verified =
           existing != null &&
@@ -422,13 +473,37 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
       if (verified && mediaSeriesKey(existing) != mediaSeriesKey(anchor)) {
         continue;
       }
-      if (normalizedSeries(identity.anime) != key ||
-          season(identity.season) != season(evidence.season) ||
-          identity.episode.isEmpty) {
+      final parsed = parseReleaseName(entry.name);
+      final bare = parsed.episode.isEmpty
+          ? bareEpisode.firstMatch(p.basenameWithoutExtension(entry.name))
+          : null;
+      final episode = verified
+          ? '${existing.data['episode'] ?? parsed.episode}'
+          : bare == null
+          ? parsed.episode
+          : '${int.parse(bare[1]!)}';
+      final fileSeason = parsed.season.isNotEmpty
+          ? parsed.season
+          : folderIdentity.season.isNotEmpty
+          ? folderIdentity.season
+          : evidence.season;
+      // Numeric and title-less filenames get their work from the selected
+      // episode, not the folder's display name. Named files still need title
+      // evidence; a verified sibling supplies its own authoritative identity.
+      if (episode.isEmpty ||
+          (!verified &&
+              ((bare == null &&
+                      parsed.anime.isNotEmpty &&
+                      !titles.contains(normalizedSeries(parsed.anime))) ||
+                  season(fileSeason) != season(evidence.season)))) {
         continue;
       }
       videos.add(entry);
-      identities[entry.path] = identity;
+      identities[entry.path] = ReleaseName(
+        evidence.anime,
+        evidence.season,
+        episode,
+      );
     }
     if (videos.isNotEmpty) {
       collection = DirectoryCollection(
@@ -436,8 +511,25 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
         season: evidence.season,
         videos: videos,
         identities: identities,
+        episodeCount: identities.values
+            .map((value) => value.episode)
+            .toSet()
+            .length,
       );
     }
+  }
+  // A manual or synced match can identify files whose basenames carry no
+  // useful episode information. Reuse those verified identities on first
+  // open, before playback can trigger a separate model refresh. Require every
+  // listed video to belong to the same work/season; an unknown or conflicting
+  // file must not inherit its neighbours' metadata.
+  if (collection == null && anchorId == null) {
+    collection = await _identifiedDirectoryCollection(
+      store,
+      sourceId,
+      visible,
+      cancel,
+    );
   }
   if (collection == null) return null;
   final donors = DirectoryMetadataDonorCache(sourceId, collection.videos);
@@ -465,6 +557,7 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
           identities: collection.identities,
           subject: collection.subject,
           episodeTitles: collection.episodeTitles,
+          episodeCount: collection.episodeCount,
         ),
         importMissing: true,
         anchorId: anchorId,
@@ -486,16 +579,71 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
       identities: {...collection.identities, ...identities},
       subject: resolved.subject,
       episodeTitles: names,
+      episodeCount: collection.episodeCount,
     ),
     changed,
     List.unmodifiable(ids),
   );
 }
 
-ReleaseName _mediaIdentity(SourceEntry entry) {
-  final folder = subjectIdentity(
-    p.posix.basename(p.posix.dirname(entry.path.replaceAll('\\', '/'))),
+Future<DirectoryCollection?> _identifiedDirectoryCollection(
+  AppStore store,
+  String sourceId,
+  List<SourceEntry> entries,
+  CancelToken? cancel,
+) async {
+  final videos = <SourceEntry>[];
+  final identities = <String, ReleaseName>{};
+  final names = <String, String>{};
+  SyncRecord? first;
+  String? seriesKey;
+  for (var index = 0; index < entries.length; index++) {
+    if (index % 128 == 0) {
+      await Future<void>.delayed(Duration.zero);
+      cancel?.check();
+    }
+    final entry = entries[index];
+    if (entry.directory || !isVideo(entry.name)) continue;
+    final record = _sourceRecord(store, sourceId, entry.path);
+    if (record == null ||
+        (record.data['bangumiId'] == null && record.data['tmdbId'] == null)) {
+      return null;
+    }
+    final key = mediaSeriesKey(record);
+    if (seriesKey != null && seriesKey != key) return null;
+    seriesKey = key;
+    first ??= record;
+    final episode = '${record.data['episode'] ?? ''}';
+    videos.add(entry);
+    identities[entry.path] = ReleaseName(
+      '${first.data['series'] ?? ''}',
+      '${first.data['season'] ?? ''}',
+      episode,
+    );
+    final name = _episodeTitle(store, record);
+    if (name.isNotEmpty) names[episode] = name;
+  }
+  if (first == null) return null;
+  return DirectoryCollection(
+    title: '${first.data['series'] ?? ''}',
+    season: '${first.data['season'] ?? ''}',
+    videos: videos,
+    identities: identities,
+    subject: mediaFieldsSubject(first.data),
+    episodeTitles: names,
+    episodeCount: identities.values
+        .map((identity) => identity.episode)
+        .where((episode) => episode.isNotEmpty)
+        .toSet()
+        .length,
   );
+}
+
+ReleaseName _mediaIdentity(SourceEntry entry, {ReleaseName? fallback}) {
+  var folder = directoryIdentity(
+    p.posix.dirname(entry.path.replaceAll('\\', '/')),
+  );
+  if (folder.anime.isEmpty && fallback != null) folder = fallback;
   var guess = parseReleaseName(entry.name);
   if (guess.episode.isEmpty && folder.anime.isNotEmpty) {
     final bare = RegExp(
@@ -638,6 +786,33 @@ class DirectoryMetadataWorker {
     anchorId,
   ], cancel: cancel);
 
+  Future<DirectoryInspection> prepareInspection(
+    String sourceId,
+    String path,
+    String context,
+    List<SourceEntry> entries, {
+    CancelToken? cancel,
+  }) => _call('inspect', [sourceId, path, context, entries], cancel: cancel);
+
+  Future<void> persistPreview(
+    String sourceId,
+    String path,
+    DirectoryPreview preview, {
+    CancelToken? cancel,
+  }) => _call('preview', [sourceId, path, preview], cancel: cancel);
+
+  Future<bool> episodeNamesCovered(
+    Map<String, ReleaseName> identities,
+    Map<String, String> names, {
+    CancelToken? cancel,
+  }) => _call('episodeCoverage', [identities, names], cancel: cancel);
+
+  Future<DirectoryPreview?> readPreview(
+    String sourceId,
+    String path, {
+    CancelToken? cancel,
+  }) => _call('readPreview', [sourceId, path], cancel: cancel);
+
   Future<DirectoryMetadataResult?> synchronizeListing(
     String sourceId,
     String path,
@@ -721,7 +896,47 @@ void _directoryWorkerMain(List<dynamic> startup) async {
     try {
       if (closing) throw const Cancelled();
       dynamic result;
-      if (row[0] == 'synchronize') {
+      if (row[0] == 'inspect') {
+        await Future<void>.delayed(Duration.zero);
+        cancel.check();
+        result = prepareDirectoryInspection(
+          row[2] as String,
+          row[3] as String,
+          row[4] as String,
+          row[5] as List<SourceEntry>,
+          folderIdentity: sourceDirectoryIdentity(
+            store,
+            row[2] as String,
+            row[3] as String,
+          ),
+        );
+      } else if (row[0] == 'episodeCoverage') {
+        cancel.check();
+        result = directoryEpisodeNamesCovered(
+          row[2] as Map<String, ReleaseName>,
+          row[3] as Map<String, String>,
+        );
+      } else if (row[0] == 'readPreview') {
+        await Future<void>.delayed(Duration.zero);
+        cancel.check();
+        result = readDirectoryPreview(
+          store,
+          row[2] as String,
+          row[3] as String,
+        );
+      } else if (row[0] == 'preview') {
+        await Future<void>.delayed(Duration.zero);
+        cancel.check();
+        await retryStoreBusy(() {
+          cancel.check();
+          persistDirectoryPreview(
+            store,
+            row[2] as String,
+            row[3] as String,
+            row[4] as DirectoryPreview,
+          );
+        });
+      } else if (row[0] == 'synchronize') {
         // Give cancellation already queued at the command port a chance before
         // beginning this atomic transaction, whose work stays off the UI thread.
         await Future<void>.delayed(Duration.zero);
@@ -846,11 +1061,16 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
     final queue = <String>[root], seen = <String>{}, queued = <String>{};
     String normalize(String path) =>
         p.posix.normalize(path.replaceAll('\\', '/'));
-    final normalizedRoot = normalize(
-      root.isEmpty && source['kind'] == 'webdav'
-          ? Uri.parse('${source['url']}').path
-          : root,
-    );
+    // Source adapters return paths in their own coordinate system. WebDAV
+    // entries are relative to its configured URL even at the empty root; URL
+    // paths here would reject every relative child as outside the subtree.
+    final normalizedRoot = normalize(root);
+    final sourceUri = source['kind'] == 'webdav'
+        ? Uri.tryParse('${source['url'] ?? ''}')
+        : null;
+    final identityRoot = sourceUri == null
+        ? ''
+        : '/${sourceUri.pathSegments.join('/')}';
     bool within(String parent, String child) => parent == '.'
         ? child != '.' &&
               child != '..' &&
@@ -905,12 +1125,18 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
           visible.add(entry);
         }
       }
-      final identified = identifyDirectory(path, visible);
+      final folderIdentity = directoryIdentity(path, rootPath: identityRoot);
+      final identified = identifyDirectory(
+        path,
+        visible,
+        folderIdentity: folderIdentity,
+      );
       final groups = <String, List<SourceEntry>>{};
       final identities = <String, ReleaseName>{};
       for (final entry in visible) {
         final identity =
-            identified?.identities[entry.path] ?? _mediaIdentity(entry);
+            identified?.identities[entry.path] ??
+            _mediaIdentity(entry, fallback: folderIdentity);
         identities[entry.path] = identity;
         (groups['${normalizedSeries(identity.anime)}:${identity.season}'] ??=
                 [])
@@ -926,6 +1152,11 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
           identities: {
             for (final entry in group) entry.path: identities[entry.path]!,
           },
+          episodeCount: {
+            for (final entry in group)
+              if (identities[entry.path]!.episode.isNotEmpty)
+                identities[entry.path]!.episode,
+          }.length,
         );
         try {
           final subject = await service.resolve(
@@ -969,12 +1200,15 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
                 identities: collection.identities,
                 subject: collection.subject,
                 episodeTitles: collection.episodeTitles,
+                episodeCount: collection.episodeCount,
               ),
               importMissing: true,
               donorCache: donorCache,
             );
           });
-          videos += result.mediaIds.length;
+          // Excluded files still exist in the folder. Count discovery
+          // independently from importing so they cannot become "no videos".
+          videos += batch.length;
           if (result.collection.subject != null) {
             matched += result.mediaIds.length;
           }

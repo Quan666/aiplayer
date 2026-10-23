@@ -15,6 +15,239 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => FlutterSecureStorage.setMockInitialValues({'syncToken': _token}));
 
+  testWidgets('unconfigured sync has no recurring maintenance wakeups', (
+    tester,
+  ) async {
+    final f = _Fixture(
+      backgroundWork: true,
+      syncClock: tester.binding.clock.now,
+    );
+    addTearDown(() async {
+      f.disposeModel();
+      await tester.pump();
+      f.store.dispose();
+    });
+    await tester.pump();
+    final initial = (f.model as _Model).syncInvocations;
+    await tester.pump(const Duration(hours: 1));
+    expect((f.model as _Model).syncInvocations, initial);
+    expect(f.client.requests, isEmpty);
+  });
+
+  testWidgets('failed long polls back off and only notify state transitions', (
+    tester,
+  ) async {
+    final f = await _Fixture.create(tester, backgroundWork: true);
+    f.client.waitFailure = const AppFailure('offline');
+    unawaited(f.model.synchronize(quiet: true));
+    await tester.pump();
+    f.client.requests.single.complete();
+    await tester.pump();
+    expect(f.client.waits, 1);
+    var notifications = 0;
+    f.model.addListener(() => notifications++);
+    for (final seconds in [3, 6, 12]) {
+      final count = f.client.waits;
+      await tester.pump(Duration(seconds: seconds - 1));
+      expect(f.client.waits, count);
+      await tester.pump(const Duration(seconds: 1));
+      expect(f.client.waits, count + 1);
+    }
+    expect(notifications, 0);
+    f.client.waitFailure = null;
+    await tester.pump(const Duration(seconds: 24));
+    expect(f.model.realtimeConnected, true);
+    expect(notifications, 1);
+    await tester.pump(const Duration(seconds: 20));
+    expect(notifications, 1);
+    f.disposeModel();
+    await tester.pump();
+  });
+
+  testWidgets(
+    'idle maintenance waits five minutes and is suspended while hidden',
+    (tester) async {
+      final f = await _Fixture.create(tester, backgroundWork: true);
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.client.requests.single.complete();
+      await tester.pump();
+      await tester.pump(const Duration(minutes: 4));
+      expect(f.client.requests, hasLength(1));
+
+      // Incremental updates must not postpone full profile maintenance forever.
+      unawaited(f.model.synchronize(quiet: true, sharedOnly: true));
+      await tester.pump();
+      f.client.requests.last.complete();
+      await tester.pump();
+      await tester.pump(const Duration(minutes: 1));
+      expect(f.client.requests, hasLength(3));
+      expect(f.client.requests.last.sharedOnly, false);
+      f.client.requests.last.complete();
+      await tester.pump();
+
+      f.model.setForeground(false);
+      final polls = f.client.waits;
+      await tester.pump(const Duration(hours: 1));
+      expect(f.client.requests, hasLength(3));
+      expect(f.client.waits, polls);
+      f.model.setForeground(true);
+      await tester.pump();
+      expect(f.client.requests, hasLength(4));
+      f.client.requests.last.complete();
+      await tester.pump();
+      f.disposeModel();
+      await tester.pump();
+    },
+  );
+
+  testWidgets('empty immediate long polls do not wake every second', (
+    tester,
+  ) async {
+    final f = await _Fixture.create(tester, backgroundWork: true);
+    unawaited(f.model.synchronize(quiet: true));
+    await tester.pump();
+    f.client.requests.single.complete();
+    await tester.pump();
+    expect(f.client.waits, 1);
+    var notifications = 0;
+    f.model.addListener(() => notifications++);
+    await tester.pump(const Duration(seconds: 19));
+    expect(f.client.waits, 1);
+    await tester.pump(const Duration(seconds: 1));
+    expect(f.client.waits, 2);
+    expect(notifications, 0);
+    f.model.setForeground(false);
+    await tester.pump(const Duration(minutes: 1));
+    expect(f.client.waits, 2);
+  });
+
+  testWidgets(
+    'quiet unchanged sync does not rebuild the model for lastSync bookkeeping',
+    (tester) async {
+      final f = await _Fixture.create(tester);
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.client.requests.single.complete();
+      await tester.pump();
+      var notifications = 0;
+      f.model.addListener(() => notifications++);
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.store.setLocal('lastSync', 'next-sync-time');
+      f.client.requests.last.complete();
+      await tester.pump();
+      expect(notifications, 0);
+
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.store.save('media', 'new-video', {'title': 'New video'});
+      f.client.requests.last.complete();
+      await tester.pump();
+      expect(notifications, 1, reason: 'downloaded data must still refresh');
+    },
+  );
+
+  testWidgets(
+    'quiet sync refreshes imported presentation keys on writes and deletions',
+    (tester) async {
+      final f = await _Fixture.create(tester);
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.client.requests.single.complete();
+      await tester.pump();
+      var notifications = 0;
+      f.model.addListener(() => notifications++);
+      const changes = <String, Object>{
+        'sourceFavorites': [],
+        'externalSource:video': {'kind': 'http'},
+        'technical:video': {'width': 1920},
+        'manualMetadata:video': true,
+        'media-title-display:series': {'visible': true},
+        'metadataEpisodeNames:series': {'1': 'Episode title'},
+        'directory-preview:folder': {'collection': {}},
+        'browse:video': {'title': 'Browsing video'},
+        'syncDevice:id': 'changed-device',
+      };
+      for (final entry in changes.entries) {
+        for (final deleted in [false, true]) {
+          final before = notifications;
+          unawaited(f.model.synchronize(quiet: true));
+          await tester.pump();
+          if (deleted) {
+            f.store.removeLocal(entry.key);
+          } else {
+            f.store.setLocal(entry.key, entry.value);
+          }
+          f.client.requests.last.complete();
+          await tester.pump();
+          expect(
+            notifications,
+            before + 1,
+            reason: '${entry.key}: ${deleted ? 'deletion' : 'write'}',
+          );
+        }
+      }
+    },
+  );
+
+  testWidgets(
+    'offline retries back off to five minutes without quiet failure rebuilds',
+    (tester) async {
+      final f = await _Fixture.create(tester);
+      f.progress(30);
+      var notifications = 0;
+      f.model.addListener(() => notifications++);
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      for (final seconds in [3, 6, 12, 24, 48, 96, 180, 300, 300]) {
+        final count = f.client.requests.length;
+        f.client.requests.last.fail();
+        await tester.pump();
+        // Incidental full requests must respect the same offline deadline.
+        unawaited(f.model.synchronize(quiet: true));
+        await tester.pump(Duration(seconds: seconds - 1));
+        expect(f.client.requests, hasLength(count));
+        await tester.pump(const Duration(milliseconds: 1001));
+        expect(f.client.requests, hasLength(count + 1));
+        expect(f.client.requests.last.sharedOnly, false);
+        expect(f.progressRecord.dirty, true);
+      }
+      expect(notifications, 0);
+      f.client.requests.last.complete();
+      await tester.pump();
+      expect(f.progressRecord.dirty, false);
+      expect(f.client.maxActive, 1);
+    },
+  );
+
+  testWidgets(
+    'manual sync bypasses backoff and successful recovery resets retry delay',
+    (tester) async {
+      final f = await _Fixture.create(tester);
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.client.requests.last.fail();
+      await tester.pump();
+      unawaited(f.model.synchronize());
+      await tester.pump();
+      expect(f.client.requests, hasLength(2));
+      f.client.requests.last.complete();
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 10));
+      expect(f.client.requests, hasLength(2));
+
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.client.requests.last.fail();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 3001));
+      expect(f.client.requests, hasLength(4));
+      f.client.requests.last.complete();
+      await tester.pump();
+    },
+  );
+
   testWidgets(
     'background suspends polling and retries, then resumes dirty work',
     (tester) async {
@@ -359,11 +592,6 @@ void main() {
       f.model.requestProgressSync();
       await tester.pump(const Duration(milliseconds: 2900));
       expect(f.client.requests, hasLength(1));
-      // AppModel's retry deadline uses the wall clock. Flutter's fake timers do
-      // not replace DateTime.now, so allow that one deadline to pass explicitly.
-      await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 3100)),
-      );
       await tester.pump(const Duration(milliseconds: 200));
       expect(f.client.requests, hasLength(2));
       expect(
@@ -384,14 +612,22 @@ class _Fixture {
   late final _Client client = _Client(store);
   late final AppModel model;
   bool _disposed = false;
-  _Fixture({bool backgroundWork = false}) {
-    model = _Model(store, client, backgroundWork: backgroundWork);
+  _Fixture({bool backgroundWork = false, DateTime Function()? syncClock}) {
+    model = _Model(
+      store,
+      client,
+      backgroundWork: backgroundWork,
+      syncClock: syncClock,
+    );
   }
   static Future<_Fixture> create(
     WidgetTester tester, {
     bool backgroundWork = false,
   }) async {
-    final fixture = _Fixture(backgroundWork: backgroundWork);
+    final fixture = _Fixture(
+      backgroundWork: backgroundWork,
+      syncClock: tester.binding.clock.now,
+    );
     addTearDown(() async {
       fixture.disposeModel();
       await tester.pump();
@@ -417,10 +653,20 @@ class _Fixture {
 
 class _Model extends AppModel {
   final SyncClient _client;
-  _Model(AppStore store, this._client, {super.backgroundWork = false})
-    : super(store, Directory.systemTemp);
+  int syncInvocations = 0;
+  _Model(
+    AppStore store,
+    this._client, {
+    super.backgroundWork = false,
+    super.syncClock,
+  }) : super(store, Directory.systemTemp);
   @override
   SyncClient get sync => _client;
+  @override
+  Future<void> synchronize({bool quiet = false, bool sharedOnly = false}) {
+    syncInvocations++;
+    return super.synchronize(quiet: quiet, sharedOnly: sharedOnly);
+  }
 }
 
 class _Request {
@@ -452,6 +698,7 @@ class _Request {
 
 class _Client extends SyncClient {
   final requests = <_Request>[];
+  AppFailure? waitFailure;
   int active = 0, maxActive = 0, waits = 0;
   _Client(super.store);
   @override
@@ -507,6 +754,7 @@ class _Client extends SyncClient {
     CancelToken? cancel,
   }) async {
     waits++;
+    if (waitFailure != null) throw waitFailure!;
     return false;
   }
 }

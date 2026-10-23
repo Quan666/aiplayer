@@ -162,7 +162,14 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(model.libraryReads, 0);
-      expect(model.snapshotReads, 1);
+      expect(
+        model.snapshotReads,
+        3,
+        reason:
+            'details checks the card snapshot once before source loading, '
+            'then obtains updated aggregates after the mocked loader; '
+            'the uncovered library then reuses that snapshot',
+      );
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
     },
@@ -292,7 +299,51 @@ void main() {
       expect(find.textContaining('已收录 6 集'), findsOneWidget);
       expect(model.snapshotReads, 1);
       expect(model.libraryReads, 0);
-      expect(model.loads, 1);
+      expect(
+        model.loads,
+        2,
+        reason: 'returning to details checks its source once for new files',
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'covered details cancel pending source work and reload once on return',
+    (tester) async {
+      episode(1);
+      await library(tester);
+      await tester.tap(find.byKey(const ValueKey('details:episode-1')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      final firstRequest = model.detailsCancel!;
+      expect(firstRequest.cancelled, isFalse);
+      final navigator = Navigator.of(tester.element(find.byType(BottomSheet)));
+      unawaited(
+        navigator.push<void>(
+          MaterialPageRoute(builder: (_) => const Scaffold(body: Text('覆盖页'))),
+        ),
+      );
+      // Settle the route transition while source cancellation is pending.
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(firstRequest.cancelled, isTrue);
+      model.loaded.completeError(const Cancelled());
+      await tester.pumpAndSettle();
+      model._loaded = null;
+      await tester.pump(const Duration(minutes: 1));
+      expect(model.loads, 1, reason: 'covered details must not poll sources');
+
+      navigator.pop();
+      await tester.pumpAndSettle();
+      expect(model.loads, 2);
+      expect(model.detailsCancel, isNot(same(firstRequest)));
+      expect(model.detailsCancel!.cancelled, isFalse);
+      episode(2);
+      model.loaded.complete(store.all('media'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('已收录 2 集'), findsOneWidget);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
     },

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import '../playback/session.dart';
+import '../playback/fullscreen_transition.dart';
 import '../ui/theme/danmaku_style.dart';
 import 'layout.dart';
 
@@ -29,7 +30,7 @@ class DanmakuOverlay extends StatefulWidget {
 }
 
 class _DanmakuOverlayState extends State<DanmakuOverlay>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController ticker = AnimationController(
     vsync: this,
     duration: const Duration(seconds: 1),
@@ -37,11 +38,32 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   final cache = _LayoutCache();
   final _wake = ValueNotifier(0);
   Timer? _wakeTimer;
+  bool _visible = true;
+  bool _foreground = true;
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _foreground = !playbackIsBackgrounded(
+      WidgetsBinding.instance.lifecycleState,
+    );
     widget.session.addListener(_playState);
     widget.session.position.addListener(_playState);
+    _playState();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _visible = TickerMode.valuesOf(context).enabled;
+    _playState();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final foreground = !playbackIsBackgrounded(state);
+    if (foreground == _foreground) return;
+    _foreground = foreground;
     _playState();
   }
 
@@ -49,6 +71,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   void didUpdateWidget(covariant DanmakuOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.session != widget.session) {
+      oldWidget.session.setDanmakuPresentationActive(false);
       oldWidget.session.removeListener(_playState);
       oldWidget.session.position.removeListener(_playState);
       cache.clear();
@@ -59,9 +82,11 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   }
 
   void _playState() {
+    widget.session.setDanmakuPresentationActive(_visible && _foreground);
     _wakeTimer?.cancel();
     _wakeTimer = null;
     if (!_playing) ticker.stop();
+    if (!_visible || !_foreground) return;
     // A seek, refresh or native clock correction must be painted before
     // deciding whether the new layout needs continuous animation.
     _wakeFrame();
@@ -71,7 +96,9 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
 
   bool get _playing {
     final s = widget.session;
-    return !s.closed &&
+    return _visible &&
+        _foreground &&
+        !s.closed &&
         s.player.state.playing &&
         !s.player.state.buffering &&
         s.danmaku?.visible == true;
@@ -99,6 +126,8 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
 
   @override
   void dispose() {
+    widget.session.setDanmakuPresentationActive(false);
+    WidgetsBinding.instance.removeObserver(this);
     widget.session.removeListener(_playState);
     widget.session.position.removeListener(_playState);
     _wakeTimer?.cancel();

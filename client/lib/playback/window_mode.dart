@@ -6,6 +6,7 @@ import '../core/network.dart';
 import '../core/logger.dart';
 import '../cast/position.dart';
 import 'session.dart';
+import 'remote_progress.dart';
 
 /// System picture-in-picture on mobile; a reversible floating window on desktop.
 class PlayerWindowMode extends ChangeNotifier {
@@ -52,11 +53,14 @@ class PlayerWindowMode extends ChangeNotifier {
           return;
         }
         transfer.update(values);
-        transfer.persist();
         if (values['error'] is String) {
           transfer.session.notice = values['error'] as String;
         }
-        if (call.method == 'restored') await _restoreIOS(transfer);
+        if (call.method == 'restored') {
+          await _restoreIOS(transfer);
+        } else {
+          await transfer.persist();
+        }
         return;
       }
       if (_closed) return;
@@ -246,7 +250,7 @@ class PlayerWindowMode extends ChangeNotifier {
       session.remotePlayback = true;
       AppLog.instance.warning('小窗', '恢复应用内播放失败，已保留系统小窗进度。');
     } finally {
-      transfer.persist();
+      await transfer.persist();
       if (identical(_iosTransfer, transfer)) {
         _iosTransfer = null;
         _active = false;
@@ -262,6 +266,14 @@ class _IosPlaybackTransfer {
   double position, duration, rate;
   bool playing;
   Future<void>? restoring;
+  late final _progress = RemotePlaybackProgress(
+    store: session.model.store,
+    progressId: session.model.progressKey(session.media),
+    watchedId: session.model.watchedKey(session.media),
+    enabled: session.media.data['transient'] != true,
+    onSaved: session.model.requestProgressSync,
+    onError: (_) => AppLog.instance.warning('小窗', '系统小窗播放进度未能写入本机。'),
+  );
   _IosPlaybackTransfer(this.requestId, this.session)
     : position = session.player.state.position.inMilliseconds / 1000,
       duration = session.player.state.duration.inMilliseconds / 1000,
@@ -282,25 +294,6 @@ class _IosPlaybackTransfer {
     if (values['playing'] is bool) playing = values['playing'] as bool;
   }
 
-  void persist() {
-    if (duration <= 0 || session.media.data['transient'] == true) return;
-    try {
-      session.model.store
-          .save('progress', session.model.progressKey(session.media), {
-            'position': position.clamp(0, duration),
-            'duration': duration,
-            'updatedAt': DateTime.now().toUtc().toIso8601String(),
-            'devicePlatform': Platform.operatingSystem,
-          });
-      if (position / duration >= .95) {
-        session.model.store.save(
-          'watched',
-          session.model.watchedKey(session.media),
-          {'watched': true},
-        );
-      }
-    } catch (_) {
-      AppLog.instance.warning('小窗', '系统小窗播放进度未能写入本机。');
-    }
-  }
+  Future<void> persist() =>
+      _progress.save(position: position, duration: duration);
 }

@@ -22,8 +22,14 @@ void main() {
       expect(saves, 9);
       expect(captures, 0);
       playing = false;
+      checkpoints.updatePlaybackState();
+      expect(clock.pendingTimers, isEmpty);
       clock.elapse(const Duration(seconds: 30));
       expect(saves, 9);
+      playing = true;
+      checkpoints.updatePlaybackState();
+      clock.elapse(PlaybackCheckpoints.interval);
+      expect(saves, 10);
       checkpoints.stop();
     });
   });
@@ -112,7 +118,7 @@ void main() {
     });
   });
 
-  test('slow periodic writes do not block timers and close waits for each', () {
+  test('slow writes coalesce checkpoints and close waits for the latest', () {
     fakeAsync((clock) {
       final pending = <Completer<void>>[];
       var captures = 0;
@@ -126,23 +132,37 @@ void main() {
         capturePreview: () async => captures++,
         onError: (error) => fail('$error'),
       )..start();
-      clock.elapse(const Duration(seconds: 30));
-      expect(pending, hasLength(3));
+      clock.elapse(const Duration(hours: 1));
+      expect(pending, hasLength(1));
       expect(captures, 0);
 
       var closed = false;
       checkpoints.close().then((_) => closed = true);
       clock.flushMicrotasks();
       expect(captures, 1);
-      for (final write in pending.skip(1)) {
-        write.complete();
-      }
-      clock.flushMicrotasks();
       expect(closed, isFalse);
       pending.first.complete();
       clock.flushMicrotasks();
+      expect(pending, hasLength(2));
+      expect(closed, isFalse);
+      pending.last.complete();
+      clock.flushMicrotasks();
       expect(closed, isTrue);
       expect(clock.pendingTimers, isEmpty);
+    });
+  });
+
+  test('starting paused does not schedule wakeups', () {
+    fakeAsync((clock) {
+      final checkpoints = PlaybackCheckpoints(
+        isPlaying: () => false,
+        saveProgress: () => fail('Paused playback has no periodic checkpoint'),
+        capturePreview: () async {},
+        onError: (error) => fail('$error'),
+      )..start();
+      expect(clock.pendingTimers, isEmpty);
+      clock.elapse(const Duration(hours: 1));
+      checkpoints.stop();
     });
   });
 

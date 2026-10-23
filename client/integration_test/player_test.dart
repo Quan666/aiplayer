@@ -175,7 +175,7 @@ void main() {
       final technical = MediaTechnicalInfo.forRecord(model.store, record);
       expect(
         technical.container,
-        'Matroska',
+        'MKV',
         reason:
             'cached=${model.store.local('technical:$id')}; '
             'native=${await native.getProperty('file-format')}',
@@ -281,7 +281,11 @@ void main() {
       final image = await boundary.toImage(pixelRatio: 1);
       final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
       image.dispose();
-      final artifacts = Directory('${Directory.current.path}/../artifacts');
+      final artifacts = Directory(
+        const String.fromEnvironment('PLAYER_ARTIFACT_DIR').isNotEmpty
+            ? const String.fromEnvironment('PLAYER_ARTIFACT_DIR')
+            : '${Directory.current.path}/../artifacts',
+      );
       await artifacts.create(recursive: true);
       await File(
         '${artifacts.path}/playback.png',
@@ -302,8 +306,14 @@ void main() {
         Brightness.light,
       );
       expect(find.text('继续观看'), findsOneWidget);
-      final playCard = find.byKey(ValueKey('play:$id')).first;
+      final playCard = find
+          .descendant(
+            of: find.byKey(const PageStorageKey('library-continue-scroll')),
+            matching: find.byType(InkWell),
+          )
+          .first;
       await tester.ensureVisible(playCard);
+      await tester.pumpAndSettle();
       await tester.tap(playCard);
       for (
         var i = 0;

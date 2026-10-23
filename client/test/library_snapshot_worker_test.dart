@@ -198,6 +198,190 @@ void main() {
   );
 
   test(
+    'one recognized episode promotes its unambiguous siblings to a complete shortcut',
+    () async {
+      for (var episode = 1; episode <= 3; episode++) {
+        store.save('media', 'episode-$episode', {
+          'title': 'Original S01E0$episode.mkv',
+          'fileName': 'Original S01E0$episode.mkv',
+          'series': episode == 2 ? '正式作品' : 'Original',
+          'season': '1',
+          'episode': '$episode',
+          'size': 10,
+          if (episode == 2) ...{
+            'bangumiId': '7',
+            'metadataTitle': '正式作品',
+            'poster': 'https://example.test/series.jpg',
+          },
+        });
+        store.save('progress', 'episode-$episode:10', {
+          'position': 5,
+          'updatedAt': '2026-10-2$episode',
+        });
+      }
+      store.save('media', 'standalone', {'title': 'Private recording.mp4'});
+      final snapshot = await model.loadLibrarySnapshot();
+      final first = snapshot.byId['episode-1']!;
+      expect(snapshot.posters.single.key, 'bangumi:7:1');
+      expect(snapshot.posters.single.value, hasLength(3));
+      expect(snapshot.seriesFor(first), same(snapshot.posters.single.value));
+      expect(snapshot.representativeFor(first).id, 'episode-2');
+      expect(snapshot.recent.map((record) => record.id), ['episode-3']);
+      expect(snapshot.files.single.value.single.id, 'standalone');
+      expect(() => snapshot.seriesKeys.clear(), throwsUnsupportedError);
+      expect(() => snapshot.representatives.clear(), throwsUnsupportedError);
+      for (final query in ['S01E02', '正式作品']) {
+        final filtered = await model.loadLibrarySnapshot(query: query);
+        expect(filtered.posters.single.value, hasLength(3));
+        expect(filtered.files, isEmpty);
+      }
+      expect(store.fullReads, 0);
+
+      // A second explicit identification makes the filename ambiguous. Keep
+      // both verified choices and the parsed siblings separate after refresh.
+      final external = AppStore.openExisting(store.path);
+      addTearDown(external.dispose);
+      final third = external.get('media', 'episode-3')!;
+      external.save('media', third.id, {...third.data, 'bangumiId': '8'});
+      final conflicted = await model.loadLibrarySnapshot();
+      expect(conflicted.series, hasLength(4));
+      expect(conflicted.seriesFor(first).single.id, 'episode-1');
+      expect(
+        conflicted.seriesKeyFor(conflicted.byId['episode-2']!),
+        'bangumi:7:1',
+      );
+      expect(
+        conflicted.seriesKeyFor(conflicted.byId['episode-3']!),
+        'bangumi:8:1',
+      );
+    },
+  );
+
+  test(
+    'canonical episode versions are prepared off-thread and track local availability',
+    () async {
+      store.save('media', 'recognized', {
+        'title': 'Original S01E01.mkv',
+        'series': '正式作品',
+        'season': '1',
+        'episode': '1',
+        'bangumiId': '7',
+        'metadataTitle': '正式作品',
+      });
+      for (final (id, episode) in [('alternate', '1'), ('next', '2')]) {
+        store.save('media', id, {
+          'title': 'Original S01E0$episode.mp4',
+          'series': 'Original',
+          'season': '1',
+          'episode': episode,
+        });
+      }
+      store.setLocal('location:alternate', {
+        'source': 'local',
+        'path': '/series/Original S01E01.mp4',
+      });
+      final snapshot = await model.loadLibrarySnapshot();
+      final first = snapshot.byId['recognized']!;
+      final alternate = snapshot.byId['alternate']!;
+      expect(snapshot.preparationIsolate, isNot(Isolate.current.hashCode));
+      expect(snapshot.episodeKeyFor(first), snapshot.episodeKeyFor(alternate));
+      expect(snapshot.versionsFor(first), hasLength(2));
+      expect(
+        snapshot.versionsFor(first),
+        same(snapshot.versionsFor(alternate)),
+      );
+      expect(snapshot.episodesFor(first).map((record) => record.id), [
+        'alternate',
+        'next',
+      ]);
+      expect(alternate.data['bangumiId'], isNull);
+      expect(() => snapshot.episodeKeys.clear(), throwsUnsupportedError);
+      expect(() => snapshot.versionsFor(first).clear(), throwsUnsupportedError);
+      expect(() => snapshot.episodesFor(first).clear(), throwsUnsupportedError);
+      expect(store.fullReads, 0);
+
+      store.setLocal('location:recognized', {
+        'source': 'local',
+        'path': '/series/Original S01E01.mkv',
+      });
+      final updated = await model.loadLibrarySnapshot();
+      expect(updated.episodesFor(first).map((record) => record.id), [
+        'recognized',
+        'next',
+      ]);
+      expect(snapshot.episodesFor(first).first.id, 'alternate');
+      expect(store.fullReads, 0);
+    },
+  );
+
+  test(
+    'filename aliases respect the recorded season and exclude movies',
+    () async {
+      for (final season in ['1', '2']) {
+        store.save('media', 'season-$season', {
+          'fileName': 'Original - 01.mkv',
+          'title': 'Original - 01.mkv',
+          'series': 'Original',
+          'season': season,
+          'episode': '1',
+          if (season == '2') 'bangumiId': '7',
+        });
+      }
+      store.save('media', 'movie', {
+        'title': 'Original - 01.mkv',
+        'series': 'Original',
+        'season': '1',
+        'episode': '1',
+        'tmdbId': '9',
+        'metadataType': 'movie',
+      });
+      final snapshot = await model.loadLibrarySnapshot();
+      expect(snapshot.series, hasLength(3));
+      expect(
+        snapshot.seriesKeyFor(snapshot.byId['season-1']!),
+        'parsed:original:1',
+      );
+      expect(snapshot.seriesKeyFor(snapshot.byId['season-2']!), 'bangumi:7:2');
+      final corrected = store.get('media', 'season-2')!;
+      store.save('media', corrected.id, {
+        ...corrected.data,
+        'fileName': 'Original S01E01.mkv',
+      });
+      final refreshed = await model.loadLibrarySnapshot();
+      expect(refreshed.series, hasLength(3));
+      expect(
+        refreshed.seriesKeyFor(refreshed.byId['season-1']!),
+        'parsed:original:1',
+      );
+    },
+  );
+
+  test(
+    'a corrected parsed title does not rejoin its original filename series',
+    () async {
+      store.save('media', 'recognized', {
+        'fileName': 'Original S01E01.mkv',
+        'series': '正式作品',
+        'season': '1',
+        'episode': '1',
+        'bangumiId': '7',
+      });
+      store.save('media', 'corrected', {
+        'fileName': 'Original S01E02.mkv',
+        'series': 'Different',
+        'season': '1',
+        'episode': '2',
+      });
+      final snapshot = await model.loadLibrarySnapshot();
+      expect(snapshot.series, hasLength(2));
+      expect(
+        snapshot.seriesKeyFor(snapshot.byId['corrected']!),
+        'parsed:different:1',
+      );
+    },
+  );
+
+  test(
     'concurrent searches keep their own results and cancellation is local',
     () async {
       store.save('media', 'alpha', {'title': 'Alpha'});

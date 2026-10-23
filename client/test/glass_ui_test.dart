@@ -192,7 +192,7 @@ void main() {
             expect(
               find.descendant(
                 of: find.byType(BottomSheet),
-                matching: find.text('星海漫游 · 第 1 集'),
+                matching: find.text('星海漫游'),
               ),
               findsOneWidget,
             );

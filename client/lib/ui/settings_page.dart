@@ -23,7 +23,8 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends State<SettingsPage>
+    with WidgetsBindingObserver {
   final origin = TextEditingController(),
       token = TextEditingController(),
       interval = TextEditingController(),
@@ -39,12 +40,16 @@ class _SettingsPageState extends State<SettingsPage> {
   String group = 'general', query = '';
   Object? _settingsRevision;
   AppPreferences? _sectionPreferences;
+  bool _foreground = true, _visible = true;
   AppModel get model => widget.model;
   AppPreferences get prefs => _sectionPreferences ?? model.preferences;
   bool get mobile => Platform.isAndroid || Platform.isIOS;
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     _settingsRevision = _revision;
     model.addListener(_modelChanged);
     load();
@@ -57,13 +62,28 @@ class _SettingsPageState extends State<SettingsPage> {
   );
 
   void _modelChanged() {
-    if (!mounted || !widget.active) return;
+    if (!mounted || !widget.active || !_foreground || !_visible) return;
     final revision = _revision;
     if (_settingsRevision == revision) return;
     _settingsRevision = revision;
     // Refresh switches and options without reloading controllers: connection
     // credentials and unsaved drafts belong to this editing session.
     setState(() {});
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _visible =
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.isCurrentOf(context) ?? true);
+    _modelChanged();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    if (_foreground) _modelChanged();
   }
 
   @override
@@ -110,6 +130,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     model.removeListener(_modelChanged);
     for (final c in [
       origin,

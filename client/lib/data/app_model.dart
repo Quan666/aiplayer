@@ -25,6 +25,7 @@ import 'sync_artwork.dart';
 import 'media_previews.dart';
 import 'library_catalog.dart';
 import 'library_snapshot.dart';
+import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
 import 'media_presentation.dart';
 import 'media_title_translation.dart';
@@ -36,6 +37,13 @@ import '../subtitles/ai.dart';
 part 'app_model_metadata_ai.dart';
 part 'app_model_metadata_tasks.dart';
 part 'app_model_directory_recognition.dart';
+
+Duration _syncRetryDelay(int failures) {
+  const seconds = [3, 6, 12, 24, 48, 96, 180, 300];
+  return Duration(
+    seconds: seconds[(failures - 1).clamp(0, seconds.length - 1)],
+  );
+}
 
 dynamic _copyJson(dynamic value) => switch (value) {
   Map() => <String, dynamic>{
@@ -90,9 +98,9 @@ class AppModel extends ChangeNotifier {
   final bool backgroundWork;
   final FlutterSecureStorage secrets;
   PosterCache? _posterCache;
-  PosterCache get posterCache => _posterCache ??= PosterCache(
+  PosterCache get posterCache => _posterCache ??= (PosterCache(
     directory: Directory(p.join(documents.path, 'poster-cache-v1')),
-  );
+  )..setActive(_foreground));
 
   void _prefetchPoster(String url) {
     if (_disposed || url.isEmpty) return;
@@ -152,6 +160,12 @@ class AppModel extends ChangeNotifier {
     _activePlaybackMediaId = id;
     _syncResumeTimer?.cancel();
     if (id != null) {
+      _directoryEnrichmentCancel.cancel();
+      _directoryEnrichmentCancel = CancelToken();
+      _pauseAutomaticMetadataTasks();
+      _metadataTimer?.cancel();
+      _syncTimer?.cancel();
+      _syncTimer = null;
       _syncWatch?.cancel();
       _syncWatch = null;
       realtimeConnected = false;
@@ -164,6 +178,7 @@ class AppModel extends ChangeNotifier {
       resumePreviews();
       _releaseAutomaticWork();
       if (backgroundWork && _foreground) {
+        _nextSyncAttempt = null;
         // Wait until decoder cleanup and the final screenshot have finished.
         _syncResumeTimer = Timer(const Duration(seconds: 1), () {
           if (_disposed || !_foreground || activePlaybackMediaId != null) {
@@ -184,6 +199,10 @@ class AppModel extends ChangeNotifier {
     aiFallback: _identifyDirectoryWithAi,
     aiContext: () => _metadataAiContext,
     onPoster: _prefetchPoster,
+    prepareDirectory: _prepareDirectoryInspection,
+    persistDirectory: _persistDirectoryPreview,
+    readDirectory: _readDirectoryPreview,
+    episodeNamesCovered: _directoryEpisodeNamesCovered,
     tmdbCredential: () async {
       final key = await secrets.read(key: 'tmdb.apiKey') ?? '';
       AppLog.instance.rememberSecret(key);
@@ -191,7 +210,98 @@ class AppModel extends ChangeNotifier {
     },
   );
   final _metadataCancel = CancelToken();
+  CancelToken _directoryEnrichmentCancel = CancelToken();
   DirectoryMetadataWorker? _directoryMetadataWorker;
+
+  Future<bool> _directoryEpisodeNamesCovered(
+    Map<String, ReleaseName> identities,
+    Map<String, String> names,
+    CancelToken? cancel,
+  ) async {
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    final covered = store.path == ':memory:'
+        ? directoryEpisodeNamesCovered(identities, names)
+        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+            store.path,
+          )).episodeNamesCovered(identities, names, cancel: cancel);
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    return covered;
+  }
+
+  Future<DirectoryInspection> _prepareDirectoryInspection(
+    String sourceId,
+    String path,
+    String context,
+    List<SourceEntry> entries,
+    CancelToken? cancel,
+  ) async {
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    final result = store.path == ':memory:'
+        ? prepareDirectoryInspection(
+            sourceId,
+            path,
+            context,
+            entries,
+            folderIdentity: sourceDirectoryIdentity(store, sourceId, path),
+          )
+        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+            store.path,
+          )).prepareInspection(
+            sourceId,
+            path,
+            context,
+            entries,
+            cancel: cancel ?? _metadataCancel,
+          );
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    return result;
+  }
+
+  Future<void> _persistDirectoryPreview(
+    String sourceId,
+    String path,
+    DirectoryPreview preview,
+    CancelToken? cancel,
+  ) async {
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    if (store.path == ':memory:') {
+      persistDirectoryPreview(store, sourceId, path, preview);
+    } else {
+      await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+        store.path,
+      )).persistPreview(
+        sourceId,
+        path,
+        preview,
+        cancel: cancel ?? _metadataCancel,
+      );
+    }
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+  }
+
+  Future<DirectoryPreview?> _readDirectoryPreview(
+    String sourceId,
+    String path,
+    CancelToken? cancel,
+  ) async {
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    final result = store.path == ':memory:'
+        ? readDirectoryPreview(store, sourceId, path)
+        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+            store.path,
+          )).readPreview(sourceId, path, cancel: cancel ?? _metadataCancel);
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    return result;
+  }
+
   CancelToken? _directoryRecognitionCancel;
   bool recognizingDirectory = false;
   DirectoryRecognitionProgress directoryRecognitionProgress =
@@ -219,6 +329,9 @@ class AppModel extends ChangeNotifier {
   bool _syncAgain = false, _syncNeedsFull = false, _syncVisible = false;
   int _catalogProfileRevision = -1;
   DateTime? _nextSyncAttempt;
+  DateTime? _syncMaintenanceAt;
+  int _syncFailures = 0;
+  final DateTime Function() _syncClock;
   MediaPreviewQueue? _previews;
   final _previewDiagnostics = <String>{};
   final _previewFileChecks = <String, Future<bool>>{};
@@ -235,7 +348,9 @@ class AppModel extends ChangeNotifier {
     PreviewCapture? previewCapture,
     this.backgroundWork = true,
     bool deferBackgroundWork = false,
-  }) : secrets = secrets ?? createCredentialStorage(documents) {
+    DateTime Function()? syncClock,
+  }) : secrets = secrets ?? createCredentialStorage(documents),
+       _syncClock = syncClock ?? DateTime.now {
     if (backgroundWork && !deferBackgroundWork) {
       scheduleMicrotask(() => unawaited(startBackgroundWork()));
     }
@@ -305,11 +420,6 @@ class AppModel extends ChangeNotifier {
       );
       unawaited(_identifyPending());
       unawaited(synchronize(quiet: true));
-      _syncTimer = Timer.periodic(const Duration(minutes: 1), (_) {
-        if (_foreground && activePlaybackMediaId == null) {
-          unawaited(synchronize(quiet: true));
-        }
-      });
     } catch (error) {
       if (!_disposed) {
         AppLog.instance.warning('后台任务', safeFailure(error).message);
@@ -320,7 +430,15 @@ class AppModel extends ChangeNotifier {
   void setForeground(bool foreground) {
     if (_disposed || _foreground == foreground) return;
     _foreground = foreground;
+    _posterCache?.setActive(foreground);
     if (!foreground) {
+      _directoryEnrichmentCancel.cancel();
+      _directoryEnrichmentCancel = CancelToken();
+      _pauseAutomaticMetadataTasks();
+      unawaited(pausePreviews());
+      _metadataTimer?.cancel();
+      _syncTimer?.cancel();
+      _syncTimer = null;
       _syncResumeTimer?.cancel();
       _syncDebounce?.cancel();
       _syncWatch?.cancel();
@@ -328,12 +446,41 @@ class AppModel extends ChangeNotifier {
       realtimeConnected = false;
       if (_activeSyncAppliesProfile) _activeSync?.cancel();
     } else {
+      resumePreviews();
       _releaseAutomaticWork();
       if (backgroundWork) {
+        _nextSyncAttempt = null;
         unawaited(synchronize(quiet: true));
         unawaited(_identifyPending());
       }
     }
+  }
+
+  void _scheduleSyncMaintenance({required bool full}) {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    if (_disposed ||
+        !backgroundWork ||
+        !_foreground ||
+        activePlaybackMediaId != null ||
+        (_syncAgain && _syncNeedsFull) ||
+        (settings['syncOrigin'] as String? ?? '').isEmpty) {
+      return;
+    }
+    // Local playback edits and remote changes already trigger their own sync.
+    // Full profile reconciliation is an idle fallback, not a minute heartbeat.
+    final now = _syncClock();
+    if (full || _syncMaintenanceAt == null) {
+      _syncMaintenanceAt = now.add(const Duration(minutes: 5));
+    }
+    final remaining = _syncMaintenanceAt!.difference(now);
+    _syncTimer = Timer(
+      remaining > Duration.zero ? remaining : Duration.zero,
+      () {
+        _syncTimer = null;
+        unawaited(synchronize(quiet: true));
+      },
+    );
   }
 
   void _releaseAutomaticWork() {
@@ -363,6 +510,50 @@ class AppModel extends ChangeNotifier {
   LibrarySnapshot? _librarySnapshot;
   (int, int, int)? _librarySnapshotRevision;
   Future<void>? _librarySnapshotWork;
+  ContinueWatchingPresentationReader? _continueWatchingReader;
+  Object? _continueWatchingRevision;
+  List<String> _continueWatchingIds = const [];
+  Map<String, ContinueWatchingPresentation> _continueWatchingCards = const {};
+
+  /// Presentation changes never invalidate the structural library snapshot.
+  Object get continueWatchingPresentationRevision => (
+    store.recordsRevision('media'),
+    store.recordsRevision('progress'),
+    store.locationRevision,
+    store.localPrefixRevision('browse:'),
+    store.localPrefixRevision('preview:'),
+    store.localPrefixRevision('mediaMetadata:'),
+    store.localPrefixRevision('episodeTitle:'),
+    store.localPrefixRevision('media-title-display:'),
+    store.localKeyRevision('settings'),
+    store.localKeyRevision('syncDevice:id'),
+  );
+
+  Future<Map<String, ContinueWatchingPresentation>>
+  loadContinueWatchingPresentations(
+    List<SyncRecord> items, {
+    CancelToken? cancel,
+  }) async {
+    final ids = List<String>.unmodifiable(items.map((item) => item.id));
+    while (true) {
+      cancel?.check();
+      if (_disposed) throw const Cancelled();
+      final revision = continueWatchingPresentationRevision;
+      if (_continueWatchingRevision == revision &&
+          listEquals(_continueWatchingIds, ids)) {
+        return _continueWatchingCards;
+      }
+      final reader = _continueWatchingReader ??=
+          ContinueWatchingPresentationReader(store);
+      final cards = await reader.read(ids, cancel: cancel);
+      cancel?.check();
+      if (_disposed) throw const Cancelled();
+      if (revision != continueWatchingPresentationRevision) continue;
+      _continueWatchingRevision = revision;
+      _continueWatchingIds = ids;
+      return _continueWatchingCards = cards;
+    }
+  }
 
   (int, int, int) get _libraryReadRevision => (
     store.recordsRevision('media'),
@@ -604,6 +795,9 @@ class AppModel extends ChangeNotifier {
     notifyListeners();
     if (value.containsKey('syncOrigin') || syncToken != null) {
       _syncConnectionRevision++;
+      _syncFailures = 0;
+      _nextSyncAttempt = null;
+      _syncMaintenanceAt = null;
       _activeSync?.cancel();
       _syncWatch?.cancel();
       _syncWatch = null;
@@ -714,8 +908,8 @@ class AppModel extends ChangeNotifier {
 
   ReleaseName mediaIdentity(SourceEntry entry) {
     var guess = parseReleaseName(entry.name);
-    final folder = subjectIdentity(
-      p.posix.basename(p.posix.dirname(entry.path.replaceAll('\\', '/'))),
+    final folder = directoryIdentity(
+      p.posix.dirname(entry.path.replaceAll('\\', '/')),
     );
     if (guess.episode.isEmpty && folder.anime.isNotEmpty) {
       final number = RegExp(
@@ -1021,6 +1215,11 @@ class AppModel extends ChangeNotifier {
           .toList()
         ..sort(compareMediaEpisodes);
 
+  final _seriesRefreshFailures = <String, int>{};
+
+  Duration seriesRefreshDelay(SyncRecord record) =>
+      Duration(seconds: 30 * (1 << (_seriesRefreshFailures[record.id] ?? 0)));
+
   /// Older libraries only stored played files. Complete their source directory
   /// before showing details so the two entry points expose the same episodes.
   Future<List<SyncRecord>> loadSeriesEpisodes(
@@ -1031,8 +1230,9 @@ class AppModel extends ChangeNotifier {
     final snapshot = await loadLibrarySnapshot(cancel: cancel);
     final current = snapshot.byId[record.id];
     if (current == null) return const [];
-    final existing = snapshot.series[mediaSeriesKey(current)] ?? [current];
+    final existing = snapshot.seriesFor(current);
     final directories = <String>{};
+    var attempted = 0, refreshed = 0;
     for (final item in existing) {
       cancel?.check();
       final location = snapshot.locations[item.id];
@@ -1040,19 +1240,31 @@ class AppModel extends ChangeNotifier {
       final sourceId = '${location['source']}';
       final path = p.posix.dirname('${location['path']}'.replaceAll('\\', '/'));
       if (!directories.add('$sourceId:$path')) continue;
+      attempted++;
       SourceAdapter? connection;
       try {
         // An already recognized folder is usable even while its source is
         // offline. Import its complete cached series before optional listing.
-        final cached = catalog.directoryPreview(sourceId, path)?.collection;
-        if (cached?.subject != null) {
-          await synchronizeCollectionInBackground(
+        try {
+          final cached = (await catalog.loadDirectoryPreview(
             sourceId,
-            cached!,
-            importMissing: true,
-            anchorId: item.id,
+            path,
             cancel: cancel,
-          );
+          ))?.collection;
+          if (cached != null) {
+            await synchronizeCollectionInBackground(
+              sourceId,
+              cached,
+              importMissing: true,
+              anchorId: item.id,
+              cancel: cancel,
+            );
+          }
+        } on Cancelled {
+          rethrow;
+        } catch (error) {
+          // A damaged or outdated cache must never prevent a fresh listing.
+          AppLog.instance.warning('系列缓存', safeFailure(error).message);
         }
         connection = await adapter(sourceId);
         cancel?.check();
@@ -1062,17 +1274,31 @@ class AppModel extends ChangeNotifier {
         });
         cancel?.check();
         if (_disposed) break;
-        await synchronizeDirectoryEntriesInBackground(
+        final collection = await synchronizeDirectoryEntriesInBackground(
           sourceId,
           path,
           entries,
           anchorId: item.id,
           cancel: cancel,
         );
+        // File discovery is published by the worker before optional network
+        // metadata. Imported siblings also need recognition and episode names;
+        // they never pass through addMedia's playback-triggered task queue.
+        if (collection == null ||
+            await _enrichSeriesDirectory(
+              sourceId,
+              collection,
+              anchorId: item.id,
+              cancel: cancel ?? _metadataCancel,
+            )) {
+          refreshed++;
+        }
       } on Cancelled {
         rethrow;
-      } catch (_) {
-        // Offline sources retain their complete last-known library records.
+      } catch (error) {
+        // Retain offline content, but preserve diagnostics and back off the
+        // visible detail's automatic retries instead of hiding listing errors.
+        AppLog.instance.warning('系列目录刷新', safeFailure(error).message);
       } finally {
         try {
           await connection?.close();
@@ -1081,9 +1307,124 @@ class AppModel extends ChangeNotifier {
         }
       }
     }
+    cancel?.check();
+    if (!_disposed && attempted > 0) {
+      final failures = _seriesRefreshFailures.remove(record.id) ?? 0;
+      if (_seriesRefreshFailures.length >= 32) {
+        _seriesRefreshFailures.remove(_seriesRefreshFailures.keys.first);
+      }
+      _seriesRefreshFailures[record.id] = refreshed == attempted
+          ? 0
+          : (failures + 1).clamp(0, 3);
+    }
     final updated = await loadLibrarySnapshot(cancel: cancel);
-    return updated.series[mediaSeriesKey(updated.byId[record.id] ?? record)] ??
-        const [];
+    return updated.seriesFor(updated.byId[record.id] ?? record);
+  }
+
+  Future<bool> _enrichSeriesDirectory(
+    String sourceId,
+    DirectoryCollection collection, {
+    required String anchorId,
+    required CancelToken cancel,
+  }) async {
+    cancel.check();
+    _metadataCancel.check();
+    if (preferences.metadataStrategy == 'off') return true;
+    if (_disposed || !_foreground || activePlaybackMediaId != null) {
+      return false;
+    }
+    Map<String, dynamic>? sourceConfiguration() {
+      if (sourceId == 'local') return null;
+      final configured = sources
+          .where((source) => source['id'] == sourceId)
+          .firstOrNull;
+      final external = configured ?? store.local('externalSource:$sourceId');
+      return external is Map ? Map<String, dynamic>.from(external) : null;
+    }
+
+    final configuration = sourceConfiguration();
+    final revision = catalog.directoryInspectionRevision(sourceId);
+    final binding = store.local('location:$anchorId');
+    void checkCurrent() {
+      cancel.check();
+      if (_disposed ||
+          revision != catalog.directoryInspectionRevision(sourceId) ||
+          !mapEquals(configuration, sourceConfiguration()) ||
+          !_equalMetadata(binding, store.local('location:$anchorId'))) {
+        throw const Cancelled();
+      }
+    }
+
+    final callerCancel = cancel;
+    cancel = CancelToken();
+    final subscriptions = [
+      for (final token in {
+        callerCancel,
+        _metadataCancel,
+        _directoryEnrichmentCancel,
+      })
+        token.whenCancelled.asStream().listen((_) => cancel.cancel()),
+    ];
+    try {
+      // Reuse an existing/manual identity. Looking it up by a renamed folder or
+      // filename could select a different work and discard a user's correction.
+      final episodeNamesRevision = catalog.episodeNamesRevision;
+      final subject =
+          collection.subject ??
+          await catalog.resolve(
+            collection.title,
+            collection.season,
+            cancel: cancel,
+          );
+      checkCurrent();
+      if (subject == null) return false;
+      if (_disposed || !_foreground || activePlaybackMediaId != null) {
+        return false;
+      }
+      var complete = true;
+      var names = collection.episodeTitles;
+      try {
+        names = await catalog.collectionEpisodeNames(
+          collection,
+          subject,
+          cancel: cancel,
+          refreshCached: !catalog.episodeNamesFetchedSince(
+            episodeNamesRevision,
+            subject,
+            season: collection.season,
+          ),
+        );
+        complete = await catalog.collectionEpisodeNamesCovered(
+          collection,
+          names,
+          cancel: cancel,
+        );
+      } on Cancelled {
+        rethrow;
+      } catch (error) {
+        // A temporary episode endpoint failure must not throw away a successful
+        // series match. The visible details retry using their existing backoff.
+        complete = false;
+        AppLog.instance.warning('系列分集资料', safeFailure(error).message);
+      }
+      checkCurrent();
+      if (_disposed || !_foreground || activePlaybackMediaId != null) {
+        return false;
+      }
+      if (preferences.metadataStrategy == 'off') return true;
+      await synchronizeCollectionInBackground(
+        sourceId,
+        collection.withMetadata(subject, names),
+        importMissing: true,
+        anchorId: anchorId,
+        cancel: cancel,
+      );
+      return complete;
+    } finally {
+      for (final subscription in subscriptions) {
+        unawaited(subscription.cancel());
+      }
+    }
   }
 
   Future<bool> identifyMediaRecords(
@@ -1286,9 +1627,10 @@ class AppModel extends ChangeNotifier {
 
   void _scheduleIdentification(String id) {
     if (_disposed || preferences.metadataStrategy == 'off') return;
-    _metadataPending.add(id);
+    if (!_metadataPending.add(id)) return;
     if (_batchMediaBindings != null) return;
     store.setLocal('metadata:automatic-pending', _metadataPending.toList());
+    if (!_foreground || activePlaybackMediaId != null) return;
     _metadataTimer?.cancel();
     _metadataTimer = Timer(const Duration(milliseconds: 350), _identifyPending);
   }
@@ -2191,10 +2533,14 @@ class AppModel extends ChangeNotifier {
   }
 
   void requestProgressSync() {
-    if (_disposed || !_foreground) return;
+    if (_disposed ||
+        !_foreground ||
+        (settings['syncOrigin'] as String? ?? '').isEmpty) {
+      return;
+    }
     _syncDebounce?.cancel();
     final remaining =
-        _nextSyncAttempt?.difference(DateTime.now()).inMilliseconds ?? 0;
+        _nextSyncAttempt?.difference(_syncClock()).inMilliseconds ?? 0;
     _syncDebounce = Timer(
       Duration(milliseconds: remaining > 150 ? remaining + 1 : 150),
       () {
@@ -2223,8 +2569,9 @@ class AppModel extends ChangeNotifier {
     }
 
     unawaited(() async {
+      var failures = 0;
       while (!_disposed && !cancel.cancelled) {
-        final started = DateTime.now();
+        final started = _syncClock();
         try {
           final changed = await sync.waitForChanges(
             address,
@@ -2232,18 +2579,30 @@ class AppModel extends ChangeNotifier {
             cancel: cancel,
           );
           if (cancel.cancelled || _disposed) return;
-          realtimeConnected = true;
+          failures = 0;
+          if (!realtimeConnected) {
+            realtimeConnected = true;
+            notifyListeners();
+          }
           if (changed) await synchronize(quiet: true, sharedOnly: true);
-          if (DateTime.now().difference(started).inMilliseconds < 1000) {
-            await pause(const Duration(seconds: 1));
+          if (cancel.cancelled || _disposed) return;
+          final retry = _nextSyncAttempt?.difference(_syncClock());
+          if (retry != null && retry > Duration.zero) {
+            await pause(retry);
+          } else if (_syncClock().difference(started).inMilliseconds < 1000) {
+            // Older servers/proxies can return immediately. Empty responses
+            // must not turn a long poll into a one-request-per-second loop.
+            await pause(Duration(seconds: changed ? 1 : 20));
           }
         } on Cancelled {
           return;
         } catch (_) {
           if (_disposed || cancel.cancelled) return;
-          realtimeConnected = false;
-          if (!_disposed) notifyListeners();
-          await pause(const Duration(seconds: 3));
+          if (realtimeConnected) {
+            realtimeConnected = false;
+            notifyListeners();
+          }
+          await pause(_syncRetryDelay(++failures));
         }
       }
     }());
@@ -2254,11 +2613,13 @@ class AppModel extends ChangeNotifier {
     if (quiet && !sharedOnly && activePlaybackMediaId != null) {
       sharedOnly = true;
     }
-    if (quiet &&
-        sharedOnly &&
-        (_nextSyncAttempt?.isAfter(DateTime.now()) ?? false)) {
+    if (quiet && (_nextSyncAttempt?.isAfter(_syncClock()) ?? false)) {
       return Future.value();
     }
+    _syncDebounce?.cancel();
+    _syncDebounce = null;
+    _syncTimer?.cancel();
+    _syncTimer = null;
     _syncAgain = true;
     _syncNeedsFull |= !sharedOnly;
     _syncVisible |= !quiet;
@@ -2312,7 +2673,9 @@ class AppModel extends ChangeNotifier {
         if (!_disposed &&
             (settings['syncOrigin'] as String? ?? '').isNotEmpty) {
           _syncAgain = true;
-          _nextSyncAttempt ??= DateTime.now().add(const Duration(seconds: 3));
+          _nextSyncAttempt ??= _syncClock().add(
+            _syncRetryDelay(++_syncFailures),
+          );
         }
         break;
       }
@@ -2325,6 +2688,8 @@ class AppModel extends ChangeNotifier {
     Set<String> artworkIds = const {},
   }) async {
     final revision = _syncConnectionRevision;
+    final presentation = _syncPresentationRevision;
+    final oldStatus = status;
     final cancel = _activeSync = CancelToken();
     final deferProfile = activePlaybackMediaId != null;
     _activeSyncAppliesProfile = !sharedOnly || !deferProfile;
@@ -2357,6 +2722,7 @@ class AppModel extends ChangeNotifier {
         return false;
       }
       _nextSyncAttempt = null;
+      _syncFailures = 0;
       if (!deferProfile && _catalogProfileRevision != sync.profileRevision) {
         catalog.reloadSyncedDirectoryPreviews();
         _catalogProfileRevision = sync.profileRevision;
@@ -2365,6 +2731,7 @@ class AppModel extends ChangeNotifier {
         _watchSync(address, token);
       }
       status = '同步完成';
+      _scheduleSyncMaintenance(full: !sharedOnly);
       if (!quiet) AppLog.instance.info('同步', status);
     } on Cancelled {
       return false;
@@ -2374,20 +2741,53 @@ class AppModel extends ChangeNotifier {
           revision != _syncConnectionRevision) {
         return false;
       }
-      _nextSyncAttempt = DateTime.now().add(const Duration(seconds: 3));
+      _nextSyncAttempt = _syncClock().add(_syncRetryDelay(++_syncFailures));
       final message = '同步失败：${safeFailure(e).message}';
       if (!quiet) status = message;
       AppLog.instance.warning('同步', message);
-      if (!_disposed && (!quiet || activePlaybackMediaId == null)) {
+      if (!_disposed &&
+          (!quiet || activePlaybackMediaId == null) &&
+          (oldStatus != status || presentation != _syncPresentationRevision)) {
         notifyListeners();
       }
       return false;
     }
-    if (!_disposed && (!quiet || activePlaybackMediaId == null)) {
+    if (!_disposed &&
+        (!quiet || activePlaybackMediaId == null) &&
+        (oldStatus != status || presentation != _syncPresentationRevision)) {
       notifyListeners();
     }
     return true;
   }
+
+  // Do not broadcast an entire model rebuild for a cursor/lastSync write.
+  // Durable store revisions also detect writes made by the sync worker and
+  // other connections, including SQL updates and transaction rollbacks.
+  Object get _syncPresentationRevision => (
+    store.recordsRevision('media'),
+    store.recordsRevision('progress'),
+    store.recordsRevision('watched'),
+    store.recordsRevision('match'),
+    store.localKeyRevision('settings'),
+    store.localKeyRevision('sources'),
+    store.localKeyRevision('sourceFavorites'),
+    store.localKeyRevision('appearance:theme'),
+    // Worker bookkeeping invalidates the whole sync* revision scope. Comparing
+    // this small scalar keeps lastSync updates from looking like device edits.
+    store.local('syncDevice:id'),
+    store.locationRevision,
+    store.localPrefixRevision('browse:'),
+    store.localPrefixRevision('externalSource:'),
+    store.localPrefixRevision('episodeTitle:'),
+    store.localPrefixRevision('preview:'),
+    store.localPrefixRevision('mediaMetadata:'),
+    store.localPrefixRevision('technical:'),
+    store.localPrefixRevision('manualMetadata:'),
+    store.localPrefixRevision('media-title-display:'),
+    store.localPrefixRevision('metadataEpisodeNames:'),
+    store.localPrefixRevision('directory-preview:'),
+    store.localPrefixRevision('directorySort:'),
+  );
 
   Future<void> resolveSyncConflict(
     SyncRecord remote, {
@@ -2411,6 +2811,7 @@ class AppModel extends ChangeNotifier {
     for (final task in _metadataTasks) {
       task._progressTimer?.cancel();
       task._cancel.cancel();
+      task._attemptCancel?.cancel();
       if (!task._done.isCompleted) task._done.complete();
     }
     _posterCache?.close();
@@ -2421,6 +2822,7 @@ class AppModel extends ChangeNotifier {
     _activeSync?.cancel();
     unawaited(sync.dispose());
     _librarySnapshotReader?.dispose();
+    _continueWatchingReader?.dispose();
     unawaited(_directoryMetadataWorker?.close());
     _directoryRecognitionCancel?.cancel();
     _metadataTimer?.cancel();

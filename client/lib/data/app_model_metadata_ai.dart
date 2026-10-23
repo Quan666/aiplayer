@@ -57,6 +57,7 @@ extension MediaAiIdentification on AppModel {
     AiMediaIdentity identity, {
     required SubtitleAiConfig config,
     required CancelToken cancel,
+    void Function()? checkReady,
   }) async {
     final found = <String, Map<String, dynamic>>{};
     Object? failure;
@@ -66,6 +67,7 @@ extension MediaAiIdentification on AppModel {
       while (next < names.length) {
         final name = names[next++];
         cancel.check();
+        checkReady?.call();
         try {
           for (final candidate in await catalog.search(name, cancel: cancel)) {
             found['${candidate['provider']}:${candidate['mediaType']}:${candidate['id']}'] =
@@ -81,6 +83,7 @@ extension MediaAiIdentification on AppModel {
 
     await Future.wait([searchNames(), searchNames()]);
     cancel.check();
+    checkReady?.call();
     if (found.isEmpty && failure != null) throw failure!;
     final candidates = found.values.toList();
     // Do not truncate a broad result set then claim the remaining candidate
@@ -94,6 +97,7 @@ extension MediaAiIdentification on AppModel {
       config: config,
       cancel: cancel,
     );
+    checkReady?.call();
     Map<String, dynamic>? subject;
     if (selected != null) {
       try {
@@ -107,6 +111,7 @@ extension MediaAiIdentification on AppModel {
       } on AppFailure {
         return AiMetadataMatch(identity, candidates, null);
       }
+      checkReady?.call();
       if (subject['provider'] == 'bangumi' &&
           identity.season.isNotEmpty &&
           !identity.searchNames.any(
@@ -124,6 +129,7 @@ extension MediaAiIdentification on AppModel {
       if (confirmed == null) subject = null;
     }
     cancel.check();
+    checkReady?.call();
     return AiMetadataMatch(identity, candidates, subject);
   }
 
@@ -133,9 +139,11 @@ extension MediaAiIdentification on AppModel {
     List<String> fileNames, {
     required CancelToken cancel,
     void Function(String)? onProgress,
+    void Function()? checkReady,
   }) async {
     if (fileNames.isEmpty) return {};
     final config = await _metadataAiConfig();
+    checkReady?.call();
     final names = fileNames
         .map(MediaAiRecognition.filenameOnly)
         .toSet()
@@ -150,6 +158,7 @@ extension MediaAiIdentification on AppModel {
           }
         : await mediaAi.analyzeFilenames(names, config: config, cancel: cancel);
     cancel.check();
+    checkReady?.call();
     final groups = <String, List<AiMediaIdentity>>{};
     for (final identity in parsed.values) {
       final key = jsonEncode([
@@ -167,6 +176,7 @@ extension MediaAiIdentification on AppModel {
     await Future.wait(
       groups.values.map(
         (group) => _metadataLookups.run(cancel, () async {
+          checkReady?.call();
           group.sort((a, b) => b.confidence.compareTo(a.confidence));
           AiMetadataMatch? match;
           try {
@@ -174,13 +184,17 @@ extension MediaAiIdentification on AppModel {
               group.first,
               config: config,
               cancel: cancel,
+              checkReady: checkReady,
             );
           } on Cancelled {
+            rethrow;
+          } on _MetadataPaused {
             rethrow;
           } catch (error) {
             failure = error;
           }
           cancel.check();
+          checkReady?.call();
           for (final identity in group) {
             results[identity.fileName] = AiMetadataMatch(
               identity,

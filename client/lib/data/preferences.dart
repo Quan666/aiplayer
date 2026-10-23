@@ -13,7 +13,7 @@ class AppPreferences {
     'pinchToZoom': true,
     'edgeDoubleTapSeek': false,
     'subtitleSimplify': false,
-    'highRefreshRate': true,
+    'highRefreshRate': false,
     'hideNavigationOnScroll': true,
     'resumePlayback': true,
     'hardwareDecoding': true,

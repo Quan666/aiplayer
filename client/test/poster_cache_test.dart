@@ -64,6 +64,251 @@ void main() {
     }).timeout(const Duration(seconds: 2));
   }
 
+  Future<void> churnResolvedHandles() async {
+    for (var i = 0; i < 512; i++) {
+      final address = url('handle-$i');
+      await cache.cachedFile(address).writeAsBytes([1]);
+      await cache.load(address);
+    }
+  }
+
+  test(
+    'background pause stops refilling slots and resumes the same work',
+    () async {
+      responseGate = Completer<void>();
+      final running = [
+        for (var i = 0; i < 4; i++) cache.loadVisible(url('running-$i'))!,
+      ];
+      await waitForRequests(4);
+      final waiting = cache.loadVisible(url('waiting'))!;
+      var completed = false;
+      waiting.then((_) => completed = true);
+      cache.setActive(false);
+      cache.setActive(false);
+      responseGate!.complete();
+      await Future.wait(running);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(requests, 4);
+      expect(completed, isFalse);
+      expect(cache.loadVisible(url('waiting')), same(waiting));
+
+      cache.setActive(true);
+      cache.setActive(true);
+      expect(await waiting.timeout(const Duration(seconds: 2)), isNotNull);
+      expect(paths.where((path) => path == '/waiting'), hasLength(1));
+      expect(peak, lessThanOrEqualTo(4));
+    },
+  );
+
+  test(
+    'closing while suspended releases pending futures without transfers',
+    () async {
+      cache.setActive(false);
+      final pending = cache.loadVisible(url('suspended'))!;
+      var completed = false;
+      pending.then((_) => completed = true);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(requests, 0);
+      expect(completed, isFalse);
+      cache.close();
+      expect(await pending.timeout(const Duration(seconds: 1)), isNull);
+      expect(requests, 0);
+      cache.setActive(true);
+    },
+  );
+
+  test('a rapid resume and suspension does not admit new work', () async {
+    cache.setActive(false);
+    final pending = cache.loadVisible(url('rapid-switch'))!;
+    cache.setActive(true);
+    cache.setActive(false);
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    expect(requests, 0);
+    cache.setActive(true);
+    expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
+    expect(requests, 1);
+  });
+
+  test('nearby work leaves a transfer slot for visible covers', () async {
+    responseGate = Completer<void>();
+    final first = cache.loadNearby(url('nearby-first'), canStart: () => true);
+    final second = cache.loadNearby(url('nearby-second'), canStart: () => true);
+    final third = cache.loadNearby(url('nearby-third'), canStart: () => true);
+    expect(first, isNotNull);
+    expect(second, isNotNull);
+    expect(third, isNotNull);
+    expect(
+      cache.loadNearby(url('nearby-first'), canStart: () => true),
+      same(first),
+    );
+    expect(
+      cache.loadNearby(url('nearby-overflow'), canStart: () => true),
+      isNull,
+    );
+    final visible = cache.loadVisible(url('foreground'))!;
+    await waitForRequests(4);
+    expect(paths, contains('/foreground'));
+    responseGate!.complete();
+    expect(await first, isNotNull);
+    expect(await second, isNotNull);
+    expect(await third, isNotNull);
+    expect(await visible, isNotNull);
+    expect(peak, lessThanOrEqualTo(4));
+  });
+
+  test(
+    'nearby admission includes disk lookups and releases on completion',
+    () async {
+      final addresses = [for (var i = 0; i < 4; i++) url('nearby-local-$i')];
+      for (final address in addresses) {
+        await cache.cachedFile(address).writeAsBytes(png);
+      }
+      final first = cache.loadNearby(addresses[0], canStart: () => true);
+      final second = cache.loadNearby(addresses[1], canStart: () => true);
+      final third = cache.loadNearby(addresses[2], canStart: () => true);
+      expect(cache.loadNearby(addresses[3], canStart: () => true), isNull);
+      expect(await first, isNotNull);
+      expect(await second, isNotNull);
+      expect(await third, isNotNull);
+      expect(
+        await cache.loadNearby(addresses[3], canStart: () => true),
+        isNotNull,
+      );
+      var synchronous = false;
+      cache.loadNearby(addresses[0], canStart: () => false)!.then((file) {
+        expect(file, isNotNull);
+        synchronous = true;
+      });
+      expect(synchronous, isTrue);
+      expect(requests, 0);
+    },
+  );
+
+  test(
+    'stale nearby waiters are dropped and visible promotion survives',
+    () async {
+      responseGate = Completer<void>();
+      final foreground = [
+        for (var i = 0; i < 4; i++) cache.loadVisible(url('busy-$i'))!,
+      ];
+      await waitForRequests(4);
+      var nearby = true;
+      final staleAddress = url('stale-nearby');
+      final stale = cache.loadNearby(staleAddress, canStart: () => nearby)!;
+      final promoted = cache.loadNearby(
+        url('promoted'),
+        canStart: () => nearby,
+      )!;
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      nearby = false;
+      expect(cache.loadVisible(url('promoted')), same(promoted));
+      final replacement = cache.loadNearby(
+        url('next-row'),
+        canStart: () => true,
+      );
+      expect(replacement, isNotNull);
+      expect(await stale.timeout(const Duration(seconds: 1)), isNull);
+      expect(paths, isNot(contains('/stale-nearby')));
+      responseGate!.complete();
+      expect(await promoted, isNotNull);
+      expect(await replacement, isNotNull);
+      await Future.wait(foreground);
+      expect(paths[4], '/promoted');
+      // Cancellation is not a failure, so returning to this cover can retry now.
+      expect(await cache.loadVisible(staleAddress), isNotNull);
+      expect(paths.where((path) => path == '/stale-nearby'), hasLength(1));
+      expect(peak, lessThanOrEqualTo(4));
+    },
+  );
+
+  test(
+    'nearby cancellation before disk lookup never starts a transfer',
+    () async {
+      var active = true;
+      final address = url('hidden-before-lookup');
+      final pending = cache.loadNearby(address, canStart: () => active);
+      active = false;
+      expect(await pending, isNull);
+      expect(requests, 0);
+      expect(await cache.loadVisible(address), isNotNull);
+      expect(requests, 1);
+    },
+  );
+
+  test(
+    'nearby eligibility is checked again when a transfer slot opens',
+    () async {
+      responseGate = Completer<void>();
+      final foreground = [
+        for (var i = 0; i < 4; i++) cache.loadVisible(url('occupied-$i'))!,
+      ];
+      await waitForRequests(4);
+      var active = true;
+      final address = url('hidden-while-queued');
+      final pending = cache.loadNearby(address, canStart: () => active);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      active = false;
+      responseGate!.complete();
+      expect(await pending, isNull);
+      await Future.wait(foreground);
+      expect(requests, 4);
+      expect(await cache.loadVisible(address), isNotNull);
+      expect(requests, 5);
+    },
+  );
+
+  test(
+    'a retained decoded-image file survives path-handle LRU eviction',
+    () async {
+      final address = url('resident');
+      final file = (await cache.load(address))!;
+      final revision = posterFileRevision(file);
+      await churnResolvedHandles();
+
+      var synchronous = false;
+      cache.loadVisible(address)!.then((value) {
+        expect(value, same(file));
+        expect(posterFileRevision(value!), revision);
+        synchronous = true;
+      });
+      expect(synchronous, isTrue);
+      expect(requests, 1);
+    },
+  );
+
+  test(
+    'weakly retained handles still honor replacement and invalidation',
+    () async {
+      final address = url('retained-replacement');
+      final original = (await cache.load(address))!;
+      await churnResolvedHandles();
+      cache.fileChanged(address);
+      expect(cache.resolvedFile(address), isNull);
+      final committed = (await cache.load(address))!;
+      expect(
+        posterFileRevision(committed),
+        isNot(posterFileRevision(original)),
+      );
+
+      await cache.restore(address, Uint8List.fromList(png), replace: true);
+      final replacement = (await cache.load(address))!;
+      expect(
+        posterFileRevision(replacement),
+        isNot(posterFileRevision(committed)),
+      );
+      await churnResolvedHandles();
+      // A delayed failure from the old generation must not delete the current
+      // file even when only the decoded image still retains its handle.
+      await cache.invalidate(address, failedFile: committed);
+      expect(cache.resolvedFile(address), same(replacement));
+      expect(await replacement.exists(), isTrue);
+      await cache.invalidate(address, failedFile: replacement);
+      expect(cache.resolvedFile(address), isNull);
+      expect(await replacement.exists(), isFalse);
+      expect(requests, 1);
+    },
+  );
+
   test(
     'replacement and worker commits revise only the changed cover',
     () async {

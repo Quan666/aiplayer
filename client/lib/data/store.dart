@@ -805,7 +805,18 @@ class AppStore {
   }
 
   void removeLocal(String key) {
-    if (!key.startsWith('sync')) _markLocalChanges(key, local(key), null);
+    if (!key.startsWith('sync') && key != 'lastSync') {
+      if (key == 'settings' || key == 'sources' || key == 'sourceFavorites') {
+        _markLocalChanges(key, local(key), null);
+      } else if (_select('SELECT 1 FROM local WHERE key=? AND value<>?', [
+        key,
+        'null',
+      ]).isNotEmpty) {
+        // Opaque caches and state have one modification marker. Deleting one
+        // must not decode and re-encode its potentially huge previous value.
+        markLocalModified(key);
+      }
+    }
     _execute('DELETE FROM local WHERE key=?', [key]);
     _written(localKey: key);
     if (key.startsWith('location:') && _locationIndex != null) {

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:aiplayer/ui/artwork_scroll_scope.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
@@ -5,6 +7,46 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  tearDown(
+    () => WidgetsBinding.instance.handleAppLifecycleStateChanged(
+      AppLifecycleState.resumed,
+    ),
+  );
+
+  testWidgets('paused without a frame ends scrolling immediately', (
+    tester,
+  ) async {
+    final controller = ScrollController();
+    final changes = <bool>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ArtworkScrollScope(
+          onActivityChanged: changes.add,
+          child: ListView(
+            controller: controller,
+            children: const [SizedBox(height: 4000)],
+          ),
+        ),
+      ),
+    );
+    final scrolling = controller.animateTo(
+      2000,
+      duration: const Duration(seconds: 10),
+      curve: Curves.linear,
+    );
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(controller.position.isScrollingNotifier.value, isTrue);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    expect(controller.position.isScrollingNotifier.value, isFalse);
+    expect(changes, [true, false]);
+    await scrolling;
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+    expect(changes, [true, false]);
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
+  });
+
   Future<void> wheel(WidgetTester tester) => tester.sendEventToBinding(
     PointerScrollEvent(
       kind: PointerDeviceKind.mouse,
@@ -12,6 +54,39 @@ void main() {
       scrollDelta: const Offset(0, 40),
     ),
   );
+
+  testWidgets('paused without a frame cancels shared scroll wake-up timers', (
+    tester,
+  ) async {
+    final timers = <Timer>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ArtworkScrollScope(
+          child: ListView(children: const [SizedBox(height: 4000)]),
+        ),
+      ),
+    );
+    await runZoned(
+      () async {
+        await wheel(tester);
+        expect(timers.any((timer) => timer.isActive), isTrue);
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+        expect(timers.every((timer) => !timer.isActive), isTrue);
+      },
+      zoneSpecification: ZoneSpecification(
+        createTimer: (self, parent, zone, duration, callback) {
+          final timer = parent.createTimer(zone, duration, callback);
+          if (duration == const Duration(milliseconds: 64) ||
+              duration == const Duration(milliseconds: 120)) {
+            timers.add(timer);
+          }
+          return timer;
+        },
+      ),
+    );
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   testWidgets('wheel bursts share one idle transition without rebuilding', (
     tester,
@@ -88,6 +163,89 @@ void main() {
     await tester.pump(const Duration(milliseconds: 120));
     expect(changes, [true, false]);
     await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('stationary gestures do not repeatedly wake an idle timer', (
+    tester,
+  ) async {
+    var idleTimers = 0;
+    await runZoned(
+      () async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: ArtworkScrollScope(
+              child: ListView(children: const [SizedBox(height: 4000)]),
+            ),
+          ),
+        );
+        final location = tester.getCenter(find.byType(ListView));
+        final gesture = await tester.startGesture(
+          location,
+          kind: PointerDeviceKind.trackpad,
+        );
+        await gesture.panZoomUpdate(location, pan: const Offset(0, -60));
+        await tester.pump(const Duration(milliseconds: 200));
+        final afterStart = idleTimers;
+        await tester.pump(const Duration(seconds: 3));
+        expect(idleTimers, afterStart);
+        expect(tester.binding.hasScheduledFrame, isFalse);
+        await gesture.panZoomEnd();
+        await tester.pump(const Duration(milliseconds: 120));
+        await tester.pumpWidget(const SizedBox());
+      },
+      zoneSpecification: ZoneSpecification(
+        createTimer: (self, parent, zone, duration, callback) {
+          if (duration == const Duration(milliseconds: 120)) idleTimers++;
+          return parent.createTimer(zone, duration, callback);
+        },
+      ),
+    );
+  });
+
+  testWidgets('hidden regions end scrolling and resume idle', (tester) async {
+    final controller = ScrollController();
+    final changes = <bool>[];
+    late StateSetter update;
+    var enabled = true;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: StatefulBuilder(
+          builder: (context, setState) {
+            update = setState;
+            return TickerMode(
+              enabled: enabled,
+              child: ArtworkScrollScope(
+                onActivityChanged: changes.add,
+                child: ListView(
+                  controller: controller,
+                  children: const [SizedBox(height: 4000)],
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+    final scrolling = controller.animateTo(
+      2000,
+      duration: const Duration(seconds: 10),
+      curve: Curves.linear,
+    );
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(changes, [true]);
+    update(() => enabled = false);
+    await tester.pump();
+    await scrolling;
+    expect(controller.position.isScrollingNotifier.value, isFalse);
+    expect(changes, [true, false]);
+    await tester.pump(const Duration(seconds: 2));
+    expect(changes, [true, false]);
+    update(() => enabled = true);
+    await tester.pump();
+    expect(changes, [true, false]);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
   });
 
   testWidgets('removing a scrolling child releases its region', (tester) async {

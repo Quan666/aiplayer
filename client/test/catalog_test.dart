@@ -27,7 +27,7 @@ void main() {
     },
   );
   test(
-    'directory series require different episodes and a consistent title/season',
+    'directory series require episodic evidence and a consistent title/season',
     () {
       SourceEntry file(String name) =>
           SourceEntry(name: name, path: '/测试作品 第二季/$name', size: 12);
@@ -52,15 +52,154 @@ void main() {
         ]),
         isNull,
       );
-      expect(
-        identifyDirectory('/mixed', [
-          file('甲 S01E01.mkv'),
-          file('甲 S01E01.mp4'),
-        ]),
-        isNull,
-      );
+      final alternate = identifyDirectory('/mixed', [
+        file('甲 S01E01.mkv'),
+        file('甲 S01E01.mp4'),
+      ]);
+      expect(alternate?.episodeCount, 1);
+      expect(alternate?.videos, hasLength(2));
       expect(
         identifyDirectory('/mixed', [file('旅行.mp4'), file('生日.mp4')]),
+        isNull,
+      );
+    },
+  );
+  test('first episode opens a series before playback and ignores extras', () {
+    final collection = identifyDirectory('/Show', const [
+      SourceEntry(name: 'Show E01.mkv', path: '/Show/Show E01.mkv'),
+      SourceEntry(name: 'trailer.mkv', path: '/Show/trailer.mkv'),
+      SourceEntry(name: 'poster.jpg', path: '/Show/poster.jpg'),
+      SourceEntry(name: 'Extras', path: '/Show/Extras', directory: true),
+    ]);
+    expect(collection?.title, 'Show');
+    expect(collection?.episodeCount, 1);
+    expect(collection?.videos.single.name, 'Show E01.mkv');
+    expect(
+      identifyDirectory('/Show', const [
+        SourceEntry(name: '01.mkv', path: '/Show/01.mkv'),
+      ])?.identities['/Show/01.mkv']?.episode,
+      '1',
+    );
+  });
+  test('omitted first-season markers share one ordered directory series', () {
+    final collection = identifyDirectory('/Show', const [
+      SourceEntry(name: 'Show E02.mkv', path: '/Show/Show E02.mkv'),
+      SourceEntry(name: 'Show S01E01.mkv', path: '/Show/Show S01E01.mkv'),
+      SourceEntry(name: 'Show E03.mkv', path: '/Show/Show E03.mkv'),
+    ]);
+    expect(collection?.season, '1');
+    expect(
+      collection?.videos.map(
+        (video) => collection.identities[video.path]?.episode,
+      ),
+      ['1', '2', '3'],
+    );
+    expect(
+      collection?.identities.values.every((value) => value.season == '1'),
+      isTrue,
+    );
+  });
+  test('season folders derive their title before a played anchor exists', () {
+    for (final path in [
+      '/Series/S02/',
+      '/Series/Season 2/',
+      '/Series/第二季/',
+      r'C:\Series\S02',
+    ]) {
+      final collection = identifyDirectory(path, [
+        SourceEntry(name: '01.mkv', path: '$path/01.mkv'),
+        SourceEntry(name: '02.mkv', path: '$path/02.mkv'),
+        SourceEntry(name: 'trailer.mkv', path: '$path/trailer.mkv'),
+      ]);
+      expect(collection?.title, 'Series', reason: path);
+      expect(collection?.season, '2', reason: path);
+      expect(collection?.episodeCount, 2, reason: path);
+    }
+    for (final path in ['S01', '/S01', 'Season 1', '/Season 1', '/S02/S01']) {
+      expect(
+        identifyDirectory(path, [
+          SourceEntry(name: '01.mkv', path: '$path/01.mkv'),
+        ]),
+        isNull,
+        reason: 'A season marker alone does not identify a series: $path',
+      );
+    }
+  });
+  test('WebDAV root identity is separate from its relative file paths', () {
+    final store = AppStore(':memory:');
+    try {
+      store.setLocal('sources', [
+        {
+          'id': 'nas',
+          'kind': 'webdav',
+          'url':
+              'https://example.test/dav/${Uri.encodeComponent('作品 #1')}/S02/',
+        },
+      ]);
+      final folder = sourceDirectoryIdentity(store, 'nas', '');
+      expect(folder.anime, '作品 #1');
+      expect(folder.season, '2');
+      const entries = [SourceEntry(name: '01.mkv', path: '01.mkv')];
+      final prepared = prepareDirectoryInspection(
+        'nas',
+        '',
+        '',
+        entries,
+        folderIdentity: folder,
+      );
+      expect(prepared.collection?.videos.single.path, '01.mkv');
+      expect(prepared.collection?.identities['01.mkv']?.episode, '1');
+      store.setLocal('sources', [
+        {
+          'id': 'nas',
+          'kind': 'webdav',
+          'url': 'https://example.test/dav/Another/S02/',
+        },
+      ]);
+      final changed = prepareDirectoryInspection(
+        'nas',
+        '',
+        '',
+        entries,
+        folderIdentity: sourceDirectoryIdentity(store, 'nas', ''),
+      );
+      expect(changed.fingerprint, isNot(prepared.fingerprint));
+      expect(changed.collection?.title, 'Another');
+    } finally {
+      store.dispose();
+    }
+  });
+  test(
+    'dot episode names do not turn codecs or hyphenated movie titles into episodes',
+    () {
+      expect(parseReleaseName('Series.01.mkv').anime, 'Series');
+      expect(parseReleaseName('Series.01.mkv').episode, '1');
+      for (final codec in ['264', '265']) {
+        final parsed = parseReleaseName('Show.H.$codec.mkv');
+        expect(parsed.anime, 'Show');
+        expect(parsed.episode, isEmpty);
+      }
+      expect(parseReleaseName('Spider-Man-2.mkv').episode, isEmpty);
+      expect(parseReleaseName('Spider-Man-2.mkv').anime, 'Spider-Man-2');
+      expect(parseReleaseName('1.5.mkv').episode, isEmpty);
+    },
+  );
+  test(
+    'single title-only files preserve explicit seasons and reject conflicts',
+    () {
+      final collection = identifyDirectory('/Show/', [
+        const SourceEntry(name: 'Show S02.mkv', path: '/Show/Show S02.mkv'),
+      ]);
+      expect(collection?.season, '2');
+      expect(collection?.identities.values.single.season, '2');
+      expect(collection?.identities.values.single.episode, isEmpty);
+      expect(
+        identifyDirectory('/Show/S02/', [
+          const SourceEntry(
+            name: 'Show S01.mkv',
+            path: '/Show/S02/Show S01.mkv',
+          ),
+        ]),
         isNull,
       );
     },
@@ -519,6 +658,7 @@ void _jointCatalogTests() {
             entries.single.path: const ReleaseName('Example', '1', '1'),
           },
           subject: _bangumi,
+          episodeTitles: const {'1': '开始'},
         );
         final model = LibraryCatalog(
           store,
@@ -540,6 +680,58 @@ void _jointCatalogTests() {
         expect(model.directoryPreview('local', '/folder'), isNull);
         await model.inspect('local', '/folder', entries);
         expect(calls, 2);
+      },
+    );
+
+    test(
+      'directory keeps its resolved subject and retries failed episode details',
+      () async {
+        var episodeRequests = 0;
+        final transport = _CatalogTransport((uri) {
+          if (uri.path == '/v0/episodes') {
+            episodeRequests++;
+            if (episodeRequests == 1) {
+              throw const AppFailure('episode catalogue temporarily offline');
+            }
+            return {
+              'data': [
+                {'sort': 1, 'name_cn': '开始'},
+              ],
+            };
+          }
+          return _catalogReply(uri);
+        });
+        final model = LibraryCatalog(store, transport: transport);
+        const entries = [
+          SourceEntry(name: 'Example S01E01.mkv', path: '/Example/E01.mkv'),
+        ];
+        final first = await model.inspect('local', '/Example', entries);
+        expect(first?.subject?['id'], 7);
+        expect(first?.metadataComplete, isFalse);
+        expect(
+          model
+              .directoryPreview('local', '/Example')
+              ?.collection
+              ?.metadataComplete,
+          isFalse,
+        );
+        expect(
+          LibraryCatalog(
+            store,
+          ).directoryPreview('local', '/Example')?.collection?.metadataComplete,
+          isFalse,
+        );
+        final second = await model.inspect('local', '/Example', entries);
+        expect(second?.subject?['id'], 7);
+        expect(second?.metadataComplete, isTrue);
+        expect(second?.episodeTitles, {'1': '开始'});
+        expect(episodeRequests, 2);
+        expect(model.directoryPreview('local', '/Example'), isNotNull);
+        expect(
+          transport.calls.where((uri) => uri.path == '/v0/subjects/7'),
+          hasLength(1),
+          reason: 'Retry reuses the already resolved work.',
+        );
       },
     );
 

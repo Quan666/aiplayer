@@ -33,8 +33,19 @@ class PosterCache {
   final _pending = <String, Future<File?>>{};
   final _invalidating = <String, Future<void>>{};
   final _resolved = <String, File>{};
+  // A decoded image can outlive the small path-handle LRU. Keep only a weak
+  // reference to that handle so revisiting it reuses the same content revision
+  // instead of invalidating an unchanged, still-resident decoded image.
+  final _retained = <String, _PosterFileHandle>{};
+  static final _releaseHandle = Finalizer<_PosterFileHandle>((handle) {
+    final cache = handle.cache.target;
+    if (cache != null && identical(cache._retained[handle.url], handle)) {
+      cache._retained.remove(handle.url);
+    }
+  });
   final _failedUntil = <String, DateTime>{};
   final _priority = <String>{};
+  final _nearby = <String, _PosterNearbyRequest>{};
   final _capacity = ValueNotifier(0);
   final _changes = ValueNotifier<PosterCacheChange?>(null);
   HttpClient? _client;
@@ -42,6 +53,7 @@ class PosterCache {
   static const maxPending = 68;
   int _active = 0;
   bool _closed = false;
+  Completer<void>? _resume;
 
   PosterCache({
     required this.directory,
@@ -57,10 +69,42 @@ class PosterCache {
   /// Content changes invalidate mounted covers; normal cache hits stay silent.
   ValueListenable<PosterCacheChange?> get changes => _changes;
 
+  /// Suspend queued disk lookups and transfers while the app is hidden.
+  /// Existing transfers may finish; their bounded slots are not refilled until
+  /// foregrounded. Keeping the same futures avoids duplicate work on resume.
+  void setActive(bool active) {
+    if (_closed) return;
+    if (!active) {
+      _resume ??= Completer<void>();
+      return;
+    }
+    final resume = _resume;
+    if (resume == null) return;
+    _resume = null;
+    resume.complete();
+    _dispatchWaiting();
+  }
+
+  void _dispatchWaiting() {
+    if (_closed || _resume != null) return;
+    while (_active < 4 && _waiting.isNotEmpty) {
+      _active++;
+      _waiting.removeAt(0).ready.complete(true);
+    }
+  }
+
+  Future<void> _waitUntilActive() async {
+    // A quick foreground/background pair must not let an earlier completed
+    // gate admit new work into the newer suspended period.
+    while (!_closed && _resume != null) {
+      await _resume!.future;
+    }
+  }
+
   /// Called after another isolate atomically replaces an artwork file.
   void fileChanged(String url) {
     if (_closed) return;
-    _resolved.remove(url);
+    _forget(url);
     _failedUntil.remove(url);
     _changes.value = PosterCacheChange(url, null);
   }
@@ -68,7 +112,7 @@ class PosterCache {
   /// Visible artwork takes the next free download slot ahead of prefetches.
   /// Null means admission was deferred, rather than that a download failed.
   Future<File?>? loadVisible(String url) {
-    if (_closed || url.isEmpty || _resolved.containsKey(url)) return load(url);
+    if (_closed || url.isEmpty || resolvedFile(url) != null) return load(url);
     if (!_pending.containsKey(url) && _pending.length >= maxPending) {
       final index = _waiting.indexWhere(
         (waiter) => !_priority.contains(waiter.url),
@@ -79,6 +123,7 @@ class PosterCache {
       displaced.ready.complete(false);
     }
     _priority.add(url);
+    _nearby.remove(url)?.promoted = true;
     final index = _waiting.indexWhere((waiter) => waiter.url == url);
     if (index >= 0) {
       final waiter = _waiting.removeAt(index);
@@ -93,6 +138,57 @@ class PosterCache {
     return load(url);
   }
 
+  /// At most three speculative lookups/downloads leave a slot for visible work.
+  /// Null means admission was deferred; [capacity] signals a later retry.
+  Future<File?>? loadNearby(String url, {required bool Function() canStart}) {
+    if (_closed || url.isEmpty || resolvedFile(url) != null) return load(url);
+    final pending = _pending[url];
+    if (pending != null) {
+      // A newly mounted card can take over an existing nearby request. A
+      // visible promotion has already removed its speculative classification.
+      _nearby[url]?.canStart = canStart;
+      return pending;
+    }
+    if (!canStart()) return Future.value();
+    _dropStaleNearby();
+    if (_nearby.length >= 3 || _pending.length >= maxPending - 4) return null;
+    final nearby = _PosterNearbyRequest(canStart);
+    _nearby[url] = nearby;
+    final result = load(url);
+    void completed() {
+      // Base load() releases this with its normal capacity notification. This
+      // also supports subclasses that override load() without using its queue.
+      if (identical(_nearby[url], nearby)) {
+        _nearby.remove(url);
+        if (!_closed) _capacity.value++;
+      }
+    }
+
+    unawaited(
+      result.then<void>(
+        (_) => completed(),
+        onError: (Object _, StackTrace _) {
+          completed();
+        },
+      ),
+    );
+    return result;
+  }
+
+  void _dropStaleNearby() {
+    // Never release an in-flight lookup or transfer early: it still counts
+    // against the three speculative slots until the platform work completes.
+    for (final entry in _nearby.entries.toList()) {
+      if (entry.value.allowed) continue;
+      final index = _waiting.indexWhere((waiter) => waiter.url == entry.key);
+      if (index < 0) continue;
+      final waiter = _waiting.removeAt(index);
+      _nearby.remove(entry.key);
+      _pending.remove(entry.key);
+      waiter.ready.complete(false);
+    }
+  }
+
   File _file(String url) =>
       File('${directory.path}/${sha256.convert(utf8.encode(url))}.image');
 
@@ -100,15 +196,33 @@ class PosterCache {
   File cachedFile(String url) => _file(url);
 
   File? resolvedFile(String url) {
-    final file = _resolved.remove(url);
-    if (file != null) _resolved[url] = file;
+    final file = _resolved.remove(url) ?? _retained[url]?.file.target;
+    if (file != null) {
+      _resolved[url] = file;
+      _trimResolved();
+    }
     return file;
   }
 
   void _remember(String url, File file) {
     _posterFileRevisions[file] ??= ++_nextPosterFileRevision;
+    final previous = _retained.remove(url);
+    if (previous != null) _releaseHandle.detach(previous);
+    final handle = _PosterFileHandle(this, url, file);
+    _retained[url] = handle;
+    _releaseHandle.attach(file, handle, detach: handle);
     _resolved.remove(url);
     _resolved[url] = file;
+    _trimResolved();
+  }
+
+  void _forget(String url) {
+    _resolved.remove(url);
+    final handle = _retained.remove(url);
+    if (handle != null) _releaseHandle.detach(handle);
+  }
+
+  void _trimResolved() {
     // Only path handles are evicted; successful files remain on disk.
     while (_resolved.length > 512) {
       _resolved.remove(_resolved.keys.first);
@@ -168,6 +282,7 @@ class PosterCache {
           if (identical(_pending[url], result)) {
             _pending.remove(url);
             _priority.remove(url);
+            _nearby.remove(url);
           }
           if (!_closed) _capacity.value++;
         });
@@ -176,6 +291,8 @@ class PosterCache {
   }
 
   Future<File?> _load(String url) async {
+    final nearby = _nearby[url];
+    if (nearby?.allowed == false) return null;
     final uri = Uri.tryParse(url);
     if (uri == null ||
         !['http', 'https'].contains(uri.scheme) ||
@@ -185,13 +302,19 @@ class PosterCache {
     }
     final file = _file(url);
     try {
+      await _waitUntilActive();
       await _invalidating[url];
+      if (nearby?.allowed == false || _closed) return null;
       if (await file.exists() && await file.length() > 0) {
-        return file;
+        return nearby?.allowed == false ? null : file;
       }
-      if ((_failedUntil[url]?.isAfter(DateTime.now()) ?? false) || _closed) {
+      if ((_failedUntil[url]?.isAfter(DateTime.now()) ?? false) ||
+          _closed ||
+          nearby?.allowed == false) {
         return null;
       }
+      await _waitUntilActive();
+      if (_closed || nearby?.allowed == false) return null;
       if (_active >= 4) {
         final waiting = _PosterWaiter(url);
         final firstBackground = _priority.contains(url)
@@ -209,7 +332,8 @@ class PosterCache {
       StreamIterator<List<int>>? chunks;
       var expired = false;
       try {
-        if (_closed) return null;
+        await _waitUntilActive();
+        if (_closed || nearby?.allowed == false) return null;
         // One pool reuses HTTP/TLS connections across covers. Cancellation
         // belongs to each request, never to other downloads sharing the pool.
         final client = _client ??= createClient()
@@ -272,11 +396,8 @@ class PosterCache {
         try {
           await chunks?.cancel();
         } finally {
-          if (_waiting.isNotEmpty) {
-            _waiting.removeAt(0).ready.complete(true);
-          } else {
-            _active--;
-          }
+          _active--;
+          _dispatchWaiting();
         }
       }
     } catch (_) {
@@ -327,7 +448,7 @@ class PosterCache {
     if (invalidating != null) return invalidating;
     // Another visible card may already have replaced this failed file. Do not
     // delete its successful repair when an older Image reports its error late.
-    final current = _resolved[url];
+    final current = _resolved[url] ?? _retained[url]?.file.target;
     if (failedFile != null &&
         current != null &&
         !identical(current, failedFile)) {
@@ -336,7 +457,7 @@ class PosterCache {
     if (failedFile != null && current == null && _pending.containsKey(url)) {
       return _pending[url]!.then<void>((_) {});
     }
-    _resolved.remove(url);
+    _forget(url);
     _changes.value = PosterCacheChange(url, null);
     if (retryImmediately) {
       _failedUntil.remove(url);
@@ -361,9 +482,13 @@ class PosterCache {
   void close() {
     if (_closed) return;
     _closed = true;
+    _resume?.complete();
+    _resume = null;
     _resolved.clear();
+    _retained.clear();
     _failedUntil.clear();
     _priority.clear();
+    _nearby.clear();
     _client?.close(force: true);
     _client = null;
     for (final waiting in _waiting) {
@@ -373,6 +498,25 @@ class PosterCache {
     _capacity.dispose();
     _changes.dispose();
   }
+}
+
+class _PosterNearbyRequest {
+  bool Function() canStart;
+  bool promoted = false;
+
+  _PosterNearbyRequest(this.canStart);
+
+  bool get allowed => promoted || canStart();
+}
+
+class _PosterFileHandle {
+  final WeakReference<PosterCache> cache;
+  final String url;
+  final WeakReference<File> file;
+
+  _PosterFileHandle(PosterCache cache, this.url, File file)
+    : cache = WeakReference(cache),
+      file = WeakReference(file);
 }
 
 class _PosterWaiter {

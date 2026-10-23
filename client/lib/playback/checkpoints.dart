@@ -10,9 +10,9 @@ class PlaybackCheckpoints {
   final Future<void> Function() capturePreview;
   final void Function(Object) onError;
   Timer? _periodic, _event;
-  Future<void>? _capture, _closing;
-  final _saves = <Future<void>>{};
-  bool _pendingPreview = false, _stopped = false;
+  Future<void>? _capture, _closing, _saveWork;
+  bool _pendingPreview = false, _pendingSave = false;
+  bool _started = false, _stopped = false;
 
   PlaybackCheckpoints({
     required this.isPlaying,
@@ -22,9 +22,27 @@ class PlaybackCheckpoints {
   });
 
   void start() {
-    if (_stopped || _periodic != null) return;
+    if (_stopped) return;
+    _started = true;
+    updatePlaybackState();
+  }
+
+  /// Pause/buffering transitions cancel the timer instead of waking the app to
+  /// discover that there is no moving position to persist.
+  void updatePlaybackState() {
+    if (_stopped || !_started) return;
+    if (!isPlaying()) {
+      _periodic?.cancel();
+      _periodic = null;
+      return;
+    }
+    if (_periodic != null) return;
     _periodic = Timer.periodic(interval, (_) {
-      if (isPlaying()) unawaited(_save());
+      if (isPlaying()) {
+        unawaited(_save());
+      } else {
+        updatePlaybackState();
+      }
     });
   }
 
@@ -35,14 +53,34 @@ class PlaybackCheckpoints {
   }
 
   Future<void> _save() {
-    late final Future<void> work;
-    work = Future<void>.sync(saveProgress)
-        .catchError((Object error) => onError(error))
-        .whenComplete(() {
-          _saves.remove(work);
-        });
-    _saves.add(work);
-    return work;
+    _pendingSave = true;
+    if (_saveWork != null) return _saveWork!;
+    final completion = Completer<void>();
+    _saveWork = completion.future;
+    unawaited(
+      _drainSaves().then(
+        completion.complete,
+        onError: completion.completeError,
+      ),
+    );
+    return completion.future;
+  }
+
+  Future<void> _drainSaves() async {
+    // A slow disk must not accumulate an unbounded queue of old checkpoints.
+    // Keep one active write and capture the newest position once it finishes.
+    try {
+      while (_pendingSave) {
+        _pendingSave = false;
+        try {
+          await saveProgress();
+        } catch (error) {
+          onError(error);
+        }
+      }
+    } finally {
+      _saveWork = null;
+    }
   }
 
   void _flush() {
@@ -86,6 +124,5 @@ class PlaybackCheckpoints {
     }
     // A pending seek may have finished while the native screenshot completed.
     await _save();
-    await Future.wait(_saves.toList());
   }
 }

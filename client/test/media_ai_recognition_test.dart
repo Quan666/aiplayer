@@ -607,6 +607,49 @@ void main() {
   );
 
   test(
+    'resuming a cancelled batch reuses every completed filename analysis',
+    () async {
+      final gates = <Completer<void>>[];
+      transport.reply = () async {
+        final input = transport.input;
+        final gate = Completer<void>();
+        gates.add(gate);
+        await gate.future;
+        return _batchResponse(input);
+      };
+      final names = List.generate(60, (i) => 'episode$i.mkv');
+      final cancel = CancelToken();
+      final pending = batch(names, cancel: cancel);
+      final assertion = expectLater(pending, throwsA(isA<Cancelled>()));
+      expect(gates, hasLength(2));
+      gates.first.complete();
+      await Future<void>.delayed(Duration.zero);
+      expect(gates, hasLength(3));
+      expect(store.localEntries('media-ai-filename:'), hasLength(20));
+      cancel.cancel();
+      gates[1].complete();
+      gates[2].complete();
+      await assertion;
+      expect(store.localEntries('media-ai-filename:'), hasLength(20));
+
+      transport.reply = () => _batchResponse(transport.input);
+      final resumed = await batch(names);
+      expect(resumed, hasLength(60));
+      expect(transport.bodies, hasLength(5));
+      final resumedNames = [
+        for (final body in transport.bodies.skip(3))
+          for (final item
+              in (jsonDecode((body['messages'] as List).last['content'])
+                      as Map)['items']
+                  as List)
+            item['fileName'],
+      ];
+      expect(resumedNames, names.skip(20).toList());
+      expect(store.localEntries('media-ai-filename:'), hasLength(60));
+    },
+  );
+
+  test(
     'episode numbers share work-level confirmation cache without losing episodic type checks',
     () async {
       transport.reply = () => _selection('7');

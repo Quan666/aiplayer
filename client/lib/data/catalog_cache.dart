@@ -1,3 +1,4 @@
+import 'dart:async';
 import '../core/network.dart';
 import 'store.dart';
 
@@ -15,16 +16,30 @@ class CatalogCache {
   final _pending = <String, _Lookup>{};
   CatalogCache(this.store);
 
+  bool isPending(String key) => _pending.containsKey(key);
+
+  T? readCached<T>(String key, T Function(Object?) decode) {
+    final saved = store?.local(key) ?? _memory[key];
+    if (saved == null) return null;
+    try {
+      return decode(saved);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<T> load<T>(
     String key, {
     required Future<T> Function(CancelToken) fetch,
     required T Function(Object?) decode,
     required bool Function(T) keep,
     CancelToken? cancel,
+    bool refresh = false,
+    FutureOr<T> Function(T previous, T refreshed)? merge,
   }) async {
     cancel?.check();
     final saved = store?.local(key) ?? _memory[key];
-    if (saved != null) {
+    if (!refresh && saved != null) {
       try {
         final value = decode(saved);
         if (keep(value)) return value;
@@ -37,8 +52,20 @@ class CatalogCache {
       final next = request = _Lookup();
       _pending[key] = next;
       next.result = Future<T>.sync(() => fetch(next.cancel))
-          .then((value) {
+          .then((value) async {
             next.cancel.check();
+            if (refresh && saved != null && merge != null && keep(value)) {
+              T? previous;
+              try {
+                previous = decode(saved);
+              } catch (_) {
+                // A malformed previous entry cannot prevent its replacement.
+              }
+              if (previous != null) {
+                value = await merge(previous, value);
+                next.cancel.check();
+              }
+            }
             if (keep(value)) {
               if (store != null) {
                 store!.setLocal(key, value);

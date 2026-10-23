@@ -161,7 +161,13 @@ class HttpSource extends SourceAdapter {
   @override
   Future<List<SourceEntry>> list(String path) async {
     if (!webdav) throw const AppFailure('HTTP 直链不支持目录浏览。');
-    final uri = url(path);
+    final requested = url(path);
+    // Browser entries retain WebDAV collection slashes, whereas an existing
+    // video's dirname does not. Request the collection directly in both cases;
+    // following redirects could send source credentials to another location.
+    final uri = requested.path.endsWith('/')
+        ? requested
+        : requested.replace(path: '${requested.path}/');
     final response = await _request(
       'PROPFIND',
       uri,

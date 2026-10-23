@@ -91,6 +91,7 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
     highContrast: true,
   );
   bool _backgrounded = false;
+  final _foreground = ValueNotifier(true);
   final _navigator = GlobalKey<NavigatorState>();
   final _messenger = GlobalKey<ScaffoldMessengerState>();
   final _routeObserver = _OpenRouteObserver();
@@ -103,6 +104,10 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    final state = WidgetsBinding.instance.lifecycleState;
+    _backgrounded = state != null && state != AppLifecycleState.resumed;
+    _foreground.value = !_backgrounded;
+    model.setForeground(!_backgrounded);
     WidgetsBinding.instance.addObserver(this);
     model.addListener(_displayPreferences);
     _displayPreferences();
@@ -200,7 +205,9 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
           } finally {
             if (request.temporary) await _inbox.release(request.location);
           }
-          if (!mounted || _closing || generation != _externalGeneration) continue;
+          if (!mounted || _closing || generation != _externalGeneration) {
+            continue;
+          }
           final media = model.store.get('media', id);
           if (media == null) continue;
           _dismissExternalRoutes();
@@ -208,7 +215,9 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
           // mounting the replacement; never show a stale import result.
           await WidgetsBinding.instance.endOfFrame;
           await PlayerPage.waitForDisposals();
-          if (!mounted || _closing || generation != _externalGeneration) continue;
+          if (!mounted || _closing || generation != _externalGeneration) {
+            continue;
+          }
           final navigator = _navigator.currentState;
           if (navigator == null) continue;
           unawaited(
@@ -246,6 +255,8 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.model != model) {
       oldWidget.model.removeListener(_displayPreferences);
+      oldWidget.model.setForeground(false);
+      model.setForeground(!_backgrounded && !_closing);
       model.addListener(_displayPreferences);
       _displayPreferences();
     }
@@ -258,7 +269,7 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
       themeMode: model.themeMode,
       animations: preferences.animations,
     );
-    final enabled = preferences.highRefreshRate;
+    final enabled = preferences.highRefreshRate && !_backgrounded && !_closing;
     if (_highRefresh == enabled) return;
     _highRefresh = enabled;
     PlayerDisplay.setHighRefreshRate(enabled);
@@ -270,12 +281,11 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
     final backgrounded = state != AppLifecycleState.resumed;
     if (_backgrounded == backgrounded) return;
     _backgrounded = backgrounded;
+    _foreground.value = !backgrounded;
     model.setForeground(!backgrounded);
+    _displayPreferences();
     if (backgrounded) {
-      unawaited(model.pausePreviews());
       unawaited(AppLog.instance.flush());
-    } else {
-      model.resumePreviews();
     }
   }
 
@@ -290,12 +300,11 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
       unawaited(_inbox.release(pending!.location));
     }
     _inbox.dispose();
-    if (_backgrounded) {
-      model.setForeground(true);
-      model.resumePreviews();
-    }
+    model.setForeground(false);
+    unawaited(PlayerDisplay.setHighRefreshRate(false));
     model.removeListener(_displayPreferences);
     _appearance.dispose();
+    _foreground.dispose();
     super.dispose();
   }
 
@@ -318,11 +327,18 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
           themeAnimationDuration: appearance.animations
               ? const Duration(milliseconds: 200)
               : Duration.zero,
-          builder: (context, child) => MotionScope(
-            enabled: appearance.animations,
-            child: AbsorbPointer(
-              absorbing: _closing,
-              child: child ?? const SizedBox(),
+          builder: (context, child) => ValueListenableBuilder<bool>(
+            valueListenable: _foreground,
+            child: child,
+            builder: (context, foreground, child) => TickerMode(
+              enabled: foreground && !_closing,
+              child: MotionScope(
+                enabled: appearance.animations,
+                child: AbsorbPointer(
+                  absorbing: _closing,
+                  child: child ?? const SizedBox(),
+                ),
+              ),
             ),
           ),
           home: child,
@@ -361,4 +377,3 @@ class _OpenRouteObserver extends NavigatorObserver {
     }
   }
 }
-

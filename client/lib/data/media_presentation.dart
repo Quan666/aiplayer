@@ -67,7 +67,7 @@ String mediaSeriesKey(SyncRecord record) {
     record.data['series'],
   ).toLowerCase().replaceAll(RegExp(r'[\s\p{P}\p{S}]', unicode: true), '');
   if (_text(record.data['episode']).isNotEmpty &&
-      series.length >= 2 &&
+      series.isNotEmpty &&
       series != '未分类') {
     return 'parsed:$series:${season.isEmpty ? '1' : season}';
   }
@@ -152,8 +152,9 @@ class MediaCollectionDetails {
       totalSeasons: num.tryParse(_text(info['totalSeasons']))?.toInt(),
       availableEpisodes: episodes.length,
       videoCount: values.length,
-      genres:
-          (info['genres'] as List?)?.whereType<String>().toList() ?? const [],
+      genres: List<String>.unmodifiable(
+        (info['genres'] as List?)?.whereType<String>() ?? const [],
+      ),
     );
   }
 

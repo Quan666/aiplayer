@@ -18,13 +18,31 @@ class DanmakuSession extends ChangeNotifier {
   double shift = 0, offset = 0;
   bool visible = true, playing = false, busy = false;
   int interval = 30, _generation = 0;
-  bool _disposed = false;
+  bool _disposed = false, _presentationActive = true;
   CancelToken? _request, _refreshRequest;
   Timer? _timer;
   DateTime? _retryAfter;
   DanmakuSession(this.store, this.api, this.mediaId);
   bool get active =>
-      !_disposed && visible && playing && episodeId != null && interval > 0;
+      !_disposed &&
+      _presentationActive &&
+      visible &&
+      playing &&
+      episodeId != null &&
+      interval > 0;
+
+  /// Presentation lifetime is separate from the video clock: audio and PiP can
+  /// keep playing while their invisible inline comments need no network work.
+  void setPresentationActive(bool value) {
+    if (_disposed || _presentationActive == value) return;
+    _presentationActive = value;
+    if (!value) {
+      _stopRefresh();
+    } else {
+      _schedule(immediate: true);
+    }
+  }
+
   void _notify() {
     if (!_disposed) notifyListeners();
   }
@@ -270,9 +288,9 @@ class DanmakuSession extends ChangeNotifier {
     _refreshRequest = null;
   }
 
-  void _schedule() {
+  void _schedule({bool immediate = false}) {
     if (busy || !active || _timer != null || _refreshRequest != null) return;
-    var delay = Duration(seconds: interval);
+    var delay = immediate ? Duration.zero : Duration(seconds: interval);
     if (_retryAfter != null) {
       final remaining = _retryAfter!.difference(DateTime.now());
       if (remaining > delay) delay = remaining;

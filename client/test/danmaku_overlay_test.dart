@@ -56,6 +56,56 @@ bool _hasPaint(Uint8List pixels) {
 }
 
 void main() {
+  testWidgets('offscreen position updates do not repaint and resume once', (
+    tester,
+  ) async {
+    final session = _Session(const [_future]);
+    addTearDown(session.dispose);
+    final boundary = GlobalKey();
+    Widget view(bool enabled) =>
+        TickerMode(enabled: enabled, child: _overlay(session, boundary));
+    await tester.pumpWidget(view(true));
+    await tester.pumpWidget(view(false));
+    expect(session.presentationActive, isFalse);
+    expect(session.player.state.playing, isTrue);
+    expect(_hasPaint(await _pixels(tester, boundary)), isFalse);
+    for (var i = 0; i < 50; i++) {
+      session.seconds = 40.1 + i / 1000;
+      session.position.value = Duration(milliseconds: 40100 + i);
+    }
+    await tester.pump(const Duration(seconds: 15));
+    expect(_hasPaint(await _pixels(tester, boundary)), isFalse);
+    expect(tester.binding.transientCallbackCount, 0);
+    await tester.pumpWidget(view(true));
+    expect(session.presentationActive, isTrue);
+    expect(_hasPaint(await _pixels(tester, boundary)), isTrue);
+    expect(tester.binding.transientCallbackCount, greaterThan(0));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('background stops arrivals and foreground uses latest position', (
+    tester,
+  ) async {
+    final session = _Session(const [_future]);
+    addTearDown(session.dispose);
+    final boundary = GlobalKey();
+    await tester.pumpWidget(_overlay(session, boundary));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    expect(session.presentationActive, isFalse);
+    expect(session.player.state.playing, isTrue);
+    session.seconds = 40.1;
+    session.position.value = const Duration(milliseconds: 40100);
+    await tester.pump(const Duration(seconds: 15));
+    expect(_hasPaint(await _pixels(tester, boundary)), isFalse);
+    expect(tester.binding.transientCallbackCount, 0);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    expect(session.presentationActive, isTrue);
+    await tester.pump();
+    expect(_hasPaint(await _pixels(tester, boundary)), isTrue);
+    expect(tester.binding.transientCallbackCount, greaterThan(0));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('empty gaps sleep and wake for the next scrolling comment', (
     tester,
   ) async {
@@ -292,6 +342,9 @@ class _Session extends ChangeNotifier implements PlaybackSession {
   int timelineRevision = 0;
 
   bool get listened => hasListeners;
+  bool presentationActive = true;
+  @override
+  void setDanmakuPresentationActive(bool value) => presentationActive = value;
 
   void refresh(List<DanmakuComment> comments) {
     danmaku.comments = comments;

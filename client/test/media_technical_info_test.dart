@@ -19,9 +19,11 @@ void main() {
   tearDown(() => store.dispose());
 
   test('native container and codec aliases use consistent names', () {
-    expect(videoContainerLabel('mkv'), 'Matroska');
-    expect(videoContainerLabel('matroska,webm'), 'Matroska');
-    expect(videoContainerLabel('mov,mp4,m4a,3gp,3g2,mj2'), 'MP4 / MOV');
+    expect(videoContainerLabel('mkv'), 'MKV');
+    expect(videoContainerLabel('matroska,webm'), 'MKV');
+    expect(videoContainerLabel('mov,mp4,m4a,3gp,3g2,mj2'), 'MP4');
+    expect(videoContainerLabel('MP4 / MOV'), 'MP4');
+    expect(videoContainerLabel('mov'), 'MOV');
     expect(videoCodecLabel('h264'), 'H.264');
     expect(videoCodecLabel('hevc'), 'H.265 / HEVC');
     expect(videoContainerLabel(''), isEmpty);
@@ -44,6 +46,45 @@ void main() {
     });
     return store.get('media', id)!;
   }
+
+  test(
+    'shared demuxer aliases retain the actual file format after sampling',
+    () {
+      for (final sample in [
+        (name: 'episode.mp4', native: 'MP4 / MOV', expected: 'MP4'),
+        (
+          name: 'episode.MOV',
+          native: 'mov,mp4,m4a,3gp,3g2,mj2',
+          expected: 'MOV',
+        ),
+        (name: 'episode.m4v', native: 'MP4', expected: 'M4V'),
+        (name: 'episode.mkv', native: 'Matroska', expected: 'MKV'),
+        (name: 'episode.webm', native: 'matroska,webm', expected: 'WEBM'),
+        (name: 'episode.m2ts', native: 'mpegts', expected: 'M2TS'),
+        (
+          name: 'https://nas.example/episode.MOV?token=.mp4#download',
+          native: 'MP4 / MOV',
+          expected: 'MOV',
+        ),
+      ]) {
+        final media = record(extra: {'fileName': sample.name});
+        MediaTechnicalInfo(container: sample.native).save(store, media);
+        expect(
+          MediaTechnicalInfo.forRecord(store, media).container,
+          sample.expected,
+          reason: sample.name,
+        );
+        expect(store.local('technical:one')['container'], sample.native);
+      }
+      expect(
+        videoContainerLabel(
+          'matroska,webm',
+          fileName: 'https://nas.example/stream?name=episode.mp4',
+        ),
+        'MKV',
+      );
+    },
+  );
 
   test(
     'unplayed files show only known size, extension and an explicit filename hint',
@@ -75,10 +116,8 @@ void main() {
       expect(sampled.save(store, media), isTrue);
       expect(sampled.save(store, media), isFalse);
       final info = MediaTechnicalInfo.forRecord(store, media);
-      expect(
-        info.label,
-        'Matroska · H.265 / HEVC · 3840 × 2160 · 视频约 12.5 Mb/s · 1.00 GiB',
-      );
+      expect(info.label, 'MKV · H.265 / HEVC · 3840 × 2160 · 1.00 GiB');
+      expect(info.bitrate, 12500000);
       expect(info.duration, 125.5);
       expect(info.resolutionHint, isEmpty);
       expect(store.get('media', media.id)!.data.containsKey('codec'), isFalse);
@@ -143,10 +182,8 @@ void main() {
         saved,
         saved.get('media', 'cached')!,
       );
-      expect(
-        restored.label,
-        'MP4 / MOV · AV1 · 1920 × 1080 · 视频约 2.0 Mb/s · 1.0 KiB',
-      );
+      expect(restored.label, 'MP4 · AV1 · 1920 × 1080 · 1.0 KiB');
+      expect(restored.bitrate, 2000000);
       expect(restored.duration, 60.5);
     } finally {
       saved.dispose();
@@ -203,7 +240,7 @@ void main() {
   );
 
   testWidgets(
-    'single video details show its recognized title, episode and cached specification',
+    'single video details show its recognized series title and cached specification',
     (tester) async {
       FlutterSecureStorage.setMockInitialValues({});
       final root = Directory.systemTemp.createTempSync('aiplayer-single-spec-');
@@ -229,11 +266,12 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        expect(find.text('正式作品 · 第 3 集'), findsOneWidget);
+        expect(find.text('正式作品'), findsOneWidget);
         expect(
-          find.textContaining('H.264 · 1920 × 1080 · 视频约 5.0 Mb/s'),
+          find.textContaining('H.264 · 1920 × 1080 · 1.00 GiB'),
           findsOneWidget,
         );
+        expect(find.textContaining('视频约'), findsNothing);
         expect(find.textContaining('第 1 季'), findsNothing);
         expect(tester.takeException(), isNull);
       } finally {

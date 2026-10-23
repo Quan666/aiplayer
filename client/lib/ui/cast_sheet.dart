@@ -8,6 +8,8 @@ import '../cast/start_guard.dart';
 import '../core/network.dart';
 import '../core/logger.dart';
 import '../playback/session.dart';
+import '../playback/remote_progress.dart';
+import '../playback/fullscreen_transition.dart';
 import '../sources/source.dart';
 import 'player_theme.dart';
 import 'theme/app_theme.dart';
@@ -29,7 +31,7 @@ class _CastSheet extends StatefulWidget {
   State<_CastSheet> createState() => _CastSheetState();
 }
 
-class _CastSheetState extends State<_CastSheet> {
+class _CastSheetState extends State<_CastSheet> with WidgetsBindingObserver {
   PlaybackSession get session => widget.session;
   final _cancel = CancelToken(), _client = DlnaClient();
   final _startGuard = CastStartGuard();
@@ -39,6 +41,18 @@ class _CastSheetState extends State<_CastSheet> {
   SourceAdapter? _source;
   CastBridge? _bridge;
   Timer? _timer;
+  bool _foreground = true;
+  int _pollFailures = 0;
+  final _progressClock = Stopwatch();
+  late final _progress = RemotePlaybackProgress(
+    store: session.model.store,
+    progressId: session.model.progressKey(session.media),
+    watchedId: session.model.watchedKey(session.media),
+    enabled: session.media.data['transient'] != true,
+    onSaved: session.model.requestProgressSync,
+    onError: (error) =>
+        AppLog.instance.warning('观看记录', safeFailure(error).message),
+  );
   bool _scanning = false,
       _starting = false,
       _active = false,
@@ -65,12 +79,45 @@ class _CastSheetState extends State<_CastSheet> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _foreground = !playbackIsBackgrounded(
+      WidgetsBinding.instance.lifecycleState,
+    );
     session.addCloseHook(_close);
     unawaited(_scan());
   }
 
   void _refresh() {
-    if (mounted && !_closing) setState(() {});
+    if (mounted && !_closing && _foreground) setState(() {});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final foreground = !playbackIsBackgrounded(state);
+    if (_foreground == foreground) return;
+    _foreground = foreground;
+    _timer?.cancel();
+    if (foreground) {
+      unawaited(_poll());
+      _refresh();
+    } else {
+      unawaited(_saveRemoteProgress());
+      _schedulePoll();
+    }
+  }
+
+  void _schedulePoll() {
+    _timer?.cancel();
+    if (!_active || _closing) return;
+    final baseSeconds = !_foreground
+        ? 30
+        : !_playing
+        ? 15
+        : 3;
+    final seconds = _pollFailures > 0
+        ? (3 * (1 << _pollFailures.clamp(0, 5))).clamp(baseSeconds, 60)
+        : baseSeconds;
+    _timer = Timer(Duration(seconds: seconds), _poll);
   }
 
   void _failure(Object error) {
@@ -185,7 +232,6 @@ class _CastSheetState extends State<_CastSheet> {
         }
       }
       if (_closing || session.closed) throw const Cancelled();
-      _timer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
       unawaited(_poll());
       AppLog.instance.info('投屏', '已连接所选局域网设备。');
     } catch (error) {
@@ -264,32 +310,23 @@ class _CastSheetState extends State<_CastSheet> {
     }
   }
 
-  void _saveRemoteProgress() {
-    if (!_active ||
-        _duration <= Duration.zero ||
-        session.media.data['transient'] == true) {
-      return;
-    }
-    session.model.store
-        .save('progress', session.model.progressKey(session.media), {
-          'position': _position.inMilliseconds / 1000,
-          'duration': _duration.inMilliseconds / 1000,
-          'updatedAt': DateTime.now().toUtc().toIso8601String(),
-          'devicePlatform': Platform.operatingSystem,
-        });
-    if (_position.inMilliseconds / _duration.inMilliseconds >= .95) {
-      session.model.store.save(
-        'watched',
-        session.model.watchedKey(session.media),
-        {'watched': true},
-      );
-    }
+  Future<void> _saveRemoteProgress() {
+    if (!_active) return Future.value();
+    _progressClock
+      ..reset()
+      ..start();
+    return _progress.save(
+      position: _position.inMilliseconds / 1000,
+      duration: _duration.inMilliseconds / 1000,
+    );
   }
 
   Future<void> _poll() async {
     if (!_active || _closing || _polling) return;
+    _timer?.cancel();
     _polling = true;
     try {
+      final before = (_position, _duration, _playing);
       final values = await _client.command(_device!, 'GetPositionInfo');
       if (_closing) return;
       final length = DlnaClient.parseTime(values['TrackDuration']);
@@ -297,15 +334,24 @@ class _CastSheetState extends State<_CastSheet> {
       final position = values['RelTime'];
       if (position != null && position != 'NOT_IMPLEMENTED') {
         _position = DlnaClient.parseTime(position);
-        _saveRemoteProgress();
       }
       final state = await _client.command(_device!, 'GetTransportInfo');
+      if (_closing) return;
       _playing = state['CurrentTransportState'] == 'PLAYING';
-      _refresh();
+      _pollFailures = 0;
+      if (!_progressClock.isRunning ||
+          (before != (_position, _duration, _playing) &&
+              (_progressClock.elapsed >= const Duration(seconds: 10) ||
+                  before.$3 != _playing))) {
+        unawaited(_saveRemoteProgress());
+      }
+      if (before != (_position, _duration, _playing)) _refresh();
     } catch (e) {
+      _pollFailures++;
       _failure(e);
     } finally {
       _polling = false;
+      _schedulePoll();
     }
   }
 
@@ -326,16 +372,13 @@ class _CastSheetState extends State<_CastSheet> {
     _cancel.cancel();
     _timer?.cancel();
     _startGuard.cancel();
-    try {
-      _saveRemoteProgress();
-    } catch (error) {
-      AppLog.instance.warning('观看记录', safeFailure(error).message);
-    }
+    final saving = _saveRemoteProgress();
     _client.close();
     await _startGuard.settle();
     await _stopRenderer();
     await _releaseRelay();
     await _restoreLocal();
+    await saving;
     session.removeCloseHook(_close);
     _active = false;
     try {
@@ -347,6 +390,7 @@ class _CastSheetState extends State<_CastSheet> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(_close());
     _address.dispose();
     super.dispose();

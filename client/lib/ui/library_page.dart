@@ -2,13 +2,15 @@ import 'dart:async';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
+import '../data/continue_watching_presentation.dart';
 import '../data/store.dart';
 import '../data/media_presentation.dart';
-import '../data/media_episodes.dart';
 import '../data/media_technical_info.dart';
 import '../data/poster_cache.dart';
 import '../data/library_snapshot.dart';
@@ -22,9 +24,12 @@ import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
 import 'metadata_tasks_sheet.dart';
 import 'media_details_content.dart';
+import 'media_file_details.dart';
 import 'search_header.dart';
 import 'navigation_reveal.dart';
 import 'device_icon.dart';
+import 'continue_watching_content.dart';
+import 'artwork_scroll_scope.dart';
 
 void showFailure(BuildContext context, Object error) {
   final failure = safeFailure(error);
@@ -43,7 +48,7 @@ class LibraryPage extends StatefulWidget {
   State<LibraryPage> createState() => _LibraryPageState();
 }
 
-class _LibraryPageState extends State<LibraryPage> {
+class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   AppModel get model => widget.model;
   int page = 0;
   final _pages = PageController();
@@ -102,6 +107,7 @@ class _LibraryPageState extends State<LibraryPage> {
   bool _detailsVisible = false, _libraryNeedsRefresh = false;
   int _coveringRoutes = 0;
   bool _libraryScrolling = false;
+  bool _foreground = true, _routeCurrent = true;
 
   void _onLibraryActivityChanged(bool active) {
     _libraryScrolling = active;
@@ -111,6 +117,9 @@ class _LibraryPageState extends State<LibraryPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     _hideNavigationOnScroll = model.preferences.hideNavigationOnScroll;
     _navigationCollapsed =
         model.store.local('desktopNavigationCollapsed') == true;
@@ -124,7 +133,9 @@ class _LibraryPageState extends State<LibraryPage> {
     _libraryNeedsRefresh |=
         _libraryDataKey != _libraryVersion ||
         _snapshotVersion != _snapshotReadVersion;
-    if (_detailsVisible ||
+    if (!_foreground ||
+        !_routeCurrent ||
+        _detailsVisible ||
         _coveringRoutes > 0 ||
         (page == 0 && _libraryScrolling)) {
       return;
@@ -145,6 +156,8 @@ class _LibraryPageState extends State<LibraryPage> {
 
   bool get _canRefreshLibrary =>
       mounted &&
+      _foreground &&
+      _routeCurrent &&
       page == 0 &&
       !_libraryScrolling &&
       !_detailsVisible &&
@@ -217,7 +230,9 @@ class _LibraryPageState extends State<LibraryPage> {
     _libraryNeedsRefresh |=
         _libraryDataKey != _libraryVersion ||
         _snapshotVersion != _snapshotReadVersion;
-    if (page != 0 ||
+    if (!_foreground ||
+        !_routeCurrent ||
+        page != 0 ||
         _libraryScrolling ||
         _detailsVisible ||
         _coveringRoutes > 0 ||
@@ -231,6 +246,37 @@ class _LibraryPageState extends State<LibraryPage> {
     _libraryNeedsRefresh = false;
     _libraryContent = null;
     setState(() {});
+  }
+
+  void _suspendLibrary() {
+    _snapshotCancel?.cancel();
+    _snapshotCancel = null;
+    _requestedSnapshotVersion = null;
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final current = ModalRoute.isCurrentOf(context) ?? true;
+    if (_routeCurrent == current) return;
+    _routeCurrent = current;
+    if (!current) {
+      _suspendLibrary();
+    } else {
+      _changed();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final foreground = state == AppLifecycleState.resumed;
+    if (_foreground == foreground) return;
+    _foreground = foreground;
+    if (!foreground) {
+      _suspendLibrary();
+    } else {
+      _changed();
+    }
   }
 
   Future<T?> _pushCoveringRoute<T>(TransitionRoute<T> route) async {
@@ -269,6 +315,7 @@ class _LibraryPageState extends State<LibraryPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     model.removeListener(_changed);
     _snapshotCancel?.cancel();
     _pages.dispose();
@@ -400,11 +447,12 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   Future<void> _details(String series, List<SyncRecord> episodes) async {
-    if (episodes.isEmpty || _detailsVisible) return;
+    final snapshot = _snapshot;
+    if (episodes.isEmpty || _detailsVisible || snapshot == null) return;
+    final complete = snapshot.seriesFor(episodes.first);
+    if (complete.isNotEmpty) episodes = complete;
     _detailsVisible = true;
     ModalRoute<dynamic>? detailsRoute;
-    final ids = episodes.map((item) => item.id).toSet();
-    final latest = _recent.where((item) => ids.contains(item.id)).firstOrNull;
     try {
       await showGlassBottomSheet(
         context: context,
@@ -413,12 +461,9 @@ class _LibraryPageState extends State<LibraryPage> {
           detailsRoute = ModalRoute.of(sheet);
           return _SeriesDetailsSheet(
             model: model,
-            episodes: episodes,
-            latest: latest,
-            onPlay: (item) {
-              Navigator.pop(sheet);
-              _play(item);
-            },
+            snapshot: snapshot,
+            anchor: episodes.first,
+            onPlay: _play,
             onMatch: (items) {
               Navigator.pop(sheet);
               showMetadataMatchDialog(
@@ -590,6 +635,7 @@ class _LibraryPageState extends State<LibraryPage> {
     final scale = MediaQuery.textScalerOf(context).scale(1);
     return CustomScrollView(
       key: const PageStorageKey('library-scroll'),
+      scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
       slivers: [
         SliverPadding(
           // Keep the initial header below the status bar, but let this inset
@@ -629,12 +675,20 @@ class _LibraryPageState extends State<LibraryPage> {
                 const SizedBox(height: 8),
               ],
               if (recent.isNotEmpty && query.isEmpty) ...[
-                _ContinueWatchingCarousel(
-                  onOpenHistory: _history,
-                  itemCount: recent.length.clamp(0, 10),
-                  cardWidth: desktop ? 340 : 306,
-                  cardHeight: 164 + (scale - 1).clamp(0, 2) * 60,
-                  itemBuilder: (_, index) => _continueCard(recent[index]),
+                ContinueWatchingContent(
+                  key: const ValueKey('library-continue-content'),
+                  model: model,
+                  items: recent,
+                  limit: 10,
+                  retainWhenOffscreen: true,
+                  builder: (_, views) => _ContinueWatchingCarousel(
+                    onOpenHistory: _history,
+                    itemCount: recent.length.clamp(0, 10),
+                    cardWidth: desktop ? 340 : 306,
+                    cardHeight: 164 + (scale - 1).clamp(0, 2) * 60,
+                    itemBuilder: (_, index) =>
+                        _continueCard(recent[index], views[recent[index].id]),
+                  ),
                 ),
               ],
               const SizedBox(height: 18),
@@ -808,41 +862,41 @@ class _LibraryPageState extends State<LibraryPage> {
         builder: (_) => GlassBackground(
           child: Scaffold(
             appBar: AppBar(title: const Text('观看历史')),
-            body: ListenableBuilder(
-              listenable: model,
-              builder: (context, _) => FutureBuilder<LibrarySnapshot>(
-                future: model.loadLibrarySnapshot(),
-                initialData: _snapshot,
-                builder: (context, snapshot) {
-                  final items = snapshot.data?.recent;
-                  if (items == null) {
-                    return const Center(child: CircularProgressIndicator());
-                  }
-                  if (items.isEmpty) {
-                    return const Center(child: Text('暂无观看历史'));
-                  }
-                  return Align(
-                    alignment: Alignment.topCenter,
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 1600),
-                      child: LayoutBuilder(
-                        builder: (context, constraints) {
-                          final scale = MediaQuery.textScalerOf(
-                            context,
-                          ).scale(1);
-                          final inset = constraints.maxWidth >= 700
-                              ? 24.0
-                              : 12.0;
-                          const gap = 16.0;
-                          final width = constraints.maxWidth - inset * 2;
-                          final minCardWidth = scale > 1.3 ? 360.0 : 300.0;
-                          final columns = ((width + gap) / (minCardWidth + gap))
-                              .floor()
-                              .clamp(1, 5);
-                          final cardWidth =
-                              (width - (columns - 1) * gap) / columns;
-                          return GridView.builder(
+            body: _HistorySnapshotContent(
+              model: model,
+              initialSnapshot: _snapshot,
+              builder: (context, snapshot) {
+                final items = snapshot?.recent;
+                if (items == null) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                if (items.isEmpty) {
+                  return const Center(child: Text('暂无观看历史'));
+                }
+                return Align(
+                  alignment: Alignment.topCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 1600),
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final scale = MediaQuery.textScalerOf(context).scale(1);
+                        final inset = constraints.maxWidth >= 700 ? 24.0 : 12.0;
+                        const gap = 16.0;
+                        final width = constraints.maxWidth - inset * 2;
+                        final minCardWidth = scale > 1.3 ? 360.0 : 300.0;
+                        final columns = ((width + gap) / (minCardWidth + gap))
+                            .floor()
+                            .clamp(1, 5);
+                        final cardWidth =
+                            (width - (columns - 1) * gap) / columns;
+                        return ContinueWatchingContent(
+                          model: model,
+                          items: items,
+                          builder: (_, views) => GridView.builder(
                             key: const PageStorageKey('library-history-grid'),
+                            scrollCacheExtent: const ScrollCacheExtent.viewport(
+                              .75,
+                            ),
                             padding: EdgeInsets.all(inset),
                             gridDelegate:
                                 SliverGridDelegateWithFixedCrossAxisCount(
@@ -854,15 +908,17 @@ class _LibraryPageState extends State<LibraryPage> {
                                   mainAxisSpacing: gap,
                                 ),
                             itemCount: items.length,
-                            itemBuilder: (_, index) =>
-                                _continueCard(items[index]),
-                          );
-                        },
-                      ),
+                            itemBuilder: (_, index) => _continueCard(
+                              items[index],
+                              views[items[index].id],
+                            ),
+                          ),
+                        );
+                      },
                     ),
-                  );
-                },
-              ),
+                  ),
+                );
+              },
             ),
           ),
         ),
@@ -896,26 +952,15 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  Widget _continueCard(SyncRecord media) {
-    final progress = model.progressFor(media);
-    final position = (progress?['position'] as num?)?.toDouble() ?? 0;
-    final duration =
-        (progress?['duration'] as num?)?.toDouble() ??
-        model.mediaDuration(media);
+  Widget _continueCard(SyncRecord media, ContinueWatchingPresentation? view) {
+    final position = view?.position ?? 0;
+    final duration = view?.duration ?? 0;
     final fraction = duration > 0 ? (position / duration).clamp(0.0, 1.0) : 0.0;
-    final episode = model.episodeLabel(media);
-    final title = model.seriesTitle(media);
-    final progressRecord = model.store.get(
-      'progress',
-      model.progressKey(media),
-    );
-    final origin =
-        progressRecord != null && progressRecord.deviceName.isNotEmpty
-        ? progressRecord
-        : media;
-    final otherDevice = origin.deviceId != model.store.deviceId
-        ? origin.deviceName
-        : '';
+    final episode = view?.episode ?? '';
+    final title =
+        view?.title ??
+        '${media.data['metadataTitle'] ?? media.data['series'] ?? media.data['title'] ?? ''}';
+    final otherDevice = view?.remoteDeviceName ?? '';
     return ClipRRect(
       key: ValueKey('history:${media.id}'),
       borderRadius: LibraryStyles.historyRadius,
@@ -923,8 +968,11 @@ class _LibraryPageState extends State<LibraryPage> {
         fit: StackFit.expand,
         children: [
           MediaArtwork(
-            thumbnail: model.thumbnailPath(media.id),
-            onRequestPreview: () => _requestPreview(media),
+            thumbnail: view?.thumbnail,
+            loadWhileScrolling: true,
+            onRequestPreview: view == null
+                ? null
+                : () => _requestPreview(media),
           ),
           DecoratedBox(decoration: LibraryStyles.of(context).historyOverlay),
           Material(
@@ -984,8 +1032,7 @@ class _LibraryPageState extends State<LibraryPage> {
                   children: [
                     Icon(
                       playbackDeviceIcon(
-                        platform:
-                            '${progressRecord?.data['devicePlatform'] ?? ''}',
+                        platform: view?.originDevicePlatform ?? '',
                         name: otherDevice,
                       ),
                       size: 14,
@@ -1011,16 +1058,14 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Widget _posterCard(String key, List<SyncRecord> items) {
     final media = items.first;
-    final poster =
-        items
-            .map((m) => '${m.data['poster'] ?? ''}')
-            .where((v) => v.isNotEmpty)
-            .firstOrNull ??
-        '';
-    final title = items.length == 1
-        ? model.displayTitle(media)
-        : model.seriesTitle(media);
-    final selected = items.every((item) => _selectedMedia.contains(item.id));
+    final isSeries = !key.startsWith('file:');
+    final representative = _snapshot?.representativeFor(media) ?? media;
+    final poster = _snapshot?.detailsFor(media).poster ?? '';
+    final title = isSeries
+        ? model.seriesTitle(representative)
+        : model.displayTitle(media);
+    final selected =
+        _selecting && items.every((item) => _selectedMedia.contains(item.id));
     void toggle() => _updateSelection(() {
       final ids = items.map((item) => item.id);
       if (selected) {
@@ -1047,7 +1092,7 @@ class _LibraryPageState extends State<LibraryPage> {
         enabled: !_removingSelection,
         onTap: _selecting
             ? toggle
-            : () => items.length == 1 ? _play(media) : _details(title, items),
+            : () => isSeries ? _details(title, items) : _play(media),
         onSelect: () => _updateSelection(() {
           _selecting = true;
           _selectedMedia.addAll(items.map((item) => item.id));
@@ -1649,6 +1694,9 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
                         key: const PageStorageKey('library-continue-scroll'),
                         controller: _scroll,
                         scrollDirection: Axis.horizontal,
+                        scrollCacheExtent: const ScrollCacheExtent.viewport(
+                          .75,
+                        ),
                         padding: EdgeInsets.only(bottom: scrollbarInset),
                         itemCount: widget.itemCount,
                         separatorBuilder: (_, _) => const SizedBox(width: 10),
@@ -1790,6 +1838,7 @@ class _PosterTileState extends State<_PosterTile> {
                             cache: widget.cache,
                             poster: widget.poster,
                             thumbnail: widget.thumbnail,
+                            loadWhileScrolling: true,
                             onRequestPreview: widget.onRequestPreview,
                           ),
                           if (widget.selecting && widget.selected)
@@ -1893,15 +1942,15 @@ class _PosterTileState extends State<_PosterTile> {
 
 class _SeriesDetailsSheet extends StatefulWidget {
   final AppModel model;
-  final List<SyncRecord> episodes;
-  final SyncRecord? latest;
+  final LibrarySnapshot snapshot;
+  final SyncRecord anchor;
   final ValueChanged<SyncRecord> onPlay;
   final ValueChanged<List<SyncRecord>> onMatch;
   final void Function(String, SyncRecord) onAction;
   const _SeriesDetailsSheet({
     required this.model,
-    required this.episodes,
-    required this.latest,
+    required this.snapshot,
+    required this.anchor,
     required this.onPlay,
     required this.onMatch,
     required this.onAction,
@@ -1910,31 +1959,42 @@ class _SeriesDetailsSheet extends StatefulWidget {
   State<_SeriesDetailsSheet> createState() => _SeriesDetailsSheetState();
 }
 
-class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
+class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
+    with WidgetsBindingObserver {
+  late LibrarySnapshot _snapshot;
+  late String _seriesKey;
   late List<SyncRecord> _allEpisodes;
-  Map<String, List<SyncRecord>> _versions = {};
   late List<SyncRecord> _episodes;
   late Widget _header;
+  late MediaCollectionDetails _collectionDetails;
+  SyncRecord? _latest;
   final _loading = ValueNotifier(false);
   final _cancel = CancelToken();
   Animation<double>? _entrance;
   bool _scheduled = false;
-  bool _metadataNotified = false;
   bool _loadStarted = false, _refreshScheduled = false, _refreshing = false;
+  bool _snapshotNeedsRefresh = true;
   bool _routeCurrent = true;
+  bool _foreground = true, _sourceLoading = false;
+  bool _sourceRefreshPending = false, _sourceRefreshScheduled = false;
+  Timer? _sourceRefreshTimer;
+  CancelToken? _sourceRefreshCancel;
+  bool get _canRefreshSource => mounted && _routeCurrent && _foreground;
   late (int, int) _recordsVersion;
+  late int _progressRevision;
   late int _episodeTitleRevision;
   late int _titleRevision;
   late String _sortFingerprint;
-  String get _sortKey =>
-      'directorySort:series:${mediaSeriesKey(_episodes.first)}';
+  String get _sortKey => 'directorySort:series:$_seriesKey';
   String get _currentSort =>
       model.directorySorting(_sortKey).toJson().toString();
   AppModel get model => widget.model;
   (int, int) get _currentRecordsVersion =>
       (model.store.recordsRevision('media'), model.store.locationRevision);
   bool get _needsMetadataRefresh =>
+      _snapshotNeedsRefresh ||
       _recordsVersion != _currentRecordsVersion ||
+      _progressRevision != model.store.recordsRevision('progress') ||
       _episodeTitleRevision !=
           model.store.localPrefixRevision('episodeTitle:') ||
       _titleRevision != model.titleTranslations.revision ||
@@ -1943,38 +2003,31 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   @override
   void initState() {
     super.initState();
-    _setEpisodes(widget.episodes);
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    _setSnapshot(widget.snapshot, widget.anchor);
     _sortEpisodes();
     _sortFingerprint = _currentSort;
     _recordsVersion = _currentRecordsVersion;
+    _progressRevision = model.store.recordsRevision('progress');
     _episodeTitleRevision = model.store.localPrefixRevision('episodeTitle:');
     _titleRevision = model.titleTranslations.revision;
     _updateHeader();
     model.addListener(_metadataChanged);
   }
 
-  void _setEpisodes(
-    List<SyncRecord> records, {
-    Map<String, Map<String, dynamic>>? locations,
-  }) {
-    _allEpisodes = records;
-    final available = <String, bool>{};
-    _versions = groupMediaEpisodes(records);
-    _episodes = uniqueMediaEpisodes(
-      records,
-      // Only duplicate versions need an availability tie-break. A details
-      // refresh must never materialize the entire library's location table.
-      playable: (item) => available.putIfAbsent(
-        item.id,
-        () =>
-            locations?.containsKey(item.id) ??
-            model.store.local('location:${item.id}') != null,
-      ),
-    )..sort(compareMediaEpisodes);
+  void _setSnapshot(LibrarySnapshot snapshot, SyncRecord anchor) {
+    _snapshot = snapshot;
+    _seriesKey = snapshot.seriesKeyFor(anchor);
+    _allEpisodes = snapshot.seriesFor(anchor);
+    _collectionDetails = snapshot.detailsFor(anchor);
+    _episodes = snapshot.episodesFor(anchor);
+    _latest = snapshot.latestFor(anchor);
   }
 
   Future<void> _chooseVersion(SyncRecord item) async {
-    final versions = _versions[mediaEpisodeKey(item)] ?? [item];
+    final versions = _snapshot.versionsFor(item);
     final selected = await showModalBottomSheet<SyncRecord>(
       context: context,
       builder: (context) => SafeArea(
@@ -2005,13 +2058,13 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   }
 
   void _metadataChanged() {
-    _metadataNotified = true;
     _scheduleMetadataRefresh();
   }
 
   void _scheduleMetadataRefresh() {
     if (!mounted ||
         !_routeCurrent ||
+        !_foreground ||
         !_loadStarted ||
         _refreshScheduled ||
         _refreshing ||
@@ -2021,7 +2074,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
     _refreshScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _refreshScheduled = false;
-      if (mounted && _routeCurrent) unawaited(_refreshMetadata());
+      if (_canRefreshSource) unawaited(_refreshMetadata());
     });
     WidgetsBinding.instance.ensureVisualUpdate();
   }
@@ -2040,37 +2093,51 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   }
 
   Future<void> _refreshMetadata() async {
-    if (_refreshing || !_needsMetadataRefresh) return;
+    if (!_canRefreshSource || _refreshing || !_needsMetadataRefresh) return;
     _refreshing = true;
     final version = _currentRecordsVersion;
+    final progressRevision = model.store.recordsRevision('progress');
+    final recordsInvalidated =
+        _snapshotNeedsRefresh || version != _recordsVersion;
+    final progressChanged = progressRevision != _progressRevision;
     var completed = false;
     try {
       LibrarySnapshot? snapshot;
       var records = _allEpisodes;
-      if (version != _recordsVersion) {
+      if (recordsInvalidated || progressChanged) {
         snapshot = await model.loadLibrarySnapshot(cancel: _cancel);
-        if (!mounted || !_routeCurrent) return;
-        if (version != _currentRecordsVersion) {
+        if (!mounted || !_routeCurrent || !_foreground) return;
+        if (version != _currentRecordsVersion ||
+            progressRevision != model.store.recordsRevision('progress')) {
           completed = true;
           return;
         }
         final anchor =
             snapshot.byId[_allEpisodes.first.id] ?? _allEpisodes.first;
-        records = snapshot.series[mediaSeriesKey(anchor)] ?? const [];
+        if (recordsInvalidated) records = snapshot.seriesFor(anchor);
+        _latest = snapshot.latestFor(anchor);
       }
-      final recordsChanged = records.isNotEmpty && !_sameEpisodes(records);
+      final recordsChanged =
+          recordsInvalidated &&
+          records.isNotEmpty &&
+          (!_sameEpisodes(records) || version.$2 != _recordsVersion.$2);
       final sortingChanged = _sortFingerprint != _currentSort;
       final namesRevision = model.store.localPrefixRevision('episodeTitle:');
       final titlesChanged =
           _episodeTitleRevision != namesRevision ||
           _titleRevision != model.titleTranslations.revision;
+      _snapshotNeedsRefresh = false;
       _recordsVersion = version;
+      _progressRevision = progressRevision;
       _episodeTitleRevision = namesRevision;
       _titleRevision = model.titleTranslations.revision;
-      if (recordsChanged || sortingChanged || titlesChanged) {
+      if (recordsChanged ||
+          sortingChanged ||
+          titlesChanged ||
+          progressChanged) {
         setState(() {
           if (recordsChanged) {
-            _setEpisodes(records, locations: snapshot?.locations);
+            _setSnapshot(snapshot!, records.first);
           }
           if (recordsChanged || sortingChanged) _sortEpisodes();
           _sortFingerprint = _currentSort;
@@ -2091,7 +2158,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   void _sortEpisodes() {
     if (model.store.local(_sortKey) == null &&
         model.store.local('directorySort:default') == null) {
-      _episodes.sort(compareMediaEpisodes);
+      _episodes = _snapshot.episodesFor(_allEpisodes.first);
       return;
     }
     final records = {for (final episode in _episodes) episode.id: episode};
@@ -2124,9 +2191,9 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   void _updateHeader() {
     _header = MediaDetailsOverview(
       model: model,
-      details: MediaCollectionDetails.fromRecords(_allEpisodes),
+      details: _collectionDetails,
       records: _allEpisodes,
-      latest: widget.latest,
+      latest: _latest,
       onPlay: widget.onPlay,
       onSort: _sortMenu,
       loading: _loading,
@@ -2137,7 +2204,13 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    final wasCurrent = _routeCurrent;
     _routeCurrent = ModalRoute.isCurrentOf(context) ?? true;
+    if (!_routeCurrent) {
+      _suspendSourceRefresh();
+    } else if (!wasCurrent && _loadStarted) {
+      _queueSourceRefresh();
+    }
     if (_routeCurrent) _scheduleMetadataRefresh();
     if (_scheduled) return;
     final animation = ModalRoute.of(context)?.animation;
@@ -2153,64 +2226,98 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
     if (status == AnimationStatus.completed) _scheduleLoad();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final wasForeground = _foreground;
+    _foreground = state == AppLifecycleState.resumed;
+    if (!_foreground) {
+      _suspendSourceRefresh();
+    } else if (!wasForeground) {
+      _queueSourceRefresh();
+    }
+  }
+
+  void _suspendSourceRefresh() {
+    _sourceRefreshTimer?.cancel();
+    _sourceRefreshTimer = null;
+    _sourceRefreshCancel?.cancel();
+    if (_loadStarted) _sourceRefreshPending = true;
+  }
+
+  void _queueSourceRefresh() {
+    _sourceRefreshPending = true;
+    if (!_canRefreshSource || _sourceLoading || _sourceRefreshScheduled) return;
+    _sourceRefreshScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _sourceRefreshScheduled = false;
+      if (_canRefreshSource && _sourceRefreshPending) unawaited(_load());
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
   void _scheduleLoad() {
     if (_scheduled) return;
     _scheduled = true;
     _entrance?.removeStatusListener(_onAnimationStatus);
-    // Even the synchronous prefix of loading can scan the library and import
-    // records. Let the final entrance frame paint before beginning that work.
+    // Keep source loading separate from the sheet's entrance animation.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && (ModalRoute.of(context)?.isCurrent ?? true)) {
-        unawaited(_load());
+      if (!mounted) return;
+      if (!(ModalRoute.of(context)?.isCurrent ?? true)) {
+        _scheduled = false;
+        return;
       }
+      unawaited(_load());
     });
   }
 
   Future<void> _load() async {
+    if (!_canRefreshSource || _sourceLoading) {
+      _sourceRefreshPending = true;
+      return;
+    }
+    _sourceRefreshTimer?.cancel();
+    _sourceRefreshTimer = null;
+    _sourceLoading = true;
+    _sourceRefreshPending = false;
+    final token = _sourceRefreshCancel = CancelToken();
+    final initial = !_loadStarted;
     _loadStarted = true;
-    _loading.value = true;
+    if (initial) _loading.value = true;
     try {
-      final episodes = await model.loadSeriesEpisodes(
-        _episodes.first,
-        cancel: _cancel,
-      );
-      if (!mounted || episodes.isEmpty || !_routeCurrent) return;
-      if (!_metadataNotified && episodes.length == _episodes.length) {
-        var unchanged = true;
-        for (var index = 0; index < episodes.length; index++) {
-          final before = _episodes[index], after = episodes[index];
-          if (before.id != after.id ||
-              before.revision != after.revision ||
-              before.version != after.version) {
-            unchanged = false;
-            break;
-          }
-        }
-        if (unchanged) return;
-      }
-      setState(() {
-        _setEpisodes(episodes);
-        _sortEpisodes();
-        _recordsVersion = _currentRecordsVersion;
-        _episodeTitleRevision = model.store.localPrefixRevision(
-          'episodeTitle:',
-        );
-        _titleRevision = model.titleTranslations.revision;
-        _sortFingerprint = _currentSort;
-        _updateHeader();
-      });
+      // The card snapshot can predate a commit made while this route opens.
+      // Refresh once even when no further writes happen during source loading.
+      await _refreshMetadata();
+      if (!mounted || _cancel.cancelled) return;
+      await model.loadSeriesEpisodes(widget.anchor, cancel: token);
+      // The loader commits episodes through its worker. Refresh from the
+      // prepared snapshot so the UI never computes collection aggregates.
     } catch (_) {
       // Existing metadata and episodes stay usable while a source is offline.
     } finally {
+      _sourceLoading = false;
+      _sourceRefreshCancel = null;
       if (mounted) {
         _loading.value = false;
         _scheduleMetadataRefresh();
+        if (_canRefreshSource) {
+          if (_sourceRefreshPending) {
+            _queueSourceRefresh();
+          } else {
+            _sourceRefreshTimer = Timer(
+              model.seriesRefreshDelay(widget.anchor),
+              _queueSourceRefresh,
+            );
+          }
+        }
       }
     }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _sourceRefreshTimer?.cancel();
+    _sourceRefreshCancel?.cancel();
     _cancel.cancel();
     model.removeListener(_metadataChanged);
     _entrance?.removeStatusListener(_onAnimationStatus);
@@ -2225,6 +2332,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
     builder: (_, scroll) => ListView.builder(
       key: const ValueKey('series-details-list'),
       controller: scroll,
+      scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       itemCount: _episodes.length + 1,
       itemBuilder: (_, index) {
@@ -2237,11 +2345,19 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
           showTechnical: _allEpisodes.length != 1,
           onPlay: () => widget.onPlay(item),
           trailing: PopupMenuButton<String>(
-            onSelected: (action) => action == 'versions'
-                ? _chooseVersion(item)
-                : widget.onAction(action, item),
+            tooltip: '视频选项',
+            onSelected: (action) {
+              if (action == 'file-details') {
+                showMediaFileDetails(context, model: model, item: item);
+              } else if (action == 'versions') {
+                _chooseVersion(item);
+              } else {
+                widget.onAction(action, item);
+              }
+            },
             itemBuilder: (_) => [
-              if ((_versions[mediaEpisodeKey(item)]?.length ?? 0) > 1)
+              const PopupMenuItem(value: 'file-details', child: Text('查看文件详情')),
+              if (_snapshot.versionsFor(item).length > 1)
                 const PopupMenuItem(value: 'versions', child: Text('选择视频版本')),
               const PopupMenuItem(value: 'edit', child: Text('更正作品与集数')),
               const PopupMenuItem(value: 'link', child: Text('重新关联视频位置')),
@@ -2253,6 +2369,147 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
       },
     ),
   );
+}
+
+/// History keeps its prepared structure while covered or scrolling. Artwork
+/// and playback labels have their own smaller presentation snapshot below it.
+class _HistorySnapshotContent extends StatefulWidget {
+  final AppModel model;
+  final LibrarySnapshot? initialSnapshot;
+  final Widget Function(BuildContext, LibrarySnapshot?) builder;
+
+  const _HistorySnapshotContent({
+    required this.model,
+    required this.initialSnapshot,
+    required this.builder,
+  });
+
+  @override
+  State<_HistorySnapshotContent> createState() =>
+      _HistorySnapshotContentState();
+}
+
+class _HistorySnapshotContentState extends State<_HistorySnapshotContent>
+    with WidgetsBindingObserver {
+  LibrarySnapshot? _snapshot;
+  Object? _revision, _requestedRevision;
+  CancelToken? _cancel;
+  ValueListenable<bool>? _activity;
+  bool _active = false, _foreground = true;
+
+  Object get _currentRevision => (
+    widget.model.store.recordsRevision('media'),
+    widget.model.store.recordsRevision('progress'),
+    widget.model.store.locationRevision,
+  );
+
+  bool get _canRead =>
+      mounted && _active && _foreground && _activity?.value != true;
+
+  @override
+  void initState() {
+    super.initState();
+    _snapshot = widget.initialSnapshot;
+    widget.model.addListener(_refresh);
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _active =
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.isCurrentOf(context) ?? true);
+    final activity = ArtworkScrollScope.maybeOf(context);
+    if (_activity != activity) {
+      _activity?.removeListener(_refresh);
+      _activity = activity;
+      _activity?.addListener(_refresh);
+    }
+    _refresh();
+  }
+
+  @override
+  void didUpdateWidget(covariant _HistorySnapshotContent oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.model == widget.model) return;
+    oldWidget.model.removeListener(_refresh);
+    widget.model.addListener(_refresh);
+    _suspend();
+    _snapshot = widget.initialSnapshot;
+    _revision = null;
+    _refresh();
+  }
+
+  void _suspend() {
+    _cancel?.cancel();
+    _cancel = null;
+    _requestedRevision = null;
+  }
+
+  void _refresh() {
+    if (!_canRead) {
+      _suspend();
+      return;
+    }
+    final revision = _currentRevision;
+    if (_requestedRevision == revision || _revision == revision) return;
+    _suspend();
+    unawaited(_read(revision));
+  }
+
+  Future<void> _read(Object revision) async {
+    final model = widget.model;
+    final cancel = _cancel = CancelToken();
+    _requestedRevision = revision;
+    try {
+      final snapshot = await model.loadLibrarySnapshot(cancel: cancel);
+      if (!mounted || cancel.cancelled || _cancel != cancel) return;
+      _cancel = null;
+      _requestedRevision = null;
+      if (!_canRead || revision != _currentRevision) {
+        _refresh();
+        return;
+      }
+      setState(() {
+        _snapshot = snapshot;
+        _revision = revision;
+      });
+    } on Cancelled {
+      // Retain the last snapshot and retry once the surface becomes idle.
+    } catch (_) {
+      // A failed read waits for new data or a replacement model, rather than
+      // retrying on every scroll notification or widget build.
+      if (mounted && !cancel.cancelled && _cancel == cancel) {
+        _revision = revision;
+      }
+    } finally {
+      if (_cancel == cancel) {
+        _cancel = null;
+        _requestedRevision = null;
+      }
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    _refresh();
+  }
+
+  @override
+  void dispose() {
+    _suspend();
+    widget.model.removeListener(_refresh);
+    _activity?.removeListener(_refresh);
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.builder(context, _snapshot);
 }
 
 class _RetainedTab extends StatefulWidget {

@@ -157,6 +157,47 @@ void main() {
   );
 
   test(
+    'EOF snapshots the completed episode before native state changes',
+    () async {
+      final store = _DelayedStore();
+      final model = _Model(store: store);
+      final session = _Session(model)..ready = true;
+      addTearDown(model.dispose);
+      addTearDown(session.close);
+      session.player.state = const PlayerState(
+        position: Duration(seconds: 599),
+        duration: Duration(minutes: 10),
+      );
+      final saved = session.saveProgress(completed: true);
+      session.player.state = const PlayerState();
+      await Future<void>.delayed(Duration.zero);
+      expect(store.positions, [600]);
+      expect(store.get('watched', 'v'), isNull);
+      store.firstWrite.complete();
+      await saved;
+      expect(store.get('progress', 'v')!.data['position'], 600);
+      expect(store.get('watched', 'v')!.data['watched'], isTrue);
+      expect(model.syncRequests, 1);
+    },
+  );
+
+  test(
+    'EOF preserves watched state when native duration is unavailable',
+    () async {
+      final model = _Model();
+      final session = _Session(model)..ready = true;
+      addTearDown(model.dispose);
+      addTearDown(session.close);
+      session.player.state = const PlayerState(
+        position: Duration(seconds: 120),
+      );
+      await session.saveProgress(completed: true);
+      expect(model.store.get('progress', 'v')!.data['duration'], 120);
+      expect(model.store.get('watched', 'v')!.data['watched'], isTrue);
+    },
+  );
+
+  test(
     'failed progress persistence does not discard the next checkpoint',
     () async {
       final store = _DelayedStore()..failFirst = true;

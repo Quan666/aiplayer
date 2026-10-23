@@ -69,10 +69,25 @@ class PlaybackSession extends ChangeNotifier {
   String? playbackUri;
   DanmakuSession? danmaku;
   bool _danmakuStarted = false;
+  bool _danmakuPresentationActive = true;
+
+  void setDanmakuPresentationActive(bool value) {
+    if (closed || value == _danmakuPresentationActive) return;
+    _danmakuPresentationActive = value;
+    danmaku?.setPresentationActive(value);
+    _refreshFirstFramePresentation();
+  }
+
   final _subscriptions = <StreamSubscription>[];
   Timer? _errorTimer, _technicalTimer;
   late final _checkpoints = PlaybackCheckpoints(
-    isPlaying: () => ready && !closed && player.state.playing,
+    isPlaying: () =>
+        ready &&
+        !closed &&
+        !_transient &&
+        !remotePlayback &&
+        player.state.playing &&
+        !player.state.buffering,
     saveProgress: saveProgress,
     capturePreview: _captureProgressPreview,
     onError: (error) =>
@@ -159,6 +174,33 @@ class PlaybackSession extends ChangeNotifier {
   Object? _requestedPreferences, _appliedPreferences;
   Future<void> _preferenceWork = Future.value();
   Future<void> _nativeOpening = Future.value();
+  bool _backgroundPlaybackBlocked = false, _nativeOpenInProgress = false;
+  int _backgroundPauseRevision = 0;
+  Future<void>? _backgroundPauseWork;
+  bool get backgroundPlaybackBlocked => _backgroundPlaybackBlocked;
+  int get backgroundPauseRevision => _backgroundPauseRevision;
+
+  /// A native pause can be overtaken by a pending open. Retain the policy
+  /// through source preparation, decoder opening and late playing events.
+  /// Clearing it never resumes playback.
+  void setBackgroundPlaybackBlocked(bool value) {
+    if (closed || value == _backgroundPlaybackBlocked) return;
+    _backgroundPlaybackBlocked = value;
+    _refreshFirstFramePresentation();
+    if (!value) return;
+    _backgroundPauseRevision++;
+    if (ready || _nativeOpenInProgress) unawaited(_pauseForBackground());
+  }
+
+  Future<void> _pauseForBackground() {
+    if (closed) return Future.value();
+    return _backgroundPauseWork ??= Future<void>.sync(player.pause)
+        .catchError((Object error) {
+          AppLog.instance.warning('后台暂停', safeFailure(error).message);
+        })
+        .whenComplete(() => _backgroundPauseWork = null);
+  }
+
   bool _openCalled = false;
   Future<void>? _closeFuture;
   bool remotePlayback = false;
@@ -465,8 +507,24 @@ class PlaybackSession extends ChangeNotifier {
 
   dynamic get _native => player.platform;
 
+  bool get _canConfirmFirstFrame =>
+      !closed &&
+      ready &&
+      !_backgroundPlaybackBlocked &&
+      _danmakuPresentationActive &&
+      !player.state.buffering;
+
+  void _refreshFirstFramePresentation() {
+    if (!_canConfirmFirstFrame) {
+      _firstFrameRetry?.cancel();
+      _firstFrameRetry = null;
+      return;
+    }
+    _videoOutputChanged();
+  }
+
   void _videoOutputChanged() {
-    if (closed ||
+    if (!_canConfirmFirstFrame ||
         !ready ||
         _firstFrameRendered ||
         !_firstFrameSignalled ||
@@ -487,7 +545,7 @@ class PlaybackSession extends ChangeNotifier {
     }
     _firstFrameWork = _confirmFirstFrame().whenComplete(() {
       _firstFrameWork = null;
-      if (!closed && !_firstFrameRendered) {
+      if (_canConfirmFirstFrame && !_firstFrameRendered) {
         _firstFrameRetry ??= Timer(const Duration(milliseconds: 32), () {
           _firstFrameRetry = null;
           _videoOutputChanged();
@@ -501,8 +559,7 @@ class PlaybackSession extends ChangeNotifier {
     // the Surface size. Require an actual decoded frame and a settled buffer.
     try {
       final frame = await _native.getProperty('video-frame-info');
-      if (closed ||
-          player.state.buffering ||
+      if (!_canConfirmFirstFrame ||
           frame == null ||
           frame.isEmpty ||
           frame == '{}' ||
@@ -603,6 +660,8 @@ class PlaybackSession extends ChangeNotifier {
   Future<void> open({bool? play, bool resume = true}) async {
     if (closed || _openCalled) return;
     _openCalled = true;
+    final openingPauseRevision = _backgroundPauseRevision;
+    final initiallyAllowedToPlay = !_backgroundPlaybackBlocked;
     _startupClock.start();
     model.activePlaybackMediaId = media.id;
     unawaited(_prepareDanmaku());
@@ -640,6 +699,8 @@ class PlaybackSession extends ChangeNotifier {
       void state() {
         _clock.reset();
         _anchor = player.state.position.inMicroseconds / 1000000;
+        _checkpoints.updatePlaybackState();
+        _refreshFirstFramePresentation();
         danmaku?.configure(
           isPlaying: player.state.playing && !player.state.buffering,
         );
@@ -649,6 +710,9 @@ class PlaybackSession extends ChangeNotifier {
       _subscriptions.add(
         player.stream.playing.listen((_) {
           state();
+          if (_backgroundPlaybackBlocked && player.state.playing) {
+            unawaited(_pauseForBackground());
+          }
           if (!player.state.playing) checkpoint();
         }),
       );
@@ -688,14 +752,19 @@ class PlaybackSession extends ChangeNotifier {
           if (closed || complete == _completed) return;
           _completed = complete;
           if (complete) {
-            checkpoint(capturePreview: false);
-            if (!_transient) {
-              model.store.save('watched', model.watchedKey(media), {
-                'watched': true,
-              });
-            }
+            // Snapshot this episode before notifying auto-next listeners. The
+            // worker persists progress and watched atomically without making
+            // an EOF transition wait for SQLite's writer lock on the UI isolate.
+            unawaited(
+              saveProgress(completed: true).then(
+                (_) {
+                  if (!closed) model.changed();
+                },
+                onError: (Object error) =>
+                    AppLog.instance.warning('观看记录', safeFailure(error).message),
+              ),
+            );
             completionRevision++;
-            model.changed();
             _notify();
           }
         }),
@@ -726,13 +795,30 @@ class PlaybackSession extends ChangeNotifier {
       _startupTimings['loadRequested'] = _startupClock.elapsedMilliseconds;
       _nativeOpening = () async {
         if (closed) return;
-        await player.open(
-          Media(
-            uri,
-            start: Duration(milliseconds: (resumePosition * 1000).round()),
-          ),
-          play: play ?? model.preferences.autoPlay,
-        );
+        _nativeOpenInProgress = true;
+        try {
+          await player.open(
+            Media(
+              uri,
+              start: Duration(milliseconds: (resumePosition * 1000).round()),
+            ),
+            play:
+                (play ?? model.preferences.autoPlay) &&
+                initiallyAllowedToPlay &&
+                !_backgroundPlaybackBlocked &&
+                openingPauseRevision == _backgroundPauseRevision,
+          );
+        } finally {
+          _nativeOpenInProgress = false;
+        }
+        if (!initiallyAllowedToPlay ||
+            _backgroundPlaybackBlocked ||
+            openingPauseRevision != _backgroundPauseRevision) {
+          // A pause issued while open was pending may precede its final play
+          // command. Always place another pause after the completed open.
+          await _backgroundPauseWork;
+          await _pauseForBackground();
+        }
       }();
       await _nativeOpening;
       if (closed) return;
@@ -762,7 +848,8 @@ class PlaybackSession extends ChangeNotifier {
       final api = await model.danmu();
       if (closed || api == null) return;
       danmaku = DanmakuSession(model.store, api, media.id)
-        ..addListener(_notify);
+        ..addListener(_notify)
+        ..setPresentationActive(_danmakuPresentationActive);
       danmaku!.configure(
         isPlaying: player.state.playing && !player.state.buffering,
         show: model.preferences.danmuVisible,
@@ -1335,15 +1422,21 @@ class PlaybackSession extends ChangeNotifier {
     }
   }
 
-  Future<void> saveProgress() {
+  Future<void> saveProgress({bool completed = false}) {
+    completed |= player.state.completed;
     if (_transient ||
         remotePlayback ||
         !ready ||
-        player.state.duration <= Duration.zero) {
+        (!completed && player.state.duration <= Duration.zero)) {
       return Future.value();
     }
-    final duration = player.state.duration.inMilliseconds / 1000;
-    final position = player.state.completed
+    final duration =
+        (completed && player.state.duration <= Duration.zero
+                ? player.state.position
+                : player.state.duration)
+            .inMilliseconds /
+        1000;
+    final position = completed
         ? duration
         : player.state.position.inMilliseconds / 1000;
     final progressId = model.progressKey(media);
@@ -1353,7 +1446,7 @@ class PlaybackSession extends ChangeNotifier {
       'updatedAt': DateTime.now().toUtc().toIso8601String(),
       'devicePlatform': Platform.operatingSystem,
     };
-    final watchedId = position / duration >= .95
+    final watchedId = completed || position / duration >= .95
         ? model.watchedKey(media)
         : null;
     // Snapshot before queuing: a slow write must never replace a later seek or
@@ -1418,6 +1511,7 @@ class PlaybackSession extends ChangeNotifier {
     // HTTP, secure-storage and adapter-open waits are cancellation-aware.
     await cleanup(() => _subtitleWork);
     await cleanup(() => _nativeOpening);
+    await cleanup(() async => _backgroundPauseWork);
     await cleanup(() async {
       await _firstFrameWork;
     });

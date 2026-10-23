@@ -267,7 +267,12 @@ void main() {
       expect(find.text('第 1 集 · 译文 Encounter'), findsOneWidget);
       Navigator.of(tester.element(find.byType(BottomSheet))).pop();
       await tester.pumpAndSettle();
-      expect(find.text('译文 Example · 第 1 集 · 译文 Encounter'), findsOneWidget);
+      expect(
+        find.text('译文 Example'),
+        findsOneWidget,
+        reason:
+            'even a single imported episode uses the translated series shortcut title',
+      );
       await tester.pumpWidget(const SizedBox());
       model.dispose();
       root.deleteSync(recursive: true);

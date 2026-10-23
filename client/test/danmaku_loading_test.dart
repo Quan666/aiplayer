@@ -11,6 +11,7 @@ import 'package:flutter_test/flutter_test.dart';
 class LoadingTransport implements JsonTransport {
   final Future<Map<String, dynamic>> Function(Uri) handle;
   final paths = <String>[];
+  final cancellations = <CancelToken?>[];
   LoadingTransport(this.handle);
 
   @override
@@ -22,6 +23,7 @@ class LoadingTransport implements JsonTransport {
     CancelToken? cancel,
   }) {
     paths.add(uri.path);
+    cancellations.add(cancel);
     return handle(uri);
   }
 }
@@ -278,6 +280,98 @@ void main() {
       expect(transport.paths.length, 1);
     });
   }
+
+  test(
+    'background audio cancels comment refresh and resumes one current request',
+    () {
+      fakeAsync((time) {
+        final store = AppStore(':memory:');
+        final pending = Completer<Map<String, dynamic>>();
+        var calls = 0;
+        final transport = LoadingTransport((_) async {
+          calls++;
+          return calls == 2 ? pending.future : snapshot;
+        });
+        final session = DanmakuSession(
+          store,
+          DanmuApiClient(
+            DanmuApiClient.defaultOrigin,
+            'fixture',
+            transport: transport,
+          ),
+          'video',
+        );
+        session.select(const EpisodeMatch('1', '作品', ''));
+        time.flushMicrotasks();
+        final original = session.comments;
+        session.configure(isPlaying: true);
+        time.elapse(const Duration(seconds: 30));
+        expect(calls, 2);
+        session.setPresentationActive(false);
+        expect(session.playing, isTrue);
+        expect(session.visible, isTrue);
+        expect(transport.cancellations.last!.cancelled, isTrue);
+        time.elapse(const Duration(hours: 2));
+        expect(calls, 2);
+        expect(time.pendingTimers, isEmpty);
+
+        pending.complete({
+          'comments': [
+            {'time': 1, 'text': 'stale background result'},
+          ],
+        });
+        time.flushMicrotasks();
+        expect(session.comments, same(original));
+        expect(session.error, isEmpty);
+        session.setPresentationActive(true);
+        session.setPresentationActive(true);
+        time.elapse(Duration.zero);
+        expect(calls, 3);
+        expect(session.active, isTrue);
+        time.elapse(const Duration(seconds: 29));
+        expect(calls, 3);
+        time.elapse(const Duration(seconds: 1));
+        expect(calls, 4);
+        session.dispose();
+        expect(time.pendingTimers, isEmpty);
+        store.dispose();
+      });
+    },
+  );
+
+  test('foreground comment refresh preserves server backoff', () {
+    fakeAsync((time) {
+      final store = AppStore(':memory:');
+      var calls = 0;
+      final session = DanmakuSession(
+        store,
+        DanmuApiClient(
+          DanmuApiClient.defaultOrigin,
+          'fixture',
+          transport: LoadingTransport((_) async {
+            calls++;
+            if (calls == 2) throw const AppFailure('rate limited', 429);
+            return snapshot;
+          }),
+        ),
+        'video',
+      );
+      session.select(const EpisodeMatch('1', '作品', ''));
+      time.flushMicrotasks();
+      session.configure(isPlaying: true);
+      time.elapse(const Duration(seconds: 30));
+      expect(calls, 2);
+      session.setPresentationActive(false);
+      session.setPresentationActive(true);
+      time.elapse(const Duration(seconds: 10));
+      expect(calls, 2);
+      time.elapse(const Duration(minutes: 5));
+      expect(calls, 3);
+      expect(session.error, isEmpty);
+      session.dispose();
+      store.dispose();
+    });
+  });
 
   test(
     'play state changes cannot refresh the old episode during rematching',

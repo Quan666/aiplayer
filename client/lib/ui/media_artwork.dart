@@ -5,9 +5,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import '../core/logger.dart';
 import '../data/poster_cache.dart';
+import 'artwork_decode_queue.dart';
+import 'artwork_lifecycle.dart';
 import 'artwork_scroll_scope.dart';
 import 'glass.dart';
 import 'theme/library_styles.dart';
+
+// One cheap layout generation for all covers. Priority checks in the download
+// and decode queues reuse geometry within a frame, including zero-time test
+// frames; no per-card frame callbacks or timers are installed.
+int _artworkLayoutGeneration = 0;
+bool _tracksArtworkLayout = false;
 
 /// Decode only a cover-sized image; scrolling never loads a full-resolution poster.
 class MediaArtwork extends StatefulWidget {
@@ -21,6 +29,10 @@ class MediaArtwork extends StatefulWidget {
   /// larger image while their first frame reuses the already visible cover.
   final int maxDecodeEdge;
 
+  /// Keep visible wall posters progressing during scrolling, with bounded
+  /// native decoding. Video capture previews still wait for the region to idle.
+  final bool loadWhileScrolling;
+
   /// Runs after layout, when the surrounding scrollables allow expensive work.
   /// A later widget update retries a previously full preview queue.
   final VoidCallback? onRequestPreview;
@@ -32,6 +44,7 @@ class MediaArtwork extends StatefulWidget {
     this.placeholder,
     this.fit = BoxFit.cover,
     this.maxDecodeEdge = 640,
+    this.loadWhileScrolling = false,
     this.onRequestPreview,
   }) : assert(maxDecodeEdge >= 64);
   @override
@@ -45,31 +58,71 @@ class _MediaArtworkState extends State<MediaArtwork> {
   int _posterRevision = 0;
   Listenable? _cacheCapacity;
   Future<File?>? _poster;
-  Timer? _posterRetry;
   bool _previewPending = false, _previewFrameScheduled = false;
   bool _imageLoadingAllowed = false;
   bool _active = true;
+  bool get _enabled => _active && ArtworkLifecycle.instance.value;
   ValueListenable<bool>? _scrollActivity;
   final _scrollPositions = <ScrollPosition>{};
   ModalRoute<dynamic>? _route;
+  Animation<double>? _routeEntrance;
   Animation<double>? _routeTransition;
+  ArtworkDecodeRequest? _decodeRequest;
+  ResizeImage? _queuedImage, _failedImage;
+  bool _waitingForDecodeCapacity = false;
+  bool _posterWasNearby = false;
+  int _geometryGeneration = -1, _geometryPriority = -1;
+  ScrollPosition? _nearestScrollPosition;
+  Axis _scrollAxis = Axis.vertical;
+
+  void _cancelDecode() {
+    _decodeRequest?.cancel();
+    _decodeRequest = null;
+    _queuedImage = null;
+    if (_waitingForDecodeCapacity) {
+      ArtworkDecodeQueue.instance.capacity.removeListener(_loadArtwork);
+      _waitingForDecodeCapacity = false;
+    }
+  }
 
   @override
   void initState() {
     super.initState();
+    ArtworkLifecycle.instance.addListener(_lifecycleChanged);
+    if (!_tracksArtworkLayout) {
+      _tracksArtworkLayout = true;
+      WidgetsBinding.instance.addPersistentFrameCallback((_) {
+        _artworkLayoutGeneration++;
+      });
+    }
     _previewPending = widget.onRequestPreview != null;
     widget.cache?.changes.addListener(_cacheChanged);
+  }
+
+  void _lifecycleChanged() {
+    if (!ArtworkLifecycle.instance.value) {
+      _cancelDecode();
+      // Even if no background frame rebuilds TickerMode, the first resumed
+      // frame must retry the cold image whose queued request was cancelled.
+      _imageLoadingAllowed = false;
+    } else {
+      _geometryGeneration = -1;
+      _loadArtwork();
+    }
   }
 
   void _cacheChanged() {
     final change = widget.cache?.changes.value;
     if (!mounted || change == null || change.url != widget.poster) return;
     void changed() {
+      _cancelDecode();
+      _failedImage = null;
+      _posterWasNearby = false;
       _poster = change.file == null ? null : SynchronousFuture(change.file);
       _posterRevision++;
     }
 
-    if (_active) {
+    if (_enabled) {
       setState(changed);
     } else {
       // A hidden route reads the newest generation once it becomes active.
@@ -81,12 +134,25 @@ class _MediaArtworkState extends State<MediaArtwork> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _geometryGeneration = -1;
+    final nearest = Scrollable.maybeOf(context);
+    _nearestScrollPosition = nearest?.position;
+    _scrollAxis = axisDirectionToAxis(
+      nearest?.axisDirection ?? AxisDirection.down,
+    );
     _active = TickerMode.valuesOf(context).enabled;
-    if (!_active) {
-      _posterRetry?.cancel();
-      _posterRetry = null;
+    if (!_enabled) {
+      _cancelDecode();
     }
     _route = ModalRoute.of(context);
+    // Sheets can lay out their covers below the screen during entrance. Retry
+    // after the transform settles even if the user has not started scrolling.
+    final entrance = _route?.animation;
+    if (entrance != _routeEntrance) {
+      _routeEntrance?.removeStatusListener(_routeSettled);
+      _routeEntrance = entrance;
+      _routeEntrance?.addStatusListener(_routeSettled);
+    }
     final transition = _route?.secondaryAnimation;
     if (transition != _routeTransition) {
       _routeTransition?.removeStatusListener(_routeSettled);
@@ -131,21 +197,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
         axis: Axis.horizontal,
       );
 
-  void _retryLoading() {
-    // The shared scope will wake every pending cover once when the region is
-    // idle. Avoid a timer per card while wheel/trackpad events keep arriving.
-    if (!_active || _scrollActivity?.value == true) return;
-    _posterRetry ??= Timer(const Duration(milliseconds: 80), () {
-      _posterRetry = null;
-      if (!mounted) return;
-      _loadArtwork();
-    });
-  }
-
   void _activityChanged() {
     if (_scrollActivity?.value == true) {
-      _posterRetry?.cancel();
-      _posterRetry = null;
+      if (widget.loadWhileScrolling) _loadArtwork();
     } else {
       _loadArtwork();
     }
@@ -168,58 +222,124 @@ class _MediaArtworkState extends State<MediaArtwork> {
     }
   }
 
-  bool get _visible {
-    if (_route?.isCurrent == false) return false;
-    final box = context.findRenderObject();
-    if (box is! RenderBox || !box.attached || !box.hasSize) return false;
-    var visible = box.localToGlobal(Offset.zero) & box.size;
-    final screen = MediaQuery.maybeSizeOf(context);
-    if (screen != null && !screen.isEmpty) {
-      visible = visible.intersect(Offset.zero & screen);
+  bool get _visible => _artworkPriority == 0;
+
+  // Only the immediately adjacent viewport is speculative. Distant sliver
+  // children, covered routes and hidden tabs never start artwork work.
+  int get _artworkPriority {
+    if (!_enabled || _route?.isCurrent == false) return -1;
+    if (_geometryGeneration == _artworkLayoutGeneration) {
+      return _geometryPriority;
     }
+    final box = context.findRenderObject();
+    if (box is! RenderBox || !box.attached || !box.hasSize) return -1;
+    final bounds = box.localToGlobal(Offset.zero) & box.size;
+    // Retained sliver children have no paint transform while offscreen.
+    // NaN rectangles can pass overlaps(), so reject them before prioritizing.
+    if (!bounds.isFinite) return -1;
+    final screen = MediaQuery.maybeSizeOf(context);
+    var viewport = screen != null && !screen.isEmpty
+        ? Offset.zero & screen
+        : bounds;
+    var hasViewport = false;
     RenderObject? ancestor = box.parent;
-    while (!visible.isEmpty && ancestor != null) {
+    while (!viewport.isEmpty && ancestor != null) {
       if (ancestor is RenderAbstractViewport) {
-        visible = visible.intersect(
-          MatrixUtils.transformRect(
-            ancestor.getTransformTo(null),
-            ancestor.paintBounds,
-          ),
+        hasViewport = true;
+        final clip = MatrixUtils.transformRect(
+          ancestor.getTransformTo(null),
+          ancestor.paintBounds,
         );
+        if (!clip.isFinite) return -1;
+        viewport = viewport.intersect(clip);
       }
       ancestor = ancestor.parent;
     }
-    return !visible.isEmpty;
+    var priority = -1;
+    if (!viewport.isEmpty && bounds.overlaps(viewport)) {
+      priority = 0;
+    } else if (widget.loadWhileScrolling && hasViewport && !viewport.isEmpty) {
+      final vertical = _scrollAxis == Axis.vertical;
+      final extent = (vertical ? viewport.height : viewport.width) * .75;
+      final nearby = vertical
+          ? Rect.fromLTRB(
+              viewport.left,
+              viewport.top - extent,
+              viewport.right,
+              viewport.bottom + extent,
+            )
+          : Rect.fromLTRB(
+              viewport.left - extent,
+              viewport.top,
+              viewport.right + extent,
+              viewport.bottom,
+            );
+      if (bounds.overlaps(nearby)) {
+        final before = vertical
+            ? bounds.bottom <= viewport.top
+            : bounds.right <= viewport.left;
+        final direction = _nearestScrollPosition?.userScrollDirection;
+        priority = switch (direction) {
+          ScrollDirection.forward => before ? 1 : 2,
+          ScrollDirection.reverse => before ? 2 : 1,
+          _ => 1,
+        };
+      }
+    }
+    _geometryGeneration = _artworkLayoutGeneration;
+    return _geometryPriority = priority;
   }
 
   void _loadArtwork() {
     final needsPoster =
-        _poster == null && widget.cache != null && widget.poster.isNotEmpty;
-    if (!_active ||
+        (_poster == null || _posterWasNearby) &&
+        widget.cache != null &&
+        widget.poster.isNotEmpty;
+    if (!_enabled ||
         _repairingPoster ||
-        _scrollActivity?.value == true ||
-        (!needsPoster && !_previewPending && _imageLoadingAllowed) ||
+        (_scrollActivity?.value == true && !widget.loadWhileScrolling) ||
+        (!needsPoster &&
+            _imageLoadingAllowed &&
+            _queuedImage == null &&
+            (!_previewPending || _scrollActivity?.value == true)) ||
         _previewFrameScheduled) {
       return;
     }
     _previewFrameScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _previewFrameScheduled = false;
-      if (!mounted || !_active || _scrollActivity?.value == true || !_visible) {
+      if (!mounted ||
+          !_enabled ||
+          (_scrollActivity?.value == true && !widget.loadWhileScrolling)) {
         return;
       }
-      // Cached sliver children are laid out before they enter the viewport.
-      // Request expensive artwork only for the cards the user can see.
-      if (_deferLoading) {
-        _retryLoading();
+      final priority = _artworkPriority;
+      if (priority < 0) return;
+      // A nearby request can become visible while another prefetch is decoding.
+      // Reuse the reserved foreground slot without waiting for that decode.
+      _decodeRequest?.refreshPriority();
+      // Prepare the small adjacent band before its posters enter the viewport;
+      // both queues reserve capacity for visible artwork.
+      if (_deferLoading && !widget.loadWhileScrolling) {
+        // The scope's idle transition or the fallback ScrollPosition listener
+        // retries once when scrolling ends. A timer per deferred cover would
+        // keep waking the UI isolate throughout every sustained gesture.
         return;
       }
-      _posterRetry?.cancel();
-      _posterRetry = null;
-      if (!_imageLoadingAllowed) setState(() => _imageLoadingAllowed = true);
-      if (_poster == null && widget.cache != null && widget.poster.isNotEmpty) {
+      if (!_imageLoadingAllowed ||
+          (_queuedImage != null && _decodeRequest?.isPending != true)) {
+        setState(() => _imageLoadingAllowed = true);
+      }
+      if ((_poster == null || (_posterWasNearby && priority == 0)) &&
+          widget.cache != null &&
+          widget.poster.isNotEmpty) {
         final cache = widget.cache!;
-        final poster = cache.loadVisible(widget.poster);
+        final poster = priority == 0
+            ? cache.loadVisible(widget.poster)
+            : cache.loadNearby(
+                widget.poster,
+                canStart: () => mounted && _artworkPriority >= 0,
+              );
         if (poster == null) {
           if (_cacheCapacity != cache.capacity) {
             _cacheCapacity?.removeListener(_loadArtwork);
@@ -230,10 +350,29 @@ class _MediaArtworkState extends State<MediaArtwork> {
           _cacheCapacity = null;
           setState(() {
             _poster = poster;
+            _posterWasNearby = priority > 0;
           });
+          if (priority > 0) {
+            poster.then((file) {
+              if (!mounted || !identical(_poster, poster)) return;
+              if (file == null) {
+                // A speculative admission can be dropped after scrolling
+                // away. A later visible visit must be able to request it.
+                final priority = _artworkPriority;
+                if (priority < 0) {
+                  _poster = null;
+                  _posterWasNearby = false;
+                } else if (priority == 0) {
+                  _loadArtwork();
+                }
+              } else {
+                _posterWasNearby = false;
+              }
+            });
+          }
         }
       }
-      if (_previewPending) {
+      if (_previewPending && priority == 0 && !_deferLoading) {
         _previewPending = false;
         widget.onRequestPreview?.call();
       }
@@ -249,7 +388,11 @@ class _MediaArtworkState extends State<MediaArtwork> {
       widget.cache?.changes.addListener(_cacheChanged);
     }
     if (oldWidget.thumbnail != widget.thumbnail ||
-        oldWidget.poster != widget.poster) {
+        oldWidget.poster != widget.poster ||
+        oldWidget.cache != widget.cache) {
+      _cancelDecode();
+      _failedImage = null;
+      _posterWasNearby = false;
       _imageLoadingAllowed = false;
     }
     if (oldWidget.thumbnail != widget.thumbnail) _reportedFailure = null;
@@ -259,8 +402,6 @@ class _MediaArtworkState extends State<MediaArtwork> {
       _repairingPoster = false;
       _cacheCapacity?.removeListener(_loadArtwork);
       _cacheCapacity = null;
-      _posterRetry?.cancel();
-      _posterRetry = null;
       _poster = null;
     }
     if (oldWidget.poster != widget.poster ||
@@ -284,8 +425,51 @@ class _MediaArtworkState extends State<MediaArtwork> {
     // Warm images require neither decoding nor viewport transforms. A parent
     // rebuild used to walk every ancestor and multiply global transforms for
     // each already-decoded poster, even though it can be displayed immediately.
-    if (cached) return true;
-    if (!_active) return false;
+    if (cached) {
+      if (_queuedImage == provider) _cancelDecode();
+      return true;
+    }
+    if (!_enabled) return false;
+    if (widget.loadWhileScrolling) {
+      if (_failedImage == provider) return false;
+      if (_queuedImage != provider) {
+        _cancelDecode();
+        _queuedImage = provider;
+      }
+      if (!_imageLoadingAllowed) {
+        _loadArtwork();
+        return false;
+      }
+      if (_decodeRequest?.isPending != true) {
+        _decodeRequest = ArtworkDecodeQueue.instance.request(
+          provider,
+          canStart: () => mounted && _enabled,
+          priority: () => _artworkPriority,
+          onStart: () {
+            if (mounted) setState(() {});
+          },
+          onError: (error, stack) {
+            if (!mounted || _queuedImage != provider) return;
+            _failedImage = provider;
+            final file = (provider.imageProvider as FileImage).file;
+            if (widget.poster.isNotEmpty && file.path != widget.thumbnail) {
+              _repairPoster(widget.poster, file);
+            } else {
+              _reportFailure(error);
+            }
+            setState(() {});
+          },
+        );
+        if (_decodeRequest == null && !_waitingForDecodeCapacity) {
+          _waitingForDecodeCapacity = true;
+          ArtworkDecodeQueue.instance.capacity.addListener(_loadArtwork);
+        } else if (_decodeRequest != null && _waitingForDecodeCapacity) {
+          ArtworkDecodeQueue.instance.capacity.removeListener(_loadArtwork);
+          _waitingForDecodeCapacity = false;
+        }
+      }
+      return false;
+    }
     if (_imageLoadingAllowed && !_deferLoading && _visible) return true;
     _imageLoadingAllowed = false;
     _loadArtwork();
@@ -309,10 +493,12 @@ class _MediaArtworkState extends State<MediaArtwork> {
 
   @override
   void dispose() {
-    _posterRetry?.cancel();
+    ArtworkLifecycle.instance.removeListener(_lifecycleChanged);
+    _cancelDecode();
     widget.cache?.changes.removeListener(_cacheChanged);
     _cacheCapacity?.removeListener(_loadArtwork);
     _scrollActivity?.removeListener(_activityChanged);
+    _routeEntrance?.removeStatusListener(_routeSettled);
     _routeTransition?.removeStatusListener(_routeSettled);
     for (final position in _scrollPositions) {
       position.removeListener(_scrollChanged);
@@ -332,11 +518,19 @@ class _MediaArtworkState extends State<MediaArtwork> {
       await _evictArtworkImages(file);
       await cache.invalidate(poster, failedFile: file, retryImmediately: true);
       if (!mounted || widget.poster != poster || widget.cache != cache) return;
-      setState(() {
+      void repaired() {
+        _cancelDecode();
+        _failedImage = null;
         _poster = null;
         _repairingPoster = false;
         _posterRevision++;
-      });
+      }
+
+      if (_enabled) {
+        setState(repaired);
+      } else {
+        repaired();
+      }
       _loadArtwork();
     });
   }
@@ -372,9 +566,16 @@ class _MediaArtworkState extends State<MediaArtwork> {
           ),
         );
     final pixelRatio = MediaQuery.devicePixelRatioOf(context);
-    Widget frame(int decodeWidth) {
+    Widget frame(int decodeWidth, {bool load = true}) {
       if (thumbnail == null || thumbnail.isEmpty) return placeholder;
-      final provider = _imageFor(File(thumbnail), decodeWidth);
+      final provider = load
+          ? _imageFor(File(thumbnail), decodeWidth)
+          : _warmArtworkImage(
+              File(thumbnail),
+              decodeWidth,
+              widget.maxDecodeEdge,
+            );
+      if (provider == null) return placeholder;
       return !_canLoadImage(provider)
           ? placeholder
           : Image(
@@ -384,6 +585,10 @@ class _MediaArtworkState extends State<MediaArtwork> {
               height: double.infinity,
               filterQuality: FilterQuality.low,
               gaplessPlayback: true,
+              frameBuilder: (_, child, frame, synchronous) =>
+                  frame != null || synchronous
+                  ? child
+                  : Stack(fit: StackFit.expand, children: [placeholder, child]),
               errorBuilder: (_, error, _) {
                 _reportFailure(error);
                 return placeholder;
@@ -418,7 +623,12 @@ class _MediaArtworkState extends State<MediaArtwork> {
                     if (snapshot.data == null) return frame(decodeWidth);
                     final provider = _imageFor(snapshot.data!, decodeWidth);
                     return !_canLoadImage(provider)
-                        ? frame(decodeWidth)
+                        ? frame(
+                            decodeWidth,
+                            load:
+                                !widget.loadWhileScrolling ||
+                                _failedImage == provider,
+                          )
                         : Image(
                             image: provider,
                             fit: fit,
@@ -426,6 +636,13 @@ class _MediaArtworkState extends State<MediaArtwork> {
                             height: double.infinity,
                             filterQuality: FilterQuality.low,
                             gaplessPlayback: true,
+                            frameBuilder: (_, child, frame, synchronous) =>
+                                frame != null || synchronous
+                                ? child
+                                : Stack(
+                                    fit: StackFit.expand,
+                                    children: [placeholder, child],
+                                  ),
                             errorBuilder: (_, error, _) {
                               _repairPoster(poster, snapshot.data!);
                               return frame(decodeWidth);

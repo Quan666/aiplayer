@@ -99,7 +99,7 @@ void main() {
       store.setLocal('sources', [
         {'id': 'nas', 'kind': 'webdav', 'url': 'https://old.example/'},
       ]);
-      final catalog = _PreviewCatalog(store);
+      final catalog = _PreviewCatalog(store, completeNames: true);
       final entries = _files(0);
       final first = await catalog.inspect(
         'nas',
@@ -110,7 +110,7 @@ void main() {
       expect(first!.poster, 'https://posters.example/作品甲.jpg');
       await catalog.inspect('nas', '0/', entries, directoryModified: 7);
       expect(catalog.resolutions, 1);
-      final restored = _PreviewCatalog(store);
+      final restored = _PreviewCatalog(store, completeNames: true);
       expect(
         restored.directoryPreview('nas', '0/', modified: 7)!.collection!.poster,
         first.poster,
@@ -233,7 +233,8 @@ class _Fixture {
 
 class _PreviewCatalog extends LibraryCatalog {
   int resolutions = 0;
-  _PreviewCatalog(super.store)
+  final bool completeNames;
+  _PreviewCatalog(super.store, {this.completeNames = false})
     : super(
         strategy: () =>
             (store.local('settings') as Map?)?['metadataStrategy'] ??
@@ -259,7 +260,7 @@ class _PreviewCatalog extends LibraryCatalog {
     String subjectId, {
     Map<String, dynamic>? subject,
     CancelToken? cancel,
-  }) async => {};
+  }) async => completeNames ? {'1': 'First', '2': 'Second'} : {};
 }
 
 class _PreviewModel extends AppModel {

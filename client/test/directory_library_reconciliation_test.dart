@@ -76,8 +76,12 @@ class _Model extends AppModel {
     super.previewCapture,
   }) : super(backgroundWork: false);
   DirectoryCollection? cached;
+  bool failCache = false;
   SourceAdapter? connection;
-  late final _catalog = _CachedCatalog(store, () => cached);
+  late final _catalog = _CachedCatalog(store, () {
+    if (failCache) throw StateError('invalid directory cache');
+    return cached;
+  });
   @override
   LibraryCatalog get catalog => _catalog;
   @override
@@ -232,6 +236,45 @@ void main() {
   );
 
   test(
+    'a broken directory cache cannot prevent reading newly added source episodes',
+    () async {
+      final id = model.addMedia('local', entries.first);
+      model.failCache = true;
+      final loaded = await model.loadSeriesEpisodes(store.get('media', id)!);
+      expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
+      expect(
+        model.seriesRefreshDelay(loaded.first),
+        const Duration(seconds: 30),
+      );
+    },
+  );
+
+  test(
+    'automatic series retries back off and reset after the source recovers',
+    () async {
+      final id = model.addMedia('local', entries.first);
+      final record = store.get('media', id)!;
+      model.connection = _OfflineSource();
+      for (final seconds in [60, 120, 240, 240]) {
+        expect(await model.loadSeriesEpisodes(record), hasLength(1));
+        expect(model.seriesRefreshDelay(record), Duration(seconds: seconds));
+      }
+      final delayed = _DelayedSource();
+      model.connection = delayed;
+      final cancel = CancelToken();
+      final pending = model.loadSeriesEpisodes(record, cancel: cancel);
+      await delayed.started.future;
+      cancel.cancel();
+      await expectLater(pending, throwsA(isA<Cancelled>()));
+      expect(model.seriesRefreshDelay(record), const Duration(seconds: 240));
+      delayed.listing.complete(entries);
+      model.connection = null;
+      expect(await model.loadSeriesEpisodes(record), hasLength(3));
+      expect(model.seriesRefreshDelay(record), const Duration(seconds: 30));
+    },
+  );
+
+  test(
     'single old-library seed recovers all cached episodes on disk while offline',
     () async {
       final id = model.addMedia('local', entries.first);
@@ -246,6 +289,19 @@ void main() {
         '第二集',
         '第三集',
       ]);
+      expect(store.records('progress'), isEmpty);
+    },
+  );
+
+  test(
+    'offline parsed folder shortcuts recover unplayed episodes without catalogue metadata',
+    () async {
+      final id = model.addMedia('local', entries.first);
+      model.cached = identifyDirectory('${root.path}/Show', entries);
+      model.connection = _OfflineSource();
+      final loaded = await model.loadSeriesEpisodes(store.get('media', id)!);
+      expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
+      expect(loaded.every((item) => item.data['bangumiId'] == null), isTrue);
       expect(store.records('progress'), isEmpty);
     },
   );
