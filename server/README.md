@@ -47,9 +47,9 @@ SYNC_ADDR=127.0.0.1:8080 SYNC_DB=./aiplayer.db ./aiplayer-sync
 
 | kind | data 允许字段 |
 | --- | --- |
-| media | title、series、season、episode、bangumiId、poster、summary、fileName、size、duration、metadataProvider、tmdbId、metadataTitle、rating、ratingCount、airDate、totalEpisodes、totalSeasons、genres、metadataType |
+| media | title、series、season、episode、episodeTitle、bangumiId、poster、summary、fileName、size、duration、metadataProvider、tmdbId、metadataTitle、rating、ratingCount、airDate、totalEpisodes、totalSeasons、genres、metadataType |
 | match | provider、episodeId、label、shift、offset |
-| progress | position、duration、updatedAt |
+| progress | position、duration、updatedAt、devicePlatform |
 | watched | watched |
 | vault | algorithm、nonce、ciphertext、mac |
 

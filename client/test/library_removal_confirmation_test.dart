@@ -24,6 +24,78 @@ class _RemovalModel extends AppModel {
 }
 
 void main() {
+  testWidgets(
+    'batch deletion selects search results and preserves cancellation',
+    (tester) async {
+      FlutterSecureStorage.setMockInitialValues({});
+      final root = Directory.systemTemp.createTempSync(
+        'aiplayer-batch-remove-',
+      );
+      final store = AppStore(':memory:');
+      final model = _RemovalModel(store, root, managed: true);
+      for (final id in ['1', '2', '3']) {
+        store.save('media', id, {
+          'title': id == '3' ? '其他.mp4' : '作品$id.mp4',
+          'series': id == '3' ? '其他' : '作品$id',
+          'episode': '',
+          'size': 100,
+        });
+      }
+      try {
+        await tester.pumpWidget(AIPlayerApp(model: model));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('批量删除'));
+        await tester.pumpAndSettle();
+        expect(
+          tester
+              .widget<FilledButton>(find.widgetWithText(FilledButton, '删除所选'))
+              .onPressed,
+          isNull,
+        );
+        await tester.tap(find.byKey(const ValueKey('select:3')));
+        await tester.pumpAndSettle();
+        expect(find.text('已选 1 个视频'), findsOneWidget);
+        await tester.tap(find.byKey(const ValueKey('select:3')));
+        await tester.tap(find.byTooltip('搜索作品或文件名'));
+        await tester.pumpAndSettle();
+        await tester.enterText(find.byType(TextField).first, '作品');
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('全选'));
+        await tester.pumpAndSettle();
+        expect(find.text('已选 2 个视频'), findsOneWidget);
+        await tester.tap(find.text('取消全选'));
+        await tester.pumpAndSettle();
+        expect(find.text('已选 0 个视频'), findsOneWidget);
+        await tester.tap(find.text('全选'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('删除所选'));
+        await tester.pumpAndSettle();
+        expect(find.text('移除这 2 个视频？'), findsOneWidget);
+        expect(
+          find.text('将移除所选视频的库记录，并删除其中 2 个应用导入副本，无法撤销。原始位置的文件不受影响。'),
+          findsOneWidget,
+        );
+        await tester.tap(find.widgetWithText(TextButton, '取消'));
+        await tester.pumpAndSettle();
+        expect(model.removed, isEmpty);
+        expect(find.text('已选 2 个视频'), findsOneWidget);
+        await tester.tap(find.text('删除所选'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, '删除视频'));
+        await tester.pumpAndSettle();
+        expect(model.removed, unorderedEquals(['1', '2']));
+        expect(model.media.map((item) => item.id), ['3']);
+        expect(find.text('完成'), findsNothing);
+        expect(tester.takeException(), isNull);
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        model.dispose();
+        store.dispose();
+        root.deleteSync(recursive: true);
+      }
+    },
+  );
+
   testWidgets('all videos can remove a whole series with one confirmation', (
     tester,
   ) async {

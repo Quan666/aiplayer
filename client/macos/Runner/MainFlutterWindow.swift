@@ -20,6 +20,10 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var terminationCompletion: (() -> Void)?
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
+    // Keep hover delivery alive while AppKit changes the key window during
+    // fullscreen transitions. Tracking still stops when another app is active.
+    flutterViewController.mouseTrackingMode = .inActiveApp
+    acceptsMouseMovedEvents = true
     self.contentViewController = flutterViewController
     // Keep the playback area at 16:9; the native title bar is extra.
     var contentSize = NSSize(width: 1280, height: 720)
@@ -124,6 +128,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     }
 
     super.awakeFromNib()
+    restoreFlutterInput()
+    initialFirstResponder = firstResponder as? NSView
   }
 
   fileprivate func handleFileCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -173,8 +179,9 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     setFrame(saved, display: true)
   }
 
-  private func setVideoFullscreen(_ enabled: Bool) {
+  func setVideoFullscreen(_ enabled: Bool) {
     guard enabled != (fullscreenFrame != nil) else { return }
+    let responder = firstResponder
     if enabled {
       guard let display = screen ?? NSScreen.main else { return }
       fullscreenFrame = frame
@@ -190,6 +197,44 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
       setFrame(saved, display: true)
     }
     makeKeyAndOrderFront(nil)
+    restoreFlutterInput(preferredResponder: responder)
+  }
+
+  func restoreFlutterInput(preferredResponder: NSResponder? = nil) {
+    acceptsMouseMovedEvents = true
+    // AppKit can reset the first responder when the window's style changes.
+    // Preserve attached editors and other valid responders before recovering
+    // the Flutter view; makeKeyAndOrderFront alone does not restore its focus.
+    for candidate in [preferredResponder, firstResponder] {
+      guard let candidate = candidate, candidate.acceptsFirstResponder else { continue }
+      let attached: Bool
+      if let view = candidate as? NSView {
+        attached = view.window === self
+      } else {
+        attached = candidate === contentViewController
+      }
+      if attached && (firstResponder === candidate ||
+          (makeFirstResponder(candidate) && firstResponder === candidate)) {
+        return
+      }
+    }
+
+    guard let controller = contentViewController else { return }
+    func acceptingView(in view: NSView) -> NSView? {
+      guard !view.isHiddenOrHasHiddenAncestor else { return nil }
+      if view.acceptsFirstResponder { return view }
+      for child in view.subviews {
+        if let candidate = acceptingView(in: child) { return candidate }
+      }
+      return nil
+    }
+    // Current Flutter versions wrap FlutterView in a non-focusable NSView.
+    // Select the accepting child rather than making that wrapper first responder.
+    if let view = acceptingView(in: controller.view), makeFirstResponder(view),
+       firstResponder === view {
+      return
+    }
+    if controller.acceptsFirstResponder { makeFirstResponder(controller) }
   }
 
   override var canBecomeKey: Bool { true }
@@ -203,6 +248,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     if fullscreenFrame != nil {
       level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 1)
     }
+    restoreFlutterInput()
   }
 }
 

@@ -109,13 +109,11 @@ class PlayerQuickSettings extends StatelessWidget {
           ),
           if (PlayerDisplay.supported)
             SwitchListTile(
-              contentPadding: EdgeInsets.zero,
               title: const Text('打开视频时全屏'),
               value: p.enterFullscreen,
               onChanged: (v) => session.updateSettings({'enterFullscreen': v}),
             ),
           SwitchListTile(
-            contentPadding: EdgeInsets.zero,
             title: const Text('播完自动播放下一集'),
             value: p.autoNextEpisode,
             onChanged: (v) => session.updateSettings({'autoNextEpisode': v}),
@@ -123,7 +121,6 @@ class PlayerQuickSettings extends StatelessWidget {
         ]),
         page('subtitle', [
           SwitchListTile(
-            contentPadding: EdgeInsets.zero,
             title: const Text('显示字幕'),
             value: p.subtitlesEnabled,
             onChanged: (v) => session.updateSettings({'subtitlesEnabled': v}),
@@ -149,14 +146,12 @@ class PlayerQuickSettings extends StatelessWidget {
         ]),
         page('danmaku', [
           ListTile(
-            contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.chat_bubble_outline_rounded),
             title: const Text('弹幕匹配'),
             trailing: const Icon(Icons.chevron_right_rounded),
             onTap: onDanmaku,
           ),
           SwitchListTile(
-            contentPadding: EdgeInsets.zero,
             title: const Text('显示弹幕'),
             value: p.danmuVisible,
             onChanged: (v) => session.updateSettings({'danmuVisible': v}),
@@ -182,13 +177,11 @@ class PlayerQuickSettings extends StatelessWidget {
         ]),
         page('diagnostics', [
           SwitchListTile(
-            contentPadding: EdgeInsets.zero,
             title: const Text('硬件解码'),
             value: p.hardwareDecoding,
             onChanged: (v) => session.setSoftware(!v),
           ),
           ListTile(
-            contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.info_outline_rounded),
             title: const Text('播放诊断'),
             trailing: const Icon(Icons.chevron_right_rounded),

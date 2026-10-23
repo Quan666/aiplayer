@@ -69,8 +69,9 @@ class _LogsViewState extends State<LogsView> {
           final entry = entries[i];
           return InkWell(
             onTap: () => _copy(entry.text),
+            borderRadius: BorderRadius.circular(GlassMetrics.small),
             child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [

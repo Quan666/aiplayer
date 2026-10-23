@@ -165,6 +165,8 @@ class AppModel extends ChangeNotifier {
   DateTime? _nextSyncAttempt;
   MediaPreviewQueue? _previews;
   final _previewDiagnostics = <String>{};
+  final _previewFileChecks = <String, Future<bool>>{};
+  final _pendingPreviewChecks = <String>{};
   final _playbackPreviewWork = <Future<void>>{};
   bool _disposed = false;
   String status = '';
@@ -1361,28 +1363,75 @@ class AppModel extends ChangeNotifier {
 
   /// Progress changes do not invalidate an existing frame. Players refresh it
   /// explicitly on pause/close; browsing only repairs absent or changed files.
-  bool needsMediaPreview(String id) {
+  Future<bool> needsMediaPreview(String id) async {
     final request = _previewRequest(id);
     if (request == null) return true;
     final saved = store.local('preview:$id');
-    return saved is! Map ||
+    if (saved is! Map ||
         saved['formatVersion'] != MediaPreview.formatVersion ||
         (saved['fingerprint'] != request.fingerprint &&
             saved['contentFingerprint'] != request.contentFingerprint) ||
-        saved['path'] is! String ||
-        !File(saved['path']).existsSync();
+        saved['path'] is! String) {
+      return true;
+    }
+    final path = saved['path'] as String;
+    final pending = _previewFileChecks[path];
+    if (pending != null) return !await pending;
+    late final Future<bool> check;
+    check = File(path)
+        .exists()
+        .catchError((Object error) {
+          if (error is FileSystemException) return false;
+          throw error;
+        })
+        .whenComplete(() {
+          if (identical(_previewFileChecks[path], check)) {
+            _previewFileChecks.remove(path);
+          }
+        });
+    _previewFileChecks[path] = check;
+    return !await check;
   }
 
   void ensureMediaPreview(String id) {
     if (_disposed || _previews == null || activePlaybackMediaId != null) return;
-    final record = store.get('media', id);
-    final request = _previewRequest(id);
-    if (request == null ||
-        (record?.deleted != false && store.local('browse:$id') == null)) {
+    if (!_pendingPreviewChecks.add(id)) return;
+    unawaited(
+      _ensureMediaPreview(id)
+          .catchError((Object error) {
+            if (!_disposed) {
+              AppLog.instance.warning('封面', safeFailure(error).message);
+            }
+          })
+          .whenComplete(() => _pendingPreviewChecks.remove(id)),
+    );
+  }
+
+  Future<void> _ensureMediaPreview(String id) async {
+    while (!_disposed && _previews != null && activePlaybackMediaId == null) {
+      final record = store.get('media', id);
+      final request = _previewRequest(id);
+      if (request == null ||
+          (record?.deleted != false && store.local('browse:$id') == null)) {
+        return;
+      }
+      final saved = store.local('preview:$id');
+      final needed = await needsMediaPreview(id);
+      if (_disposed || activePlaybackMediaId != null) return;
+      // A newer playback frame, source edit or progress update can arrive
+      // while the filesystem responds. Only schedule the current snapshot.
+      final current = store.local('preview:$id');
+      if (_previewRequest(id)?.fingerprint != request.fingerprint ||
+          (saved is Map && current is Map
+              ? !mapEquals(saved, current)
+              : saved != current)) {
+        continue;
+      }
+      if (needed) {
+        _previews!.schedule(request, priority: request.position != null);
+      }
       return;
     }
-    if (!needsMediaPreview(id)) return;
-    _previews!.schedule(request, priority: request.position != null);
   }
 
   /// Includes a player's queued captures, so a secondary engine can save its

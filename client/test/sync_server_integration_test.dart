@@ -12,7 +12,10 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 const _token = 'real-server-integration-token-with-24-characters';
-final _binary = File('../artifacts/aiplayer-sync-linux-amd64').absolute;
+final _binary = File(
+  Platform.environment['AIPLAYER_SYNC_TEST_BINARY'] ??
+      '../artifacts/aiplayer-sync-linux-amd64',
+).absolute;
 
 void main() {
   // These ordinary tests intentionally do not initialize the widget binding,
@@ -162,6 +165,45 @@ void main() {
       expect(first.store.conflicts, isEmpty);
       expect(second.store.conflicts, isEmpty);
       expect(jsonEncode(await server.changes()), isNot(contains('local-only')));
+    },
+    skip: skip,
+  );
+
+  test(
+    'real server lightweight sync publishes NAS playback dependencies before media',
+    () async {
+      final server = await _GoServer.start();
+      final first = _Device(server, 'first');
+      final second = _Device(server, 'second');
+      first.seedRemote();
+
+      await first.client.synchronize(server.origin, _token, sharedOnly: true);
+      final changes = (await server.changes())['changes'] as List;
+      final sourceIndex = changes.indexWhere(
+        (row) => row['kind'] == 'vault' && row['id'].startsWith('source:'),
+      );
+      final bindingIndex = changes.indexWhere(
+        (row) => row['kind'] == 'vault' && row['id'].startsWith('binding:'),
+      );
+      final mediaIndex = changes.indexWhere(
+        (row) => row['kind'] == 'media' && row['id'] == 'remote-video',
+      );
+      expect(sourceIndex, greaterThanOrEqualTo(0));
+      expect(bindingIndex, greaterThan(sourceIndex));
+      expect(mediaIndex, greaterThan(bindingIndex));
+
+      await second.client.synchronize(server.origin, _token, sharedOnly: true);
+
+      expect(second.store.get('media', 'remote-video')!.deleted, false);
+      expect(second.store.local('sources'), first.store.local('sources'));
+      expect(second.secrets.values['source:nas'], 'private-nas-password');
+      expect(
+        second.store.local('location:remote-video'),
+        first.store.local('location:remote-video'),
+      );
+      expect(second.store.local('episodeTitle:remote-video'), '相逢');
+      expect(second.store.local('settings'), isNull);
+      expect(second.store.conflicts, isEmpty);
     },
     skip: skip,
   );

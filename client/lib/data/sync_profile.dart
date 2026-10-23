@@ -801,9 +801,14 @@ class SyncProfile {
         cancel?.check();
         final entry = snapshot[id];
         final old = baseline[id] as Map?;
-        final localOverride =
-            old?['descriptor']?['type'] == 'binding' &&
-            localMedia.contains(old?['descriptor']?['key']);
+        final bindingKey = old?['descriptor']?['type'] == 'binding'
+            ? old?['descriptor']?['key'] as String?
+            : null;
+        final preserveBinding =
+            bindingKey != null &&
+            (localMedia.contains(bindingKey) ||
+                (entry == null &&
+                    store.get('media', bindingKey)?.deleted != true));
         final fingerprint = _fingerprint(entry);
         final record = store.get('vault', id);
         if (entry == null && old == null && record?.dirty != true) continue;
@@ -844,9 +849,9 @@ class SyncProfile {
             }
           }
         }
-        if (localOverride || (entry == null && old == null)) {
-          // A local file association suppresses this device's projection, not the
-          // shared remote location. Rotation still preserves and reseals it.
+        if (preserveBinding || (entry == null && old == null)) {
+          // A missing location or local override does not delete a shared
+          // binding. Only an explicit media deletion does; rotation preserves it.
           if (rotate) {
             store.save(
               'vault',
@@ -1110,7 +1115,12 @@ class SyncProfile {
         store.setLocal('syncProfile:applied:${record.id}', stamp);
         continue;
       }
+      final missingBinding =
+          now == null &&
+          descriptor?['type'] == 'binding' &&
+          store.get('media', descriptor!['key'] as String)?.deleted != true;
       if (forceId != record.id &&
+          !missingBinding &&
           fingerprint != old?['fingerprint'] &&
           fingerprint != remoteFingerprint) {
         final editTime = _entryModified(now?.descriptor ?? descriptor);

@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
+import 'package:aiplayer/data/media_previews.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -35,6 +37,123 @@ Future<Uint8List> _frame({bool blank = false}) async {
 }
 
 void main() {
+  testWidgets(
+    'visible preview checks are asynchronous, shared, and repair missing files',
+    (tester) async {
+      FlutterSecureStorage.setMockInitialValues({});
+      final store = AppStore(':memory:')
+        ..save('media', 'video', {'title': 'video.mp4', 'size': 100})
+        ..setLocal('location:video', {
+          'source': 'remote',
+          'path': '/video.mp4',
+          'size': 100,
+        });
+      final model = _LazyPreviewModel(store, Directory.systemTemp);
+      final checks = <Completer<bool>>[];
+      void saved(String path) => store.setLocal('preview:video', {
+        'path': path,
+        'contentFingerprint': const MediaPreviewRequest(
+          'video',
+          'remote',
+          '/video.mp4',
+          100,
+        ).contentFingerprint,
+        'formatVersion': MediaPreview.formatVersion,
+      });
+      saved('/cached.jpg');
+      try {
+        await IOOverrides.runZoned(
+          () async {
+            model.ensureMediaPreview('video');
+            model.ensureMediaPreview('video');
+            final check = model.needsMediaPreview('video');
+            expect(checks, hasLength(1));
+            await tester.pump(const Duration(seconds: 1));
+            expect(model.opened, isEmpty);
+            checks.single.complete(true);
+            expect(await check, false);
+            await tester.pump(const Duration(seconds: 1));
+            expect(model.opened, isEmpty);
+
+            model.ensureMediaPreview('video');
+            expect(checks, hasLength(2));
+            checks.last.complete(false);
+            await tester.pump();
+            await tester.pump(const Duration(milliseconds: 120));
+            expect(model.opened, ['remote']);
+          },
+          createFile: (_) {
+            final check = Completer<bool>();
+            checks.add(check);
+            return _PendingFile(check.future);
+          },
+        );
+      } finally {
+        model.dispose();
+        await tester.pump();
+        store.dispose();
+      }
+    },
+  );
+
+  testWidgets(
+    'preview checks discard replaced files and stop when playback starts or model closes',
+    (tester) async {
+      FlutterSecureStorage.setMockInitialValues({});
+      final store = AppStore(':memory:')
+        ..save('media', 'video', {'title': 'video.mp4', 'size': 100})
+        ..setLocal('location:video', {
+          'source': 'remote',
+          'path': '/video.mp4',
+          'size': 100,
+        });
+      final model = _LazyPreviewModel(store, Directory.systemTemp);
+      final checks = <String, Completer<bool>>{};
+      void saved(String path) => store.setLocal('preview:video', {
+        'path': path,
+        'contentFingerprint': const MediaPreviewRequest(
+          'video',
+          'remote',
+          '/video.mp4',
+          100,
+        ).contentFingerprint,
+        'formatVersion': MediaPreview.formatVersion,
+      });
+      saved('/old.jpg');
+      await IOOverrides.runZoned(
+        () async {
+          model.ensureMediaPreview('video');
+          saved('/new.jpg');
+          model.ensureMediaPreview('video');
+          checks['/old.jpg']!.complete(false);
+          await tester.pump();
+          expect(checks.keys, ['/old.jpg', '/new.jpg']);
+          checks['/new.jpg']!.complete(true);
+          await tester.pump(const Duration(seconds: 1));
+          expect(model.opened, isEmpty);
+
+          model.ensureMediaPreview('video');
+          model.activePlaybackMediaId = 'video';
+          checks['/new.jpg']!.complete(false);
+          await tester.pump(const Duration(seconds: 1));
+          expect(model.opened, isEmpty);
+
+          model.activePlaybackMediaId = null;
+          model.ensureMediaPreview('video');
+          model.dispose();
+          store.dispose();
+          checks['/new.jpg']!.complete(false);
+          await tester.pump(const Duration(seconds: 1));
+          expect(model.opened, isEmpty);
+        },
+        createFile: (path) {
+          final check = checks[path] = Completer<bool>();
+          return _PendingFile(check.future);
+        },
+      );
+    },
+  );
+
   testWidgets(
     'startup, imports and source changes wait for a visible preview request',
     (tester) async {
@@ -124,13 +243,13 @@ void main() {
           await model.savePlaybackPreview(otherId, good, position: 65);
           final firstCover = model.thumbnailPath(id)!;
           final otherCover = model.thumbnailPath(otherId)!;
-          expect(model.needsMediaPreview(id), false);
+          expect(await model.needsMediaPreview(id), false);
           store.save('progress', key, {'position': 49, 'duration': 120});
           // Browsing reuses the existing image while progress changes. Only
           // an explicit pause/close capture replaces a valid frame.
           expect(model.thumbnailPath(id), firstCover);
-          expect(model.needsMediaPreview(id), false);
-          expect(model.needsMediaPreview(otherId), false);
+          expect(await model.needsMediaPreview(id), false);
+          expect(await model.needsMediaPreview(otherId), false);
           await model.savePlaybackPreview(
             id,
             await _frame(blank: true),
@@ -138,16 +257,16 @@ void main() {
           );
           expect(model.thumbnailPath(id), firstCover);
           expect(File(firstCover).existsSync(), true);
-          expect(model.needsMediaPreview(id), false);
+          expect(await model.needsMediaPreview(id), false);
           await model.savePlaybackPreview(id, good, position: 49);
           expect(model.thumbnailPath(id), isNot(firstCover));
-          expect(model.needsMediaPreview(id), false);
+          expect(await model.needsMediaPreview(id), false);
           expect(model.thumbnailPath(otherId), otherCover);
           expect(store.get('progress', otherKey)!.data['position'], 65);
           // Missing cache files are recoverable even when their fingerprint is
           // current (e.g. OS cache cleanup).
           File(model.thumbnailPath(id)!).deleteSync();
-          expect(model.needsMediaPreview(id), true);
+          expect(await model.needsMediaPreview(id), true);
         });
       } finally {
         model.dispose();
@@ -168,4 +287,18 @@ class _LazyPreviewModel extends AppModel {
     opened.add(id);
     throw const AppFailure('preview request observed');
   }
+}
+
+class _PendingFile implements File {
+  final Future<bool> result;
+  _PendingFile(this.result);
+
+  @override
+  Future<bool> exists() => result;
+
+  @override
+  bool existsSync() => throw StateError('Synchronous preview file check');
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

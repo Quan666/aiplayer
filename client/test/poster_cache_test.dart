@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:aiplayer/data/poster_cache.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:image/image.dart' as images;
 
 class _RealHttp extends HttpOverrides {}
 
@@ -46,6 +47,17 @@ void main() {
     await directory.delete(recursive: true);
   });
   String url(String name) => 'http://127.0.0.1:${server.port}/$name';
+
+  test(
+    'validation handles very narrow posters without upscaling them',
+    () async {
+      final bytes = images.encodePng(images.Image(width: 1, height: 8192));
+      final address = url('narrow');
+      await cache.restore(address, bytes);
+      expect(await (await cache.load(address))!.readAsBytes(), bytes);
+      expect(requests, 0);
+    },
+  );
 
   test('different posters reuse one connection and one client', () async {
     cache.close();

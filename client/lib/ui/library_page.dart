@@ -51,6 +51,36 @@ class _LibraryPageState extends State<LibraryPage> {
   late bool _navigationCollapsed;
   String query = '';
   bool importing = false;
+  bool _selecting = false, _removingSelection = false;
+  final _selectedMedia = <String>{};
+
+  void _updateSelection(VoidCallback update) {
+    setState(() {
+      update();
+      _libraryContent = null;
+    });
+  }
+
+  Future<void> _removeSelected() async {
+    if (_removingSelection) return;
+    final items = model.media
+        .where((item) => _selectedMedia.contains(item.id))
+        .toList();
+    if (items.isEmpty) return;
+    _updateSelection(() => _removingSelection = true);
+    try {
+      await _removeItems(items);
+    } finally {
+      if (mounted) {
+        _updateSelection(() {
+          _removingSelection = false;
+          _selectedMedia.retainAll(model.media.map((item) => item.id));
+          if (_selectedMedia.isEmpty) _selecting = false;
+        });
+      }
+    }
+  }
+
   bool _openingPlayer = false;
   final _navigationHidden = ValueNotifier(false);
   late bool _hideNavigationOnScroll;
@@ -132,6 +162,8 @@ class _LibraryPageState extends State<LibraryPage> {
     if (oldWidget.model == model) return;
     oldWidget.model.removeListener(_changed);
     model.addListener(_changed);
+    _selectedMedia.clear();
+    _selecting = false;
     _mediaRevision = null;
     _libraryContent = null;
     _hideNavigationOnScroll = model.preferences.hideNavigationOnScroll;
@@ -453,6 +485,7 @@ class _LibraryPageState extends State<LibraryPage> {
     final mediaRevision = model.store.recordsRevision('media');
     if (_mediaRevision != mediaRevision) {
       _media = model.media;
+      _selectedMedia.retainAll(_media.map((item) => item.id));
       _mediaRevision = mediaRevision;
       _groupQuery = null;
       _recentProgressRevision = null;
@@ -533,10 +566,6 @@ class _LibraryPageState extends State<LibraryPage> {
                 const LinearProgressIndicator(),
                 const SizedBox(height: 16),
               ],
-              if (!mobile && model.status.isNotEmpty) ...[
-                Text(model.status, style: AppStyles.of(context).caption),
-                const SizedBox(height: 12),
-              ],
               if (recent.isNotEmpty && query.isEmpty) ...[
                 const SizedBox(height: 18),
                 _ContinueWatchingCarousel(
@@ -548,7 +577,68 @@ class _LibraryPageState extends State<LibraryPage> {
                 ),
               ],
               const SizedBox(height: 18),
-              _sectionHeading(query.isEmpty ? '全部视频' : '搜索结果', '$groupCount'),
+              Row(
+                children: [
+                  Expanded(
+                    child: _sectionHeading(
+                      query.isEmpty ? '全部视频' : '搜索结果',
+                      '$groupCount',
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  TextButton(
+                    onPressed:
+                        _removingSelection || (!_selecting && groupCount == 0)
+                        ? null
+                        : () => _updateSelection(() {
+                            _selecting = !_selecting;
+                            _selectedMedia.clear();
+                          }),
+                    child: Text(_selecting ? '完成' : '批量删除'),
+                  ),
+                ],
+              ),
+              if (_selecting)
+                Wrap(
+                  spacing: 12,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text('已选 ${_selectedMedia.length} 个视频'),
+                    TextButton(
+                      onPressed: _removingSelection || groupCount == 0
+                          ? null
+                          : () => _updateSelection(() {
+                              final ids = [...posters, ...files]
+                                  .expand((group) => group.value)
+                                  .map((item) => item.id)
+                                  .toSet();
+                              if (_selectedMedia.containsAll(ids)) {
+                                _selectedMedia.removeAll(ids);
+                              } else {
+                                _selectedMedia.addAll(ids);
+                              }
+                            }),
+                      child: Text(
+                        groupCount > 0 &&
+                                [...posters, ...files]
+                                    .expand((group) => group.value)
+                                    .every(
+                                      (item) =>
+                                          _selectedMedia.contains(item.id),
+                                    )
+                            ? '取消全选'
+                            : '全选',
+                      ),
+                    ),
+                    FilledButton.icon(
+                      onPressed: _removingSelection || _selectedMedia.isEmpty
+                          ? null
+                          : _removeSelected,
+                      icon: const Icon(Icons.delete_outline_rounded),
+                      label: Text(_removingSelection ? '处理中…' : '删除所选'),
+                    ),
+                  ],
+                ),
               const SizedBox(height: 10),
             ],
           ),
@@ -853,7 +943,7 @@ class _LibraryPageState extends State<LibraryPage> {
     final title = items.length == 1
         ? model.displayTitle(media)
         : model.seriesTitle(media);
-    return Semantics(
+    final tile = Semantics(
       key: ValueKey(key),
       button: true,
       label: '$title，${items.length} 个视频',
@@ -869,6 +959,49 @@ class _LibraryPageState extends State<LibraryPage> {
         onDetails: () => _details(title, items),
         onRemove: () => _removeItems(items),
         onRequestPreview: () => _requestPreview(media),
+      ),
+    );
+    if (!_selecting) return tile;
+    final selected = items.every((item) => _selectedMedia.contains(item.id));
+    void toggle() => _updateSelection(() {
+      final ids = items.map((item) => item.id);
+      if (selected) {
+        _selectedMedia.removeAll(ids);
+      } else {
+        _selectedMedia.addAll(ids);
+      }
+    });
+    return Semantics(
+      label: '$title，${items.length} 个视频',
+      checked: selected,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: ExcludeSemantics(child: AbsorbPointer(child: tile)),
+          ),
+          Positioned.fill(
+            child: Material(
+              color: selected
+                  ? Theme.of(context).colorScheme.primary.withValues(alpha: .15)
+                  : Colors.transparent,
+              borderRadius: LibraryStyles.posterRadius,
+              child: InkWell(
+                key: ValueKey('select:${media.id}'),
+                borderRadius: LibraryStyles.posterRadius,
+                hoverColor: Colors.transparent,
+                onTap: _removingSelection ? null : toggle,
+              ),
+            ),
+          ),
+          Positioned(
+            top: 4,
+            right: 4,
+            child: Checkbox(
+              value: selected,
+              onChanged: _removingSelection ? null : (_) => toggle(),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1377,7 +1510,10 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
                     onTap: widget.onOpenHistory,
                     borderRadius: LibraryStyles.compactRadius,
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
                       child: Row(
                         children: [
                           Text(
@@ -1531,6 +1667,7 @@ class _PosterTileState extends State<_PosterTile> {
               onTapUp: (_) => _interaction(press: false),
               onTapCancel: () => _interaction(press: false),
               borderRadius: LibraryStyles.posterRadius,
+              hoverColor: Colors.transparent,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -1921,7 +2058,6 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet> {
           key: ValueKey('series-episode:${item.id}'),
           dense: true,
           visualDensity: const VisualDensity(vertical: -1),
-          contentPadding: EdgeInsets.zero,
           leading: Icon(
             model.store
                         .get('watched', model.watchedKey(item))

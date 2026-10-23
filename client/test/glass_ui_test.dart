@@ -296,7 +296,16 @@ void main() {
               widget is TextField && widget.decoration?.labelText == 'Token',
         );
         await chooseSettingsGroup(tester, '弹幕');
-        await tester.ensureVisible(tokenField);
+        await tester.scrollUntilVisible(
+          tokenField,
+          300,
+          scrollable: find
+              .descendant(
+                of: find.byKey(const PageStorageKey('settings-danmaku')),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
         await tester.enterText(tokenField, 'unsaved-theme-test');
         await chooseSettingsGroup(tester, '常规');
         await tester.ensureVisible(find.text('深色'));

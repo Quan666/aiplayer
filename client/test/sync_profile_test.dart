@@ -194,6 +194,86 @@ void main() {
   );
 
   test(
+    'preparing an active video without a local location keeps its binding',
+    () async {
+      final device = _Device(_SyncServer());
+      device.seedRemote();
+      await device.sync();
+      final binding = device.store
+          .records('vault')
+          .singleWhere((record) => record.id.startsWith('binding:'));
+      device.store.removeLocal('location:remote-video');
+
+      await device.profile.prepare();
+
+      final current = device.store.get('vault', binding.id)!;
+      expect(current.deleted, false);
+      expect(current.dirty, false);
+      expect(current.revision, binding.revision);
+      expect(device.store.get('media', 'remote-video')!.deleted, false);
+    },
+  );
+
+  test('deleting a video still deletes its shared binding', () async {
+    final server = _SyncServer();
+    final first = _Device(server), second = _Device(server);
+    first.seedRemote();
+    await first.sync();
+    await second.sync();
+    final binding = first.store
+        .records('vault')
+        .singleWhere((record) => record.id.startsWith('binding:'));
+    first.store.save('media', 'remote-video', {}, deleted: true);
+    first.store.removeLocal('location:remote-video');
+
+    await first.sync();
+    await second.sync();
+
+    expect(server.records['vault:${binding.id}']!.deleted, true);
+    expect(second.store.get('vault', binding.id)!.deleted, true);
+    expect(second.store.get('media', 'remote-video')!.deleted, true);
+    expect(second.store.local('location:remote-video'), isNull);
+    expect(second.store.conflicts, isEmpty);
+  });
+
+  test(
+    'applying a live binding does not treat a missing location as deletion',
+    () async {
+      final server = _SyncServer();
+      final first = _Device(server), second = _Device(server);
+      first.seedRemote();
+      await first.sync();
+      await second.sync();
+      first.store.setLocal('episodeTitle:remote-video', 'Updated title');
+      await first.sync();
+      second.store.removeLocal('location:remote-video');
+      await second.client.synchronize(
+        _origin,
+        _token,
+        sharedOnly: true,
+        deferProfile: true,
+      );
+      final binding = second.store
+          .records('vault')
+          .singleWhere((record) => record.id.startsWith('binding:'));
+      expect(second.store.local('location:remote-video'), isNull);
+
+      await second.profile.apply();
+
+      expect(
+        second.store.local('location:remote-video'),
+        first.store.local('location:remote-video'),
+      );
+      expect(second.store.local('episodeTitle:remote-video'), 'Updated title');
+      final current = second.store.get('vault', binding.id)!;
+      expect(current.deleted, false);
+      expect(current.dirty, false);
+      expect(current.version, binding.version);
+      expect(second.store.conflicts, isEmpty);
+    },
+  );
+
+  test(
     'artwork checkpoint stages only selected bindings and sources',
     () async {
       final server = _SyncServer();

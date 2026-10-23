@@ -221,7 +221,6 @@ class _SettingsPageState extends State<SettingsPage> {
   );
   Widget toggle(String label, String key, bool value, {String? hint}) =>
       SwitchListTile.adaptive(
-        contentPadding: EdgeInsets.zero,
         dense: true,
         title: Text(label, style: AppStyles.of(context).body),
         subtitle: hint == null
@@ -532,7 +531,6 @@ class _SettingsPageState extends State<SettingsPage> {
       tapActionOptions,
     ),
     ListTile(
-      contentPadding: EdgeInsets.zero,
       dense: true,
       title: Text('手势跳转时间', style: AppStyles.of(context).body),
       subtitle: Text(
@@ -581,7 +579,6 @@ class _SettingsPageState extends State<SettingsPage> {
     toggle('启用播放器快捷键', 'keyboardEnabled', prefs.keyboardEnabled),
     for (final item in AppPreferences.shortcutLabels.entries)
       ListTile(
-        contentPadding: EdgeInsets.zero,
         dense: true,
         title: Text(item.value, style: AppStyles.of(context).body),
         trailing: Container(
@@ -690,13 +687,11 @@ class _SettingsPageState extends State<SettingsPage> {
   ];
   Widget about() => section('关于与维护', [
     const ListTile(
-      contentPadding: EdgeInsets.zero,
       leading: Icon(Icons.play_circle_outline_rounded),
       title: Text('映库 · AIPlayer'),
       subtitle: Text('0.5.8 · 个人影视库'),
     ),
     ListTile(
-      contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.code_rounded),
       title: const Text('开源许可'),
       trailing: const Icon(Icons.chevron_right_rounded),
@@ -707,7 +702,6 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
     ),
     ListTile(
-      contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.receipt_long_outlined),
       title: const Text('运行日志'),
       subtitle: const Text('查看、搜索和复制诊断信息'),
@@ -724,7 +718,6 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
     ),
     ListTile(
-      contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.restore_rounded),
       title: const Text('恢复播放与操作设置'),
       trailing: const Icon(Icons.chevron_right_rounded),

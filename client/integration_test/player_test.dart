@@ -1071,17 +1071,30 @@ void main() {
           reason: 'Mouse movement reveals fullscreen controls',
         );
         expect(find.byTooltip('退出全屏').hitTestable(), findsOneWidget);
-        await pagePlayback.player.pause();
         await fullscreenMouse.removePointer();
+        await model.updatePreferences({'keyboardEnabled': false});
+        await tester.pump(const Duration(seconds: 4));
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(find.byTooltip('播放器设置'), findsNothing);
+        await pagePlayback.player.pause();
       }
       debugPrint('player regression: seek immediately followed by system Back');
       // The seek command may return before decoding finishes. Closing must not
       // save the previous nonblank frame under this new resume position.
       await pagePlayback.player.seek(const Duration(seconds: 20));
-      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.escape);
       await tester.pump(const Duration(milliseconds: 300));
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.escape);
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.escape);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.escape);
+      await tester.pump(const Duration(milliseconds: 100));
       expect(find.byType(PlayerPage), findsOneWidget);
       expect(find.byTooltip('退出全屏'), findsNothing);
+      expect(
+        find.byTooltip('播放器设置').hitTestable(),
+        findsOneWidget,
+        reason: 'Escape reveals controls after leaving fullscreen',
+      );
       expect(
         identical(
           (tester.state(find.byType(PlayerPage)) as dynamic).session,
@@ -1097,7 +1110,7 @@ void main() {
       final savedFrame = model.store.local('preview:${record.id}') as Map;
       expect(savedFrame['requestedPosition'], closeTo(20, .2));
       expect(savedFrame['capturedPosition'], closeTo(20, .2));
-      expect(model.needsMediaPreview(record.id), false);
+      expect(await model.needsMediaPreview(record.id), false);
       await File(
         '${artifacts.path}/player-close-seek-051.jpg',
       ).writeAsBytes(await File(savedFrame['path'] as String).readAsBytes());

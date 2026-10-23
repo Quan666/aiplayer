@@ -225,10 +225,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
     var cached = false;
     // FileImage and ResizeImage return synchronous keys. Use the resolved key,
     // not the provider object, to reuse decoded/pending textures while flinging.
-    ResizeImage(
-      FileImage(file),
-      width: width,
-    ).obtainKey(ImageConfiguration.empty).then((key) {
+    artworkImage(file, width).obtainKey(ImageConfiguration.empty).then((key) {
       cached = PaintingBinding.instance.imageCache.statusForKey(key).tracked;
     });
     if (!cached) {
@@ -286,12 +283,11 @@ class _MediaArtworkState extends State<MediaArtwork> {
             thumbnail.isEmpty ||
             !_canLoadImage(File(thumbnail), decodeWidth)
         ? placeholder
-        : Image.file(
-            File(thumbnail),
+        : Image(
+            image: artworkImage(File(thumbnail), decodeWidth),
             fit: fit,
             width: double.infinity,
             height: double.infinity,
-            cacheWidth: decodeWidth,
             filterQuality: FilterQuality.low,
             gaplessPlayback: true,
             errorBuilder: (_, error, _) {
@@ -323,12 +319,11 @@ class _MediaArtworkState extends State<MediaArtwork> {
                       snapshot.data == null ||
                           !_canLoadImage(snapshot.data!, decodeWidth)
                       ? frame(decodeWidth)
-                      : Image.file(
-                          snapshot.data!,
+                      : Image(
+                          image: artworkImage(snapshot.data!, decodeWidth),
                           fit: fit,
                           width: double.infinity,
                           height: double.infinity,
-                          cacheWidth: decodeWidth,
                           filterQuality: FilterQuality.low,
                           gaplessPlayback: true,
                           errorBuilder: (_, error, _) {
@@ -355,3 +350,11 @@ String mediaTime(double seconds) {
   final secs = (total % 60).toString().padLeft(2, '0');
   return hours > 0 ? '$hours:$minutes:$secs' : '$minutes:$secs';
 }
+
+/// Use the same SDK provider/key for lookup and display, bounding both axes.
+ResizeImage artworkImage(File file, int edge) => ResizeImage(
+  FileImage(file),
+  width: edge,
+  height: edge,
+  policy: ResizeImagePolicy.fit,
+);

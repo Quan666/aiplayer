@@ -49,8 +49,8 @@ type Server struct {
 
 var identifier = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,200}$`)
 var fields = map[string]map[string]bool{
-	"media":    allowed("title", "series", "season", "episode", "bangumiId", "poster", "summary", "fileName", "size", "duration", "metadataProvider", "tmdbId", "metadataTitle", "rating", "ratingCount", "airDate", "totalEpisodes", "totalSeasons", "genres", "metadataType"),
-	"progress": allowed("position", "duration", "updatedAt"),
+	"media":    allowed("title", "series", "season", "episode", "episodeTitle", "bangumiId", "poster", "summary", "fileName", "size", "duration", "metadataProvider", "tmdbId", "metadataTitle", "rating", "ratingCount", "airDate", "totalEpisodes", "totalSeasons", "genres", "metadataType"),
+	"progress": allowed("position", "duration", "updatedAt", "devicePlatform"),
 	"watched":  allowed("watched"),
 	"match":    allowed("provider", "episodeId", "label", "shift", "offset"),
 	"vault":    allowed("algorithm", "nonce", "ciphertext", "mac"),
@@ -125,6 +125,15 @@ func send(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 func fail(w http.ResponseWriter, status int, message string) {
+	if status == http.StatusBadRequest {
+		// Never log request bodies, credentials, or client-controlled field names.
+		reason := message
+		if strings.HasPrefix(reason, "unsupported field:") {
+			keyHash := sha256.Sum256([]byte(strings.TrimPrefix(reason, "unsupported field: ")))
+			reason = fmt.Sprintf("unsupported field (key hash %x)", keyHash[:6])
+		}
+		log.Printf("sync request rejected: status=400 reason=%q", reason)
+	}
 	send(w, status, map[string]string{"error": message})
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

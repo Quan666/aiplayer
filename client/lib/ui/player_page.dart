@@ -30,6 +30,7 @@ import 'player_model_changes.dart';
 import 'player_theme.dart';
 import 'glass.dart';
 import 'library_page.dart';
+import 'media_artwork.dart';
 
 String clockText(Duration value) {
   final total = value.inSeconds.clamp(0, 1 << 40);
@@ -572,7 +573,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                   ListTile(
                     dense: true,
                     minTileHeight: 42,
-                    contentPadding: EdgeInsets.zero,
                     title: const Text('时间偏移'),
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -609,7 +609,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                   ListTile(
                     dense: true,
                     minTileHeight: 42,
-                    contentPadding: EdgeInsets.zero,
                     leading: const Icon(Icons.file_open_outlined, size: 19),
                     title: const Text('选择本地外挂字幕'),
                     onTap: () async {
@@ -912,7 +911,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                     onTap: () => d.select(match),
                   ),
                 ListTile(
-                  contentPadding: EdgeInsets.zero,
                   title: const Text('弹幕偏移'),
                   subtitle: Text(
                     '${d.offset.toStringAsFixed(1)} 秒 · 匹配偏移 ${d.shift.toStringAsFixed(1)} 秒',
@@ -1067,7 +1065,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                 ),
                 if (session.notice.isNotEmpty) Text(session.notice),
                 SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
                   title: const Text('强制软件解码'),
                   value: session.software,
                   onChanged: (value) async {
@@ -1119,15 +1116,14 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                 Positioned.fill(
                   key: const ValueKey('player-opening-cover'),
                   child: IgnorePointer(
-                    child: Image.file(
-                      File(path),
+                    child: MediaArtwork(
+                      thumbnail: path,
                       fit: switch (widget.model.preferences.videoFit) {
                         'cover' => BoxFit.cover,
                         'fill' => BoxFit.fill,
                         _ => BoxFit.contain,
                       },
-                      errorBuilder: (_, error, stack) =>
-                          const SizedBox.shrink(),
+                      placeholder: const SizedBox.shrink(),
                     ),
                   ),
                 ),
@@ -1803,9 +1799,14 @@ class _PlayerControlsState extends State<_PlayerControls>
     // Handle player keys before a focused slider or button consumes arrows
     // and Space. Modal routes and text fields retain their own keyboard input.
     if (!mobile &&
-        event is KeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.escape) {
-      unawaited(widget.fullscreen ? _exitFull() : _back());
+        event.logicalKey == LogicalKeyboardKey.escape &&
+        (event is KeyDownEvent || event is KeyRepeatEvent)) {
+      // Escape remains available when shortcuts are disabled or controls are
+      // locked. Holding it must not close playback after leaving fullscreen.
+      if (event is KeyDownEvent) {
+        if (widget.fullscreen) setState(reveal);
+        unawaited(widget.fullscreen ? _exitFull() : _back());
+      }
       return KeyEventResult.handled;
     }
     final p = widget.model.preferences;

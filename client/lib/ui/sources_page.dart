@@ -77,7 +77,6 @@ Future<void> showDirectoryOptions(
                 ),
                 const SizedBox(height: 8),
                 SwitchListTile.adaptive(
-                  contentPadding: EdgeInsets.zero,
                   title: const Text('降序'),
                   value: value.descending,
                   onChanged: (descending) =>
@@ -85,7 +84,6 @@ Future<void> showDirectoryOptions(
                 ),
                 if (showSubtitleOption)
                   SwitchListTile.adaptive(
-                    contentPadding: EdgeInsets.zero,
                     title: const Text('显示字幕文件'),
                     value: value.showSubtitles,
                     onChanged: (show) =>
@@ -94,7 +92,6 @@ Future<void> showDirectoryOptions(
                 if (onApplyAll != null) ...[
                   const Divider(height: 16),
                   ListTile(
-                    contentPadding: EdgeInsets.zero,
                     leading: const Icon(Icons.folder_copy_outlined),
                     title: const Text('应用到所有文件夹'),
                     onTap: () {
@@ -1058,7 +1055,6 @@ class _FolderRow extends StatelessWidget {
     child: ListTile(
       dense: true,
       visualDensity: SettingsStyles.folderRowDensity,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 2),
       horizontalTitleGap: 10,
       minLeadingWidth: 52,
       shape: SettingsStyles.folderRowShape,
@@ -1437,7 +1433,6 @@ class _SourceEditorPageState extends State<SourceEditorPage> {
                   if (kind == 'webdav') ...[
                     _field('path', 'WebDAV 目录', hint: '/dav/'),
                     SwitchListTile.adaptive(
-                      contentPadding: EdgeInsets.zero,
                       title: const Text('HTTPS 加密'),
                       value: encrypted,
                       onChanged: testing
@@ -1462,7 +1457,6 @@ class _SourceEditorPageState extends State<SourceEditorPage> {
                   _field('password', '密码（可选）'),
                   if (kind == 'smb') ...[
                     ListTile(
-                      contentPadding: EdgeInsets.zero,
                       leading: const Icon(Icons.folder_outlined),
                       title: Text(
                         fields['share']!.text.isEmpty
@@ -1477,7 +1471,6 @@ class _SourceEditorPageState extends State<SourceEditorPage> {
                       ),
                     ),
                     ExpansionTile(
-                      tilePadding: EdgeInsets.zero,
                       title: Text('高级', style: AppStyles.of(context).bodyLarge),
                       children: [
                         _field('domain', '域（可选）'),
@@ -1598,7 +1591,6 @@ class _DiscoveryPickerState extends State<_DiscoveryPicker> {
                     itemBuilder: (context, index) {
                       final service = snapshot.services[index];
                       return ListTile(
-                        contentPadding: EdgeInsets.zero,
                         leading: Icon(_protocolIcon(service.kind)),
                         title: Text(service.name),
                         subtitle: Text(
@@ -1931,13 +1923,12 @@ class _SourceBrowserState extends State<SourceBrowser> {
       poster: poster,
       frame: frame,
       folder: false,
-      onRequestPreview: widget.model.needsMediaPreview(id)
-          ? () {
-              if (mounted && ticket == generation) {
-                widget.model.ensureSourceMediaPreview(sourceId, entry);
-              }
-            }
-          : null,
+      onRequestPreview: () async {
+        final needed = await widget.model.needsMediaPreview(id);
+        if (needed && mounted && ticket == generation) {
+          widget.model.ensureSourceMediaPreview(sourceId, entry);
+        }
+      },
     );
   }
 

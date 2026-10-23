@@ -51,6 +51,36 @@ class _DeferredPhysics extends ScrollPhysics {
 }
 
 void main() {
+  testWidgets('opening details starts cache lookup during the transition', (
+    tester,
+  ) async {
+    final navigator = GlobalKey<NavigatorState>();
+    final cache = _RecordingPosterCache();
+    await tester.pumpWidget(
+      MaterialApp(navigatorKey: navigator, home: const Scaffold()),
+    );
+    navigator.currentState!.push<void>(
+      MaterialPageRoute(
+        builder: (_) => Scaffold(
+          body: Center(
+            child: SizedBox(
+              width: 100,
+              height: 150,
+              child: MediaArtwork(poster: 'details', cache: cache),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(cache.requested, ['details']);
+    await tester.pumpAndSettle();
+    expect(cache.requested, ['details']);
+    await tester.pumpWidget(const SizedBox());
+    cache.close();
+  });
+
   testWidgets('wheel bursts defer newly visible posters and previews', (
     tester,
   ) async {
@@ -241,10 +271,7 @@ void main() {
     await tester.pumpWidget(const MaterialApp(home: SizedBox()));
     final context = tester.element(find.byType(SizedBox).last);
     await tester.runAsync(
-      () => precacheImage(
-        ResizeImage(FileImage(File(path)), width: 128),
-        context,
-      ),
+      () => precacheImage(artworkImage(File(path), 128), context),
     );
     await tester.pumpWidget(
       MaterialApp(
@@ -300,6 +327,8 @@ void main() {
     await mount(const Size(400, 600));
     provider = tester.widget<Image>(find.byType(Image)).image as ResizeImage;
     expect(provider.width, 640);
+    expect(provider.height, 640);
+    expect(provider.policy, ResizeImagePolicy.fit);
     await tester.pumpWidget(const SizedBox());
   });
 

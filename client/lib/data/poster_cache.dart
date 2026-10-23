@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -211,7 +212,16 @@ class PosterCache {
           descriptor.width * descriptor.height > 64000000) {
         throw const FormatException('Invalid artwork dimensions');
       }
-      codec = await descriptor.instantiateCodec(targetWidth: 32);
+      // Validation only needs a tiny frame. Width alone can still decode a
+      // very tall image into a huge pixel buffer.
+      final scale = math.min(
+        1.0,
+        32 / math.max(descriptor.width, descriptor.height),
+      );
+      codec = await descriptor.instantiateCodec(
+        targetWidth: math.max(1, (descriptor.width * scale).round()),
+        targetHeight: math.max(1, (descriptor.height * scale).round()),
+      );
       image = (await codec.getNextFrame()).image;
     } finally {
       image?.dispose();

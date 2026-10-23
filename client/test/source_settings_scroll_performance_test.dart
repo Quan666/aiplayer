@@ -339,7 +339,7 @@ class _CountingModel extends AppModel {
   Future<SourceAdapter> adapter(String id) async => _Episodes();
 
   @override
-  bool needsMediaPreview(String id) => false;
+  Future<bool> needsMediaPreview(String id) async => false;
 }
 
 class _Episodes extends SourceAdapter {

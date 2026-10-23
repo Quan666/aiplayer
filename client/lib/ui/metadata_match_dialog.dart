@@ -218,7 +218,6 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
     final original = '${result['name'] ?? ''}';
     return ListTile(
       dense: true,
-      contentPadding: EdgeInsets.zero,
       title: Text(name, maxLines: 2, overflow: TextOverflow.ellipsis),
       subtitle: Text(
         [
