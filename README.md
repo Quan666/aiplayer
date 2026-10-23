@@ -1,0 +1,191 @@
+# 映库 · AIPlayer
+
+面向个人动漫收藏的 Flutter 播放器与可选 Go 同步服务。包含 Android、iOS/iPadOS、Windows、macOS 工程；Linux 工程用于本次环境的实际播放验证。界面默认中文、浅色，可在「设置 → 常规 → 外观与文件」切换深色，选择保存在本机。
+
+**当前源码版本为 0.5.14+20，尚未完成四端实机验收。** 本轮优化 WebDAV 播放、控件展开和影视库浏览：网络视频转发移到独立任务，控件与视频分离更新，播放器控件默认不做实时背景模糊；缓存播放列表及影视库索引，封面按可见卡片懒加载。移除同步播放，保留跨设备进度和资料同步；进度每 10 秒或暂停、切后台、退出时保存，截图仅在暂停、退出等事件按需生成。具体实现及测试边界见 [验证记录](docs/VALIDATION.md) 和 [封面说明](docs/PREVIEWS.md)。
+
+本轮提供 [0.5.14 Android 通用 release APK](artifacts/performance-0514/aiplayer-0.5.14-android.apk)，支持 Android 7.0+ 的 ARM32、ARM64 与 x86_64，版本号 `0.5.14+20`，大小 135,301,586 字节。沿用现有签名，0.5.4 至 0.5.13 可覆盖升级；密钥仍保存在 `.local-build/signing/debug.keystore`。[构建与 APK 校验](artifacts/performance-0514/build-android.json)、[校验和](artifacts/performance-0514/SHA256SUMS-android)。配套进度同步仍兼容现有 [0.5.3 服务包](artifacts/aiplayer-sync-0.5.3-linux-amd64.tar.gz)；服务端源码已移除同步播放接口，本轮未部署或替换运行中的服务。
+
+本轮 Flutter 单元 / 组件测试 567 项通过，Linux 原生播放回归 2 项通过，Go 服务测试通过；静态分析无错误或警告，保留 3 条既有测试风格提示。受控 HTTP 测试验证界面线程阻塞期间仍能转发视频，以及取消连接时释放套接字。没有连接 Android 真机或用户 WebDAV 服务；未构建 Apple / Windows 发布包。原有产物保留，新包及日志位于 `artifacts/performance-0514/`，二进制产物不纳入源码版本管理。
+
+界面采用紧凑的浅色 / 深色布局，来源以文件夹形式浏览，导航与弹层统一圆角。播放器默认使用暗色透明控件、白色文字和玻璃面板；影视库、来源、设置、弹幕与播放器样式通过同一主题目录维护。
+
+应用图标包含 Android 自适应 / 单色、iOS、macOS、Windows 与 Linux 各端资源，[图标预览](client/assets/branding/icon_preview.png)；源 SVG 与生成脚本随源码保存。
+
+桌面端统一在主应用内播放：影视库、来源和外部打开都使用同一个播放页，不再创建独立播放器窗口或支持多个播放窗口。退出播放返回原页面，切集保留当前播放页；F 切换主窗口全屏，Esc 先退出全屏、再次返回。关闭应用会先保存进度并释放播放器。此项改动的验证边界见 [验证记录](docs/VALIDATION.md)。
+
+## 使用
+
+1. 在「来源」右上角添加 SMB、WebDAV、HTTP(S) 直链，或进入第一个「本地视频」文件夹导入。来源和目录在当前标签内浏览，保留各标签状态、目录层级与滚动位置，支持搜索与各目录独立排序；排序菜单可将当前规则「应用到所有文件夹」，覆盖现有目录并作为新目录默认值，后续仍可单独修改；长按子文件夹可收藏、主动识别影视资料或手动搜索匹配；视频也支持长按识别和搜索。来源首页的「我的收藏」可直接进入。来源的更多菜单可编辑或确认移除。在添加来源时手动查找局域网设备，结果可预填连接信息；直链显示名称可选，留空使用文件名。桌面支持扫描文件夹、拖放文件；移动端导入的视频复制到应用资料目录。SMB/WebDAV 可浏览目录、扫描入库。
+2. 影视库优先展示关联海报，海报首次下载后缓存在设备磁盘，影视库、文件夹和详情共用，重启或离线时直接读取，成功海报长期保留，不按时间或总容量自动淘汰；未匹配视频自动截取一帧作封面；继续观看每个系列只保留最近播放的一集，各集仍独立记忆进度；使用保存进度处的截图作为完整背景，名称最多显示两行，同时显示已播时间、总时长及百分比；点击“继续观看”展开按屏幕宽度排列的历史网格；桌面轮播支持滚轮、拖拽、滚动条和左右按钮；两处历史卡片均可长按后点击「移除这条观看记录」，只移除该文件当前版本的观看进度，保留视频、影视库条目及其它集数的记录。单视频卡片点击即播放，右上角图标进入详情；多集作品进入集数列表。影视库详情与来源目录共用资料展示、评分、季度和集数统计，进入目录同步收录该作品各集；显示总集数与已收录集数，同一集的不同编码不会重复计算集数。单文件同样显示已识别季集，仅在未确认有多季时省略默认第 1 季，特别篇保留标识。详情提供实际解码取得的封装、视频编码、宽高及可用码率；未取得宽高时，文件名中的 1080p 等明确标为「文件名标注」。评分等信息使用彩色加粗标签，简介可展开、AI 翻译及切回原文；「AI 翻译简介」右侧可一次翻译作品名和已有的单集标题，并切换标题原文 / 译文；保留各集进度与继续观看入口，可纠正名称、季度、集数并标记已看。资料搜索固定联合 Bangumi 动画、TMDB 剧集和电影，结果注明来源与类型；未配置 TMDB Key 时仍可使用 Bangumi。资料策略、TMDB Key 和默认关闭的「AI 自动识别信息」位于「设置 → 常规 → 作品资料」；开启 AI 后，普通识别失败时解析文件名，再核对真实候选与详情，手动匹配也可点击「AI 自动识别」。普通识别只查询清理后的作品名与季度；AI 仅接收文件名及候选资料，不上传视频、截图、完整路径或直链。详见 [资料匹配说明](docs/METADATA.md)。同名、季度和类型一致且候选唯一时才自动采用，确认是同一动画时优先 Bangumi；冲突或歧义保留人工匹配。多视频目录仅在全部属于同一作品、同一季度时聚合，AI 回退也支持单视频目录；混合目录继续浏览文件。重新扫描保留人工修改。移除前会明确提示：导入副本会删除，外部本地与远程文件仅移除库记录。
+3. 在「设置 → 弹幕 → 弹幕服务」填写弹幕 Token，默认服务为 `https://danmu-api.cutejk.com`。播放页可选择匹配、调整偏移、字号、透明度、区域和密度。没有 Token 时照常播放视频。
+4. 播放器顶部为关闭、画面适配、小窗与音量，中央播放 / 暂停及前后操作，底部显示白色标题、进度、已播 / 剩余时间；右下玻璃菜单提供音轨、字幕、弹幕和高级选项。左上角画面按钮循环切换完整 / 裁切 / 拉伸，旁边进入小窗；投屏在音量左侧，设置保持原右下位置，速度按钮位于设置、截图和播放列表旁；速度、音轨与列表在按钮旁以小弹窗打开，共用带内边距的选中行样式。快捷设置不再重复速度入口，高级设置按播放、字幕、弹幕、诊断四类组织，不重复提供音轨或速度入口。所有播放器弹层、按钮、输入框共用暗色玻璃主题，并提高面板不透明度，便于看清选项。右侧居中可锁定控件，拖动时显示目标时间与独立解码的真实预览帧。操作控件、拖动滑块或打开弹层时不会被隐藏计时器打断；关闭按钮和系统返回一次退出播放器。默认进入全屏，横屏与方形视频保持横屏，确认竖屏尺寸后才使用竖屏；已缓存尺寸的视频直接按对应方向打开。全屏按钮只切换系统栏，不重新创建播放页面或改变视频方向，切集保留当前窗口；离开播放器后归还系统方向。Android 左右横屏切换遵循系统旋转锁。移动端默认双击暂停 / 继续；三击左侧后退 89 秒、右侧前进 89 秒，中间沿用原三击动作。左、中、右三击区域的动作可在「设置 → 播放」中独立配置；双击和三击共用的跳转时间按分钟和秒输入；已有自定义三击动作保留，双击仍可单独设置。支持横滑定位、左右纵滑亮度 / 音量、长按倍速、捏合切换完整显示 / 裁切铺满，以及可选的两侧双击跳转；可临时锁定触控。桌面默认空格暂停、左右键跳转 10 秒、上下键音量、M 静音、F 全屏、Esc 先退出全屏、再次按下返回原页面，S 字幕、D 弹幕、逗号打开设置；可重新绑定组合键，输入文字时不触发。
+5. 字幕面板支持同名外挂自动加载、轨道选择、时间偏移、离线繁体转简体、恢复原文与可选 AI 翻译。转换保持文本字幕的时间轴及 ASS 样式；图片字幕不支持文本转换。截图保存视频画面及原生字幕，不包含 Flutter 弹幕或控制栏。AI 配置统一位于全局「设置 → AI 翻译」，可填写兼容服务地址、API Key、目标语言及翻译要求，明确提供加载模型、搜索选择模型和手动填写入口；点击翻译后直接处理字幕对白，视频、文件路径和直链不会发送。Key 仅在本机安全存储，真实在线服务尚未联调。
+6. 可从其他应用通过“打开方式”打开视频，Android 也支持分享视频；原生端将有临时授权的文件流复制后交给客户端导入，保留原显示名称。Linux 提供视频 MIME 桌面入口；Windows 提供当前用户的可选注册脚本，见下文。外部打开作为临时播放，不进入影视库或观看历史、不参与同步；关闭后清理本次临时副本，保留原文件。外部打开不会修改系统默认播放器。Apple 文档打开源码已接入，仍需 Xcode 与实机验收。
+7. 如需跨设备同步，各设备配置相同的同步服务地址与 Token。远程来源与视频位置会自动恢复；应用设置（含 API Key）、来源密码、收藏、人工匹配、播放记录、已缓存海报和视频封面截图一并同步，同时保留已有的单集标题、资料与字幕翻译缓存、目录资料、视频时长及有效技术参数。图片压缩后加密传输，接收设备恢复自己的图片缓存；单台设备清理图片缓存不会删除其他设备的图片。本地视频及其路径、视频文件、运行日志和临时任务不上传。同步连接本身的地址与 Token 是各设备加入时的本地配置。凭据和新增图片等资料以密文保存在同步数据库中，具体范围和 Token 轮换见 [同步服务说明](server/README.md)。
+
+影视资料识别按批次处理：每批最多 20 个未缓存文件名，AI 分析最多 2 路并行，资料查询最多 3 个作品组并行；同作品、同季度复用搜索、详情和候选确认，各文件保留自己的集号。识别面板显示进度，关闭面板或切页后继续，可从任务按钮查看或明确取消；未完成任务在本机保存，重启后恢复。后台执行依赖应用进程仍在运行，不保证系统挂起或强杀后继续联网。成功的识别、搜索、详情、集名、目录、海报和翻译缓存长期保留并跨重启复用，失败及空结果仍可重试；文件和配置身份变化时仍校验失效，主动失效后可重新获取对应资料。拖动预览的临时内存帧、解码器和连接按生命周期释放。
+
+设置按常规、播放、字幕、弹幕、AI 翻译、同步、关于七类组织，可搜索、点击分类或左右滑动切换。外观与影视资料放在常规，手势 / 快捷键放在播放，弹幕连接放在弹幕，运行日志从关于进入；弹幕和同步各自保存配置。隐藏文件和文件夹默认隐藏。支持自动播放、续播与播完自动下一集；自动下一集开关也可在播放器快捷设置中调整。支持硬/软解、后台暂停、常亮、音频偏移、画面适配、控制栏隐藏时间；字幕语言、缩放、偏移、位置、颜色和描边；弹幕大小、不透明度、区域、密度、速度、滚动/顶部/底部筛选与屏蔽词。ASS 保留脚本样式。移动端显示手势设置，桌面端显示快捷键设置；全部偏好保存在本机，恢复默认保留库、来源与凭证。界面动画遵循系统减少动画设置，上滑隐藏底部导航、下滑恢复。Android 自动请求设备在当前分辨率下支持的高刷新率；系统可能按省电策略限制实际刷新率，且不会增加视频原始帧率。这些行为不再提供单独开关。影视库、设置、日志共用可展开的搜索图标；日志保留本机最近 400 条，可筛选、点击单条复制、清空，凭证和完整连接地址会隐藏。
+
+局域网发现使用 mDNS/Bonjour 和当前私有 IPv4 网段中的 SMB 445 端口探测，每次最多 254 个相邻地址；由添加来源中的“扫描局域网”手动启动，可中途停止，不在后台自动扫描。WebDAV 必须广播其服务才能自动发现，未发现时可手动添加。发现结果并不表示认证成功，不会自动保存凭证或连接共享。
+
+SMB 填写主机、端口（默认 445）与账户；默认列出该服务器的所有共享，不要求填写共享名，也可选择只进入某个共享。支持 SMB 2 / 3，隔离测试服务器已验证 SMB 3.1.1 的签名和加密连接。WebDAV 分别填写主机、端口、目录及 HTTPS 开关（默认 443，HTTP 默认 80）。保存前可测试未保存的配置，连接失败会显示认证、端口、TLS、目录等具体原因。建议 SMB 使用有读取权限的账户，匿名共享尚存在兼容问题。HTTP 直链只代表单个视频；重定向地址请改填最终地址。来源必须提供文件大小；无 Range 时仅能顺序读取，不能保证拖动。
+
+## 开发与构建
+
+本次使用 Flutter **3.47.7 / Dart 3.13.5**、Go **1.27.3**。保留 `client/pubspec.lock`、`server/go.sum`；libsmb2 源码已固定在仓库。首次 Flutter 构建仍需获取插件媒体原生库。
+
+```bash
+cd client
+flutter pub get
+flutter analyze
+flutter test
+flutter run -d <设备ID>
+```
+
+| 目标 | 环境 | 构建命令（在 client 下） |
+| --- | --- | --- |
+| Android | JDK 17、Android SDK/NDK，最低 API 24 | `flutter build apk --release --target-platform android-arm,android-arm64,android-x64` |
+| Linux x64 | Linux、GTK 3、libmpv、libsecret | `flutter build linux --release` |
+| Windows | Windows、Visual Studio C++ 桌面组件 | `flutter build windows --release` |
+| macOS | Mac、Xcode、CocoaPods | `flutter build macos --release` |
+| iOS/iPadOS | Mac、Xcode、CocoaPods、设备签名 | `flutter build ios --release --no-codesign`，随后配置签名安装 |
+
+苹果端先执行 `flutter config --no-enable-swift-package-manager`；当前 SMB 插件使用 CocoaPods。`--no-codesign` 产物不能直接安装到 iPhone。Android 为自用签名，未配置商店发布签名。0.5.4 起使用用户同意更换的新签名：旧签名所在的临时目录已丢失，因此旧签名版本不能直接覆盖升级；后续版本沿用项目内的持久密钥。
+
+测试任务在 [.github/workflows/verify.yml](.github/workflows/verify.yml)，打包任务统一放在 [Build packages](.github/workflows/packages.yml)，目前只启用 Android 和 macOS；Windows、Linux、iOS 任务及其手动选项已注释保留。远程 CI 曾在 Apple SMB 头文件和 Linux/Windows CMake 配置阶段失败，修复后的各平台结果仍需重新构建确认；已有工程或 CI 配置不代表已经通过设备验收。
+
+### GitHub Actions 多平台打包
+
+推送源码到 GitHub 默认分支后，在 **Actions → Build packages → Run workflow** 选择 `target`：`all`（默认）、`android` 或 `macos`。`all` 只包括 Android 和 macOS，各打包任务独立运行，一个任务失败不阻塞其它任务。
+
+| 平台 | 下载产物 | 签名与安装条件 |
+| --- | --- | --- |
+| Android | 通用 APK、ARM64 APK，各提供一份带版本号的原文件；通用包包含 ARM32、ARM64 和 x86_64 | 必须配置现有密钥 Secret；校验签名指纹，支持 0.5.4+ 覆盖升级 |
+| macOS | 一份 `.app` ZIP，包含 Apple Silicon / Intel 通用应用 | ad-hoc 签名、未公证；详细说明见下节 |
+
+全部构建成功的推送或 `target: all` 手动运行，在运行页面的 **Artifacts** 中只提供三个下载项：通用 `.apk`、ARM64 `.apk` 和一份包含 `aiplayer.app` 的 `.zip`。macOS 的 `.app` 是目录包，需先用 `ditto` 归档，才能在上传时保留权限和符号链接；解压一次即可得到应用。上传使用 [upload-artifact 的单文件直传](https://github.com/actions/upload-artifact#upload-an-individual-file-unzipped)，不再额外套一层 Artifact ZIP。Android 两种包均使用 `--no-android-alias`，不上传内容相同的固定名 APK 副本。
+
+CI 不再上传 DMG、`build-*.json`、`SHA256SUMS-*` 或截图产物；验证工作流的测试仍保留。下载产物保留 30 天，不自动创建 GitHub Release。相关源码变更及 `v*` 标签触发自动构建；PR 只构建 macOS，**不向 PR 代码提供 Android 签名密钥，也不生成正式 Android 包**。自动构建和手动构建都由 `packages.yml` 内的对应任务执行，不另设 macOS 工作流。
+
+Android 首次运行前，在仓库 **Settings → Secrets and variables → Actions** 配置 `ANDROID_KEYSTORE_BASE64`，内容为现有 `.local-build/signing/debug.keystore` 的 Base64。已登录 GitHub CLI 时，可在本机 Linux 项目根目录运行以下命令，将值通过标准输入上传，不打印密钥：
+
+```bash
+base64 -w0 .local-build/signing/debug.keystore | gh secret set ANDROID_KEYSTORE_BASE64 --repo OWNER/REPO
+```
+
+将 `OWNER/REPO` 替换为目标仓库。Base64 本身不是加密，值只放入 Secrets，不提交到 Git。CI 会将密钥临时恢复到运行器临时目录，校验其证书与 [公开指纹](signing/android-certificate.sha256) 一致，构建完成或失败后清理。缺少 Secret 或密钥不匹配时直接失败，不自动生成新签名。打包脚本还会核对最终 APK 的签名。仓库中新增的指纹不是私钥备份；请继续保留本地密钥及独立加密备份。
+
+### GitHub Actions 打包 macOS
+
+将源码推送到 GitHub 仓库后，在 **Actions → Build packages → Run workflow** 选择分支和 `target: macos`（或 `all`）。手动入口需要该工作流已存在于默认分支。客户端、原生依赖包或打包脚本变更时自动构建；推送 `v*` 标签也会构建。本地 `origin` 指向 NAS，`github` 指向 GitHub；需要将修复同步到 GitHub 才能使用 GitHub 托管运行器。
+
+流程使用 macOS 15、Flutter 3.47.7、Xcode 和 CocoaPods，构建 Apple Silicon / Intel 通用包。CI 执行 `bash scripts/package_macos.sh --app-only`，只生成并上传 `aiplayer-macos-unsigned.zip`。在运行页面的 **Artifacts** 下载后，解压一次得到 `aiplayer.app`，再移到 Applications；归档保留应用包权限和符号链接。
+
+构建产物保留 30 天，不会自动发布到 GitHub Releases；需要长期留存时请下载保存。文件名中的 `unsigned` 表示无开发者证书、公证，本流程实际使用 ad-hoc 签名并验证包内签名与双架构。无需上传 Apple 证书或 Android 密钥。首次打开可能需要到「系统设置 → 隐私与安全性」允许打开。
+
+自用流程通过构建参数关闭 App Sandbox，密码与 Token 保存在应用数据目录的 `credentials/local-v1.sqlite3` 中，不再访问钥匙串，因此不会因读取这些凭据弹出钥匙串授权窗口。凭据文件未加密，通过文件权限限制为当前用户读写（文件 `0600`，所在目录 `0700`）。普通签名构建仍使用原有沙盒和钥匙串配置。
+
+从使用钥匙串的旧自用包升级后，需要重新填写同步 Token；此前已同步的来源密码与 API Key 可通过已有的加密同步记录恢复，未同步的凭据需要重新填写。程序不会读取、迁移或删除旧的钥匙串条目。播放、SMB/WebDAV 和本地凭据读写仍需在 Mac 上验收。本机为 Linux，不能代替 macOS 原生构建或验收。
+
+在 Mac 本机执行 `bash scripts/package_macos.sh --app-only` 可使用与 CI 相同的打包流程。不传参数的 `bash scripts/package_macos.sh` 仍生成 ZIP、DMG、校验文件和构建记录。
+
+### 本地打包
+
+本地或 CI 完成 `flutter pub get` 后，可用统一打包脚本构建并生成校验文件：
+
+```bash
+python3 scripts/package.py android  # 通用 release APK，Android 7+
+python3 scripts/package.py android --android-abi arm64  # 可选：较小的64位包
+python3 scripts/package.py linux    # tar.gz；有 dpkg 工具时同时生成 deb
+# 以下命令需在对应操作系统运行：
+python3 scripts/package.py windows  # ZIP；包含 Visual C++ 运行库
+python3 scripts/package.py windows --windows-installer  # 额外生成 EXE，需 Inno Setup 6
+python3 scripts/package.py macos
+python3 scripts/package.py ios      # 未签名 IPA 和 .app 压缩包，不可直接安装
+```
+
+Android 打包先校验清单、ZIP CRC、重复条目、v1/v2/v3 签名、每个 ABI 的核心原生库与 16KB 对齐；生成带版本名的 APK、文件大小、SHA256 与验证记录。更新继续使用原证书，避免丢失本机数据。
+
+本地默认同时保留固定文件名的 APK 别名；传入 `--no-android-alias` 可与 CI 一样只生成带版本名的一份，校验文件和构建记录也只列这一份。
+
+本机只打包 ARM64 时执行 `bash scripts/package_android_arm64.sh`。它通过 `scripts/local_build_env.sh` 固定使用项目 `.local-build/sdk/` 内的 Flutter / Android 工具、`.local-build/cache/` 内的依赖缓存、`.local-build/tmp/` 内的构建临时文件和 `.local-build/signing/debug.keystore` 签名，产物位于 `artifacts/`；不再依赖系统 `/tmp`。`.local-build/` 已排除版本控制和 Telegram 交付，请单独备份签名文件。密钥缺失时脚本会停止，防止悄悄更换签名。
+
+脚本支持 `--flutter /path/to/flutter` 与 `--skip-build`，按 pubspec.lock 获取依赖，不执行依赖升级。Linux 压缩包解压后运行 `launch.sh`；系统依赖见包内 `RUNTIME.txt`，`.deb` 记录本次构建实际需要的库版本。当前 Linux 包在 Ubuntu 24.04 x64 构建，要求 glibc ≥ 2.38 及包中列出的库；包含 Flutter 与插件，但不是兼容任意发行版的静态程序。
+
+Linux 验证需要 `clang cmake ninja-build pkg-config libgtk-3-dev libmpv-dev libsecret-1-dev ffmpeg xvfb`；正常运行需系统密钥环服务保存凭证。
+
+Windows 便携包可选择执行 `register-open-with.ps1 -Executable "C:\映库\aiplayer.exe"` 注册当前用户的“打开方式”菜单，`-Remove` 撤销；脚本不改系统默认应用。Linux 安装包提供 `.desktop` 视频 MIME 入口，命令行也接受文件路径 / 视频 URL。Windows、Apple 注册与授权行为仍需在目标系统验证。
+
+
+```bash
+bash scripts/make_media_fixture.sh
+cd client
+xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 flutter test integration_test/player_test.dart -d linux
+xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 flutter test integration_test/subtitle_tools_test.dart -d linux
+# Linux 原生集成按独立进程逐个运行；集成测试使用测试入口，之后重建正常应用：
+flutter build linux --release
+```
+
+## 架构
+
+```text
+client/lib/
+  sources/    本地 / WebDAV / HTTP / SMB，回环 HTTP Range 桥接
+  playback/   media_kit 生命周期、播放时钟、手势、续播与诊断
+  subtitles/  字幕解析、内嵌提取、OpenCC 繁简、AI 翻译与字幕工具
+  core/       网络、日志、外部打开入口与凭证边界
+  danmaku/    API、文件名识别、匹配、缓存、刷新、Flutter 绘制
+  data/       SQLite、本地配置、影视库、Bangumi / TMDB、离线同步
+  cast/       DLNA 发现 / 控制、单文件局域网 Range 桥接
+  ui/         影视库、来源、播放器与设置
+packages/aiplayer_smb/  Dart FFI + 专用 isolate + libsmb2
+server/                单用户 Go / SQLite 同步 API 与 Docker 部署
+```
+
+网络视频由客户端读取，通过仅监听 `127.0.0.1`、带随机会话令牌的 Range 桥接供 mpv 使用。SMB 原生调用运行在专用 isolate，以 64 位偏移随机读取；断开时重建连接并重试失败的读取。
+
+播放器默认 `hwdec=auto-safe`，支持软件回退；ASS 交由 mpv/libass 渲染，支持附件字体，Android 提供 Noto Sans SC 后备字体。Flutter 弹幕跟随播放时钟，暂停、缓冲、拖动及倍速时同步。
+
+弹幕只发送整理后的名称和集数；`POST /match` 请求体只有 `fileName`，不发送视频内容、哈希、完整路径或直链。客户端校验 HTTPS 站点地址及 Token 格式，不跟随重定向，错误不暴露 Token URL。成功缓存以服务、凭证身份和集数隔离并长期保存，空结果可重试；自动刷新默认 30 秒，仅播放且显示弹幕时运行，支持 0 或 30–3600 秒。相同快照不重建布局；有增删改时保留屏幕上弹幕的原文字、轨道和运动进度至自然结束，只重新安排后续弹幕，不补播新增的历史弹幕。空快照也不会中断已经显示的弹幕；拖动、切集或调整筛选与时间偏移后按最新数据重建。429 退避 5 分钟，25 秒超时按无数据间隔计算。切集、重新匹配取消旧请求并检查代次。
+
+SQLite 分别保存作品资料、弹幕匹配、已看、精确续播、本机文件位置和缓存。已看按作品/季度/集数标识；续播按媒体 ID 与文件大小组成的视频版本标识。相同大小但不同剪辑版本需作为不同媒体导入。所有同步冲突按实际修改时间自动选择较新的操作，播放进度向后拖动也会保留；同时间删除优先，再按稳定设备 ID 排序。设置、来源和收藏逐项比较，观看记录显示来源设备的名称和型号。本地视频及其进度、已看状态和封面留在本机。
+
+封面截图使用单解码队列，播放和后台期间暂停，图片最长边 480px 并缓存在本机。图片缩放解码、独立进度通知与弹幕重绘边界减少滚动及播放时的重复绘制；显示刷新率请求不改变视频原始帧率。退出播放时直接取当前解码器帧并替换进度封面；后台队列优先处理最新观看记录，迟到图片不会覆盖新进度。无法取得帧时保留已有封面，不阻塞播放。
+
+## 小窗与投屏
+
+Android 8+ 使用系统画中画，系统提供展开 / 关闭；播放控制在展开后的播放器中。Android 7 仍可普通播放。桌面小窗复用当前应用窗口缩小并置顶，退出后恢复原尺寸。iOS 使用 AVPlayer 临时接管系统画中画，仅支持系统可解码的格式，ASS / 弹幕不随 mpv 转入；Apple 与 Windows 原生实现待对应系统编译验收。
+
+投屏使用 DLNA / UPnP AVTransport。手动选择接收设备后，客户端用临时单文件 Range 地址传送视频，不经同步服务器，不转码、不发送来源凭证。是否支持视频格式和字幕取决于电视；本版不含 Chromecast 或系统 AirPlay。停止投屏会确认本机实际定位后恢复播放，失败时保留远端进度。完整行为与限制见 [投屏说明](docs/CASTING.md)。
+
+## 可选同步服务
+
+映库客户端可通过同一套同步服务共享同一文件版本的续播位置、按集记录的已看状态、海报与封面截图。自动冲突处理与设备名称需要各设备更新客户端，并部署当前源码的同步服务，以支持修改时间和设备信息；服务启动时自动补充数据库字段，保留现有资料。
+
+观看进度会在暂停、切到后台、退出播放时保存并在后台同步，持续播放时每 10 秒更新一次。进度截图只在暂停、切到后台或退出时按需生成，不随定时进度更新反复截图。各设备独立控制播放。
+
+实时增量通知需要从当前源码重新构建、部署同步服务；现有 `0.5.3` 服务发布包不包含这些新增接口。升级保留原 Token 和 SQLite 数据即可，新增字段由服务启动时自动迁移。海报、截图等扩展资料使用已有 vault 协议，不依赖实时接口。
+
+见 [服务部署与 API](server/README.md)。无需服务器也可独立使用。服务器接收允许字段的资料、记录及加密配置，不读取、代理、扫描或转码视频。
+
+```bash
+cd server
+export SYNC_TOKEN="$(openssl rand -hex 32)"
+docker compose up -d --build
+```
+
+默认 Compose 仅暴露宿主机回环 `127.0.0.1:8080`，跨设备通过自己的 HTTPS 反向代理接入。客户端填写服务根地址，自动追加 `/v1`；Token 自行安全保存并在各端填写。
+
+## 验收边界
+
+移动端当前采用文件复制导入，尚未实现外部本地目录长期授权扫描。只授权单个视频时，应用不能自动读取其原目录中的外挂字幕；可另外选择字幕，或使用已授权、可列目录的 SMB / WebDAV 来源。不同设备独立导入的重复媒体需人工关联。播放列表支持手动切集与播完自动下一集；自动下一集和新增手势尚未经过本轮功能测试或实机验证，后台音频服务尚未实现。
+
+字幕繁简转换为本地 OpenCC 词典处理；AI 翻译为可选联网服务。文本格式支持和模拟接口测试不等同于任意供应商在线可用，未完成真实 Key 联调。MKV 文本字幕提取有读取与大小边界，图片字幕或无法提取的内嵌轨会提示选择外挂文本字幕。
+
+四端硬解、HEVC/4K、H.264 10-bit 回退、不同 NAS、Apple 授权与原生库、Windows 构建及真实 Token 弹幕均需按 [验证记录](docs/VALIDATION.md) 继续验收。HDR、杜比视界、音频直通、转码、下载管理、发送弹幕、Emby/Jellyfin 不在首版范围。
+
+第三方来源与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+

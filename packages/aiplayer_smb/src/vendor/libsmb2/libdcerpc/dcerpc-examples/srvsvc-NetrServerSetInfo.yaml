@@ -1,0 +1,12 @@
+NetrServerSetInfo: Request
+  ServerName: \\WIN16-1
+  Level: SERVER_INFO_101
+  ServerInfo:
+    ServerInfo101:
+      PlatformId: PLATFORM_ID_NT
+      Name: WIN16-1
+      VersionMajor: 10
+      VersionMinor: 0
+      Type: 0
+      Comment: Updated comment
+  ParmError: 0

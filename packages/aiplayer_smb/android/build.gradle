@@ -1,0 +1,14 @@
+group = 'app.aiplayer.smb'
+version = '1.0'
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies { classpath 'com.android.tools.build:gradle:8.9.1' }
+}
+apply plugin: 'com.android.library'
+android {
+    namespace 'app.aiplayer.smb'
+    compileSdk 35
+    ndkVersion '28.2.13676358'
+    defaultConfig { minSdk 24 }
+    externalNativeBuild { cmake { path '../src/CMakeLists.txt' } }
+}

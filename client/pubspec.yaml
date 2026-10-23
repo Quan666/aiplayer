@@ -1,0 +1,49 @@
+name: aiplayer
+description: 四端动漫播放器与个人影视库
+publish_to: none
+version: 0.5.14+20
+environment:
+  sdk: '>=3.9.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  media_kit: ^1.2.6
+  media_kit_video: ^2.0.1
+  media_kit_libs_video: ^1.0.7
+  sqlite3: ^2.9.4
+  sqlite3_flutter_libs: ^0.5.41
+  flutter_secure_storage: ^9.2.4
+  file_picker: ^10.3.10
+  path_provider: ^2.1.5
+  path: ^1.9.1
+  crypto: ^3.0.6
+  image: 4.12.0
+  uuid: ^4.5.1
+  xml: ^6.6.1
+  desktop_drop: ^0.7.0
+  aiplayer_smb:
+    path: ../packages/aiplayer_smb
+  cryptography: ^2.9.0
+dependency_overrides:
+  # The default Android native library omits the Blu-ray PGS decoder.
+  media_kit_libs_android_video:
+    path: ../packages/media_kit_libs_android_video
+dev_dependencies:
+  integration_test:
+    sdk: flutter
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  fake_async: ^1.3.3
+flutter:
+  uses-material-design: true
+  fonts:
+    - family: NotoSansSC
+      fonts:
+        - asset: assets/fonts/NotoSansSC-Regular.ttf
+  assets:
+    - assets/branding/app_icon.png
+    - assets/branding/tmdb.png
+    - assets/fonts/NotoSansSC-Regular.ttf
+    - assets/fonts/OFL.txt
+    - assets/opencc/

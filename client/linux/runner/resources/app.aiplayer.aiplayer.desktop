@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=映库
+Name[en]=AIPlayer
+GenericName=Video Player
+GenericName[zh_CN]=视频播放器
+Exec=aiplayer %U
+TryExec=aiplayer
+Icon=app.aiplayer.aiplayer
+Terminal=false
+MimeType=video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;video/x-m4v;video/mp2t;video/x-flv;video/x-ms-wmv;
+Categories=AudioVideo;Video;Player;
+StartupWMClass=app.aiplayer.aiplayer
+StartupNotify=true

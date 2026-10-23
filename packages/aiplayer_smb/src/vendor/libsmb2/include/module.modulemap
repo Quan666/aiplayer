@@ -1,0 +1,23 @@
+module SMB2 [system] [extern_c] {
+    module LibSMB2 {
+        header "apple/config.h"
+        // smb2.h includes this constants-only header. Keep that include textual
+        // so it cannot import this module while smb2.h is still being parsed.
+        textual header "smb2/smb2-errors.h"
+        header "smb2/smb2.h"
+        header "smb2/libsmb2.h"
+        // Full DCERPC moved to the separate, Linux-only libdcerpc project.
+        // Share enumeration remains part of libsmb2 on Apple platforms.
+        header "smb2/libsmb2-share-enum.h"
+    }
+    
+    module Internal {
+        header "libsmb2-private.h"
+    }
+    
+    explicit module Raw {
+        header "smb2/libsmb2-raw.h"
+    }
+    
+    export SMB2
+}

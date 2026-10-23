@@ -1,0 +1,12 @@
+services:
+  sync:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SYNC_TOKEN: ${SYNC_TOKEN:?Set a random token of at least 24 characters}
+    volumes:
+      - sync-data:/data
+    restart: unless-stopped
+volumes:
+  sync-data:

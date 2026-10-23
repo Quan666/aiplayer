@@ -1,0 +1,326 @@
+name: Build packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Platform to package
+        type: choice
+        default: all
+        options:
+          - all # Android + macOS only for now.
+          - android
+          # - windows
+          # - linux
+          # - ios
+          - macos
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths:
+      - 'client/**'
+      - 'packages/**'
+      - 'scripts/**'
+      - 'signing/android-certificate.sha256'
+      - '.github/workflows/packages.yml'
+  pull_request:
+    paths:
+      - 'client/**'
+      - 'packages/**'
+      - 'scripts/**'
+      - '.github/workflows/packages.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.workflow }}-${{ github.ref }}-${{ inputs.target || 'automatic' }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_SUPPRESS_ANALYTICS: 'true'
+  DART_SUPPRESS_ANALYTICS: 'true'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  android:
+    # Never pass the persistent signing key to pull request code.
+    if: github.event_name != 'pull_request' && (inputs.target == '' || inputs.target == 'all' || inputs.target == 'android')
+    name: Android (${{ matrix.abi }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [universal, arm64]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore and verify the existing Android key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          AIPLAYER_ANDROID_KEYSTORE: ${{ runner.temp }}/aiplayer-signing/debug.keystore
+        run: |
+          printf 'AIPLAYER_ANDROID_KEYSTORE=%s\n' "$AIPLAYER_ANDROID_KEYSTORE" >> "$GITHUB_ENV"
+          python3 scripts/restore_android_signing.py
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+        working-directory: client
+      - name: Build and validate APK
+        run: python3 scripts/package.py android --android-abi "${{ matrix.abi }}" --no-android-alias
+      # One APK per ABI; do not upload aliases or separate reports.
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/aiplayer-*-android*.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove restored signing key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/aiplayer-signing/debug.keystore"
+
+  # Temporarily paused platforms. Uncomment these jobs and target options to restore.
+  # windows:
+  #   if: inputs.target == '' || inputs.target == 'all' || inputs.target == 'windows'
+  #   name: Windows x64
+  #   runs-on: windows-2022
+  #   timeout-minutes: 60
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #       with:
+  #         persist-credentials: false
+  #     - uses: subosito/flutter-action@v2
+  #       with:
+  #         flutter-version: '3.47.7'
+  #         channel: stable
+  #         cache: true
+  #     - name: Locate Inno Setup
+  #       shell: pwsh
+  #       run: |
+  #         $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+  #         if (-not (Test-Path $compiler)) {
+  #           choco install innosetup --yes --no-progress
+  #           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+  #         }
+  #         if (-not (Test-Path $compiler)) { throw 'Inno Setup 6 compiler is missing' }
+  #         "AIPLAYER_ISCC=$compiler" >> $env:GITHUB_ENV
+  #     - name: Test Windows batch command launching
+  #       run: python -B -m unittest discover -s scripts/tests -p 'test_package_commands.py' -v
+  #     - name: Verify Flutter launch from Python
+  #       run: python -B -c "import sys; sys.path.insert(0, 'scripts'); from package import run; print(run(['flutter', '--version'], capture=True))"
+  #     - run: flutter config --enable-windows-desktop
+  #     - run: flutter pub get --enforce-lockfile
+  #       working-directory: client
+  #     - name: Build ZIP and installer
+  #       id: windows_package
+  #       shell: pwsh
+  #       run: |
+  #         New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+  #         python scripts/package.py windows --windows-installer --verbose 2>&1 | Tee-Object -FilePath artifacts/windows-build.log
+  #         $buildExitCode = $LASTEXITCODE
+  #         exit $buildExitCode
+  #     - name: Upload failed Windows build log
+  #       if: failure() && steps.windows_package.outcome == 'failure'
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: aiplayer-windows-build-log-${{ github.run_number }}
+  #         path: |
+  #           artifacts/windows-build.log
+  #           client/build/windows/**/cmake_install.cmake
+  #         if-no-files-found: ignore
+  #         retention-days: 14
+  #     - name: Check silent installation and uninstallation
+  #       shell: pwsh
+  #       run: |
+  #         $installDir = Join-Path $env:RUNNER_TEMP 'aiplayer-install-check'
+  #         $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$installDir`"")
+  #         $install = Start-Process -FilePath 'artifacts/aiplayer-windows-x64-setup.exe' -ArgumentList $arguments -Wait -PassThru
+  #         if ($install.ExitCode -ne 0) { throw "Installer failed: $($install.ExitCode)" }
+  #         foreach ($file in @('aiplayer.exe', 'flutter_windows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'data/flutter_assets', 'unins000.exe')) {
+  #           if (-not (Test-Path (Join-Path $installDir $file))) { throw "Installed package is missing $file" }
+  #         }
+  #         $uninstall = Start-Process -FilePath (Join-Path $installDir 'unins000.exe') -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+  #         if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstall.ExitCode)" }
+  #         if (Test-Path (Join-Path $installDir 'aiplayer.exe')) { throw 'Uninstaller left the application executable behind' }
+  #     - name: Upload Windows installer
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         path: artifacts/aiplayer-windows-x64-setup.exe
+  #         archive: false
+  #         if-no-files-found: error
+  #         retention-days: 30
+  #     - name: Upload Windows portable ZIP
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         path: artifacts/aiplayer-windows-x64.zip
+  #         archive: false
+  #         if-no-files-found: error
+  #         retention-days: 30
+  #     - name: Upload Windows build metadata
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: aiplayer-windows-x64-metadata-${{ github.run_number }}
+  #         path: |
+  #           artifacts/build-windows.json
+  #           artifacts/SHA256SUMS-windows
+  #         if-no-files-found: error
+  #         retention-days: 30
+
+  # linux:
+  #   if: inputs.target == '' || inputs.target == 'all' || inputs.target == 'linux'
+  #   name: Linux x64 (Ubuntu 24.04)
+  #   runs-on: ubuntu-24.04
+  #   timeout-minutes: 60
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #       with:
+  #         persist-credentials: false
+  #     - name: Install build dependencies
+  #       run: |
+  #         sudo apt-get update
+  #         sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libmpv-dev libsecret-1-dev dpkg-dev binutils
+  #     - uses: subosito/flutter-action@v2
+  #       with:
+  #         flutter-version: '3.47.7'
+  #         channel: stable
+  #         cache: true
+  #     - run: flutter config --enable-linux-desktop
+  #     - run: flutter pub get --enforce-lockfile
+  #       working-directory: client
+  #     - run: python3 scripts/package.py linux
+  #     - name: Verify DEB was produced
+  #       run: dpkg-deb --info artifacts/aiplayer-linux-amd64.deb
+  #     - name: Upload Linux DEB
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         path: artifacts/aiplayer-linux-amd64.deb
+  #         archive: false
+  #         if-no-files-found: error
+  #         retention-days: 30
+  #     - name: Upload Linux portable archive
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         path: artifacts/aiplayer-linux-x64.tar.gz
+  #         archive: false
+  #         if-no-files-found: error
+  #         retention-days: 30
+  #     - name: Upload Linux build metadata
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: aiplayer-linux-x64-metadata-${{ github.run_number }}
+  #         path: |
+  #           artifacts/build-linux.json
+  #           artifacts/SHA256SUMS-linux
+  #         if-no-files-found: error
+  #         retention-days: 30
+
+  # ios:
+  #   if: inputs.target == '' || inputs.target == 'all' || inputs.target == 'ios'
+  #   name: iOS (unsigned, requires re-signing)
+  #   runs-on: macos-15
+  #   timeout-minutes: 60
+  #   env:
+  #     COCOAPODS_DISABLE_STATS: 'true'
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #       with:
+  #         persist-credentials: false
+  #     - uses: subosito/flutter-action@v2
+  #       with:
+  #         flutter-version: '3.47.7'
+  #         channel: stable
+  #         cache: true
+  #     - run: flutter config --no-enable-swift-package-manager
+  #     - run: flutter pub get --enforce-lockfile
+  #       working-directory: client
+  #     - run: python3 scripts/package.py ios
+  #     - name: Upload unsigned iOS IPA
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         path: artifacts/aiplayer-ios-unsigned.ipa
+  #         archive: false
+  #         if-no-files-found: error
+  #         retention-days: 30
+  #     - name: Upload iOS app ZIP
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         path: artifacts/aiplayer-ios-unsigned.zip
+  #         archive: false
+  #         if-no-files-found: error
+  #         retention-days: 30
+  #     - name: Upload iOS build metadata
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: aiplayer-ios-unsigned-metadata-${{ github.run_number }}
+  #         path: |
+  #           artifacts/build-ios.json
+  #           artifacts/SHA256SUMS-ios
+  #         if-no-files-found: error
+  #         retention-days: 30
+  #     - name: Explain iOS signing requirement
+  #       run: |
+  #         cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+  #         ### iOS 未签名包
+  #         IPA 内含 `Payload/Runner.app`，供后续自行签名使用。
+  #         **不能直接安装到 iPhone，也不能直接上传 TestFlight / App Store。**
+  #         本工作流未配置 Apple 证书、描述文件或签名分发。
+  #         EOF
+
+  macos:
+    if: inputs.target == '' || inputs.target == 'all' || inputs.target == 'macos'
+    name: macOS universal (Apple Silicon + Intel)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      COCOAPODS_DISABLE_STATS: 'true'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+      - name: Show build tools
+        run: |
+          flutter --version
+          xcodebuild -version
+          pod --version
+      - name: Build and package for personal use
+        run: bash scripts/package_macos.sh --app-only
+      - name: Upload macOS app ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/aiplayer-macos-unsigned.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+      - name: Download instructions
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ### macOS 自用包
+          在本次运行的 Artifacts 中下载 `aiplayer-macos-unsigned.zip`，
+          解压一次即得到 `aiplayer.app`，将其拖到 Applications。
+          `.app` 是目录包，使用 ZIP 传输以保留可执行权限和符号链接。
+
+          包含 Apple Silicon / Intel 架构；仅上传这一份应用包。
+          使用 ad-hoc 签名，未经 Apple 公证；首次运行可能需要在
+          「系统设置 → 隐私与安全性」中允许打开。
+          自用构建不启用 App Sandbox，凭据保存在应用数据目录中的本地文件，
+          不再访问钥匙串或因读取凭据弹出钥匙串授权窗口。
+          凭据文件未加密，仅允许当前用户读写（文件 `0600`，所在目录 `0700`）。
+          从旧自用包升级后需重新填写同步 Token；已同步的凭据可从加密同步记录恢复，
+          未同步的凭据需重新填写。旧钥匙串条目保留，程序不会读取或迁移这些条目。
+          CI 打包通过不代表播放、网络来源和本地凭据读写已完成实机验收。
+          EOF

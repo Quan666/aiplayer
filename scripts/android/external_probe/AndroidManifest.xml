@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="app.aiplayer.externalprobe">
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35" />
+    <application android:label="映库外部打开测试" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity android:name=".ExternalProbeActivity" android:exported="true" />
+        <provider android:name=".ProbeContentProvider" android:authorities="app.aiplayer.externalprobe.files" android:exported="false" android:grantUriPermissions="true" />
+    </application>
+</manifest>
