@@ -10,36 +10,14 @@ bool playbackIsBackgrounded(AppLifecycleState? state) => switch (state) {
   AppLifecycleState.resumed || AppLifecycleState.inactive || null => false,
 };
 
-/// Desktop window managers can briefly withdraw/occlude a window while
-/// changing fullscreen geometry. Confirm hidden before pausing; never resume
-/// playback automatically, which would override a user's explicit pause.
-class PlaybackBackgroundGuard {
-  final void Function() onBackground;
-  final bool deferHidden;
-  Timer? _confirmation;
-  bool _disposed = false;
-
-  PlaybackBackgroundGuard({
-    required this.onBackground,
-    required this.deferHidden,
-  });
-
-  void update(AppLifecycleState state) {
-    if (_disposed) return;
-    _confirmation?.cancel();
-    if (!playbackIsBackgrounded(state)) return;
-    if (deferHidden && state == AppLifecycleState.hidden) {
-      _confirmation = Timer(const Duration(milliseconds: 250), onBackground);
-    } else {
-      onBackground();
-    }
-  }
-
-  void dispose() {
-    _disposed = true;
-    _confirmation?.cancel();
-  }
-}
+/// Desktop occlusion/minimization must not interrupt playback. Mobile keeps
+/// explicit background playback and PiP exemptions, independently of focus.
+bool playbackShouldPauseInBackground({
+  required bool mobile,
+  required bool backgrounded,
+  required bool pauseOnBackground,
+  required bool pictureInPicture,
+}) => mobile && backgrounded && pauseOnBackground && !pictureInPicture;
 
 /// Orders native fullscreen and orientation changes without touching playback.
 /// In particular, a transition must never restore an old playing state after

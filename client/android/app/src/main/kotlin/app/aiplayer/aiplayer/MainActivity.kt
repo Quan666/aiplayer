@@ -1,17 +1,27 @@
 package app.aiplayer.aiplayer
 
 import android.app.PictureInPictureParams
+import android.app.PendingIntent
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
 import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.util.Rational
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.Settings
 import android.os.Build
 import android.os.PowerManager
 import android.view.OrientationEventListener
+import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import io.flutter.embedding.android.FlutterActivity
@@ -32,6 +42,14 @@ class MainActivity : FlutterActivity() {
     private var immersiveActive = false
     private var orientationListener: OrientationEventListener? = null
     private var lastGravityOrientation: String? = null
+    private var pipReceiver: BroadcastReceiver? = null
+    private var pipRequestId = 0L
+    private var pipPlaying = false
+    private val pipPendingActions = mutableMapOf<String, PendingIntent>()
+    private var pipBackground: Drawable? = null
+    private var pipPrepared = false
+    private val pipPlayAction get() = "$packageName.PIP_PLAY"
+    private val pipPauseAction get() = "$packageName.PIP_PAUSE"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -103,14 +121,40 @@ class MainActivity : FlutterActivity() {
                     "enter" -> {
                         if (!supported) result.success(false)
                         else try {
+                            pipRequestId = call.argument<Number>("requestId")?.toLong() ?: 0L
+                            pipPlaying = call.argument<Boolean>("playing") == true
                             val value = (call.argument<Number>("aspectRatio")?.toDouble() ?: (16.0 / 9))
                             val ratio = if (value.isFinite()) value.coerceIn(.42, 2.39) else 16.0 / 9
-                            val params = PictureInPictureParams.Builder()
-                                .setAspectRatio(Rational((ratio * 1000).toInt(), 1000)).build()
-                            result.success(enterPictureInPictureMode(params))
+                            val builder = PictureInPictureParams.Builder()
+                                .setAspectRatio(Rational((ratio * 1000).toInt(), 1000))
+                                .setActions(pipActions())
+                            pipSourceRect(call.argument<Map<String, Number>>("sourceRect"))?.let {
+                                builder.setSourceRectHint(it)
+                            }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                builder.setSeamlessResizeEnabled(true)
+                            }
+                            preparePip()
+                            val entered = enterPictureInPictureMode(builder.build())
+                            if (!entered) releasePip()
+                            result.success(entered)
                         } catch (_: Exception) {
+                            releasePip()
                             result.error("pip_denied", "无法进入小窗，请在系统设置中允许画中画。", null)
                         }
+                    }
+                    "setPlayback" -> {
+                        if (supported && call.argument<Number>("requestId")?.toLong() == pipRequestId) {
+                            val playing = call.argument<Boolean>("playing") == true
+                            if (playing != pipPlaying) {
+                                pipPlaying = playing
+                                if (isInPictureInPictureMode) {
+                                    setPictureInPictureParams(PictureInPictureParams.Builder()
+                                        .setActions(pipActions()).build())
+                                }
+                            }
+                        }
+                        result.success(null)
                     }
                     "exit" -> {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
@@ -149,7 +193,79 @@ class MainActivity : FlutterActivity() {
 
     override fun onPictureInPictureModeChanged(active: Boolean, configuration: Configuration) {
         super.onPictureInPictureModeChanged(active, configuration)
+        if (!active) releasePip()
         windowModeChannel?.invokeMethod("changed", active)
+    }
+
+    private fun pipActions(): List<RemoteAction> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || pipRequestId == 0L) return emptyList()
+        val action = if (pipPlaying) pipPauseAction else pipPlayAction
+        val label = if (pipPlaying) "暂停" else "播放"
+        val icon = if (pipPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+        val pending = pipPendingActions.getOrPut(action) {
+            val intent = Intent(action).setPackage(packageName).putExtra("requestId", pipRequestId)
+            PendingIntent.getBroadcast(this, pipRequestId.hashCode(), intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        }
+        return listOf(RemoteAction(Icon.createWithResource(this, icon), label, label, pending))
+    }
+
+    private fun pipSourceRect(values: Map<String, Number>?): Rect? {
+        if (values == null) return null
+        val edges = listOf("left", "top", "right", "bottom").map {
+            values[it]?.toDouble()?.takeIf { value -> value.isFinite() } ?: return null
+        }
+        val origin = IntArray(2)
+        findViewById<View>(android.R.id.content)?.getLocationInWindow(origin)
+        val rect = Rect(edges[0].toInt() + origin[0], edges[1].toInt() + origin[1],
+            edges[2].toInt() + origin[0], edges[3].toInt() + origin[1])
+        val decor = window.decorView
+        return rect.takeIf { !it.isEmpty && it.intersect(0, 0, decor.width, decor.height) }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun preparePip() {
+        if (!pipPrepared) {
+            pipPrepared = true
+            pipBackground = window.decorView.background
+            // Resizing the Flutter surface can briefly expose the native window.
+            // Keep that surface black instead of showing the light launch theme.
+            window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+        }
+        if (pipReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N || !isInPictureInPictureMode ||
+                    intent?.getLongExtra("requestId", 0L) != pipRequestId) return
+                val playing = when (intent.action) {
+                    pipPlayAction -> true
+                    pipPauseAction -> false
+                    else -> return
+                }
+                windowModeChannel?.invokeMethod("playback",
+                    mapOf("requestId" to pipRequestId, "playing" to playing))
+            }
+        }
+        val filter = IntentFilter().apply { addAction(pipPlayAction); addAction(pipPauseAction) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
+        pipReceiver = receiver
+    }
+
+    private fun releasePip() {
+        pipReceiver?.let { unregisterReceiver(it) }
+        pipReceiver = null
+        pipPendingActions.values.forEach { it.cancel() }
+        pipPendingActions.clear()
+        pipRequestId = 0L
+        if (pipPrepared) {
+            window.setBackgroundDrawable(pipBackground)
+            pipBackground = null
+            pipPrepared = false
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -303,6 +419,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        releasePip()
         windowModeChannel?.setMethodCallHandler(null)
         windowModeChannel = null
         deviceInfoChannel?.setMethodCallHandler(null)

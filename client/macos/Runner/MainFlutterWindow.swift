@@ -6,6 +6,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var windowModeChannel: FlutterMethodChannel?
   private var floatingFrame: NSRect?
   private var originalLevel: NSWindow.Level = .normal
+  private var originalCollectionBehavior: NSWindow.CollectionBehavior = []
+  private var originalHidesOnDeactivate = false
   private var fileChannel: FlutterMethodChannel?
   private var discoveryChannel: FlutterMethodChannel?
   private var systemProxy: SystemProxyHandler?
@@ -92,13 +94,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
         self.setVideoFullscreen(enabled)
         result(self.fullscreenFrame != nil)
       case "enter":
-        self.setVideoFullscreen(false)
         let value = ((call.arguments as? [String: Any])?["aspectRatio"] as? NSNumber)?.doubleValue ?? 16.0 / 9
-        let ratio = value.isFinite ? min(2.39, max(0.42, value)) : 16.0 / 9
-        if self.floatingFrame == nil { self.floatingFrame = self.frame; self.originalLevel = self.level }
-        self.level = .floating
-        let height = min(540.0, 480.0 / ratio)
-        self.setContentSize(NSSize(width: height * ratio, height: height))
+        self.enterFloating(aspectRatio: value)
         result(true)
       case "exit": self.exitFloating(); result(nil)
       default: result(FlutterMethodNotImplemented)
@@ -182,9 +179,35 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     return true
   }
 
-  private func exitFloating() {
+  func enterFloating(aspectRatio value: Double) {
+    setVideoFullscreen(false)
+    let ratio = value.isFinite ? min(2.39, max(0.42, value)) : 16.0 / 9
+    if floatingFrame == nil {
+      floatingFrame = frame
+      originalLevel = level
+      originalCollectionBehavior = collectionBehavior
+      originalHidesOnDeactivate = hidesOnDeactivate
+    }
+    // The same Flutter view keeps playing while this window follows the user
+    // between desktops and full-screen Spaces. These flags must replace their
+    // mutually exclusive primary-window counterparts, rather than be appended.
+    var behavior = originalCollectionBehavior
+    behavior.subtract([.moveToActiveSpace, .fullScreenPrimary,
+                       .fullScreenNone, .fullScreenAllowsTiling])
+    behavior.formUnion([.canJoinAllSpaces, .fullScreenAuxiliary,
+                        .fullScreenDisallowsTiling])
+    collectionBehavior = behavior
+    hidesOnDeactivate = false
+    level = .floating
+    let height = min(540.0, 480.0 / ratio)
+    setContentSize(NSSize(width: height * ratio, height: height))
+  }
+
+  func exitFloating() {
     guard let saved = floatingFrame else { return }
     floatingFrame = nil
+    collectionBehavior = originalCollectionBehavior
+    hidesOnDeactivate = originalHidesOnDeactivate
     level = originalLevel
     setFrame(saved, display: true)
   }

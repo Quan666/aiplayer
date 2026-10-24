@@ -715,7 +715,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     final posterLayout = _snapshot?.posters.isNotEmpty ?? false;
     final sorting = model.librarySorting;
     final recent = _recent;
-    final inset = desktop ? 20.0 : 12.0;
+    final inset = desktop ? GlassMetrics.desktopPageInset : 12.0;
     final scale = MediaQuery.textScalerOf(context).scale(1);
     final scroll = CustomScrollView(
       key: const PageStorageKey('library-scroll'),

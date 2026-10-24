@@ -177,17 +177,36 @@ class PlaybackSession extends ChangeNotifier {
   bool _backgroundPlaybackBlocked = false, _nativeOpenInProgress = false;
   int _backgroundPauseRevision = 0;
   Future<void>? _backgroundPauseWork;
+  Future<void>? _backgroundRestoreWork;
+  bool _resumeAfterBackground = false, _openingWantsPlay = false;
+  bool? _pendingPlayingIntent;
+  int _playbackIntentRevision = 0;
   bool get backgroundPlaybackBlocked => _backgroundPlaybackBlocked;
   int get backgroundPauseRevision => _backgroundPauseRevision;
 
   /// A native pause can be overtaken by a pending open. Retain the policy
   /// through source preparation, decoder opening and late playing events.
-  /// Clearing it never resumes playback.
-  void setBackgroundPlaybackBlocked(bool value) {
+  /// Mobile callers can restore the interrupted playback intent on foreground.
+  /// An initially hidden session has no foreground playback to restore.
+  void setBackgroundPlaybackBlocked(
+    bool value, {
+    bool restoreOnForeground = false,
+  }) {
     if (closed || value == _backgroundPlaybackBlocked) return;
+    if (value) {
+      _resumeAfterBackground =
+          restoreOnForeground &&
+          (_pendingPlayingIntent ??
+              (_resumeAfterBackground ||
+                  player.state.playing ||
+                  (_openCalled && !ready && _openingWantsPlay)));
+    }
     _backgroundPlaybackBlocked = value;
     _refreshFirstFramePresentation();
-    if (!value) return;
+    if (!value) {
+      _restoreAfterBackground();
+      return;
+    }
     _backgroundPauseRevision++;
     if (ready || _nativeOpenInProgress) unawaited(_pauseForBackground());
   }
@@ -199,6 +218,53 @@ class PlaybackSession extends ChangeNotifier {
           AppLog.instance.warning('后台暂停', safeFailure(error).message);
         })
         .whenComplete(() => _backgroundPauseWork = null);
+  }
+
+  void _restoreAfterBackground() {
+    if (closed ||
+        !ready ||
+        _backgroundPlaybackBlocked ||
+        !_resumeAfterBackground ||
+        _backgroundRestoreWork != null) {
+      return;
+    }
+    if (remotePlayback || player.state.completed || error.isNotEmpty) {
+      _resumeAfterBackground = false;
+      return;
+    }
+    final revision = _backgroundPauseRevision;
+    final intent = _playbackIntentRevision;
+    bool current() =>
+        !closed &&
+        !_backgroundPlaybackBlocked &&
+        _resumeAfterBackground &&
+        !remotePlayback &&
+        !player.state.completed &&
+        error.isEmpty &&
+        revision == _backgroundPauseRevision &&
+        intent == _playbackIntentRevision;
+    _backgroundRestoreWork =
+        () async {
+              // A slow native pause must finish before the corresponding resume.
+              await _backgroundPauseWork;
+              if (!current()) return;
+              await player.play();
+              if (current()) _resumeAfterBackground = false;
+              if (!closed && _backgroundPlaybackBlocked) {
+                await _pauseForBackground();
+              }
+            }()
+            .catchError((Object error) {
+              _resumeAfterBackground = false;
+              AppLog.instance.warning('恢复播放', safeFailure(error).message);
+            })
+            .whenComplete(() {
+              _backgroundRestoreWork = null;
+              // Coalesce rapid background/foreground cycles into one latest intent.
+              if (revision != _backgroundPauseRevision) {
+                _restoreAfterBackground();
+              }
+            });
   }
 
   bool _openCalled = false;
@@ -255,7 +321,57 @@ class PlaybackSession extends ChangeNotifier {
 
   Future<void> togglePlayback() async {
     if (closed) return;
-    await player.playOrPause();
+    await setPlaying(
+      !(_pendingPlayingIntent ??
+          (_resumeAfterBackground || player.state.playing)),
+    );
+  }
+
+  Future<void> setPlaying(bool playing) => _setPlaying(playing);
+
+  /// Native PiP hands back its latest intent, including when the inline player
+  /// must wait for foreground before it can continue.
+  Future<void> restoreTransferredPlayback(bool playing) =>
+      _setPlaying(playing, restoreWhenForeground: true);
+
+  Future<void> _setPlaying(
+    bool playing, {
+    bool restoreWhenForeground = false,
+  }) async {
+    if (closed) return;
+    _resumeAfterBackground = restoreWhenForeground && playing;
+    _pendingPlayingIntent = playing;
+    _openingWantsPlay = playing;
+    final intent = ++_playbackIntentRevision;
+    try {
+      await _backgroundRestoreWork;
+      await _backgroundPauseWork;
+      if (closed || intent != _playbackIntentRevision) return;
+      if (playing && !_backgroundPlaybackBlocked) {
+        await player.play();
+        if (intent == _playbackIntentRevision && !_backgroundPlaybackBlocked) {
+          _resumeAfterBackground = false;
+        }
+        if (!closed && _backgroundPlaybackBlocked) await _pauseForBackground();
+      } else {
+        await player.pause();
+      }
+    } finally {
+      if (intent == _playbackIntentRevision) {
+        _pendingPlayingIntent = null;
+        if (restoreWhenForeground) _restoreAfterBackground();
+      }
+    }
+  }
+
+  /// Settle lifecycle commands before transferring playback to a native owner.
+  Future<void> settleBackgroundPlayback() async {
+    while (!closed) {
+      final pause = _backgroundPauseWork, restore = _backgroundRestoreWork;
+      if (pause == null && restore == null) return;
+      await pause;
+      await restore;
+    }
   }
 
   Future<void> temporaryRate(double rate) async {
@@ -660,6 +776,8 @@ class PlaybackSession extends ChangeNotifier {
   Future<void> open({bool? play, bool resume = true}) async {
     if (closed || _openCalled) return;
     _openCalled = true;
+    _openingWantsPlay = play ?? model.preferences.autoPlay;
+    final openingIntentRevision = _playbackIntentRevision;
     final openingPauseRevision = _backgroundPauseRevision;
     final initiallyAllowedToPlay = !_backgroundPlaybackBlocked;
     _startupClock.start();
@@ -803,7 +921,7 @@ class PlaybackSession extends ChangeNotifier {
               start: Duration(milliseconds: (resumePosition * 1000).round()),
             ),
             play:
-                (play ?? model.preferences.autoPlay) &&
+                _openingWantsPlay &&
                 initiallyAllowedToPlay &&
                 !_backgroundPlaybackBlocked &&
                 openingPauseRevision == _backgroundPauseRevision,
@@ -813,6 +931,8 @@ class PlaybackSession extends ChangeNotifier {
         }
         if (!initiallyAllowedToPlay ||
             _backgroundPlaybackBlocked ||
+            (openingIntentRevision != _playbackIntentRevision &&
+                !_openingWantsPlay) ||
             openingPauseRevision != _backgroundPauseRevision) {
           // A pause issued while open was pending may precede its final play
           // command. Always place another pause after the completed open.
@@ -823,6 +943,7 @@ class PlaybackSession extends ChangeNotifier {
       await _nativeOpening;
       if (closed) return;
       ready = true;
+      _restoreAfterBackground();
       _videoOutputChanged();
       model.activePlaybackMediaId = media.id;
       _scheduleTechnicalInfo();
@@ -1471,6 +1592,7 @@ class PlaybackSession extends ChangeNotifier {
 
   Future<void> _close() async {
     closed = true;
+    _resumeAfterBackground = false;
     _startupCancel.cancel();
     _firstFrameRetry?.cancel();
     if (_watchingVideoOutput) {
@@ -1512,6 +1634,7 @@ class PlaybackSession extends ChangeNotifier {
     await cleanup(() => _subtitleWork);
     await cleanup(() => _nativeOpening);
     await cleanup(() async => _backgroundPauseWork);
+    await cleanup(() async => _backgroundRestoreWork);
     await cleanup(() async {
       await _firstFrameWork;
     });

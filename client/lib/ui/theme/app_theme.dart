@@ -24,6 +24,7 @@ abstract final class GlassMetrics {
   static const navigationInset = 4.0;
   static const navigationItemRadius = navigationRadius - navigationInset;
   static const pageTopInset = 4.0;
+  static const desktopPageInset = 20.0;
   static const menuItemHeight = 36.0;
   static const menuItemPadding = EdgeInsets.symmetric(horizontal: 12);
   static const menuDividerHeight = 8.0;

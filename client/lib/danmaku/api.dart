@@ -90,7 +90,8 @@ List<DanmakuComment> normalizeComments(List<dynamic> input) {
       final c = a.$2.time.compareTo(b.$2.time);
       return c != 0 ? c : a.$1.compareTo(b.$1);
     });
-  return indexed.map((e) => e.$2).toList();
+  // Snapshot identity is the revision used by the presentation worker.
+  return List<DanmakuComment>.unmodifiable(indexed.map((e) => e.$2));
 }
 
 Future<List<DanmakuComment>> normalizeCommentsAsync(

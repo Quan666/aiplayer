@@ -46,6 +46,8 @@ void main() {
     expect(preferences.danmuArea, 1);
     expect(preferences.refreshInterval, 30);
     expect(preferences.seekStepSeconds, 10);
+    expect(preferences.controlsHideSeconds, 2);
+    expect(AppPreferences({'controlsHideSeconds': 3}).controlsHideSeconds, 3);
     expect(preferences.videoFit, 'contain');
     expect(preferences.subtitleLanguage, 'zh-Hans');
     expect(preferences.subtitleColor, '#FFFFFF');

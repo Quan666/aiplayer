@@ -3,61 +3,33 @@ import 'dart:ui' show AppLifecycleState;
 
 import 'package:aiplayer/playback/fullscreen_transition.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:fake_async/fake_async.dart';
 
 void main() {
-  test('brief desktop fullscreen occlusion does not pause playback', () {
-    fakeAsync((clock) {
-      var pauses = 0;
-      final guard = PlaybackBackgroundGuard(
-        onBackground: () => pauses++,
-        deferHidden: true,
-      );
-      guard.update(AppLifecycleState.hidden);
-      clock.elapse(const Duration(milliseconds: 100));
-      guard.update(AppLifecycleState.inactive);
-      clock.elapse(const Duration(seconds: 1));
-      expect(pauses, 0);
-      guard.update(AppLifecycleState.hidden);
-      clock.elapse(const Duration(milliseconds: 250));
-      expect(pauses, 1, reason: 'An actually minimized window still pauses');
-      guard.update(AppLifecycleState.resumed);
-      expect(pauses, 1, reason: 'Restoring a window never forces playback');
-      guard.dispose();
-    });
-  });
-
-  test('mobile backgrounding and desktop detachment remain immediate', () {
-    var pauses = 0;
-    final mobile = PlaybackBackgroundGuard(
-      onBackground: () => pauses++,
-      deferHidden: false,
-    );
-    mobile.update(AppLifecycleState.hidden);
-    expect(pauses, 1);
-    mobile.dispose();
-    final desktop = PlaybackBackgroundGuard(
-      onBackground: () => pauses++,
-      deferHidden: true,
-    );
-    desktop.update(AppLifecycleState.detached);
-    expect(pauses, 2);
-    desktop.dispose();
-  });
-
-  test('closing a hidden window cancels deferred background work', () {
-    fakeAsync((clock) {
-      var pauses = 0;
-      final guard = PlaybackBackgroundGuard(
-        onBackground: () => pauses++,
-        deferHidden: true,
-      );
-      guard.update(AppLifecycleState.hidden);
-      guard.dispose();
-      clock.elapse(const Duration(seconds: 1));
-      expect(pauses, 0);
-      expect(clock.pendingTimers, isEmpty);
-    });
+  test('desktop background never pauses; mobile honors PiP and preference', () {
+    for (final backgrounded in [false, true]) {
+      for (final pauseOnBackground in [false, true]) {
+        for (final pictureInPicture in [false, true]) {
+          expect(
+            playbackShouldPauseInBackground(
+              mobile: false,
+              backgrounded: backgrounded,
+              pauseOnBackground: pauseOnBackground,
+              pictureInPicture: pictureInPicture,
+            ),
+            isFalse,
+          );
+          expect(
+            playbackShouldPauseInBackground(
+              mobile: true,
+              backgrounded: backgrounded,
+              pauseOnBackground: pauseOnBackground,
+              pictureInPicture: pictureInPicture,
+            ),
+            backgrounded && pauseOnBackground && !pictureInPicture,
+          );
+        }
+      }
+    }
   });
 
   test('fullscreen entry, exit, and reentry cannot overlap', () async {

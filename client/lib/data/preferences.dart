@@ -26,7 +26,7 @@ class AppPreferences {
     'audioDelay': 0.0,
     'videoFit': 'contain',
     'seekStepSeconds': 10,
-    'controlsHideSeconds': 3,
+    'controlsHideSeconds': 2,
     'subtitlesEnabled': true,
     'autoLoadExternalSubtitles': true,
     'subtitleLanguage': 'zh-Hans',

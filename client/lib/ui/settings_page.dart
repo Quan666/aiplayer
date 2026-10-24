@@ -434,12 +434,13 @@ class _SettingsPageState extends State<SettingsPage>
     toggle('从上次位置继续', 'resumePlayback', prefs.resumePlayback),
     toggle('优先硬件解码', 'hardwareDecoding', prefs.hardwareDecoding),
     toggle('播放时保持屏幕常亮', 'keepScreenOn', prefs.keepScreenOn),
-    toggle(
-      '切到后台时暂停',
-      'pauseOnBackground',
-      prefs.pauseOnBackground,
-      hint: '关闭后仅在系统允许应用运行时继续',
-    ),
+    if (mobile)
+      toggle(
+        '切到后台时暂停',
+        'pauseOnBackground',
+        prefs.pauseOnBackground,
+        hint: '关闭后仅在系统允许应用运行时继续',
+      ),
     select('默认倍速', 'playbackRate', prefs.playbackRate, [
       for (final v in ({
         for (var i = 1; i <= 12; i++) i / 4,
@@ -818,7 +819,7 @@ class _SettingsPageState extends State<SettingsPage>
     const ListTile(
       leading: Icon(Icons.play_circle_outline_rounded),
       title: Text('映库 · AIPlayer'),
-      subtitle: Text('0.5.16 · 个人影视库'),
+      subtitle: Text('0.5.17 · 个人影视库'),
     ),
     ListTile(
       leading: const Icon(Icons.code_rounded),
@@ -827,7 +828,7 @@ class _SettingsPageState extends State<SettingsPage>
       onTap: () => showLicensePage(
         context: context,
         applicationName: '映库',
-        applicationVersion: '0.5.16',
+        applicationVersion: '0.5.17',
       ),
     ),
     ListTile(
@@ -1050,7 +1051,10 @@ class _SettingsPageState extends State<SettingsPage>
         .toList();
     return LayoutBuilder(
       builder: (context, box) {
-        final inset = box.maxWidth < 600 ? 12.0 : 20.0;
+        final desktop = MediaQuery.sizeOf(context).width >= 1000;
+        final inset = desktop
+            ? GlassMetrics.desktopPageInset
+            : (box.maxWidth < 600 ? 12.0 : 20.0);
         Widget scrolling(Key key, List<Widget Function()> sections) =>
             ListView.separated(
               key: key,
@@ -1061,7 +1065,9 @@ class _SettingsPageState extends State<SettingsPage>
             );
         return Center(
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 880),
+            constraints: BoxConstraints(
+              maxWidth: desktop ? double.infinity : 880,
+            ),
             child: Padding(
               padding: EdgeInsets.fromLTRB(
                 inset,

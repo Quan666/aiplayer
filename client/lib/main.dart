@@ -13,6 +13,7 @@ import 'ui/glass.dart';
 import 'sources/apple_access.dart';
 import 'core/logger.dart';
 import 'playback/display.dart';
+import 'playback/fullscreen_transition.dart';
 import 'core/external_open.dart';
 import 'ui/player_page.dart';
 import 'playback/desktop_window.dart';
@@ -36,7 +37,7 @@ Future<void> main(List<String> arguments) async {
     final documents = await getApplicationSupportDirectory();
     await documents.create(recursive: true);
     await AppLog.instance.initialize(documents);
-    AppLog.instance.info('应用', '映库 0.5.16 启动');
+    AppLog.instance.info('应用', '映库 0.5.17 启动');
     final model = AppModel(
       await AppStore.open(p.join(documents.path, 'library.db')),
       documents,
@@ -91,7 +92,7 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
     highContrast: true,
   );
   bool _backgrounded = false;
-  final _foreground = ValueNotifier(true);
+  final _presentationVisible = ValueNotifier(true);
   final _navigator = GlobalKey<NavigatorState>();
   final _messenger = GlobalKey<ScaffoldMessengerState>();
   final _routeObserver = _OpenRouteObserver();
@@ -106,7 +107,7 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
     super.initState();
     final state = WidgetsBinding.instance.lifecycleState;
     _backgrounded = state != null && state != AppLifecycleState.resumed;
-    _foreground.value = !_backgrounded;
+    _presentationVisible.value = !playbackIsBackgrounded(state);
     model.setForeground(!_backgrounded);
     WidgetsBinding.instance.addObserver(this);
     model.addListener(_displayPreferences);
@@ -278,10 +279,13 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (_closing) return;
+    // An unfocused window and the mobile notification shade can leave video
+    // visible and playing. Keep its animation clock running even while
+    // maintenance work waits for focus to return.
+    _presentationVisible.value = !playbackIsBackgrounded(state);
     final backgrounded = state != AppLifecycleState.resumed;
     if (_backgrounded == backgrounded) return;
     _backgrounded = backgrounded;
-    _foreground.value = !backgrounded;
     model.setForeground(!backgrounded);
     _displayPreferences();
     if (backgrounded) {
@@ -304,7 +308,7 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
     unawaited(PlayerDisplay.setHighRefreshRate(false));
     model.removeListener(_displayPreferences);
     _appearance.dispose();
-    _foreground.dispose();
+    _presentationVisible.dispose();
     super.dispose();
   }
 
@@ -328,10 +332,10 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
               ? const Duration(milliseconds: 200)
               : Duration.zero,
           builder: (context, child) => ValueListenableBuilder<bool>(
-            valueListenable: _foreground,
+            valueListenable: _presentationVisible,
             child: child,
-            builder: (context, foreground, child) => TickerMode(
-              enabled: foreground && !_closing,
+            builder: (context, visible, child) => TickerMode(
+              enabled: visible && !_closing,
               child: MotionScope(
                 enabled: appearance.animations,
                 child: AbsorbPointer(

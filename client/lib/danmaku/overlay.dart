@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import '../playback/session.dart';
 import '../playback/fullscreen_transition.dart';
 import '../ui/theme/danmaku_style.dart';
 import 'layout.dart';
+import 'layout_worker.dart';
+import 'presentation_clock.dart';
 
 class DanmakuOverlay extends StatefulWidget {
   final PlaybackSession session;
@@ -35,11 +38,23 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     vsync: this,
     duration: const Duration(seconds: 1),
   );
-  final cache = _LayoutCache();
+  late final cache = _LayoutCache(_layoutChanged);
+  final _clock = DanmakuPresentationClock();
   final _wake = ValueNotifier(0);
   Timer? _wakeTimer;
+  Size? _size;
   bool _visible = true;
   bool _foreground = true;
+
+  @visibleForTesting
+  Future<void> get debugLayoutReady => cache.layout.ready;
+
+  @visibleForTesting
+  DanmakuLayoutWorker get debugLayoutWorker => cache.layout.worker;
+
+  @visibleForTesting
+  int get debugTextLayouts => cache.textLayouts;
+
   @override
   void initState() {
     super.initState();
@@ -55,7 +70,9 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _visible = TickerMode.valuesOf(context).enabled;
+    final visible = TickerMode.valuesOf(context).enabled;
+    if (_visible != visible) _clock.reset();
+    _visible = visible;
     _playState();
   }
 
@@ -64,6 +81,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     final foreground = !playbackIsBackgrounded(state);
     if (foreground == _foreground) return;
     _foreground = foreground;
+    _clock.reset();
     _playState();
   }
 
@@ -75,6 +93,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       oldWidget.session.removeListener(_playState);
       oldWidget.session.position.removeListener(_playState);
       cache.clear();
+      _clock.reset();
       widget.session.addListener(_playState);
       widget.session.position.addListener(_playState);
     }
@@ -85,11 +104,15 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     widget.session.setDanmakuPresentationActive(_visible && _foreground);
     _wakeTimer?.cancel();
     _wakeTimer = null;
+    cache.layout.setSuspended(!_visible || !_foreground);
     if (!_playing) ticker.stop();
     if (!_visible || !_foreground) return;
-    // A seek, refresh or native clock correction must be painted before
-    // deciding whether the new layout needs continuous animation.
+    _prepareLayout();
     _wakeFrame();
+  }
+
+  void _layoutChanged() {
+    if (mounted && _visible && _foreground) _wakeFrame();
   }
 
   void _wakeFrame() => _wake.value++;
@@ -104,6 +127,68 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
         s.danmaku?.visible == true;
   }
 
+  Object get _timelineContext {
+    final s = widget.session, state = s.danmaku;
+    return (
+      s,
+      s.timelineRevision,
+      state,
+      state?.episodeId,
+      state?.shift,
+      state?.offset,
+    );
+  }
+
+  void _prepareLayout([Size? size]) {
+    if (size != null) _size = size;
+    if (!_visible || !_foreground) return;
+    final state = widget.session.danmaku, viewport = _size;
+    if (state == null || !state.visible || widget.session.closed) {
+      cache.clear();
+      return;
+    }
+    if (viewport == null || viewport.isEmpty) return;
+    final count = max(
+      1,
+      ((viewport.height * widget.area - 30) /
+              (widget.fontSize * 1.5) *
+              widget.density)
+          .floor(),
+    );
+    // The widget/layout path only compares revisions and enqueues work. The
+    // worker owns full-snapshot filtering and lane allocation, never paint.
+    cache.layout.update(
+      state.comments,
+      DanmakuLayoutOptions(
+        count: count,
+        speed: widget.speed,
+        scroll: widget.scroll,
+        top: widget.top,
+        bottom: widget.bottom,
+        presetFilter: widget.presetFilter,
+        blockedWords: widget.blockedWords,
+      ),
+      now: _presentationTime(),
+      position: widget.session.position.value,
+      contextKey: _timelineContext,
+    );
+  }
+
+  double _presentationTime() {
+    final s = widget.session, state = s.danmaku;
+    return _clock.sample(
+      position: s.seconds - (state?.shift ?? 0) - (state?.offset ?? 0),
+      // Vsync timestamps avoid work-time jitter and cover single arrival/
+      // expiry frames after idle gaps without an extra wall-clock timer.
+      elapsed: SchedulerBinding.instance.currentSystemFrameTimeStamp,
+      playing: _playing,
+      rate: s.player.state.rate,
+      contextKey: _timelineContext,
+      timelineRevision: s.timelineRevision,
+      nativePosition: s.position.value,
+    );
+  }
+
   void _scheduleFrame(bool moving, double? nextChange, double now) {
     _wakeTimer?.cancel();
     _wakeTimer = null;
@@ -113,9 +198,6 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     if (!_playing || animate || nextChange == null) return;
     final rate = widget.session.player.state.rate;
     if (!rate.isFinite || rate <= 0) return;
-    // Static comments only change on arrival/expiry. Empty spans only change
-    // on the next arrival. Keep that timing at every playback rate, without
-    // relying on the less frequent native position events to reveal comments.
     _wakeTimer = Timer(
       Duration(
         microseconds: max(1, ((nextChange - now) / rate * 1000000).ceil()),
@@ -133,48 +215,67 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     _wakeTimer?.cancel();
     ticker.dispose();
     _wake.dispose();
-    cache.clear();
+    cache.dispose();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) => widget.session.closed
-      ? const SizedBox.expand()
-      : IgnorePointer(
-          child: RepaintBoundary(
-            child: ClipRect(
-              child: CustomPaint(
+  Widget build(BuildContext context) {
+    if (widget.session.closed) return const SizedBox.expand();
+    cache.ensureStyle(
+      widget.fontSize,
+      widget.opacity,
+      DanmakuStyle.of(context),
+    );
+    return IgnorePointer(
+      child: RepaintBoundary(
+        child: ClipRect(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              _prepareLayout(constraints.biggest);
+              return CustomPaint(
                 size: Size.infinite,
                 painter: _Painter(
                   widget.session,
                   cache,
                   widget.fontSize,
-                  widget.opacity,
-                  widget.area,
-                  widget.density,
-                  widget.speed,
-                  widget.scroll,
-                  widget.top,
-                  widget.bottom,
-                  widget.presetFilter,
-                  widget.blockedWords,
-                  DanmakuStyle.of(context),
+                  () => _visible && _foreground,
+                  _presentationTime,
                   Listenable.merge([ticker, _wake]),
                   _scheduleFrame,
                 ),
-              ),
-            ),
+              );
+            },
           ),
-        );
+        ),
+      ),
+    );
+  }
 }
 
 class _LayoutCache {
-  final layout = DanmakuLayout();
+  final AsyncDanmakuLayout layout;
+  _LayoutCache(void Function() onChanged)
+    : layout = AsyncDanmakuLayout(onChanged);
   double font = 0, opacity = 0;
   DanmakuStyle? style;
   final text = <ScheduledComment, TextPainter>{};
+  int textLayouts = 0;
+  DanmakuSchedule? _prepared;
+  List<ScheduledComment> _visible = const [];
+  double _lastTime = double.negativeInfinity;
+  double? nextChange;
+  bool moving = false;
+
   void clear() {
     layout.clear();
+    clearText();
+    _prepared = null;
+    _visible = const [];
+  }
+
+  void dispose() {
+    layout.dispose();
     clearText();
   }
 
@@ -193,107 +294,91 @@ class _LayoutCache {
       style = currentStyle;
     }
   }
+
+  TextPainter textFor(ScheduledComment item) => text.putIfAbsent(item, () {
+    textLayouts++;
+    return TextPainter(
+      text: TextSpan(
+        text: item.comment.text,
+        style: style!.comment(
+          color: item.comment.color,
+          size: font,
+          opacity: opacity,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    )..layout();
+  });
+
+  List<ScheduledComment> visibleAt(double now) {
+    final prepared = layout.schedule;
+    if (identical(prepared, _prepared) &&
+        now >= _lastTime &&
+        (nextChange == null || now < nextChange!)) {
+      _lastTime = now;
+      return _visible;
+    }
+    _prepared = prepared;
+    _lastTime = now;
+    _visible = prepared.visibleAt(now).toList(growable: false);
+    nextChange = prepared.nextStartAfter(now);
+    moving = false;
+    for (final item in _visible) {
+      moving = moving || item.comment.mode == 0;
+      final end = item.start + item.duration;
+      nextChange = nextChange == null ? end : min(nextChange!, end);
+    }
+    // Membership changes only on arrival, expiry, seek or snapshot replacement.
+    // Keep glyph layouts and avoid allocating/scanning sets on every vsync.
+    final active = _visible.toSet();
+    text.removeWhere((item, painter) {
+      if (active.contains(item)) return false;
+      painter.dispose();
+      return true;
+    });
+    return _visible;
+  }
 }
 
 class _Painter extends CustomPainter {
   final PlaybackSession session;
   final _LayoutCache cache;
-  final double fontSize, opacity, area, density, speed;
-  final bool scroll, top, bottom, presetFilter;
-  final String blockedWords;
-  final DanmakuStyle style;
+  final double fontSize;
+  final bool Function() presentationActive;
+  final double Function() presentationTime;
   final void Function(bool, double?, double) scheduleFrame;
   _Painter(
     this.session,
     this.cache,
     this.fontSize,
-    this.opacity,
-    this.area,
-    this.density,
-    this.speed,
-    this.scroll,
-    this.top,
-    this.bottom,
-    this.presetFilter,
-    this.blockedWords,
-    this.style,
+    this.presentationActive,
+    this.presentationTime,
     Listenable ticker,
     this.scheduleFrame,
   ) : super(repaint: ticker);
   @override
   void paint(Canvas canvas, Size size) {
     final state = session.danmaku;
-    if (state == null || !state.visible) {
-      cache.clear();
+    if (!presentationActive() ||
+        state == null ||
+        !state.visible ||
+        session.closed) {
       scheduleFrame(false, null, 0);
       return;
     }
-    final now = session.seconds - state.shift - state.offset,
-        laneHeight = fontSize * 1.5;
-    final count = max(
-      1,
-      ((size.height * area - 30) / laneHeight * density).floor(),
-    );
-    cache.ensureStyle(fontSize, opacity, style);
-    cache.layout.update(
-      state.comments,
-      count,
-      now: now,
-      position: session.position.value,
-      contextKey: (
-        session,
-        session.timelineRevision,
-        state,
-        state.episodeId,
-        state.shift,
-        state.offset,
-        size,
-        fontSize,
-      ),
-      speed: speed,
-      scroll: scroll,
-      top: top,
-      bottom: bottom,
-      presetFilter: presetFilter,
-      blockedWords: blockedWords,
-    );
-    final visible = cache.layout.visibleAt(now).toSet();
-    var moving = false;
-    var nextChange = cache.layout.nextStartAfter(now);
+    final now = presentationTime(), laneHeight = fontSize * 1.5;
+    final visible = cache.visibleAt(now);
     for (final item in visible) {
       final age = now - item.start;
       final c = item.comment;
-      if (c.mode == 0) {
-        moving = true;
-      } else {
-        final end = item.start + item.duration;
-        nextChange = nextChange == null ? end : min(nextChange, end);
-      }
-      final tp = cache.text.putIfAbsent(
-        item,
-        () => TextPainter(
-          text: TextSpan(
-            text: c.text,
-            style: style.comment(
-              color: c.color,
-              size: fontSize,
-              opacity: opacity,
-            ),
-          ),
-          textDirection: TextDirection.ltr,
-          maxLines: 1,
-        )..layout(),
-      );
+      final tp = cache.textFor(item);
       final x = c.mode == 0
           ? size.width - (size.width + tp.width) * age / item.duration
           : (size.width - tp.width) / 2;
       tp.paint(canvas, Offset(x, 12 + item.lane * laneHeight));
     }
-    for (final key
-        in cache.text.keys.where((k) => !visible.contains(k)).toList()) {
-      cache.text.remove(key)!.dispose();
-    }
-    scheduleFrame(moving, nextChange, now);
+    scheduleFrame(cache.moving, cache.nextChange, now);
   }
 
   @override

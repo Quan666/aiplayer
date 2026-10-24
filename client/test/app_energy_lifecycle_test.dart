@@ -51,39 +51,40 @@ void main() {
     root.deleteSync(recursive: true);
   });
 
-  testWidgets('background library updates coalesce to one read on resume', (
-    tester,
-  ) async {
-    await tester.pumpWidget(AIPlayerApp(model: model));
-    await tester.pumpAndSettle();
-    final reads = model.libraryReads;
-    final library = find.byKey(const PageStorageKey('library-scroll'));
-    final original = tester.widget<CustomScrollView>(library);
-    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
-    await tester.pumpAndSettle();
-    expect(
-      TickerMode.valuesOf(tester.element(find.byType(LibraryPage))).enabled,
-      isFalse,
-    );
-    for (var i = 0; i < 10; i++) {
-      store.save('progress', 'video:1', {'position': i, 'duration': 100});
-      model.changed();
-      await tester.pump();
-    }
-    expect(model.libraryReads, reads);
-    expect(tester.widget<CustomScrollView>(library), same(original));
-    expect(tester.binding.hasScheduledFrame, isFalse);
-    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-    await tester.pumpAndSettle();
-    expect(model.libraryReads, reads + 1);
-    expect(tester.widget<CustomScrollView>(library), isNot(same(original)));
-    expect(
-      TickerMode.valuesOf(tester.element(find.byType(LibraryPage))).enabled,
-      isTrue,
-    );
-    await tester.pumpWidget(const SizedBox());
-    expect(model.foregroundChanges.last, isFalse);
-  });
+  testWidgets(
+    'unfocused library defers updates while visible tickers remain on',
+    (tester) async {
+      await tester.pumpWidget(AIPlayerApp(model: model));
+      await tester.pumpAndSettle();
+      final reads = model.libraryReads;
+      final library = find.byKey(const PageStorageKey('library-scroll'));
+      final original = tester.widget<CustomScrollView>(library);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pumpAndSettle();
+      expect(
+        TickerMode.valuesOf(tester.element(find.byType(LibraryPage))).enabled,
+        isTrue,
+      );
+      for (var i = 0; i < 10; i++) {
+        store.save('progress', 'video:1', {'position': i, 'duration': 100});
+        model.changed();
+        await tester.pump();
+      }
+      expect(model.libraryReads, reads);
+      expect(tester.widget<CustomScrollView>(library), same(original));
+      expect(tester.binding.hasScheduledFrame, isFalse);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+      expect(model.libraryReads, reads + 1);
+      expect(tester.widget<CustomScrollView>(library), isNot(same(original)));
+      expect(
+        TickerMode.valuesOf(tester.element(find.byType(LibraryPage))).enabled,
+        isTrue,
+      );
+      await tester.pumpWidget(const SizedBox());
+      expect(model.foregroundChanges.last, isFalse);
+    },
+  );
 
   testWidgets('initial hidden lifecycle and model replacement stay suspended', (
     tester,
@@ -97,11 +98,29 @@ void main() {
       await tester.pumpAndSettle();
       expect(model.libraryReads, 0);
       expect(model.foregroundChanges, [false]);
+      expect(
+        TickerMode.valuesOf(tester.element(find.byType(LibraryPage))).enabled,
+        isFalse,
+      );
       await tester.pumpWidget(AIPlayerApp(model: replacement));
       tester.binding.scheduleForcedFrame();
       await tester.pumpAndSettle();
       expect(replacement.libraryReads, 0);
       expect(replacement.foregroundChanges, [false]);
+      expect(
+        TickerMode.valuesOf(tester.element(find.byType(LibraryPage))).enabled,
+        isFalse,
+      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      // The visible initial-loading indicator can animate until focus returns
+      // and allows the deferred library snapshot to load.
+      await tester.pump();
+      expect(replacement.libraryReads, 0);
+      expect(replacement.foregroundChanges, [false]);
+      expect(
+        TickerMode.valuesOf(tester.element(find.byType(LibraryPage))).enabled,
+        isTrue,
+      );
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pumpAndSettle();
       expect(replacement.libraryReads, 1);

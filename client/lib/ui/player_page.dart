@@ -26,7 +26,9 @@ import 'cast_sheet.dart';
 import '../core/logger.dart';
 import '../subtitles/tools_panel.dart';
 import 'player_controls_settings.dart';
+import 'player_loading.dart';
 import 'player_model_changes.dart';
+import 'player_seek_readout.dart';
 import 'player_theme.dart';
 import 'glass.dart';
 import 'library_page.dart';
@@ -80,12 +82,17 @@ class PlayerPage extends StatefulWidget {
   final SyncRecord media;
   final PlayerPageController? controller;
   final Future<void> Function()? onClose;
+
+  /// Exercise mobile lifecycle policy with a real decoder on a desktop test host.
+  @visibleForTesting
+  final bool? mobilePlaybackLifecycle;
   const PlayerPage({
     super.key,
     required this.model,
     required this.media,
     this.controller,
     this.onClose,
+    this.mobilePlaybackLifecycle,
   });
   @override
   State<PlayerPage> createState() => _PlayerPageState();
@@ -100,10 +107,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   bool _backgrounded = false;
   final _fullscreenTransitions = FullscreenTransition();
   final _mediaTransitions = FullscreenTransition();
-  late final _backgroundGuard = PlaybackBackgroundGuard(
-    onBackground: _saveBackgroundState,
-    deferHidden: !PlayerDisplay.supported,
-  );
   int _fullscreenRevision = 0;
   Object? _surfaceState, _videoWidgetKey;
   Widget? _videoWidget;
@@ -459,17 +462,22 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (!playbackIsBackgrounded(state)) {
+    if (state == AppLifecycleState.resumed) {
       _backgrounded = false;
       _syncBackgroundPlayback();
+    } else if (playbackIsBackgrounded(state)) {
+      _saveBackgroundState();
     }
-    _backgroundGuard.update(state);
   }
 
   void _syncBackgroundPlayback() => session.setBackgroundPlaybackBlocked(
-    _backgrounded &&
-        widget.model.preferences.pauseOnBackground &&
-        !windowMode.active,
+    playbackShouldPauseInBackground(
+      mobile: widget.mobilePlaybackLifecycle ?? PlayerDisplay.supported,
+      backgrounded: _backgrounded,
+      pauseOnBackground: widget.model.preferences.pauseOnBackground,
+      pictureInPicture: windowMode.active,
+    ),
+    restoreOnForeground: true,
   );
 
   void _saveBackgroundState() {
@@ -484,7 +492,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   void dispose() {
     _disposed = true;
     widget.controller?._select = null;
-    _backgroundGuard.dispose();
     _orientationDeadline?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     session.removeListener(_changed);
@@ -500,7 +507,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     // Decoder disposal and progress thumbnails continue behind the disposal
     // barrier; they must not block the user's navigation gesture.
     if (!session.closed) {
-      unawaited(session.player.pause().catchError((Object _) {}));
+      unawaited(session.setPlaying(false).catchError((Object _) {}));
     }
     if (widget.onClose != null) {
       await widget.onClose!();
@@ -546,7 +553,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     try {
       if (windowMode.active) await windowMode.exit();
       if (!mounted || _disposed || _leaving || !requestIsCurrent()) return;
-      await previous.player.pause();
+      await previous.setPlaying(false);
       if (!mounted || _disposed || _leaving || !requestIsCurrent()) return;
       if (_retiringSession == null && _framePresented) {
         _retiringSession = previous;
@@ -712,6 +719,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     String label, {
     required bool selected,
     bool centerSelection = false,
+    int maxLines = 2,
     required VoidCallback onTap,
   }) => PlayerScrollToSelection(
     selected: centerSelection && selected,
@@ -719,7 +727,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       selected: selected,
       title: Text(
         label,
-        maxLines: 2,
+        maxLines: maxLines,
         overflow: TextOverflow.ellipsis,
         style: PlayerTheme.of(context).playlistItemStyle(selected: selected),
       ),
@@ -754,7 +762,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                 ) +
                 1,
             itemExtent:
-                PlayerTheme.choiceTrackRowHeight *
+                PlayerTheme.compactChoiceRowHeight *
                 MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
             padding: PlayerTheme.choiceMenuPadding,
             itemCount: tracks.isEmpty ? 2 : tracks.length + 1,
@@ -773,6 +781,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
               final track = tracks[index - 1];
               return _trackRow(
                 _audioTrackLabel(track),
+                maxLines: 1,
                 selected: current.player.state.track.audio.id == track.id,
                 onTap: () => Navigator.pop(c, track),
               );
@@ -805,7 +814,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         key: const ValueKey('player-speed-popup'),
         selectedIndex: rates.indexOf(current.player.state.rate) + 1,
         itemExtent:
-            PlayerTheme.choiceRowHeight *
+            PlayerTheme.compactChoiceRowHeight *
             MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
         padding: PlayerTheme.choiceMenuPadding,
         itemCount: rates.length + 1,
@@ -821,6 +830,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
           final value = rates[index - 1];
           return _trackRow(
             '$value×',
+            maxLines: 1,
             selected: current.player.state.rate == value,
             onTap: () => Navigator.pop(c, value),
           );
@@ -1291,12 +1301,13 @@ class _PlayerControlsState extends State<_PlayerControls>
   Timer? hudTimer;
   late final hideTimer = PlaybackControlsTimer(() {
     if (mounted &&
+        show &&
         ModalRoute.of(context)?.isCurrent == true &&
         heldRate == null) {
-      setState(() => show = false);
+      setState(_hideControls);
     }
   });
-  bool _closing = false, _rotating = false;
+  bool _closing = false, _rotating = false, _preparingPip = false;
   final _playlistAnchor = GlobalKey();
   final Map<int, Offset> _touches = {};
   int? _mousePointer;
@@ -1373,7 +1384,7 @@ class _PlayerControlsState extends State<_PlayerControls>
 
   void _configureControls() {
     hideTimer.configure(
-      playing: _controlsCanAutoHide,
+      playing: show && _controlsCanAutoHide,
       seconds: widget.model.preferences.controlsHideSeconds,
     );
     _maybeAutoFullscreen();
@@ -1406,23 +1417,26 @@ class _PlayerControlsState extends State<_PlayerControls>
     });
   }
 
-  Future<T?> _panel<T>(Future<T?> Function() open) async {
+  Future<T?> _panel<T>(
+    Future<T?> Function() open, {
+    bool revealControls = true,
+  }) async {
     _cancelSurfaceTaps();
     hideTimer.hold();
-    if (mounted) setState(() => show = true);
+    if (mounted && revealControls) setState(() => show = true);
     try {
       return await open();
     } finally {
       hideTimer.release();
-      if (mounted && !s.closed) setState(reveal);
+      if (mounted && !s.closed && revealControls) setState(reveal);
     }
   }
 
-  Future<void> _settings() async {
+  Future<void> _settings({bool revealControls = true}) async {
     await _panel<void>(() async {
-      if (widget.settingsAnchor.currentContext == null) {
-        // Keyboard shortcuts can reveal hidden controls. Measure the button
-        // after it mounts and its entrance translation finishes.
+      if (revealControls && widget.settingsAnchor.currentContext == null) {
+        // Pointer actions may reveal controls before opening a menu. Let
+        // their anchors mount; the keyboard menu has its own fixed position.
         await WidgetsBinding.instance.endOfFrame;
         if (!mounted || s.closed) return;
         await Future<void>.delayed(
@@ -1434,7 +1448,7 @@ class _PlayerControlsState extends State<_PlayerControls>
         await WidgetsBinding.instance.endOfFrame;
       }
       if (mounted && !s.closed) await widget.onSettings();
-    });
+    }, revealControls: revealControls);
   }
 
   void _lock() {
@@ -1447,22 +1461,66 @@ class _PlayerControlsState extends State<_PlayerControls>
   }
 
   Future<void> _pip() async {
+    if (_preparingPip || s.closed) return;
+    var heldControls = false;
     try {
       if (widget.windowMode.active) {
         await widget.windowMode.exit();
         return;
       }
       if (!widget.windowMode.systemPip) await _exitFull();
+      if (!mounted || s.closed) return;
       final params = s.player.state.videoParams;
-      final width = params.dw ?? params.w ?? 16;
-      final height = params.dh ?? params.h ?? 9;
-      await _panel<void>(
-        () => widget.windowMode.enter(
-          aspectRatio: width / (height > 0 ? height : 9),
-        ),
+      final ratio =
+          videoAspectRatio(
+            width: params.dw ?? params.w,
+            height: params.dh ?? params.h,
+            rotation: params.rotate ?? 0,
+          ) ??
+          16 / 9;
+      final surface = context.findRenderObject();
+      Rect? sourceRect;
+      if (surface is RenderBox && surface.hasSize) {
+        final bounds = surface.localToGlobal(Offset.zero) & surface.size;
+        sourceRect = bounds;
+        if (widget.model.preferences.videoFit == 'contain') {
+          final fitted = applyBoxFit(
+            BoxFit.contain,
+            Size(ratio, 1),
+            bounds.size,
+          ).destination;
+          sourceRect = Alignment.center.inscribe(fitted, bounds);
+        }
+      }
+      final pixelRatio = MediaQuery.devicePixelRatioOf(context);
+      final entering = s;
+      final pauseRevision = entering.backgroundPauseRevision;
+      _cancelSurfaceTaps();
+      hideTimer.hold();
+      heldControls = true;
+      if (widget.windowMode.systemPip) {
+        setState(() => _preparingPip = true);
+        // Compose the retained video without controls before Android snapshots
+        // the activity for its PiP transition. Background policy is synchronous.
+        await WidgetsBinding.instance.endOfFrame;
+      }
+      if (!mounted ||
+          entering.closed ||
+          entering != s ||
+          entering.backgroundPauseRevision != pauseRevision ||
+          playbackIsBackgrounded(WidgetsBinding.instance.lifecycleState)) {
+        return;
+      }
+      await widget.windowMode.enter(
+        aspectRatio: ratio,
+        sourceRect: sourceRect,
+        pixelRatio: pixelRatio,
       );
     } catch (error) {
       if (mounted) showFailure(context, error);
+    } finally {
+      if (heldControls) hideTimer.release();
+      if (mounted) setState(() => _preparingPip = false);
     }
   }
 
@@ -1582,7 +1640,7 @@ class _PlayerControlsState extends State<_PlayerControls>
     if (mounted) setState(reveal);
   }
 
-  void _action(String action) {
+  void _action(String action, {bool revealControls = true}) {
     if (s.closed) return;
     final p = widget.model.preferences;
     switch (action) {
@@ -1601,7 +1659,7 @@ class _PlayerControlsState extends State<_PlayerControls>
         final seconds = action.startsWith('skip') ? 89 : p.seekStepSeconds;
         seekBy(backwards ? -seconds : seconds);
         _feedback(
-          '${backwards ? '−' : '+'}$seconds 秒',
+          '${backwards ? '-' : '+'}$seconds 秒',
           backwards ? Icons.fast_rewind_rounded : Icons.fast_forward_rounded,
         );
       case 'volumeUp':
@@ -1640,9 +1698,15 @@ class _PlayerControlsState extends State<_PlayerControls>
           Icons.chat_bubble_outline_rounded,
         );
       case 'settings':
-        _settings();
+        _settings(revealControls: revealControls);
     }
-    if (mounted) setState(reveal);
+    if (mounted && revealControls) {
+      setState(reveal);
+    } else if (show) {
+      // Keyboard actions keep the current visibility. If controls were
+      // already visible, give that interaction a fresh auto-hide interval.
+      hideTimer.arm();
+    }
   }
 
   int get _maximumSurfaceTaps {
@@ -1717,8 +1781,7 @@ class _PlayerControlsState extends State<_PlayerControls>
         if (_singleTapShowsControls) {
           reveal();
         } else {
-          show = false;
-          hideTimer.cancel();
+          _hideControls();
         }
       });
       return;
@@ -1840,7 +1903,6 @@ class _PlayerControlsState extends State<_PlayerControls>
       // Escape remains available when shortcuts are disabled or controls are
       // locked. Holding it must not close playback after leaving fullscreen.
       if (event is KeyDownEvent) {
-        if (widget.fullscreen) setState(reveal);
         unawaited(widget.fullscreen ? _exitFull() : _back());
       }
       return KeyEventResult.handled;
@@ -1858,8 +1920,16 @@ class _PlayerControlsState extends State<_PlayerControls>
       }
       return KeyEventResult.ignored;
     }
-    _action(action);
+    _action(action, revealControls: false);
     return KeyEventResult.handled;
+  }
+
+  void _hideControls() {
+    show = false;
+    hideTimer.configure(
+      playing: false,
+      seconds: widget.model.preferences.controlsHideSeconds,
+    );
   }
 
   void reveal() {
@@ -1959,7 +2029,6 @@ class _PlayerControlsState extends State<_PlayerControls>
 
   Widget _seekPreviewCard(Size viewport) {
     final target = Duration(milliseconds: dragging!.round());
-    final forwards = target >= seekTimeline.origin;
     final width = (viewport.width * .25).clamp(140.0, 260.0);
     final controller = seekPreview;
     Widget unavailable() => ColoredBox(
@@ -1984,23 +2053,12 @@ class _PlayerControlsState extends State<_PlayerControls>
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                clockText(target),
-                key: const ValueKey('seek-preview-time'),
-                style: PlayerTheme.of(context).seekTimeStyle,
-              ),
-              const SizedBox(width: 6),
-              Icon(
-                forwards
-                    ? Icons.keyboard_double_arrow_right_rounded
-                    : Icons.keyboard_double_arrow_left_rounded,
-                color: PlayerTheme.of(context).foreground,
-                size: 36,
-              ),
-            ],
+          PlayerSeekReadout(
+            key: const ValueKey('seek-preview-readout'),
+            time: clockText(target),
+            target: target,
+            origin: seekTimeline.origin,
+            maxWidth: (viewport.width * .75).clamp(140.0, 420.0),
           ),
           const SizedBox(height: 8),
           ClipRRect(
@@ -2136,7 +2194,7 @@ class _PlayerControlsState extends State<_PlayerControls>
           selectedIndex:
               items.indexWhere((media) => media.id == s.media.id) + 1,
           itemExtent:
-              PlayerTheme.choiceRowWithSubtitleHeight *
+              PlayerTheme.playlistRowHeight *
               MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
           padding: PlayerTheme.choiceMenuPadding,
           itemCount: items.length + 1,
@@ -2169,7 +2227,7 @@ class _PlayerControlsState extends State<_PlayerControls>
                   : null,
               title: Text(
                 title(media),
-                maxLines: 2,
+                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: PlayerTheme.of(
                   context,
@@ -2323,11 +2381,15 @@ class _PlayerControlsState extends State<_PlayerControls>
   @override
   Widget build(BuildContext context) {
     // The page can rebuild once while the close animation is removing it.
-    if (s.closed || (widget.windowMode.active && widget.windowMode.systemPip)) {
+    if (s.closed ||
+        _preparingPip ||
+        (widget.windowMode.active && widget.windowMode.systemPip)) {
       return const SizedBox.expand();
     }
     final st = s.player.state;
     final duration = st.duration.inMilliseconds.toDouble();
+    final loading =
+        s.error.isEmpty && (!s.ready || !s.firstFrameRendered || st.buffering);
     final p = widget.model.preferences;
     final viewport = MediaQuery.sizeOf(context);
     final safePadding = MediaQuery.paddingOf(context);
@@ -2355,7 +2417,8 @@ class _PlayerControlsState extends State<_PlayerControls>
           cursor: !mobile && widget.fullscreen && !show
               ? SystemMouseCursors.none
               : SystemMouseCursors.basic,
-          onEnter: _pointerActivity,
+          // Closing a keyboard-opened panel can synthesize an enter event
+          // under a stationary mouse. Only actual movement reveals controls.
           onHover: _pointerActivity,
           child: Stack(
             children: [
@@ -2502,22 +2565,6 @@ class _PlayerControlsState extends State<_PlayerControls>
                     presetFilter: p.danmuPresetFilter,
                     blockedWords: p.danmuBlockedWords,
                   ),
-                ),
-              ),
-              Positioned(
-                key: const ValueKey('player-buffering-layer'),
-                top: 0,
-                left: 0,
-                right: 0,
-                child: IgnorePointer(
-                  child:
-                      s.error.isEmpty &&
-                          (!s.ready || !s.firstFrameRendered || st.buffering)
-                      ? const _PlayerLoading(
-                          key: ValueKey('player-buffering'),
-                          label: '正在加载视频',
-                        )
-                      : const SizedBox.shrink(),
                 ),
               ),
               // The feedback layer stays in the tree and rebuilds on its own.
@@ -2717,7 +2764,9 @@ class _PlayerControlsState extends State<_PlayerControls>
                                   const SizedBox(width: 34),
                                   _PlayerButton(
                                     tooltip: st.playing ? '暂停' : '播放',
-                                    icon: st.playing
+                                    icon: loading
+                                        ? null
+                                        : st.playing
                                         ? Icons.pause_rounded
                                         : Icons.play_arrow_rounded,
                                     size: 76,
@@ -2748,6 +2797,20 @@ class _PlayerControlsState extends State<_PlayerControls>
                           ),
                         ),
                       ),
+                    ),
+                  ),
+                ),
+                // Keep loading visible even when controls are hidden/locked.
+                // A separate stable layer avoids remounting the video surface.
+                Positioned.fill(
+                  key: const ValueKey('player-buffering-layer'),
+                  child: IgnorePointer(
+                    child: Center(
+                      child: loading
+                          ? const PlayerLoading(
+                              key: ValueKey('player-buffering'),
+                            )
+                          : const SizedBox.shrink(),
                     ),
                   ),
                 ),
@@ -2885,24 +2948,6 @@ class _RenderTapPassthrough extends RenderProxyBox {
   }
 }
 
-class _PlayerLoading extends StatelessWidget {
-  final String label;
-  const _PlayerLoading({super.key, required this.label});
-
-  @override
-  Widget build(BuildContext context) => Semantics(
-    label: label,
-    child: const SizedBox(
-      height: 3,
-      child: LinearProgressIndicator(
-        minHeight: 3,
-        color: Colors.white,
-        backgroundColor: Colors.white24,
-      ),
-    ),
-  );
-}
-
 class _ChromeEntrance extends StatefulWidget {
   final Widget child;
   final bool visible;
@@ -2951,7 +2996,7 @@ class _ChromeEntranceState extends State<_ChromeEntrance> {
 
 class _PlayerButton extends StatelessWidget {
   final String tooltip;
-  final IconData icon;
+  final IconData? icon;
   final VoidCallback? onPressed;
   final double iconSize, size;
   const _PlayerButton({
@@ -2967,11 +3012,13 @@ class _PlayerButton extends StatelessWidget {
     tooltip: tooltip,
     onPressed: onPressed,
     style: PlayerTheme.of(context).controlButtonStyle(size),
-    icon: Icon(
-      icon,
-      size: iconSize,
-      shadows: PlayerTheme.of(context).iconShadows,
-    ),
+    icon: icon == null
+        ? SizedBox.square(dimension: iconSize)
+        : Icon(
+            icon,
+            size: iconSize,
+            shadows: PlayerTheme.of(context).iconShadows,
+          ),
   );
 }
 

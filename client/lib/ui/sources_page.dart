@@ -754,16 +754,21 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   );
 
   Widget _root() {
+    final desktop = MediaQuery.sizeOf(context).width >= 1000;
     final sources = model.sources;
     final sourcesById = {for (final source in sources) source['id']: source};
     final saved = favorites.available(
       sources.map((source) => source['id'] as String),
     );
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
+      padding: EdgeInsets.symmetric(
+        horizontal: desktop ? GlassMetrics.desktopPageInset : 12,
+      ),
       child: Center(
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 960),
+          constraints: BoxConstraints(
+            maxWidth: desktop ? double.infinity : 960,
+          ),
           child: RefreshIndicator(
             onRefresh: _refreshSources,
             child: CustomScrollView(
@@ -1433,29 +1438,37 @@ class _ContentList extends StatelessWidget {
   });
   @override
   Widget build(BuildContext context) => LayoutBuilder(
-    builder: (context, constraints) => ListView.builder(
-      physics: physics,
-      scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
-      padding: EdgeInsets.fromLTRB(
-        constraints.maxWidth < 600 ? 12 : 24,
-        GlassMetrics.pageTopPadding(context) +
-            MediaQuery.paddingOf(context).top,
-        constraints.maxWidth < 600 ? 12 : 24,
-        20 + MediaQuery.paddingOf(context).bottom,
-      ),
-      itemCount: children.length + itemCount,
-      itemBuilder: (context, index) => Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 960),
-          child: SizedBox(
-            width: double.infinity,
-            child: index < children.length
-                ? children[index]
-                : itemBuilder!(context, index - children.length),
+    builder: (context, constraints) {
+      final desktop = MediaQuery.sizeOf(context).width >= 1000;
+      final inset = desktop
+          ? GlassMetrics.desktopPageInset
+          : (constraints.maxWidth < 600 ? 12.0 : 24.0);
+      return ListView.builder(
+        physics: physics,
+        scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
+        padding: EdgeInsets.fromLTRB(
+          inset,
+          GlassMetrics.pageTopPadding(context) +
+              MediaQuery.paddingOf(context).top,
+          inset,
+          20 + MediaQuery.paddingOf(context).bottom,
+        ),
+        itemCount: children.length + itemCount,
+        itemBuilder: (context, index) => Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: desktop ? double.infinity : 960,
+            ),
+            child: SizedBox(
+              width: double.infinity,
+              child: index < children.length
+                  ? children[index]
+                  : itemBuilder!(context, index - children.length),
+            ),
           ),
         ),
-      ),
-    ),
+      );
+    },
   );
 }
 
@@ -3589,16 +3602,23 @@ class _SourceBrowserState extends State<SourceBrowser>
     final value = collection;
     final records = value == null ? const <SyncRecord>[] : _collectionRecords;
     final hasCollectionHeader = value != null && _hasCollectionHeader;
+    final width = MediaQuery.sizeOf(context).width;
+    final desktop = width >= 1000;
+    final inset = desktop
+        ? GlassMetrics.desktopPageInset
+        : (width < 600 ? 12.0 : 24.0);
     final body = Padding(
       padding: EdgeInsets.fromLTRB(
-        MediaQuery.sizeOf(context).width < 600 ? 12 : 24,
+        inset,
         GlassMetrics.pageTopPadding(context),
-        MediaQuery.sizeOf(context).width < 600 ? 12 : 24,
+        inset,
         0,
       ),
       child: Center(
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 960),
+          constraints: BoxConstraints(
+            maxWidth: desktop ? double.infinity : 960,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [

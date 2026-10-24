@@ -218,6 +218,64 @@ class RunnerTests: XCTestCase {
     XCTAssertTrue(window.acceptsMouseMovedEvents)
     XCTAssertEqual(controller.mouseTrackingMode, .inActiveApp)
   }
+
+  func testFloatingWindowFollowsSpacesWithoutLosingItsOriginalWindowState() {
+    let (window, input) = makeWindow()
+    defer { window.close() }
+    window.collectionBehavior = [.moveToActiveSpace, .fullScreenPrimary,
+                                 .fullScreenAllowsTiling]
+    window.hidesOnDeactivate = true
+    let originalFrame = window.frame
+    let originalBehavior = window.collectionBehavior
+    let originalLevel = window.level
+    let originalController = window.contentViewController
+    XCTAssertTrue(window.makeFirstResponder(input))
+
+    window.enterFloating(aspectRatio: 16.0 / 9)
+    XCTAssertTrue(window.collectionBehavior.contains(.canJoinAllSpaces))
+    XCTAssertTrue(window.collectionBehavior.contains(.fullScreenAuxiliary))
+    XCTAssertFalse(window.collectionBehavior.contains(.moveToActiveSpace))
+    XCTAssertFalse(window.collectionBehavior.contains(.fullScreenPrimary))
+    XCTAssertFalse(window.collectionBehavior.contains(.fullScreenAllowsTiling))
+    XCTAssertFalse(window.hidesOnDeactivate)
+    XCTAssertEqual(window.level, .floating)
+
+    // Clicking another app must not lower or hide the floating player.
+    window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window))
+    XCTAssertEqual(window.level, .floating)
+    XCTAssertFalse(window.hidesOnDeactivate)
+    // Repeated entries resize the same view and retain the initial snapshot.
+    window.enterFloating(aspectRatio: 4.0 / 3)
+    XCTAssertTrue(window.contentViewController === originalController)
+    XCTAssertTrue(window.firstResponder === input)
+    window.exitFloating()
+    window.exitFloating()
+    XCTAssertEqual(window.frame, originalFrame)
+    XCTAssertEqual(window.level, originalLevel)
+    XCTAssertEqual(window.collectionBehavior, originalBehavior)
+    XCTAssertTrue(window.hidesOnDeactivate)
+  }
+
+  func testFloatingFromFullscreenRestoresTheOriginalRegularWindow() throws {
+    guard NSScreen.main != nil else { throw XCTSkip("Fullscreen needs a display") }
+    let (window, input) = makeWindow()
+    defer { window.close() }
+    let originalFrame = window.frame
+    let originalStyle = window.styleMask
+    let originalBehavior = window.collectionBehavior
+    XCTAssertTrue(window.makeFirstResponder(input))
+
+    window.setVideoFullscreen(true)
+    window.enterFloating(aspectRatio: 16.0 / 9)
+    XCTAssertEqual(window.styleMask, originalStyle)
+    XCTAssertEqual(window.level, .floating)
+    XCTAssertTrue(window.firstResponder === input)
+    window.exitFloating()
+    XCTAssertEqual(window.frame, originalFrame)
+    XCTAssertEqual(window.styleMask, originalStyle)
+    XCTAssertEqual(window.collectionBehavior, originalBehavior)
+    XCTAssertEqual(window.level, .normal)
+  }
 }
 
 private final class InputView: NSView {

@@ -26,8 +26,10 @@ abstract final class PlayerTheme {
   static const menuGap = 8.0;
   static const menuRowHeight = 42.0;
   static const choiceRowHeight = 40.0;
+  static const compactChoiceRowHeight = 36.0;
   static const choiceTrackRowHeight = 44.0;
   static const choiceRowWithSubtitleHeight = 56.0;
+  static const playlistRowHeight = 48.0;
   static const choiceContentPadding = EdgeInsets.symmetric(horizontal: 16);
   static const choiceTilePadding = EdgeInsets.symmetric(
     horizontal: 8,

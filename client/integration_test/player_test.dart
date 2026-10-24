@@ -818,14 +818,16 @@ void main() {
         find.byKey(const ValueKey('player-buffering')),
       );
       final transport = tester.getRect(
-        find.byTooltip(pagePlayback.player.state.playing ? '暂停' : '播放'),
+        find.byKey(const ValueKey('player-transport-controls')),
       );
-      expect(loading.overlaps(transport), isFalse);
-      expect(loading.height, 3);
+      expect(loading.center, transport.center);
+      expect(loading.size, const Size.square(76));
+      expect(find.byIcon(Icons.pause_rounded), findsNothing);
+      expect(find.byIcon(Icons.play_arrow_rounded), findsNothing);
       expect(
         find.descendant(
-          of: find.byKey(const ValueKey('player-buffering')),
-          matching: find.byType(CircularProgressIndicator),
+          of: find.byType(PlayerPage),
+          matching: find.byType(LinearProgressIndicator),
         ),
         findsNothing,
       );
@@ -840,6 +842,10 @@ void main() {
       pageNative.bufferingController.add(false);
       await tester.pump(const Duration(milliseconds: 50));
       expect(find.byKey(const ValueKey('player-buffering')), findsNothing);
+      expect(
+        find.byTooltip(pagePlayback.player.state.playing ? '暂停' : '播放'),
+        findsOneWidget,
+      );
       expect(
         tester.widget<Video>(find.byType(Video)),
         same(videoBeforeBuffering),
@@ -1092,6 +1098,11 @@ void main() {
       // The seek command may return before decoding finishes. Closing must not
       // save the previous nonblank frame under this new resume position.
       await pagePlayback.player.seek(const Duration(seconds: 20));
+      final controlsVisibleBeforeEscape = find
+          .byTooltip('播放器设置')
+          .hitTestable()
+          .evaluate()
+          .isNotEmpty;
       await tester.sendKeyDownEvent(LogicalKeyboardKey.escape);
       await tester.pump(const Duration(milliseconds: 300));
       await tester.sendKeyRepeatEvent(LogicalKeyboardKey.escape);
@@ -1102,8 +1113,8 @@ void main() {
       expect(find.byTooltip('退出全屏'), findsNothing);
       expect(
         find.byTooltip('播放器设置').hitTestable(),
-        findsOneWidget,
-        reason: 'Escape reveals controls after leaving fullscreen',
+        controlsVisibleBeforeEscape ? findsOneWidget : findsNothing,
+        reason: 'Escape preserves control visibility after leaving fullscreen',
       );
       expect(
         identical(

@@ -10,7 +10,8 @@ class DanmakuSession extends ChangeNotifier {
   final AppStore store;
   final DanmuApiClient api;
   final String mediaId;
-  List<DanmakuComment> comments = [];
+  // Replace immutable snapshots; workers cache them by identity.
+  List<DanmakuComment> comments = const [];
   List<DanmakuComment>? _cachedComments;
   List<EpisodeMatch> candidates = [];
   String? episodeId;

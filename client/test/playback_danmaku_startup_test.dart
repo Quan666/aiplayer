@@ -157,6 +157,235 @@ void main() {
     },
   );
 
+  for (final wasPlaying in [true, false]) {
+    test(
+      'foreground restores original playing=$wasPlaying without frames',
+      () async {
+        final model = _Model();
+        final session = _Session(model);
+        _cleanup(model, session);
+        model.credentials.complete(null);
+        model.source.complete(_Source());
+        await session.open(play: wasPlaying);
+        session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+        await Future<void>.delayed(Duration.zero);
+        expect(session.player.state.playing, isFalse);
+        session.setBackgroundPlaybackBlocked(false);
+        await Future<void>.delayed(Duration.zero);
+        expect(session.player.state.playing, wasPlaying);
+        expect(session.player.plays, wasPlaying ? 1 : 0);
+      },
+    );
+  }
+
+  for (final duringNativeOpen in [true, false]) {
+    test(
+      'mobile restore waits for startup (native=$duringNativeOpen)',
+      () async {
+        final model = _Model();
+        final session = _Session(model);
+        _cleanup(model, session);
+        model.credentials.complete(null);
+        final gate = duringNativeOpen
+            ? session.player.openGate = Completer<void>()
+            : null;
+        if (duringNativeOpen) model.source.complete(_Source());
+        final opening = session.open(play: true);
+        if (duringNativeOpen) await session.player.openStarted.future;
+        session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+        session.setBackgroundPlaybackBlocked(false);
+        if (duringNativeOpen) {
+          gate!.complete();
+        } else {
+          model.source.complete(_Source());
+        }
+        await opening;
+        await Future<void>.delayed(Duration.zero);
+        expect(session.player.state.playing, isTrue);
+        expect(session.player.plays, 1);
+      },
+    );
+  }
+
+  test('slow pause and repeated background cycles restore once', () async {
+    final model = _Model();
+    final session = _Session(model);
+    _cleanup(model, session);
+    model.credentials.complete(null);
+    model.source.complete(_Source());
+    await session.open();
+    final pause = session.player.pauseGate = Completer<void>();
+    session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+    session.setBackgroundPlaybackBlocked(false);
+    session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+    session.setBackgroundPlaybackBlocked(false);
+    await Future<void>.delayed(Duration.zero);
+    expect(session.player.plays, 0);
+    final settled = session.settleBackgroundPlayback();
+    pause.complete();
+    await settled;
+    expect(session.player.state.playing, isTrue);
+    expect(session.player.plays, 1);
+  });
+
+  test(
+    'returning to background while native resume waits reasserts pause',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      await session.open();
+      session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+      await Future<void>.delayed(Duration.zero);
+      final play = session.player.playGate = Completer<void>();
+      session.setBackgroundPlaybackBlocked(false);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.plays, 1);
+      session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+      play.complete();
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+      session.setBackgroundPlaybackBlocked(false);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isTrue);
+      expect(session.player.plays, 2);
+    },
+  );
+
+  test('manual pause cancels an in-flight foreground restore', () async {
+    final model = _Model();
+    final session = _Session(model);
+    _cleanup(model, session);
+    model.credentials.complete(null);
+    model.source.complete(_Source());
+    await session.open();
+    session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+    await Future<void>.delayed(Duration.zero);
+    final play = session.player.playGate = Completer<void>();
+    session.setBackgroundPlaybackBlocked(false);
+    await Future<void>.delayed(Duration.zero);
+    final pausing = session.togglePlayback();
+    play.complete();
+    await pausing;
+    expect(session.player.state.playing, isFalse);
+    session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+    session.setBackgroundPlaybackBlocked(false);
+    await Future<void>.delayed(Duration.zero);
+    expect(session.player.state.playing, isFalse);
+  });
+
+  test(
+    'explicit pause pending on native player survives background restore',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      await session.open();
+      final gate = session.player.pauseGate = Completer<void>();
+      final pausing = session.setPlaying(false);
+      session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+      gate.complete();
+      await pausing;
+      session.setBackgroundPlaybackBlocked(false);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+      expect(session.player.plays, 0);
+    },
+  );
+
+  for (final duringNativeOpen in [false, true]) {
+    test(
+      'explicit startup pause cancels autoplay and restore (native=$duringNativeOpen)',
+      () async {
+        final model = _Model();
+        final session = _Session(model);
+        _cleanup(model, session);
+        model.credentials.complete(null);
+        final gate = duringNativeOpen
+            ? session.player.openGate = Completer<void>()
+            : null;
+        if (duringNativeOpen) model.source.complete(_Source());
+        final opening = session.open(play: true);
+        if (duringNativeOpen) await session.player.openStarted.future;
+        await session.setPlaying(false);
+        session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+        session.setBackgroundPlaybackBlocked(false);
+        if (duringNativeOpen) {
+          gate!.complete();
+        } else {
+          model.source.complete(_Source());
+        }
+        await opening;
+        await Future<void>.delayed(Duration.zero);
+        expect(session.player.state.playing, isFalse);
+        expect(session.player.plays, 0);
+      },
+    );
+  }
+
+  for (final playing in [true, false]) {
+    test(
+      'PiP handback while hidden restores playing=$playing only in foreground',
+      () async {
+        final model = _Model();
+        final session = _Session(model);
+        _cleanup(model, session);
+        model.credentials.complete(null);
+        model.source.complete(_Source());
+        await session.open(play: false);
+        session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+        await session.restoreTransferredPlayback(playing);
+        expect(session.player.state.playing, isFalse);
+        expect(session.player.plays, 0);
+        session.setBackgroundPlaybackBlocked(false);
+        await session.settleBackgroundPlayback();
+        expect(session.player.state.playing, playing);
+        expect(session.player.plays, playing ? 1 : 0);
+      },
+    );
+  }
+
+  test(
+    'initially backgrounded startup has no playing state to restore',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+      await session.open(play: true);
+      session.setBackgroundPlaybackBlocked(false);
+      await Future<void>.delayed(Duration.zero);
+      expect(session.player.state.playing, isFalse);
+      expect(session.player.plays, 0);
+    },
+  );
+
+  test(
+    'closing before a slow background pause completes cancels restore',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      await session.open();
+      final pause = session.player.pauseGate = Completer<void>();
+      session.setBackgroundPlaybackBlocked(true, restoreOnForeground: true);
+      session.setBackgroundPlaybackBlocked(false);
+      final closing = session.close();
+      pause.complete();
+      await closing;
+      expect(session.player.plays, 0);
+      expect(session.player.disposed, isTrue);
+    },
+  );
+
   test('an allowed playback session retains requested autoplay', () async {
     final model = _Model();
     final session = _Session(model);
@@ -618,6 +847,8 @@ class _Player implements Player {
   );
   int opens = 0;
   int pauses = 0;
+  int plays = 0;
+  Completer<void>? pauseGate, playGate;
   final playRequests = <bool>[];
   final _playing = StreamController<bool>.broadcast();
   final openStarted = Completer<void>();
@@ -644,7 +875,15 @@ class _Player implements Player {
   @override
   Future<void> pause() async {
     pauses++;
+    await pauseGate?.future;
     emitPlaying(false);
+  }
+
+  @override
+  Future<void> play() async {
+    plays++;
+    await playGate?.future;
+    emitPlaying(true);
   }
 
   @override

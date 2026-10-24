@@ -1,5 +1,36 @@
 # 验证记录
 
+## 2026-10-24：0.5.17 版本升级
+
+- 源码版本升为 `0.5.17+23`，发布标签为 `v0.5.17`；同步启动日志、设置页、关于信息、请求 User-Agent 及 README 发布示例。包含本轮弹幕排道 / 展示时钟、加载圆环、拖动时间差、隐藏控件快捷键，以及此前完成的播放生命周期、小窗和桌面布局修改。
+- 版本与标签一致性检查通过，发布脚本 11 项回归通过。功能及性能验证沿用下列对应记录；标签推送后由既有 GitHub Actions 构建 Android 通用 / ARM64 APK 和 macOS universal 应用，并在全部打包成功后发布 Release。版本升级本身不代表安装包或四端实机验收已完成。
+
+## 2026-10-24：拖动时间差与隐藏控件快捷键
+
+- 保留左侧拖动提示的位置，将目标时间、`>>` / `<<` 和时间差在同一行垂直居中；差值固定以开始拖动时的播放位置为基准，按两端显示的整秒相减。例如 `1:30` 拖到 `2:00` 显示 `+0:30`，反向显示 `-0:30`。小数秒不产生少一秒或 `-0:00`，长时间与大字体在窄屏下等比缩小，符号均为 ASCII。
+- Space、K、J、音量、静音、字幕、弹幕、设置与全屏快捷键保留控件原来的显示状态；鼠标移动仍正常显示控件。默认自动隐藏改为 2 秒，保留用户已配置的时长；隐藏状态同时停用自动隐藏计时器，避免快捷键恢复播放后安排无意义的隐藏回调。
+- 原生回归[复现设置弹层关闭后控件意外显示](../artifacts/player-controls-20261024/native-panel-enter-before.log)：鼠标未移动，但移除弹层触发 `MouseRegion.onEnter`。取消通过进入事件显示控件，保留真实鼠标移动、悬停及点击的交互路径。
+- [34 项针对性回归](../artifacts/player-controls-20261024/regressions.log)和[全项目静态分析](../artifacts/player-controls-20261024/analyze.log)通过，覆盖快捷键映射、拖动 / 弹层计时、偏好默认值、时间线、ASCII 正负差值、小数秒、垂直对齐、窄屏大字体及拖动期间播放推进。
+- 修复后[真实 PlayerPage / libmpv 回归通过](../artifacts/player-controls-20261024/native.log)：20 个交互观测覆盖 Space / K 暂停和恢复、J / Shift+J、音量、静音、字幕、弹幕、设置、F / Escape 及鼠标显示；原生 `pause` / `time-pos` 验证操作确实生效，暂停位置停止增长。默认隐藏观测为 2081ms；两个方向拖动验证释放前不跳转、释放后提交预览位置，且文字中心对齐、浮层仍在左侧原位置。见[完整结果](../artifacts/player-controls-20261024/player-controls.json)、[向前拖动截图](../artifacts/player-controls-20261024/seek-forward.png)和[向后拖动截图](../artifacts/player-controls-20261024/seek-backward.png)。该验证使用 Linux / Xvfb、debug、本地 H264 和软件渲染，仅作为功能验证；未覆盖手机真机交互、帧率或功耗，未制作或发布安装包。
+
+## 2026-10-24：弹幕滚动与居中加载动画
+
+- 定位到弹幕刷新 / 设置变化时，绘制流程同步过滤并重新分配整批弹幕轨道；原生进度事件重置时间锚点也会使滚动文字小幅回跳。现由复用的后台 isolate 排道，最多一个在途任务和一个最新待处理任务；同一不可变快照只传一次，结果只返回位置索引。绘制读取准备好的数据，仅在到达 / 过期 / 修订变化时更新可见集合，复用字形布局。独立展示时钟平滑细小校正，跳转、倍速、缓冲与恢复分别对齐，不改变播放进度和原生播放器时钟。
+- `hidden/paused` 直接停止弹幕 ticker、到达计时器及 worker，无需下一帧；快速后台 / 前台切换也只允许一个正在启动的 isolate。中断刷新保留最小排道参数，同源恢复沿用原截止时间，避免漏掉后台期间到达但尚未过期的弹幕；来源、设置或时间线变化则丢弃旧参数。切集、关闭和迟到结果均受修订号校验。
+- 顶部加载进度条替换为播放按钮位置上的渐变细圆环和半透明深色圆底；加载期间隐藏播放 / 暂停图标，保留按钮点击功能。控件隐藏或锁定时仍可看到加载提示，后台立即停转，减少动画设置下显示静态圆环。见[圆环截图](../artifacts/danmaku-smoothness-20261024/player-loading-ring.png)及[真实播放器截图](../artifacts/danmaku-smoothness-20261024/player-loading.png)。
+- [124 项弹幕回归](../artifacts/danmaku-smoothness-20261024/danmaku-regressions.log)及 [38 项播放器 / 界面回归](../artifacts/danmaku-smoothness-20261024/player-regressions.log)全部通过：包括 12 万条后台排道、主事件循环响应、来源传输复用、队列上限、120 帧不重复排道或字形布局、时钟校正、刷新保持原文字、后台不 pump、初始后台、恢复与取消。全项目[静态分析](../artifacts/danmaku-smoothness-20261024/analyze.log)、最终弹幕[静态分析](../artifacts/danmaku-smoothness-20261024/danmaku-analyze.log)及 `git diff --check` 通过。
+- [真实 PlayerPage profile 用例](../client/integration_test/danmaku_player_performance_test.dart)使用 3 万条弹幕、本地 H264 影片及三轮重进播放器，每轮播放期间刷新三次。同步排道[预备对照](../artifacts/danmaku-smoothness-20261024/before/danmaku-player.json)的刷新帧 build 最大耗时为 133.56–139.06ms；[最终运行](../artifacts/danmaku-smoothness-20261024/danmaku-player.json)为 **1.47–2.38ms**，p95 为 **0.568–0.988ms**。主 isolate 心跳最大间隔为 42.05–44.00ms，仍受到宿主软件渲染影响。对照保留旧 overlay 与等价布局提取的源码及二进制指纹，其报告收尾失败，数据由原始日志恢复；不作为完整旧版本验收或加速百分比。最终运行 114 份应用源码及测试的构建前后指纹一致，见[运行日志](../artifacts/danmaku-smoothness-20261024/run.log)和[源码清单](../artifacts/danmaku-smoothness-20261024/source-after.sha256)。
+- 最终原生回归每轮均在刷新已排队时立即进入后台，不再 pump：后台 0 帧、0 次 worker 启动 / 源传输，恢复后中断刷新完成；手动暂停的 libmpv `pause=yes` 且位置变化为 0，回前台保持手动暂停。前台 profile 使用 `fullyLive`，该测试框架会主动请求帧，因此不将前台暂停阶段帧数解释为生产应用动画；后台改为 `onlyPumps` 并保持无 pump。测量环境为 Linux / Xvfb、软件视频解码与软件光栅化，刷新阶段 raster p95 仍约 50ms，不能宣称用户设备无掉帧。未覆盖真实网络弹幕服务、大媒体库同步并行、Android / Apple / Windows 硬件渲染、真机功耗与温升；未制作或发布安装包。
+
+## 2026-10-24：播放失焦、后台恢复与小窗
+
+- 桌面端隐藏、遮挡、切换窗口 / 全屏空间不再触发播放暂停；移动端仅在真正后台暂停，返回 `resumed` 时恢复此前播放意图，原本手动暂停继续暂停。按本次需求替代此前“回前台不自动恢复”的策略；显式允许后台播放和 PiP 继续豁免。恢复等待原生暂停完成，合并快速切换，并校验会话、后台修订和用户播放意图，覆盖来源准备、迟到开播、手动暂停和关闭。
+- 根级 `TickerMode` 区分失焦与不可见，桌面失焦及移动通知栏 `inactive` 不冻结弹幕；`hidden/paused` 仍通过生命周期直接停止不可见弹幕和轮询。维护、识别、图片工作继续按原有后台门控暂停，没有新增周期轮询。
+- Android PiP 增加随实际播放事件更新的播放 / 暂停按钮，拒绝旧会话动作；每次进入最多保留两个 PendingIntent，退出释放 receiver 和 PendingIntent。进入前先绘制无控件的视频帧，传递实际视频区域 `sourceRectHint`，原生窗口在转换时使用黑底，减少浅色启动背景露出。iOS 保留 AVKit 原生控制，补齐前台恢复与 PiP 转移 / 退出的竞态保护。macOS 现有置顶浮窗增加跨 Space / 全屏辅助窗口标志，退出恢复原属性；Windows / Linux 保留现有置顶小窗，没有引入另一播放器或系统 PiP 桥接。播放列表行高由 56 改为 48，保留惰性构建。
+- [121 项定向回归通过](../artifacts/playback-lifecycle-tests-20261024.log)，包括后台后不 pump 的弹幕停止、原暂停保持、慢原生暂停 / 开播、快速后台恢复、关闭、Android 小窗动作与去重、iOS 转移及列表缓存。[全项目静态分析](../artifacts/playback-lifecycle-analyze-20261024.log)与差异检查通过。Android `MainActivity` 使用缓存 SDK 的 Kotlin 编译检查通过；不是 APK 构建或安装验收。
+- [慢来源与自动续集原生回归](../artifacts/playback-background-native-20261024.log)通过：HTTP HEAD 未返回时切后台、快速恢复、原暂停保持、显式后台播放，以及排队自动续集因后台修订失效。使用真实 PlayerPage 的完整移动生命周期策略和原生 `time-pos`，普通后台 1200ms 位移为 0，返回后继续播放；后台 / 前台循环没有打开排队的下一集。早期测试仅在 Linux session 手动设置阻止标志，会被桌面页面的模型通知重新应用桌面策略覆盖；最终改用页面级移动策略注入，保留原停止阈值，旧失败日志已单独留档。
+- 新增 [Linux 原生播放器回归](../client/integration_test/playback_lifecycle_test.dart) **2 项测试 / 13 个观测通过**，使用实际 `PlayerPage` / libmpv；所有后台观测不 pump，检查原生 `pause` 和 `time-pos`。桌面隐藏期间原生保持播放；显式模拟移动策略后台位置变化为 0，恢复后继续增长；手动暂停及快速切换保持正确。见[原生结果](../artifacts/playback-lifecycle.json)。这是 Linux / Xvfb 功能验证，未测 Android / iOS 真机生命周期投递、PiP 转场画面、macOS 跨全屏 Space 实际显示或 Windows 原生行为；新增 AppKit XCTest 未运行。未测真机 profile/release 帧耗时、后台功耗、CPU 唤醒或温升，不宣称白屏已在所有手机消除或续航提升。本轮未制作或发布安装包。
+
 ## 2026-10-24：安卓观看历史侧滑返回白屏
 
 - 使用真实 `flutter/backgesture` 入站消息复现：进入“观看历史”，取消一次系统侧滑，再侧滑完成返回；旧版在 `ContinueWatchingContent._inViewport` 中对尚未布局的 `RenderFractionalTranslation` 调用坐标转换，随后触发 sliver 子节点顺序异常。[组件失败日志](../artifacts/history-return-20261024/predictive-back-baseline.log)与 [Linux 原生 profile 失败日志](../artifacts/history-return-20261024/predictive-native-before.log)保留；普通页面返回按钮没有触发此路径。

@@ -120,7 +120,7 @@ double? videoAspectRatio({int? width, int? height, int rotation = 0}) {
 class PlaybackControlsTimer {
   final void Function() onHide;
   Timer? _timer;
-  int _holds = 0, _seconds = 3;
+  int _holds = 0, _seconds = 2;
   bool _playing = false, _disposed = false;
   int _generation = 0;
   PlaybackControlsTimer(this.onHide);

@@ -2,26 +2,39 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart' show WidgetsBinding;
 import '../core/network.dart';
 import '../core/logger.dart';
 import '../cast/position.dart';
 import 'session.dart';
 import 'remote_progress.dart';
+import 'fullscreen_transition.dart';
 
 /// System picture-in-picture on mobile; a reversible floating window on desktop.
 class PlayerWindowMode extends ChangeNotifier {
   static const _channel = MethodChannel('app.aiplayer/window_mode');
   final bool _isIOS;
+  final bool _isAndroid;
   bool _active = false, _supported = false, _closed = false;
   PlaybackSession? _session;
+  int _sessionRevision = 0;
   _IosPlaybackTransfer? _iosTransfer;
   static int _iosRequest = 0;
+  static int _androidRequest = 0;
+  int _androidRequestId = 0;
+  bool? _androidPlaying;
   void bindSession(PlaybackSession session) {
     if (_closed || identical(_session, session)) return;
     final previous = _session;
     if (previous != null) unbindSession(previous);
     _session = session;
+    _sessionRevision++;
     if (_isIOS) session.addCloseHook(close);
+    if (_isAndroid) {
+      _androidRequestId = ++_androidRequest;
+      _androidPlaying = null;
+      session.addListener(_syncAndroidPlaybackState);
+    }
   }
 
   /// A player page retains its native window while switching episodes. Detach
@@ -30,15 +43,20 @@ class PlayerWindowMode extends ChangeNotifier {
   void unbindSession(PlaybackSession session) {
     if (!identical(_session, session)) return;
     if (_isIOS) session.removeCloseHook(close);
+    if (_isAndroid) session.removeListener(_syncAndroidPlaybackState);
     _session = null;
+    _sessionRevision++;
   }
 
   bool get active => _active;
   bool get supported => _supported;
-  bool get systemPip => Platform.isAndroid || _isIOS;
+  bool get systemPip => _isAndroid || _isIOS;
   late final Future<void> _ready = _initialize();
-  PlayerWindowMode({@visibleForTesting bool? isIOS})
-    : _isIOS = isIOS ?? Platform.isIOS {
+  PlayerWindowMode({
+    @visibleForTesting bool? isIOS,
+    @visibleForTesting bool? isAndroid,
+  }) : _isIOS = isIOS ?? Platform.isIOS,
+       _isAndroid = isAndroid ?? Platform.isAndroid {
     unawaited(_ready);
   }
   Future<void> _initialize() async {
@@ -64,8 +82,25 @@ class PlayerWindowMode extends ChangeNotifier {
         return;
       }
       if (_closed) return;
+      if (_isAndroid && call.method == 'playback') {
+        final session = _session;
+        final values = call.arguments;
+        if (!_active ||
+            session == null ||
+            session.closed ||
+            !session.ready ||
+            session.remotePlayback ||
+            values is! Map ||
+            values['requestId'] != _androidRequestId ||
+            values['playing'] is! bool) {
+          return;
+        }
+        await session.setPlaying(values['playing'] as bool);
+        return;
+      }
       if (call.method == 'changed') {
         _active = call.arguments == true;
+        if (!_active) _androidPlaying = null;
         notifyListeners();
       }
     });
@@ -79,12 +114,16 @@ class PlayerWindowMode extends ChangeNotifier {
     if (!_closed) notifyListeners();
   }
 
-  Future<void> enter({required double aspectRatio}) async {
+  Future<void> enter({
+    required double aspectRatio,
+    Rect? sourceRect,
+    double pixelRatio = 1,
+  }) async {
     await _ready;
-    if (_closed) return;
+    if (_closed || _active) return;
     if (!_supported) {
       throw AppFailure(
-        Platform.isAndroid
+        _isAndroid
             ? '系统画中画需要 Android 8.0 或更新版本，并允许此应用使用画中画。'
             : '当前系统或播放器内核尚不支持系统小窗。',
       );
@@ -92,6 +131,10 @@ class PlayerWindowMode extends ChangeNotifier {
     if (_isIOS) {
       await _enterIOS(aspectRatio);
       return;
+    }
+    if (_isAndroid) {
+      _androidRequestId = ++_androidRequest;
+      _androidPlaying = null;
     }
     // Android sends inactive before the PiP state callback. Mark the pending
     // transition now so the lifecycle observer does not pause the video.
@@ -102,12 +145,59 @@ class PlayerWindowMode extends ChangeNotifier {
         'aspectRatio': aspectRatio.isFinite
             ? aspectRatio.clamp(.42, 2.39)
             : 16 / 9,
+        if (_isAndroid) ...{
+          'requestId': _androidRequestId,
+          'playing': _session?.player.state.playing ?? false,
+          if (sourceRect != null &&
+              sourceRect.isFinite &&
+              !sourceRect.isEmpty &&
+              pixelRatio.isFinite &&
+              pixelRatio > 0)
+            'sourceRect': {
+              'left': sourceRect.left * pixelRatio,
+              'top': sourceRect.top * pixelRatio,
+              'right': sourceRect.right * pixelRatio,
+              'bottom': sourceRect.bottom * pixelRatio,
+            },
+        },
       });
       if (entered != true) throw const AppFailure('系统未允许进入小窗，请检查画中画权限。');
+      _androidPlaying = null;
+      _syncAndroidPlaybackState();
     } catch (_) {
       _active = false;
       if (!_closed) notifyListeners();
       rethrow;
+    }
+  }
+
+  // Session notifications already follow native playing events. Only send a
+  // changed state while PiP is active; no polling or background frame is needed.
+  void _syncAndroidPlaybackState() {
+    final session = _session;
+    if (!_isAndroid ||
+        _closed ||
+        !_active ||
+        session == null ||
+        session.closed) {
+      return;
+    }
+    final playing = session.player.state.playing;
+    if (_androidPlaying == playing) return;
+    _androidPlaying = playing;
+    unawaited(_sendAndroidPlaybackState(_androidRequestId, playing));
+  }
+
+  Future<void> _sendAndroidPlaybackState(int requestId, bool playing) async {
+    try {
+      await _channel.invokeMethod<void>('setPlayback', {
+        'requestId': requestId,
+        'playing': playing,
+      });
+    } on MissingPluginException {
+      // The engine can detach before a final native playback event arrives.
+    } on PlatformException {
+      // A dismissed PiP window no longer needs to update its controls.
     }
   }
 
@@ -169,6 +259,18 @@ class PlayerWindowMode extends ChangeNotifier {
       throw const AppFailure('请等待视频加载完成后再开启小窗。');
     }
     if (session.remotePlayback) throw const AppFailure('请先结束当前投屏，再开启系统小窗。');
+    final revision = _sessionRevision;
+    final pauseRevision = session.backgroundPauseRevision;
+    await session.settleBackgroundPlayback();
+    if (_closed ||
+        session.closed ||
+        revision != _sessionRevision ||
+        pauseRevision != session.backgroundPauseRevision ||
+        session.backgroundPlaybackBlocked ||
+        playbackIsBackgrounded(WidgetsBinding.instance.lifecycleState)) {
+      throw const Cancelled();
+    }
+    if (_iosTransfer != null) return;
     final transfer = _IosPlaybackTransfer(++_iosRequest, session);
     _iosTransfer = transfer;
     _active = true;
@@ -176,7 +278,13 @@ class PlayerWindowMode extends ChangeNotifier {
     notifyListeners();
     try {
       await session.player.pause();
-      if (_closed || session.closed) throw const Cancelled();
+      if (_closed ||
+          session.closed ||
+          revision != _sessionRevision ||
+          pauseRevision != session.backgroundPauseRevision ||
+          playbackIsBackgrounded(WidgetsBinding.instance.lifecycleState)) {
+        throw const Cancelled();
+      }
       final entered = await _channel
           .invokeMethod<bool>('enter', {
             'requestId': transfer.requestId,
@@ -237,11 +345,15 @@ class PlayerWindowMode extends ChangeNotifier {
           }
           await session.player.setRate(transfer.rate);
           session.remotePlayback = false;
-          if (!_closed && transfer.playing) {
-            await session.player.play();
-          } else {
-            await session.player.pause();
+          if (identical(_iosTransfer, transfer) && _active) {
+            // Reapply the page's background policy before returning ownership
+            // to the inline player. PiP can close while the app stays hidden.
+            _active = false;
+            if (!_closed) notifyListeners();
           }
+          await session.restoreTransferredPlayback(
+            !_closed && transfer.playing,
+          );
         }
       }
     } catch (_) {
@@ -253,8 +365,9 @@ class PlayerWindowMode extends ChangeNotifier {
       await transfer.persist();
       if (identical(_iosTransfer, transfer)) {
         _iosTransfer = null;
+        final changed = _active;
         _active = false;
-        if (!_closed) notifyListeners();
+        if (!_closed && changed) notifyListeners();
       }
     }
   }();

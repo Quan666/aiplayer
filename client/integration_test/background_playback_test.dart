@@ -15,13 +15,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:media_kit/media_kit.dart';
 
-// Native decoder regression, runnable under Linux/Xvfb. Lifecycle events are
-// injected: this verifies real libmpv pause state, not Android battery usage.
+// Native decoder regression, runnable under Linux/Xvfb. Linux selects the mobile
+// PlayerPage policy, including model-change callbacks; Android/iOS use the native
+// platform default. This verifies libmpv state, not lifecycle delivery or power.
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized()
     ..framePolicy = LiveTestWidgetsFlutterBindingFramePolicy.fullyLive;
 
-  testWidgets('backgrounding during native open cannot restart playback', (
+  testWidgets('mobile background policy preserves playback across native open', (
     tester,
   ) async {
     MediaKit.ensureInitialized();
@@ -61,10 +62,18 @@ void main() {
         );
         await tester.pumpWidget(
           MaterialApp(
-            home: PlayerPage(model: model, media: store.get('media', id)!),
+            home: PlayerPage(
+              model: model,
+              media: store.get('media', id)!,
+              mobilePlaybackLifecycle: Platform.isLinux ? true : null,
+            ),
           ),
         );
         final state = tester.state(find.byType(PlayerPage)) as dynamic;
+        void changeLifecycle(AppLifecycleState lifecycle) {
+          binding.handleAppLifecycleStateChanged(lifecycle);
+        }
+
         final session = state.session as PlaybackSession;
         final native = session.player.platform as NativePlayer;
         await native.setProperty('ao', 'null');
@@ -72,58 +81,79 @@ void main() {
           () async => (await server.command('status'))['heads'] != 0,
         );
         expect(session.ready, isFalse, reason: 'HEAD response is still held');
-        binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+        changeLifecycle(AppLifecycleState.paused);
         if (rapidResume) {
-          binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+          changeLifecycle(AppLifecycleState.resumed);
         }
         await server.command('release');
         // Deliberately no tester.pump: an Android paused app has no new frames.
         await _until(() async => session.ready || session.error.isNotEmpty);
         expect(session.error, isEmpty);
-        if (pause) {
+        final remainsPaused = pause && !rapidResume;
+        if (remainsPaused) {
           await _until(() async => await native.getProperty('pause') == 'yes');
         } else {
-          await _until(
-            () async => session.player.state.position.inMilliseconds >= 500,
-          );
+          await _until(() async => await _nativePositionMs(native) >= 500);
         }
-        final before = session.player.state.position.inMilliseconds;
+        final before = await _nativePositionMs(native);
         await Future<void>.delayed(const Duration(milliseconds: 1200));
-        final after = session.player.state.position.inMilliseconds;
+        final after = await _nativePositionMs(native);
         final nativePause = await native.getProperty('pause');
-        expect(nativePause, pause ? 'yes' : 'no');
-        if (pause) {
+        expect(nativePause, remainsPaused ? 'yes' : 'no');
+        if (remainsPaused) {
           expect(after - before, lessThanOrEqualTo(100));
         } else {
           expect(after - before, greaterThan(500));
         }
-        binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-        await Future<void>.delayed(const Duration(milliseconds: 250));
-        expect(await native.getProperty('pause'), pause ? 'yes' : 'no');
+        changeLifecycle(AppLifecycleState.resumed);
+        await _until(
+          () async =>
+              await native.getProperty('pause') == 'no' &&
+              await _nativePositionMs(native) > after + 300,
+        );
         results.add({
           'case': name,
           'nativePause': nativePause,
           'positionDeltaMs': after - before,
           'observationMs': 1200,
+          'foregroundNativePause': await native.getProperty('pause'),
+          'foregroundPositionAdvanced': true,
         });
 
         if (pause) {
-          // A deliberate foreground play still works; backgrounding an already
-          // playing session must stop the actual decoder as well.
-          await session.player.play();
-          await _until(
-            () async =>
-                session.player.state.position.inMilliseconds > after + 300,
-          );
-          binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+          // A session already playing must stop the actual decoder immediately
+          // in the background, then resume the same episode on foreground.
+          changeLifecycle(AppLifecycleState.paused);
           await _until(() async => await native.getProperty('pause') == 'yes');
-          final stopped = session.player.state.position.inMilliseconds;
+          final stopped = await _nativePositionMs(native);
           await Future<void>.delayed(const Duration(milliseconds: 600));
           expect(
-            session.player.state.position.inMilliseconds - stopped,
+            await _nativePositionMs(native) - stopped,
             lessThanOrEqualTo(150),
           );
-          binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+          changeLifecycle(AppLifecycleState.resumed);
+          await _until(
+            () async =>
+                await native.getProperty('pause') == 'no' &&
+                await _nativePositionMs(native) > stopped + 300,
+          );
+
+          // Explicit user pause takes precedence over lifecycle restoration.
+          await session.setPlaying(false);
+          await _until(() async => await native.getProperty('pause') == 'yes');
+          changeLifecycle(AppLifecycleState.paused);
+          changeLifecycle(AppLifecycleState.resumed);
+          final userPaused = await _nativePositionMs(native);
+          await Future<void>.delayed(const Duration(milliseconds: 600));
+          expect(await native.getProperty('pause'), 'yes');
+          final userPausedAfter = await _nativePositionMs(native);
+          expect(userPausedAfter - userPaused, lessThanOrEqualTo(150));
+          results.add({
+            'case': '$name-user-paused-before-background',
+            'nativePause': await native.getProperty('pause'),
+            'positionDeltaMs': userPausedAfter - userPaused,
+            'observationMs': 600,
+          });
         }
         if (name == 'background-before-open') {
           final nextId = model.addMedia(
@@ -148,29 +178,36 @@ void main() {
           await _until(
             () async => (await server.command('status'))['heads'] != 0,
           );
+          final pending = state.session as PlaybackSession;
+          final pauseRevision = pending.backgroundPauseRevision;
           final queued =
               state.selectMedia(
                     store.get('media', automaticId)!,
                     autoAdvance: true,
                   )
                   as Future<void>;
-          binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
-          binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+          changeLifecycle(AppLifecycleState.paused);
+          changeLifecycle(AppLifecycleState.resumed);
+          expect(pending.backgroundPauseRevision, greaterThan(pauseRevision));
+          expect(pending.backgroundPlaybackBlocked, isFalse);
           await server.command('release');
           await switching;
           await queued;
           final retained = state.session as PlaybackSession;
           expect(retained.media.id, nextId);
           expect((await server.command('status'))['heads'], 1);
-          expect(
-            await (retained.player.platform as NativePlayer).getProperty(
-              'pause',
-            ),
-            'yes',
+          final retainedNative = retained.player.platform as NativePlayer;
+          await _until(
+            () async =>
+                await retainedNative.getProperty('pause') == 'no' &&
+                await _nativePositionMs(retainedNative) >= 500,
           );
           results.add({
             'case': 'queued-auto-next-invalidated-by-background-and-resume',
-            'nativePause': 'yes',
+            'nativePause': await retainedNative.getProperty('pause'),
+            'retainedEpisodePositionMs': await _nativePositionMs(
+              retainedNative,
+            ),
             'openedQueuedEpisode': false,
           });
         }
@@ -179,9 +216,13 @@ void main() {
       }
       final report = {
         'platform': Platform.operatingSystem,
+        'positionSource': 'libmpv time-pos',
         'scope':
-            'Real PlayerPage and libmpv; held HTTP HEAD; injected lifecycle',
-        'limitation': 'No Android hardware or battery measurement',
+            'Real PlayerPage and libmpv; held HTTP HEAD; injected lifecycle; '
+            '${Platform.isLinux ? 'simulated mobile pause/restore policy on Linux' : 'platform PlayerPage playback policy'}',
+        'limitation':
+            'Injected lifecycle does not verify Android lifecycle delivery; '
+            'no Android battery measurement',
         'results': results,
       };
       binding.reportData = report;
@@ -204,6 +245,24 @@ void main() {
       await root.delete(recursive: true);
     }
   });
+}
+
+// Native pause acknowledgement can arrive before the last Dart position event.
+// Read the decoder clock directly for both stopped and advancing observations.
+Future<double> _nativePositionMs(NativePlayer native) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 20));
+  while (true) {
+    // A paused open can acknowledge readiness before mpv has a clock value.
+    // Wait for that value instead of treating an unavailable position as zero.
+    final seconds = double.tryParse(await native.getProperty('time-pos'));
+    if (seconds != null && seconds.isFinite) {
+      return seconds * Duration.millisecondsPerSecond;
+    }
+    if (DateTime.now().isAfter(deadline)) {
+      fail('Native playback position did not become available');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
 }
 
 Future<void> _until(Future<bool> Function() condition) async {

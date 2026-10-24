@@ -88,6 +88,76 @@ void main() {
     expect(next.closeHooks, hasLength(1));
   });
 
+  test('iOS handoff waits for an outstanding foreground restore', () async {
+    session.player.state = session.player.state.copyWith(playing: false);
+    final settled = Completer<void>();
+    session.lifecycleSettled = settled.future;
+    final entering = mode.enter(aspectRatio: 16 / 9);
+    await Future<void>.delayed(Duration.zero);
+    expect(request, isNull);
+    expect(mode.active, false);
+    session.player.state = session.player.state.copyWith(playing: true);
+    settled.complete();
+    await entering;
+    expect(request?['playing'], true);
+  });
+
+  test(
+    'backgrounding during foreground restore cancels native handoff',
+    () async {
+      final settled = Completer<void>();
+      session.lifecycleSettled = settled.future;
+      final entering = mode.enter(aspectRatio: 16 / 9);
+      final result = expectLater(entering, throwsA(isA<Cancelled>()));
+      await Future<void>.delayed(Duration.zero);
+      session.backgroundPauseRevision++;
+      session.backgroundPlaybackBlocked = true;
+      settled.complete();
+      await result;
+      expect(request, isNull);
+      expect(mode.active, false);
+      expect(session.remotePlayback, false);
+    },
+  );
+
+  test(
+    'rebinding during foreground restore cancels the old native handoff',
+    () async {
+      final settled = Completer<void>();
+      session.lifecycleSettled = settled.future;
+      final entering = mode.enter(aspectRatio: 16 / 9);
+      final result = expectLater(entering, throwsA(isA<Cancelled>()));
+      await Future<void>.delayed(Duration.zero);
+      mode.bindSession(_Session(model, store.get('media', 'video')!));
+      settled.complete();
+      await result;
+      expect(request, isNull);
+      expect(mode.active, false);
+      expect(session.remotePlayback, false);
+    },
+  );
+
+  test(
+    'hidden iOS restore applies background policy before inline play',
+    () async {
+      await mode.enter(aspectRatio: 16 / 9);
+      mode.addListener(() {
+        if (!mode.active) session.backgroundPlaybackBlocked = true;
+      });
+      await native('restored', {
+        'requestId': request!['requestId'],
+        'position': 49.0,
+        'duration': 120.0,
+        'playing': true,
+      });
+      expect(mode.active, false);
+      expect(session.remotePlayback, false);
+      expect(session.player.state.playing, false);
+      expect(session.player.calls, isNot(contains('play')));
+      expect(session.transferredPlaying, [true]);
+    },
+  );
+
   test(
     'iOS handoff pauses mpv, records native progress, ignores stale callbacks and restores pause state',
     () async {
@@ -248,6 +318,12 @@ class _Session implements PlaybackSession {
   @override
   bool ready = true, closed = false, remotePlayback = false;
   @override
+  bool backgroundPlaybackBlocked = false;
+  @override
+  int backgroundPauseRevision = 0;
+  Future<void>? lifecycleSettled;
+  final transferredPlaying = <bool>[];
+  @override
   String notice = '';
   @override
   String? playbackUri = 'file:///private/test/video.mp4';
@@ -259,6 +335,18 @@ class _Session implements PlaybackSession {
   void addCloseHook(Future<void> Function() hook) => closeHooks.add(hook);
   @override
   void removeCloseHook(Future<void> Function() hook) => closeHooks.remove(hook);
+  @override
+  Future<void> settleBackgroundPlayback() async => await lifecycleSettled;
+  @override
+  Future<void> restoreTransferredPlayback(bool playing) async {
+    transferredPlaying.add(playing);
+    if (playing && !backgroundPlaybackBlocked) {
+      await player.play();
+    } else {
+      await player.pause();
+    }
+  }
+
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
