@@ -83,6 +83,80 @@ void main() {
     );
   }
 
+  for (final idle in [300, 5000]) {
+    test('resume between frames excludes a $idle ms idle gap', () {
+      final clock = DanmakuPresentationClock();
+      double sample(
+        int milliseconds,
+        double position,
+        bool playing, {
+        bool isFrame = true,
+      }) => clock.sample(
+        position: position,
+        elapsed: Duration(milliseconds: milliseconds),
+        playing: playing,
+        rate: 2,
+        contextKey: 0,
+        isFrame: isFrame,
+      );
+      sample(0, 30, true);
+      final frozen = sample(100, 30.2, false);
+      // The resume notification sees the last painted timestamp. Repeated
+      // layout/position notifications must not consume the pending resume.
+      expect(sample(100, 30.1, true, isFrame: false), frozen);
+      expect(sample(100, 30.1, true, isFrame: false), frozen);
+      expect(sample(100 + idle, 30.1, true), frozen);
+      expect(sample(110 + idle, 30.12, true), closeTo(frozen + .018, 1e-9));
+      // Ordinary notifications while running must keep interpolation active.
+      sample(110 + idle, 30.12, true, isFrame: false);
+      expect(sample(120 + idle, 30.14, true), closeTo(frozen + .036, 1e-9));
+    });
+  }
+
+  test('pause and resume between paints still exclude the idle interval', () {
+    final clock = DanmakuPresentationClock();
+    double sample(int milliseconds, bool playing, {bool isFrame = true}) =>
+        clock.sample(
+          position: 30,
+          elapsed: Duration(milliseconds: milliseconds),
+          playing: playing,
+          rate: 1,
+          contextKey: 0,
+          isFrame: isFrame,
+        );
+    sample(0, true);
+    for (var i = 0; i < 3; i++) {
+      sample(0, false, isFrame: false);
+      sample(0, true, isFrame: false);
+    }
+    expect(sample(500, true), 30);
+    expect(sample(510, true), closeTo(30.009, 1e-9));
+  });
+
+  test('resume between frames still accepts an explicit seek', () {
+    final clock = DanmakuPresentationClock();
+    double sample(
+      int milliseconds,
+      double position,
+      bool playing,
+      int revision, {
+      bool isFrame = true,
+    }) => clock.sample(
+      position: position,
+      elapsed: Duration(milliseconds: milliseconds),
+      playing: playing,
+      rate: 1,
+      contextKey: revision,
+      timelineRevision: revision,
+      nativePosition: Duration(milliseconds: (position * 1000).round()),
+      isFrame: isFrame,
+    );
+    sample(0, 30, false, 0);
+    expect(sample(0, 30, true, 0, isFrame: false), 30);
+    expect(sample(0, 10, true, 1, isFrame: false), 10);
+    expect(sample(300, 10, true, 1), 10);
+  });
+
   test('rate changes preserve position and use the new playback rate', () {
     final clock = DanmakuPresentationClock();
     double sample(int milliseconds, double position, double rate) =>

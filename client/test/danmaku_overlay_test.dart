@@ -316,6 +316,87 @@ void main() {
     await _settleLayout(tester);
   });
 
+  for (final buffering in [false, true]) {
+    for (final idle in [
+      const Duration(milliseconds: 300),
+      const Duration(seconds: 5),
+    ]) {
+      final reason = buffering ? 'buffering' : 'pause';
+      testWidgets('$reason resumes continuously after a $idle frame gap', (
+        tester,
+      ) async {
+        final session = _Session(const [_current]);
+        addTearDown(session.dispose);
+        final boundary = GlobalKey();
+        await tester.pumpWidget(_overlay(session, boundary));
+        await _settleLayout(tester);
+        session.seconds = 30.1;
+        await tester.pump(const Duration(milliseconds: 100));
+
+        session.player.state = PlayerState(
+          playing: buffering,
+          buffering: buffering,
+        );
+        // Native playback can still report the preceding position at pause.
+        session.seconds = 30;
+        session.refresh(session.danmaku.comments);
+        await tester.pump();
+        final paused = await _pixels(tester, boundary);
+        expect(_hasPaint(paused), isTrue);
+        expect(tester.binding.transientCallbackCount, 0);
+        expect(tester.binding.hasScheduledFrame, isFalse);
+
+        final pausedFrame = tester.binding.currentSystemFrameTimeStamp;
+        await tester.pump(idle);
+        expect(tester.binding.currentSystemFrameTimeStamp, pausedFrame);
+        expect(tester.binding.transientCallbackCount, 0);
+
+        session.player.state = const PlayerState(playing: true);
+        session.refresh(session.danmaku.comments);
+        await tester.pump();
+        final resumed = await _pixels(tester, boundary);
+        expect(
+          listEquals(resumed, paused),
+          isTrue,
+          reason: 'The first resumed frame must not advance through idle time.',
+        );
+        expect(tester.binding.transientCallbackCount, greaterThan(0));
+
+        session.seconds += .016;
+        await tester.pump(const Duration(milliseconds: 16));
+        expect(listEquals(await _pixels(tester, boundary), resumed), isFalse);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await _settleLayout(tester);
+      });
+    }
+  }
+
+  testWidgets(
+    'rapid pause and resume before a frame preserves comment position',
+    (tester) async {
+      final session = _Session(const [_current]);
+      addTearDown(session.dispose);
+      final boundary = GlobalKey();
+      await tester.pumpWidget(_overlay(session, boundary));
+      await _settleLayout(tester);
+      final before = await _pixels(tester, boundary);
+
+      session.player.state = const PlayerState(playing: false);
+      session.refresh(session.danmaku.comments);
+      expect(tester.binding.transientCallbackCount, 0);
+      // Advance fake time without allowing the requested pause repaint to run.
+      await tester.binding.delayed(const Duration(milliseconds: 300));
+      session.player.state = const PlayerState(playing: true);
+      session.refresh(session.danmaku.comments);
+      session.refresh(session.danmaku.comments);
+      await tester.pump();
+      expect(listEquals(await _pixels(tester, boundary), before), isTrue);
+      expect(tester.binding.transientCallbackCount, greaterThan(0));
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _settleLayout(tester);
+    },
+  );
+
   testWidgets('fully filtered comments never start a frame ticker', (
     tester,
   ) async {

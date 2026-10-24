@@ -14,6 +14,7 @@ class DanmakuPresentationClock {
   double _position = 0;
   double _rate = 1;
   bool _playing = false;
+  bool _resumePending = false;
   int? _timelineRevision;
   Duration? _nativePosition;
   Duration? _seekSettlesUntil;
@@ -25,6 +26,8 @@ class DanmakuPresentationClock {
     _timelineRevision = null;
     _nativePosition = null;
     _seekSettlesUntil = null;
+    _playing = false;
+    _resumePending = false;
   }
 
   /// [elapsed] is a monotonic time shared by successive paints, including
@@ -32,6 +35,9 @@ class DanmakuPresentationClock {
   /// or a timing configuration change so those changes take effect immediately.
   /// A changed [timelineRevision] briefly accepts [nativePosition] updates
   /// directly: native seek reports can arrive after the command notification.
+  /// Notifications between frames pass [isFrame] as false: their [elapsed]
+  /// still belongs to the last frame, so resuming must await a fresh frame
+  /// timestamp before starting another interval of motion.
   double sample({
     required double position,
     required Duration elapsed,
@@ -40,11 +46,17 @@ class DanmakuPresentationClock {
     required Object contextKey,
     int timelineRevision = 0,
     Duration? nativePosition,
+    bool isFrame = true,
   }) {
     if (!position.isFinite) return _position;
     final previousElapsed = _elapsed;
     final nextRate = rate.isFinite && rate > 0 ? rate : 0.0;
     final running = playing && nextRate > 0;
+    if (!running) {
+      _resumePending = false;
+    } else if (!_playing && !isFrame) {
+      _resumePending = true;
+    }
     final seeking =
         _timelineRevision != null && timelineRevision != _timelineRevision;
     if (seeking) {
@@ -63,9 +75,10 @@ class DanmakuPresentationClock {
         settling) {
       _position = position;
     } else {
-      final delta =
-          (elapsed - previousElapsed).inMicroseconds /
-          Duration.microsecondsPerSecond;
+      final delta = _resumePending
+          ? 0.0
+          : (elapsed - previousElapsed).inMicroseconds /
+                Duration.microsecondsPerSecond;
       // Finish the preceding interval at its preceding rate. Pausing freezes
       // the displayed position; a stale native anchor cannot pull it backwards.
       final predicted = _position + (_playing ? delta * _rate : 0);
@@ -89,6 +102,7 @@ class DanmakuPresentationClock {
     _playing = running;
     _timelineRevision = timelineRevision;
     _nativePosition = nativePosition;
+    if (isFrame) _resumePending = false;
     return _position;
   }
 }

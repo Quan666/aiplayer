@@ -176,11 +176,13 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
 
   double _presentationTime() {
     final s = widget.session, state = s.danmaku;
+    final scheduler = SchedulerBinding.instance;
     return _clock.sample(
       position: s.seconds - (state?.shift ?? 0) - (state?.offset ?? 0),
       // Vsync timestamps avoid work-time jitter and cover single arrival/
       // expiry frames after idle gaps without an extra wall-clock timer.
-      elapsed: SchedulerBinding.instance.currentSystemFrameTimeStamp,
+      elapsed: scheduler.currentSystemFrameTimeStamp,
+      isFrame: scheduler.schedulerPhase != SchedulerPhase.idle,
       playing: _playing,
       rate: s.player.state.rate,
       contextKey: _timelineContext,
