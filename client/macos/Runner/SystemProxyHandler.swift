@@ -256,9 +256,8 @@ final class AppleSystemProxyLookup {
     var context = CFStreamClientContext(version: 0,
       info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
     let callback: CFProxyAutoConfigurationResultCallback = { info, proxies, error in
-      guard let info = info else { return }
       let lookup = Unmanaged<AppleSystemProxyLookup>.fromOpaque(info).takeUnretainedValue()
-      if error == nil, let proxies = proxies, let entries = proxies as? [[String: Any]] {
+      if error == nil, let entries = proxies as? [[String: Any]] {
         lookup.pacResult = .success(entries)
       } else { lookup.pacResult = .failure(.invalid) }
       CFRunLoopStop(CFRunLoopGetCurrent())
