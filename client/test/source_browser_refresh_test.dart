@@ -125,6 +125,15 @@ Future<void> _settle(WidgetTester tester, bool Function() complete) async {
   fail('Source listing and its background metadata did not settle.');
 }
 
+Future<void> _refresh(WidgetTester tester) async {
+  final work = tester
+      .widget<RefreshIndicator>(find.byType(RefreshIndicator))
+      .onRefresh();
+  await tester.pumpAndSettle();
+  await work;
+  await tester.pumpAndSettle();
+}
+
 List<SourceEntry> _videos(int count) => [
   for (var episode = 1; episode <= count; episode++)
     SourceEntry(
@@ -304,6 +313,142 @@ class _AutomaticModel extends _ControlledModel {
 }
 
 void main() {
+  testWidgets('source home and local videos refresh from short lists', (
+    tester,
+  ) async {
+    final root = Directory.systemTemp.createTempSync('source-root-pull-');
+    final store = AppStore(':memory:')
+      ..setLocal('settings', {'metadataStrategy': 'off'});
+    final model = _ControlledModel(store, root);
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SourcesPage(
+              model: model,
+              onImport: () async {},
+              onPlay: (_) async {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final before = model.snapshotReads;
+      await tester.drag(find.byType(CustomScrollView), const Offset(0, 400));
+      await tester.pumpAndSettle();
+      expect(model.snapshotReads, before + 1);
+      expect(model.requests, 0);
+      await tester.tap(find.text('本地视频'));
+      await tester.pumpAndSettle();
+      expect(find.text('还没有本地视频'), findsOneWidget);
+      final beforeLocal = model.snapshotReads;
+      await tester.drag(find.byType(ListView), const Offset(0, 400));
+      await tester.pumpAndSettle();
+      expect(model.snapshotReads, beforeLocal + 1);
+      expect(model.requests, 0);
+      expect(tester.takeException(), isNull);
+    } finally {
+      await tester.pumpWidget(const SizedBox());
+      model.dispose();
+      store.dispose();
+      root.deleteSync(recursive: true);
+    }
+  });
+
+  for (final initiallyEmpty in [true, false]) {
+    testWidgets(
+      'pull refresh reads ${initiallyEmpty ? 'empty' : 'short'} source folders',
+      (tester) async {
+        final root = Directory.systemTemp.createTempSync('source-folder-pull-');
+        final store = AppStore(':memory:')
+          ..setLocal('settings', {'metadataStrategy': 'off'});
+        final model = _ControlledModel(store, root)
+          ..listing = initiallyEmpty ? [] : _videos(1);
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: SourceBrowser(
+                model: model,
+                initialPath: 'Series',
+                source: const {'id': 'nas', 'kind': 'webdav', 'label': 'NAS'},
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(model.requests, 1);
+          model.listing = _videos(2);
+          await tester.drag(
+            find.byType(initiallyEmpty ? SingleChildScrollView : ListView),
+            const Offset(0, 400),
+          );
+          await tester.pumpAndSettle();
+          expect(model.requests, 2);
+          expect(find.textContaining('已收录 2 集'), findsOneWidget);
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox());
+          model.dispose();
+          store.dispose();
+          root.deleteSync(recursive: true);
+        }
+      },
+    );
+  }
+
+  testWidgets('manual refresh shares work and retains search and scroll', (
+    tester,
+  ) async {
+    final root = Directory.systemTemp.createTempSync('source-refresh-state-');
+    final store = AppStore(':memory:')
+      ..setLocal('settings', {'metadataStrategy': 'off'});
+    final model = _ControlledModel(store, root)..listing = _videos(40);
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SourceBrowser(
+            model: model,
+            initialPath: 'Series',
+            source: const {'id': 'nas', 'kind': 'webdav', 'label': 'NAS'},
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('搜索'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'Example');
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pumpAndSettle();
+      final scroll = tester.widget<ListView>(find.byType(ListView)).controller!;
+      scroll.jumpTo(200);
+      await tester.pumpAndSettle();
+      final pending = model.pending = Completer<List<SourceEntry>>();
+      final refresh = tester
+          .widget<RefreshIndicator>(find.byType(RefreshIndicator))
+          .onRefresh;
+      final first = refresh();
+      final second = refresh();
+      expect(identical(first, second), isTrue);
+      await tester.pump();
+      expect(model.requests, 2);
+      pending.complete(_videos(41));
+      await tester.pumpAndSettle();
+      await first;
+      expect(model.requests, 2);
+      expect(model.maxActive, 1);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'Example',
+      );
+      expect(scroll.offset, 200);
+      expect(tester.takeException(), isNull);
+    } finally {
+      await tester.pumpWidget(const SizedBox());
+      model.dispose();
+      store.dispose();
+      root.deleteSync(recursive: true);
+    }
+  });
+
   testWidgets(
     'existing partial series information does not suppress a failed lookup retry',
     (tester) async {
@@ -338,8 +483,7 @@ void main() {
         model.transport
           ..failing = false
           ..secondEpisode = true;
-        await tester.pump(const Duration(seconds: 60));
-        await tester.pumpAndSettle();
+        await _refresh(tester);
         expect(model.transport.searches, greaterThan(searches));
         expect(
           model.media
@@ -385,8 +529,7 @@ void main() {
         expect(model.transport.episodeRequests, 1);
         final searches = model.transport.searches;
         model.transport.episodesFailing = false;
-        await tester.pump(const Duration(seconds: 60));
-        await tester.pumpAndSettle();
+        await _refresh(tester);
         expect(find.text('自动识别的系列'), findsOneWidget);
         expect(model.media.single.data['episodeTitle'], '第一集的资料');
         expect(model.transport.episodeRequests, 2);
@@ -463,7 +606,7 @@ void main() {
   );
 
   testWidgets(
-    'automatic folder metadata retries unchanged files with backoff without reimporting',
+    'manual refresh retries incomplete metadata without polling or reimporting',
     (tester) async {
       final root = Directory.systemTemp.createTempSync('source-auto-retry-');
       final store = AppStore(':memory:');
@@ -484,17 +627,15 @@ void main() {
         expect(find.textContaining('已收录 1 集'), findsOneWidget);
         final firstSearches = model.transport.searches;
         expect(firstSearches, greaterThan(0));
-        await tester.pump(const Duration(seconds: 59));
+        await tester.pump(const Duration(minutes: 10));
         expect(model.transport.searches, firstSearches);
-        await tester.pump(const Duration(seconds: 1));
-        await tester.pumpAndSettle();
+        await _refresh(tester);
         final secondSearches = model.transport.searches;
         expect(secondSearches, greaterThan(firstSearches));
-        await tester.pump(const Duration(seconds: 119));
+        await tester.pump(const Duration(minutes: 10));
         expect(model.transport.searches, secondSearches);
         model.transport.failing = false;
-        await tester.pump(const Duration(seconds: 1));
-        await tester.pumpAndSettle();
+        await _refresh(tester);
         expect(find.text('自动识别的系列'), findsOneWidget);
         expect(model.media.single.data['episodeTitle'], '第一集的资料');
         expect(model.reconciliations, 1);
@@ -837,15 +978,66 @@ void main() {
         await tester.pumpAndSettle();
         expect(
           model.paths.where((path) => path == 'Series'),
-          hasLength(1),
+          hasLength(2),
           reason:
-              'The completed listing is reused while its cancelled metadata inspection retries.',
+              'The cancelled network listing is fetched again after resume.',
         );
         expect(find.text('Example'), findsOneWidget);
         expect(model.media, isEmpty);
         expect(tester.takeException(), isNull);
       } finally {
         if (!pending.isCompleted) pending.complete(_videos(1));
+        await tester.pumpWidget(const SizedBox());
+        model.dispose();
+        store.dispose();
+        root.deleteSync(recursive: true);
+      }
+    },
+  );
+
+  testWidgets(
+    'paused without a frame closes folder previews and resumes the cancelled batch',
+    (tester) async {
+      final root = Directory.systemTemp.createTempSync('source-preview-pause-');
+      final store = AppStore(':memory:')
+        ..setLocal('settings', {'metadataStrategy': 'off'});
+      final model = _ControlledModel(store, root)..folders = true;
+      final pending = model.folderPending = Completer<List<SourceEntry>>();
+      try {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SourceBrowser(
+              model: model,
+              source: const {'id': 'nas', 'kind': 'webdav'},
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(model.paths.where((path) => path == 'Series'), hasLength(1));
+        expect(model.activeRequests, 1);
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+        await tester.idle();
+        expect(model.activeRequests, 0);
+        final pausedRequests = model.requests;
+        // Complete the obsolete request while Android supplies no more frames.
+        pending.complete(_videos(8));
+        model.folderPending = null;
+        await tester.idle();
+        expect(model.requests, pausedRequests);
+        expect(model.activeRequests, 0);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pumpAndSettle();
+        expect(model.paths.where((path) => path == 'Series'), hasLength(2));
+        expect(find.text('Example'), findsOneWidget);
+        expect(model.media, isEmpty);
+        expect(tester.takeException(), isNull);
+      } finally {
+        if (!pending.isCompleted) pending.complete(_videos(1));
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
         await tester.pumpWidget(const SizedBox());
         model.dispose();
         store.dispose();
@@ -884,7 +1076,10 @@ void main() {
         await tester.pumpAndSettle();
         expect(model.requests, 1);
         final pending = model.pending = Completer<List<SourceEntry>>();
-        await tester.pump(const Duration(seconds: 30));
+        final refresh = tester
+            .widget<RefreshIndicator>(find.byType(RefreshIndicator))
+            .onRefresh();
+        await tester.pump();
         await tester.pumpAndSettle();
         expect(model.requests, 2);
         await tester.pump(const Duration(minutes: 2));
@@ -892,6 +1087,7 @@ void main() {
         update(() => active = false);
         await tester.pumpAndSettle();
         expect(model.activeRequests, 0);
+        await refresh;
         model.pending = null;
         model.listing = _videos(3);
         update(() => active = true);
@@ -912,7 +1108,77 @@ void main() {
     },
   );
 
-  testWidgets('source refresh backs off failures and resets after recovery', (
+  testWidgets(
+    'unchanged folders stay silent and resume once without polling timers',
+    (tester) async {
+      final root = Directory.systemTemp.createTempSync('source-idle-refresh-');
+      final store = AppStore(':memory:')
+        ..setLocal('settings', {'metadataStrategy': 'off'});
+      final model = _ControlledModel(store, root);
+      final timers = <Timer>[];
+      try {
+        await runZoned(
+          () async {
+            await tester.pumpWidget(
+              MaterialApp(
+                home: SourceBrowser(
+                  model: model,
+                  initialPath: 'Series',
+                  source: const {'id': 'nas', 'kind': 'webdav'},
+                ),
+              ),
+            );
+            await tester.pumpAndSettle();
+            expect(model.requests, 1);
+            for (final seconds in [30, 60, 120, 240, 300, 300]) {
+              await tester.pump(Duration(seconds: seconds));
+              await tester.pumpAndSettle();
+              expect(model.requests, 1);
+            }
+            expect(timers, isEmpty);
+            tester.binding.handleAppLifecycleStateChanged(
+              AppLifecycleState.paused,
+            );
+            final pausedRequests = model.requests;
+            model.listing = _videos(2);
+            model.changed();
+            // Android may stop drawing immediately after paused.
+            await tester.idle();
+            expect(model.requests, pausedRequests);
+            tester.binding.handleAppLifecycleStateChanged(
+              AppLifecycleState.resumed,
+            );
+            await tester.pumpAndSettle();
+            expect(model.requests, pausedRequests + 1);
+            expect(find.textContaining('已收录 2 集'), findsOneWidget);
+            await tester.pump(const Duration(minutes: 10));
+            await tester.pumpAndSettle();
+            expect(model.requests, pausedRequests + 1);
+          },
+          zoneSpecification: ZoneSpecification(
+            createTimer: (self, parent, zone, duration, callback) {
+              final timer = parent.createTimer(zone, duration, callback);
+              if (duration >= const Duration(seconds: 30) &&
+                  duration <= const Duration(minutes: 5)) {
+                timers.add(timer);
+              }
+              return timer;
+            },
+          ),
+        );
+      } finally {
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pumpWidget(const SizedBox());
+        model.dispose();
+        store.dispose();
+        root.deleteSync(recursive: true);
+      }
+    },
+  );
+
+  testWidgets('failed manual refresh stays idle and another pull recovers', (
     tester,
   ) async {
     final root = Directory.systemTemp.createTempSync('source-refresh-retry-');
@@ -931,28 +1197,20 @@ void main() {
       );
       await tester.pumpAndSettle();
       model.failing = true;
-      await tester.pump(const Duration(seconds: 30));
+      await _refresh(tester);
+      expect(model.requests, 2);
+      await tester.pump(const Duration(minutes: 10));
       await tester.pumpAndSettle();
       expect(model.requests, 2);
-      await tester.pump(const Duration(seconds: 59));
-      expect(model.requests, 2);
-      await tester.pump(const Duration(seconds: 1));
-      await tester.pumpAndSettle();
-      expect(model.requests, 3);
-      await tester.pump(const Duration(seconds: 119));
-      expect(model.requests, 3);
-      await tester.pump(const Duration(seconds: 1));
-      await tester.pumpAndSettle();
-      expect(model.requests, 4);
+      expect(find.textContaining('已收录 1 集'), findsOneWidget);
       model.failing = false;
       model.listing = _videos(2);
-      await tester.pump(const Duration(seconds: 240));
-      await tester.pumpAndSettle();
-      expect(model.requests, 5);
+      await _refresh(tester);
+      expect(model.requests, 3);
       expect(find.textContaining('已收录 2 集'), findsOneWidget);
-      await tester.pump(const Duration(seconds: 30));
+      await tester.pump(const Duration(minutes: 10));
       await tester.pumpAndSettle();
-      expect(model.requests, 6);
+      expect(model.requests, 3);
     } finally {
       await tester.pumpWidget(const SizedBox());
       model.dispose();
@@ -1083,7 +1341,13 @@ void main() {
         var notifications = 0;
         void changed() => notifications++;
         model.addListener(changed);
-        await tester.pump(const Duration(seconds: 30));
+        var sameFinished = false;
+        unawaited(
+          tester
+              .widget<RefreshIndicator>(find.byType(RefreshIndicator))
+              .onRefresh()
+              .then((_) => sameFinished = true),
+        );
         await _settle(
           tester,
           () =>
@@ -1094,17 +1358,26 @@ void main() {
           () => Future<void>.delayed(const Duration(milliseconds: 100)),
         );
         await tester.pump();
+        await _settle(tester, () => sameFinished);
         expect(model.reconciliations, reconciliations);
         expect(browserBuilds, beforeBuilds);
         expect(notifications, 0);
         model.removeListener(changed);
 
         available = 4;
-        await tester.pump(const Duration(seconds: 30));
+        var changedFinished = false;
+        unawaited(
+          tester
+              .widget<RefreshIndicator>(find.byType(RefreshIndicator))
+              .onRefresh()
+              .then((_) => changedFinished = true),
+        );
         await _settle(
           tester,
           () => find.textContaining('已收录 4 集').evaluate().isNotEmpty,
         );
+        await _settle(tester, () => model.media.length == 4);
+        await _settle(tester, () => changedFinished);
         update(() => active = false);
         await tester.pumpAndSettle();
         final hiddenRequests = requests.length;

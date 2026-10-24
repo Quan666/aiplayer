@@ -138,7 +138,7 @@ void main() {
         tester.getRect(card(2)).top,
         greaterThanOrEqualTo(tester.getRect(find.byType(ListView)).bottom),
       );
-      expect(previews, [0, 1]);
+      expect(previews, isEmpty);
       expect(cache.nearby.keys, containsAll([addresses[2], addresses[3]]));
       expect(cache.requested, isNot(contains(addresses[4])));
       expect(cache.requested, isNot(contains(addresses[6])));
@@ -160,10 +160,10 @@ void main() {
       );
       expect(_decoded(tester, card(2)), isTrue);
       expect(_decoded(tester, card(3)), isTrue);
-      expect(previews, [0, 1]);
+      expect(previews, isEmpty);
       await gesture.panZoomEnd();
       await tester.pump(const Duration(milliseconds: 120));
-      expect(previews, containsAll([2, 3]));
+      expect(previews, isEmpty);
     } finally {
       await tester.pumpWidget(const SizedBox());
       cache.close();
@@ -546,7 +546,7 @@ void main() {
       update(() => poster = 'https://example.com/changed-while-hidden.png');
       await tester.pump(const Duration(milliseconds: 200));
       expect(cache.requested, hasLength(1));
-      expect(previews, hasLength(1));
+      expect(previews, isEmpty);
       await tester.pumpWidget(const SizedBox());
       cache.fileChanged(poster);
       await tester.pump(const Duration(milliseconds: 200));

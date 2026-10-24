@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/library_snapshot.dart';
+import 'package:aiplayer/data/library_sort.dart';
+import 'package:aiplayer/data/media_title_translation.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -93,6 +96,335 @@ void main() {
       expect(location.locations['video']?['path'], '/video.mp4');
       external.save('media', 'video', {}, deleted: true);
       expect((await model.loadLibrarySnapshot()).media, isEmpty);
+      expect(store.fullReads, 0);
+    },
+  );
+
+  for (final disk in [false, true]) {
+    test(
+      'progress-only refresh preserves structural indices (disk: $disk)',
+      () async {
+        final source = _CountingStore(
+          disk ? '${directory.path}/progress.db' : ':memory:',
+        );
+        final writer = disk ? AppStore.openExisting(source.path) : source;
+        final reader = LibrarySnapshotReader(source);
+        addTearDown(() {
+          reader.dispose();
+          if (disk) writer.dispose();
+          source.dispose();
+        });
+        for (final entry in [
+          ('a-1', 'Alpha', '1'),
+          ('a-2', 'Alpha', '2'),
+          ('b', 'Beta', '1'),
+        ]) {
+          writer.save('media', entry.$1, {
+            'title': entry.$2,
+            'series': entry.$2,
+            'episode': entry.$3,
+            'size': 10,
+          });
+          writer.setLocal('location:${entry.$1}', {
+            'source': 'nas',
+            'path': 'Shows/${entry.$1}.mkv',
+            'size': 10,
+          });
+        }
+        Future<LibrarySnapshot> read() => reader.read(
+          query: '',
+          revision: (
+            source.recordsRevision('media'),
+            source.recordsRevision('progress'),
+            source.locationRevision,
+          ),
+        );
+        void played(String id, String at) =>
+            writer.save('progress', '$id:10', {'position': 5, 'updatedAt': at});
+        final original = await read();
+        final fullReads = source.fullReads;
+        played('a-1', '2026-10-20');
+        final first = await read();
+        expect(source.fullReads - fullReads, disk ? 0 : 1);
+        expect(first.recent.single.id, 'a-1');
+        final alpha = first.seriesKeyFor(first.byId['a-1']!);
+        const folder = 'nas\u0000Shows';
+        if (!disk) {
+          expect(first.media, same(original.media));
+          expect(first.series, same(original.series));
+          expect(first.episodes, same(original.episodes));
+          expect(first.details, same(original.details));
+          expect(first.locations, same(original.locations));
+          expect(first.recordsBySource, same(original.recordsBySource));
+          expect(
+            first.folders[folder]!.entries,
+            same(original.folders[folder]!.entries),
+          );
+          expect(
+            first.folders[folder]!.recordsByPath,
+            same(original.folders[folder]!.recordsByPath),
+          );
+        }
+        expect(
+          first.folders[folder]!.recordsByPath['Shows/a-2.mkv']!.id,
+          'a-2',
+        );
+        expect(
+          () => first.folders[folder]!.recordsByPath.clear(),
+          throwsUnsupportedError,
+        );
+        played('a-2', '2026-10-21');
+        played('b', '2026-10-22');
+        final advanced = await read();
+        expect(advanced.recent.map((record) => record.id), ['b', 'a-2']);
+        expect(advanced.groups.map((group) => group.value.first.id), [
+          'b',
+          'a-1',
+        ]);
+        expect(advanced.latestBySeries[alpha]!.id, 'a-2');
+        expect(advanced.folders[folder]!.latestBySeries[alpha]!.id, 'a-2');
+        writer.save('progress', 'a-2:10', {}, deleted: true);
+        final removed = await read();
+        expect(removed.latestBySeries[alpha]!.id, 'a-1');
+        expect(removed.folders[folder]!.latestBySeries[alpha]!.id, 'a-1');
+        expect(advanced.latestBySeries[alpha]!.id, 'a-2');
+        expect(advanced.progress, contains('a-2:10'));
+        writer.save('progress', 'b:10', {}, deleted: true);
+        writer.save('progress', 'a-1:10', {
+          'position': 0,
+          'updatedAt': '2026-10-23',
+        });
+        final cleared = await read();
+        expect(cleared.recent, isEmpty);
+        expect(cleared.folders[folder]!.latestBySeries, isEmpty);
+        expect(cleared.groups.map((group) => group.value.first.id), [
+          'a-1',
+          'b',
+        ]);
+        expect(
+          () => cleared.folders[folder]!.latestBySeries.clear(),
+          throwsUnsupportedError,
+        );
+
+        played('a-1', '2026-10-24');
+        expect((await read()).recent.single.id, 'a-1');
+        writer.setLocal('location:a-1', {
+          'source': 'nas',
+          'path': 'Other/a-1.mkv',
+          'size': 20,
+        });
+        final relocated = await read();
+        expect(relocated.recent, isEmpty);
+        expect(relocated.folders, contains('nas\u0000Other'));
+        expect(relocated.folders[folder]!.records.map((record) => record.id), [
+          'a-2',
+          'b',
+        ]);
+        final media = writer.get('media', 'a-1')!;
+        writer.save('media', media.id, {...media.data, 'series': 'Changed'});
+        final changed = await read();
+        expect(changed.series, hasLength(3));
+        expect(changed.seriesKeyFor(changed.byId['a-1']!), isNot(alpha));
+      },
+    );
+  }
+
+  test(
+    'local import index follows source and metadata revisions in worker',
+    () async {
+      for (final id in [
+        'local',
+        'remote',
+        'hidden',
+        'subtitle',
+        'hidden-subtitle',
+        'transient',
+      ]) {
+        store.save('media', id, {
+          'title': '$id.mp4',
+          if (id == 'hidden') 'fileName': '.hidden.mp4',
+          if (id == 'subtitle') 'fileName': 'Captions.srt',
+          if (id == 'hidden-subtitle') 'fileName': '.Captions.srt',
+          if (id == 'transient') 'transient': true,
+        });
+        store.setLocal('location:$id', {
+          'source': id == 'remote' ? 'nas' : 'local',
+          'path': '/media/$id.mp4',
+          'size': 30,
+          'modified': 12,
+        });
+      }
+      final first = await model.loadLibrarySnapshot();
+      expect(first.localRecords.keys.toSet(), {
+        'local',
+        'hidden',
+        'subtitle',
+        'hidden-subtitle',
+      });
+      expect(first.localEntries.map((entry) => entry.path).toSet(), {
+        'local',
+        'hidden',
+        'subtitle',
+        'hidden-subtitle',
+      });
+      expect(first.localHiddenEntries, 2);
+      expect(first.localSubtitleEntries, 2);
+      expect(first.localHiddenSubtitleEntries, 1);
+      final hidden = first.localEntries.singleWhere(
+        (entry) => entry.path == 'hidden',
+      );
+      expect(hidden.name, '.hidden.mp4');
+      expect(hidden.size, 30);
+      expect(hidden.modified, 12);
+      expect(() => first.localEntries.clear(), throwsUnsupportedError);
+      expect(() => first.localRecords.clear(), throwsUnsupportedError);
+      final external = AppStore.openExisting(store.path);
+      addTearDown(external.dispose);
+      external.setLocal('location:local', {
+        'source': 'nas',
+        'path': '/media/local.mp4',
+        'size': 40,
+      });
+      external.save('media', 'hidden', {}, deleted: true);
+      external.save('media', 'hidden-subtitle', {}, deleted: true);
+      final changed = await model.loadLibrarySnapshot();
+      expect(changed.localRecords.keys, ['subtitle']);
+      expect(changed.localEntries.single.name, 'Captions.srt');
+      expect(changed.localHiddenEntries, 0);
+      expect(changed.localSubtitleEntries, 1);
+      expect(changed.localHiddenSubtitleEntries, 0);
+      expect(changed.preparationIsolate, isNot(Isolate.current.hashCode));
+      expect(store.fullReads, 0);
+    },
+  );
+
+  test('all-video ordering aggregates complete groups in the worker', () async {
+    void save(
+      String id,
+      String title,
+      String updated, {
+      String? episode,
+      int? size,
+      bool poster = false,
+    }) {
+      store.save('media', id, {
+        'title': title,
+        if (episode != null) ...{'series': title, 'episode': episode},
+        'size': ?size,
+        if (poster) 'poster': 'https://example.test/poster.jpg',
+      }, modifiedAt: updated);
+    }
+
+    save('a-1', 'Show 10', '2026-10-20', episode: '1', size: 3);
+    save('a-2', 'Show 10', '2026-10-21', episode: '2', size: 4, poster: true);
+    save('b', 'Show 2', '2026-10-23', size: 12);
+    save('c', 'Movie', '2026-10-22');
+    save('d', 'Unknown', '2026-10-22');
+    store.db.execute("UPDATE records SET modified_at='' WHERE id='d'");
+    store.setLocal('location:a-1', {
+      'size': 30,
+      'modified': DateTime.utc(2026, 10, 20).millisecondsSinceEpoch,
+    });
+    store.setLocal('location:a-2', {
+      'size': 4,
+      'modified': DateTime.utc(2026, 10, 24).millisecondsSinceEpoch,
+    });
+    store.setLocal('location:b', {
+      'size': 12,
+      'modified': DateTime.utc(2026, 10, 23).millisecondsSinceEpoch,
+    });
+    store.save('progress', 'a-1:3', {'position': 5, 'updatedAt': '2026-10-30'});
+    store.save('progress', 'a-2:4', {
+      'position': 5,
+      'updatedAt': '2026-10-24T08:00:00+08:00',
+    });
+    store.save('progress', 'b:12', {
+      'position': 5,
+      'updatedAt': '2026-10-23T23:00:00Z',
+    });
+    store.save('progress', 'c:0', {'position': 0, 'updatedAt': '2026-10-30'});
+    store.fullReads = 0;
+    final reader = LibrarySnapshotReader(store);
+    addTearDown(reader.dispose);
+    Future<LibrarySnapshot> read(String field, {bool descending = true}) =>
+        reader.read(
+          query: '',
+          revision: (
+            store.recordsRevision('media'),
+            store.recordsRevision('progress'),
+            store.locationRevision,
+          ),
+          sort: LibrarySort(field: field, descending: descending),
+        );
+    List<String> ids(LibrarySnapshot snapshot) =>
+        snapshot.groups.map((group) => group.value.first.id).toList();
+
+    final recent = await read('recent');
+    expect(ids(recent), ['a-1', 'b', 'c', 'd']);
+    expect(recent.preparationIsolate, isNot(Isolate.current.hashCode));
+    expect(recent.groups.first.value.map((record) => record.id), [
+      'a-1',
+      'a-2',
+    ]);
+    expect(ids(await read('recent', descending: false)), [
+      'b',
+      'a-1',
+      'c',
+      'd',
+    ]);
+    expect(ids(await read('modified')), ['a-1', 'b', 'c', 'd']);
+    expect(ids(await read('modified', descending: false)), [
+      'c',
+      'b',
+      'a-1',
+      'd',
+    ]);
+    expect(ids(await read('updated')), ['b', 'c', 'a-1', 'd']);
+    expect(ids(await read('size')), ['a-1', 'b', 'c', 'd']);
+    expect(ids(await read('size', descending: false)), ['b', 'a-1', 'c', 'd']);
+    final named = await read('name', descending: false);
+    expect(ids(named), ['c', 'b', 'a-1', 'd']);
+    expect(named.posters.single.key, recent.posters.single.key);
+    expect(named.files.map((group) => group.value.first.id), ['c', 'b', 'd']);
+    expect(() => named.groups.clear(), throwsUnsupportedError);
+    expect(
+      named.recent.map((record) => record.id),
+      recent.recent.map((record) => record.id),
+    );
+    expect(store.fullReads, 0);
+  });
+
+  test(
+    'sorting is deterministic, cached by preference and refreshed in flight',
+    () async {
+      for (final id in ['c', 'a', 'b']) {
+        store.save('media', id, {'title': 'Same', 'size': 12});
+      }
+      await model.setLibrarySorting(
+        const LibrarySort(field: 'name', descending: false),
+      );
+      final first = await model.loadLibrarySnapshot();
+      expect(first.groups.map((group) => group.value.single.id), [
+        'a',
+        'b',
+        'c',
+      ]);
+      expect(await model.loadLibrarySnapshot(), same(first));
+      model.updatePreferences({'volume': 40});
+      expect(await model.loadLibrarySnapshot(), same(first));
+      store.save('media', 'd', {'title': 'Zebra'});
+      final inFlight = model.loadLibrarySnapshot();
+      await model.setLibrarySorting(const LibrarySort(field: 'name'));
+      await inFlight;
+      final changed = await model.loadLibrarySnapshot();
+      expect(changed.sort, const LibrarySort(field: 'name'));
+      expect(changed.groups.map((group) => group.value.single.id), [
+        'd',
+        'a',
+        'b',
+        'c',
+      ]);
+      expect(await model.loadLibrarySnapshot(), same(changed));
       expect(store.fullReads, 0);
     },
   );
@@ -193,6 +525,188 @@ void main() {
         'beta',
         'gamma',
       ]);
+      expect(filtered.searchRecent.map((item) => item.id), ['alpha-1']);
+      expect(snapshot.searchRecent, same(snapshot.recent));
+      expect(store.fullReads, 0);
+    },
+  );
+
+  test(
+    'search finds older history by any episode and resumes the latest in its series',
+    () async {
+      for (var index = 0; index < 15; index++) {
+        store.save('media', 'newer-$index', {
+          'title': 'Newer recording $index',
+          'size': 10,
+        });
+        store.save('progress', 'newer-$index:10', {
+          'position': 5,
+          'updatedAt': DateTime.utc(2026, 10, index + 10).toIso8601String(),
+        });
+      }
+      for (var episode = 1; episode <= 3; episode++) {
+        store.save('media', 'older-$episode', {
+          'title': 'Original S01E0$episode.mkv',
+          'fileName': 'Original S01E0$episode.mkv',
+          'series': episode == 2 ? '正式作品' : 'Original',
+          'season': '1',
+          'episode': '$episode',
+          'size': 10,
+          if (episode == 1) 'episodeTitle': 'Forgotten episode',
+          if (episode == 2) ...{
+            'bangumiId': '7',
+            'metadataTitle': '正式作品',
+            'poster': 'https://example.test/series.jpg',
+          },
+        });
+      }
+      for (final episode in [1, 3]) {
+        store.save('progress', 'older-$episode:10', {
+          'position': episode * 5,
+          'updatedAt': DateTime.utc(2026, 10, episode).toIso8601String(),
+        });
+      }
+      final original = await model.loadLibrarySnapshot();
+      expect(original.recent, hasLength(16));
+      expect(original.recent.last.id, 'older-3');
+      for (final query in ['ORIGINAL', '正式作品', 'S01E02', 'Forgotten']) {
+        final filtered = await model.loadLibrarySnapshot(query: query);
+        expect(filtered.searchRecent.single.id, 'older-3');
+        expect(filtered.recent, hasLength(16));
+        expect(filtered.posters.single.value, hasLength(3));
+        expect(filtered.preparationIsolate, isNot(Isolate.current.hashCode));
+        expect(() => filtered.searchRecent.clear(), throwsUnsupportedError);
+      }
+      final missing = await model.loadLibrarySnapshot(query: 'missing');
+      expect(missing.searchRecent, isEmpty);
+      expect(missing.groups, isEmpty);
+      expect(missing.recent, hasLength(16));
+
+      final external = AppStore.openExisting(store.path);
+      addTearDown(external.dispose);
+      external.save('progress', 'older-1:10', {
+        'position': 80,
+        'updatedAt': '2026-10-25',
+      });
+      final advanced = await model.loadLibrarySnapshot(query: 'Forgotten');
+      expect(advanced.searchRecent.single.id, 'older-1');
+      expect(advanced.progress['older-1:10']!['position'], 80);
+      external.save('progress', 'older-1:10', {}, deleted: true);
+      final removed = await model.loadLibrarySnapshot(query: 'Forgotten');
+      expect(removed.searchRecent.single.id, 'older-3');
+      expect(advanced.searchRecent.single.id, 'older-1');
+      external.save('progress', 'older-3:10', {}, deleted: true);
+      final cleared = await model.loadLibrarySnapshot(query: 'Forgotten');
+      expect(cleared.searchRecent, isEmpty);
+      expect(cleared.posters.single.value, hasLength(3));
+      expect(store.fullReads, 0);
+    },
+  );
+
+  test(
+    'search indexes current visible titles without invalidating unfiltered snapshots',
+    () async {
+      for (var episode = 1; episode <= 2; episode++) {
+        store.save('media', 'episode-$episode', {
+          'title': 'Example S01E0$episode.mkv',
+          'series': 'Example',
+          'season': '1',
+          'episode': '$episode',
+          'size': 10,
+        });
+        store.save('progress', 'episode-$episode:10', {
+          'position': 5,
+          'updatedAt': '2026-10-2$episode',
+        });
+      }
+      final unfiltered = await model.loadLibrarySnapshot();
+      store.setLocal('episodeTitle:episode-1', 'Cached pilot');
+      store.setLocal('episodeTitle:episode-2', 'Cached finale');
+      expect(await model.loadLibrarySnapshot(), same(unfiltered));
+      var filtered = await model.loadLibrarySnapshot(query: ' cached pilot ');
+      expect(filtered.query, 'cached pilot');
+      expect(filtered.searchRecent.single.id, 'episode-2');
+      expect(filtered.preparationIsolate, isNot(Isolate.current.hashCode));
+
+      final key = MediaTitleTranslations.stateKeyFor(
+        'parsed:example:1',
+        MediaTitleTranslations.profileFor({}),
+      );
+      final translated = {
+        'visible': true,
+        'titles': {
+          'Example': '示例作品',
+          'Cached pilot': '初章',
+          'Cached finale': '终章',
+        },
+      };
+      store.setLocal(key, translated);
+      for (final query in ['示例作品', '初章', '终章', '第 2 集']) {
+        filtered = await model.loadLibrarySnapshot(query: query);
+        expect(filtered.searchRecent.single.id, 'episode-2');
+        expect(filtered.groups.single.value, hasLength(2));
+      }
+      final sameQuery = await model.loadLibrarySnapshot(query: '示例作品');
+      final searchRevision = model.librarySearchRevision;
+      store.setLocal('settings', {'volume': 30});
+      store.setLocal('syncState', {'cursor': 12});
+      expect(model.librarySearchRevision, searchRevision);
+      expect(await model.loadLibrarySnapshot(query: '示例作品'), same(sameQuery));
+      store.setLocal('settings', {'aiSubtitleTarget': 'English'});
+      expect(
+        (await model.loadLibrarySnapshot(query: '示例作品')).searchRecent,
+        isEmpty,
+      );
+      store.setLocal('settings', {});
+      expect(
+        (await model.loadLibrarySnapshot(query: '示例作品')).searchRecent.single.id,
+        'episode-2',
+      );
+
+      final external = AppStore.openExisting(store.path);
+      addTearDown(external.dispose);
+      external.setLocal(key, {...translated, 'visible': false});
+      expect(
+        (await model.loadLibrarySnapshot(query: '示例作品')).searchRecent,
+        isEmpty,
+      );
+      store.db.execute('UPDATE local SET value=? WHERE key=?', [
+        jsonEncode(translated),
+        key,
+      ]);
+      expect(
+        (await model.loadLibrarySnapshot(query: '示例作品')).searchRecent.single.id,
+        'episode-2',
+      );
+      store.db.execute('BEGIN');
+      store.db.execute('UPDATE local SET value=? WHERE key=?', [
+        jsonEncode({...translated, 'visible': false}),
+        key,
+      ]);
+      store.db.execute('ROLLBACK');
+      expect(
+        (await model.loadLibrarySnapshot(query: '示例作品')).searchRecent.single.id,
+        'episode-2',
+      );
+      external.setLocal('episodeTitle:episode-1', 'Revised pilot');
+      expect(
+        (await model.loadLibrarySnapshot(query: '初章')).searchRecent,
+        isEmpty,
+      );
+      expect(
+        (await model.loadLibrarySnapshot(
+          query: 'Revised pilot',
+        )).searchRecent.single.id,
+        'episode-2',
+      );
+      external.removeLocal('episodeTitle:episode-1');
+      expect(
+        (await model.loadLibrarySnapshot(query: 'Revised pilot')).searchRecent,
+        isEmpty,
+      );
+      final inFlight = model.loadLibrarySnapshot(query: 'Arriving title');
+      store.setLocal('episodeTitle:episode-1', 'Arriving title');
+      expect((await inFlight).searchRecent.single.id, 'episode-2');
       expect(store.fullReads, 0);
     },
   );

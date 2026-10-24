@@ -5,3 +5,8 @@ Coverage includes
 ASS style/ReadOrder, UTF-8, 5 GiB virtual offsets, unknown Segment/Cluster sizes,
 subtitle-only indexed reads, codecs and malformed/missing indexing. The sparse
 fixture stores only metadata and simulates the large zero-filled gap in tests.
+
+proxy_local_test_cert.pem and proxy_local_test_key.pem are a generated,
+throwaway self-signed localhost TLS fixture for CONNECT routing regressions.
+They are public test material, never application credentials. The test explicitly
+accepts this certificate only on its private loopback HttpClient.

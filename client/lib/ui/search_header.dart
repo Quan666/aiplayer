@@ -2,6 +2,25 @@ import 'package:flutter/material.dart';
 import 'glass.dart';
 import 'theme/settings_styles.dart';
 
+/// Lets navigation dismiss this input and cancel focus queued for its entrance
+/// animation without clearing the user's search text.
+class SearchHeaderController {
+  final _focus = FocusNode();
+  int _focusRevision = 0;
+  bool _disposed = false;
+
+  void dismissFocus() {
+    _focusRevision++;
+    _focus.unfocus();
+  }
+
+  void dispose() {
+    _disposed = true;
+    _focusRevision++;
+    _focus.dispose();
+  }
+}
+
 /// The same compact search interaction for the library, settings and logs.
 class SearchHeader extends StatefulWidget {
   final String title, hint;
@@ -9,11 +28,13 @@ class SearchHeader extends StatefulWidget {
   final Widget? trailing;
   final double titleSize;
   final ValueChanged<String> onChanged;
+  final SearchHeaderController? controller;
   const SearchHeader({
     super.key,
     required this.title,
     required this.hint,
     required this.onChanged,
+    this.controller,
     this.subtitle,
     this.trailing,
     this.titleSize = SettingsStyles.searchTitleSize,
@@ -23,25 +44,55 @@ class SearchHeader extends StatefulWidget {
   State<SearchHeader> createState() => _SearchHeaderState();
 }
 
-class _SearchHeaderState extends State<SearchHeader> {
+class _SearchHeaderState extends State<SearchHeader>
+    with AutomaticKeepAliveClientMixin {
   final controller = TextEditingController();
-  final focus = FocusNode();
+  SearchHeaderController? _internalController;
+  SearchHeaderController get _search =>
+      widget.controller ?? (_internalController ??= SearchHeaderController());
   bool expanded = false;
+
+  // A lazy sliver may evict an unfocused input after scrolling. Retain only the
+  // expanded header so its text and open state survive; ordinary rows stay lazy.
+  @override
+  bool get wantKeepAlive => expanded;
+
+  @override
+  void didUpdateWidget(SearchHeader oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.controller != oldWidget.controller) {
+      (oldWidget.controller ?? _internalController)?.dismissFocus();
+    }
+  }
+
   @override
   void dispose() {
     controller.dispose();
-    focus.dispose();
+    _internalController?.dispose();
     super.dispose();
   }
 
   void toggle() {
     setState(() => expanded = !expanded);
+    updateKeepAlive();
     if (expanded) {
+      final search = _search;
+      final revision = search._focusRevision;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && expanded) focus.requestFocus();
+        if (!mounted ||
+            !expanded ||
+            search != _search ||
+            search._disposed ||
+            revision != search._focusRevision ||
+            !(ModalRoute.of(context)?.isCurrent ?? true)) {
+          return;
+        }
+        final lifecycle = WidgetsBinding.instance.lifecycleState;
+        if (lifecycle != null && lifecycle != AppLifecycleState.resumed) return;
+        search._focus.requestFocus();
       });
     } else {
-      focus.unfocus();
+      _search.dismissFocus();
       controller.clear();
       widget.onChanged('');
     }
@@ -49,6 +100,7 @@ class _SearchHeaderState extends State<SearchHeader> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     final content = ConstrainedBox(
       constraints: BoxConstraints(minHeight: widget.subtitle == null ? 48 : 56),
       child: AnimatedSwitcher(
@@ -60,13 +112,17 @@ class _SearchHeaderState extends State<SearchHeader> {
                   Expanded(
                     child: TextField(
                       controller: controller,
-                      focusNode: focus,
+                      focusNode: _search._focus,
                       onChanged: widget.onChanged,
                       textInputAction: TextInputAction.search,
                       decoration: InputDecoration(
                         hintText: widget.hint,
                         isDense: true,
                         prefixIcon: const Icon(Icons.search_rounded, size: 20),
+                        prefixIconConstraints: const BoxConstraints(
+                          minWidth: 36,
+                          minHeight: 36,
+                        ),
                         contentPadding: SettingsStyles.searchFieldPadding,
                       ),
                     ),

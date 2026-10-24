@@ -21,6 +21,9 @@ class _RecordingPosterCache extends PosterCache {
     requested.add(url);
     return null;
   }
+
+  @override
+  bool hasFailed(String url) => requested.contains(url);
 }
 
 class _DelayedPosterCache extends PosterCache {
@@ -712,6 +715,8 @@ void main() {
     expect(previews, [0, 1]);
     await tester.pump(const Duration(milliseconds: 1));
     expect(cache.requested, ['poster-0', 'poster-1', 'poster-4', 'poster-5']);
+    // Video fallback follows an actual poster failure, not its admission.
+    await tester.pump();
     expect(previews, [0, 1, 4, 5]);
     await tester.pumpWidget(const SizedBox());
     cache.close();

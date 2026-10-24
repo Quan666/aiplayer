@@ -32,7 +32,7 @@ class SettingsStyles {
   );
   static const searchFieldPadding = EdgeInsets.symmetric(
     horizontal: 12,
-    vertical: 10,
+    vertical: 8,
   );
 
   TextStyle searchTitle(double size) => theme.textTheme.headlineLarge!.copyWith(

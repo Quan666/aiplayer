@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
@@ -20,11 +21,22 @@ HttpSource _webdav(String address) => HttpOverrides.runWithHttpOverrides(
 
 class _WebDavModel extends AppModel {
   final String address;
+  int completedSeriesLoads = 0;
   _WebDavModel(super.store, super.documents, this.address)
     : super(backgroundWork: false);
 
   @override
   Future<SourceAdapter> adapter(String id) async => _webdav(address);
+
+  @override
+  Future<List<SyncRecord>> loadSeriesEpisodes(
+    SyncRecord record, {
+    CancelToken? cancel,
+  }) async {
+    final episodes = await super.loadSeriesEpisodes(record, cancel: cancel);
+    completedSeriesLoads++;
+    return episodes;
+  }
 }
 
 String _seriesListing(int count) {
@@ -155,7 +167,7 @@ void main() {
   );
 
   testWidgets(
-    'visible All Videos details discover new WebDAV episodes and pause while covered',
+    'All Videos details stay idle until reentered and pause without new frames',
     (tester) async {
       FlutterSecureStorage.setMockInitialValues({});
       late Directory root;
@@ -166,7 +178,7 @@ void main() {
       var available = 1;
       final requests = <String>[];
       await tester.runAsync(() async {
-        root = await Directory.systemTemp.createTemp('series-webdav-poll-');
+        root = await Directory.systemTemp.createTemp('series-webdav-entry-');
         store = AppStore('${root.path}/library.db')
           ..setLocal('settings', {'metadataStrategy': 'off'});
         server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -211,15 +223,28 @@ void main() {
         await tester.pump(const Duration(milliseconds: 400));
         await _settleSource(
           tester,
-          () =>
-              requests.length == 1 &&
-              find.byType(LinearProgressIndicator).evaluate().isEmpty,
+          () => requests.length == 1 && model.completedSeriesLoads == 1,
         );
         expect(find.textContaining('已收录 1 集'), findsOneWidget);
         final originalDetails = tester.element(details);
 
         available = 3;
-        await tester.pump(const Duration(seconds: 30));
+        await tester.pump(const Duration(minutes: 6));
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        expect(requests, ['/dav/Series/']);
+        expect(find.textContaining('已收录 1 集'), findsOneWidget);
+
+        unawaited(
+          navigator.currentState!.push<void>(
+            MaterialPageRoute(builder: (_) => const Scaffold()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        navigator.currentState!.pop();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
         await _settleSource(
           tester,
           () => find.textContaining('已收录 3 集').evaluate().isNotEmpty,
@@ -254,14 +279,13 @@ void main() {
         expect(tester.element(details), same(originalDetails));
 
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
-        await tester.pump();
         available = 5;
         final beforePaused = requests.length;
-        await tester.pump(const Duration(minutes: 2));
+        // A paused Android app may receive no further frames. Lifecycle
+        // handling must suspend requests directly, before any widget rebuild.
         await tester.runAsync(
           () => Future<void>.delayed(const Duration(milliseconds: 50)),
         );
-        await tester.pump();
         expect(requests.length, beforePaused);
 
         tester.binding.handleAppLifecycleStateChanged(
@@ -296,7 +320,7 @@ void main() {
   );
 
   testWidgets(
-    'in-flight WebDAV refresh does not overlap and cancels its stale response on pause',
+    'entry-triggered WebDAV refresh stays bounded and cancels without a frame on pause',
     (tester) async {
       FlutterSecureStorage.setMockInitialValues({});
       late Directory root;
@@ -420,18 +444,27 @@ void main() {
           () =>
               requests == 1 &&
               activeRequests == 0 &&
-              find.byType(LinearProgressIndicator).evaluate().isEmpty,
+              model.completedSeriesLoads == 1,
         );
         final originalDetails = tester.element(details);
 
-        await tester.pump(const Duration(seconds: 30));
+        final navigator = Navigator.of(tester.element(details));
+        unawaited(
+          navigator.push<void>(
+            MaterialPageRoute(builder: (_) => const Scaffold()),
+          ),
+        );
+        await tester.pumpAndSettle();
+        navigator.pop();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
         await _settleSource(tester, () => secondStarted.isCompleted);
         expect(requests, 2);
         expect(activeRequests, 1);
         for (var interval = 0; interval < 6; interval++) {
           await tester.pump(const Duration(seconds: 10));
           await tester.runAsync(() async {
-            // Keep this response alive beyond multiple refresh intervals,
+            // Keep this response alive beyond the former refresh intervals,
             // without testing the separate network inactivity timeout.
             _writeChunk(pendingSocket!, ' ');
             await pendingSocket!.flush();
@@ -444,8 +477,9 @@ void main() {
         expect(find.textContaining('已收录 1 集'), findsOneWidget);
 
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
-        await tester.pump();
-        await _settleSource(tester, () => secondClosed.isCompleted);
+        await tester.runAsync(
+          () => secondClosed.future.timeout(const Duration(seconds: 3)),
+        );
         expect(activeRequests, 0);
         expect(requests, 2);
         expect(store.records('media'), hasLength(1));

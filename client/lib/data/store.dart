@@ -80,7 +80,25 @@ class AppStore {
   late int _dataVersion;
   Map<String, int> _changeCounters = {};
   Future<void> _playbackWrites = Future.value();
+
+  /// Initialize and migrate before opening the lightweight UI connection.
+  /// Even a one-time schema upgrade can wait for another engine's writer lock.
+  static Future<AppStore> open(String path) async {
+    if (path == ':memory:') return AppStore(path);
+    await _initializeStoreInWorker(path);
+    return AppStore.openExisting(path);
+  }
+
   AppStore(this.path) : db = sqlite3.open(path) {
+    try {
+      _initialize();
+    } catch (_) {
+      dispose();
+      rethrow;
+    }
+  }
+
+  void _initialize() {
     _configureConnection();
     db.execute(
       '''CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL,id TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 0,revision INTEGER NOT NULL DEFAULT 0,dirty INTEGER NOT NULL DEFAULT 0,deleted INTEGER NOT NULL DEFAULT 0,data TEXT NOT NULL,PRIMARY KEY(kind,id));
@@ -104,7 +122,6 @@ class AppStore {
       'ON records(kind,id) WHERE dirty=1',
     );
     _createChangeCounters();
-    db.execute('PRAGMA user_version=2');
     _readInitialRevisions();
     if (local('syncDevice:id') == null) {
       setLocal('syncDevice:id', const Uuid().v4());
@@ -140,6 +157,30 @@ class AppStore {
   }
 
   void _createChangeCounters() {
+    const version = 3;
+    int schemaVersion() =>
+        db.select('PRAGMA user_version').first.values.first as int;
+    if (schemaVersion() >= version) return;
+    db.execute('BEGIN IMMEDIATE');
+    try {
+      // Another engine may have migrated while this connection waited. Replace
+      // old local triggers once; IF NOT EXISTS alone would retain the broad
+      // settings scope on existing installations.
+      if (schemaVersion() < version) {
+        for (final event in ['insert', 'update', 'delete']) {
+          db.execute('DROP TRIGGER IF EXISTS store_change_local_$event');
+        }
+        _installChangeCounters();
+        db.execute('PRAGMA user_version=$version');
+      }
+      db.execute('COMMIT');
+    } catch (_) {
+      db.execute('ROLLBACK');
+      rethrow;
+    }
+  }
+
+  void _installChangeCounters() {
     // data_version alone cannot distinguish our checkpoint worker from a
     // concurrent library edit in another Flutter engine. These counters are
     // committed atomically with every mutation, including direct SQL writes.
@@ -156,7 +197,10 @@ class AppStore {
                 '${event == 'UPDATE' ? ' AND OLD.kind=NEW.kind' : ''}'
                 " THEN $row.kind ELSE 'other' END",
           'local' =>
-            "CASE WHEN ($row.key='lastSync' OR substr($row.key,1,4)='sync')"
+            "CASE WHEN $row.key='settings'"
+                '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
+                " THEN 'settings'"
+                " WHEN ($row.key='lastSync' OR substr($row.key,1,4)='sync')"
                 '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
                 " THEN 'sync' ELSE 'other' END",
           _ => "'other'",
@@ -264,6 +308,16 @@ class AppStore {
                 _localPrefixRevisions[prefix] = revision;
               }
             }
+          } else if (scope == 'settings') {
+            _localRevision = revision;
+            if (_localKeyRevisions.containsKey('settings')) {
+              _localKeyRevisions['settings'] = revision;
+            }
+            for (final prefix in _localPrefixRevisions.keys) {
+              if ('settings'.startsWith(prefix)) {
+                _localPrefixRevisions[prefix] = revision;
+              }
+            }
           } else {
             _recordRevisions[scope] = revision;
           }
@@ -287,6 +341,8 @@ class AppStore {
     if (count == 0) return;
     final scope = kind == 'progress' || kind == 'watched'
         ? kind!
+        : localKey == 'settings'
+        ? 'settings'
         : localKey != null &&
               (localKey.startsWith('sync') || localKey == 'lastSync')
         ? 'sync'
@@ -804,6 +860,27 @@ class AppStore {
     }
   }
 
+  /// Small user preference edits still must not wait for SQLite on the UI
+  /// isolate. Only the patch crosses isolates; read/merge/encoding stay here.
+  Future<bool> patchSettingsInBackground(Map<String, dynamic> patch) {
+    final detached = Map<String, dynamic>.of(patch);
+    if (path == ':memory:') return Future.value(_patchSettings(detached));
+    return _patchSettingsInWorker(path, detached);
+  }
+
+  bool _patchSettings(Map<String, dynamic> patch) {
+    var changed = false;
+    transaction(() {
+      final current = Map<String, dynamic>.from(local('settings') ?? {});
+      if (patch.entries.every((entry) => current[entry.key] == entry.value)) {
+        return;
+      }
+      setLocal('settings', {...current, ...patch});
+      changed = true;
+    });
+    return changed;
+  }
+
   void removeLocal(String key) {
     if (!key.startsWith('sync') && key != 'lastSync') {
       if (key == 'settings' || key == 'sources' || key == 'sourceFavorites') {
@@ -918,6 +995,11 @@ class AppStore {
   }
 }
 
+Future<void> _initializeStoreInWorker(String path) => Isolate.run(() async {
+  final store = await retryStoreBusy(() => AppStore(path));
+  store.dispose();
+});
+
 Future<bool> _savePlaybackProgressInWorker(
   String path,
   String progressId,
@@ -933,6 +1015,18 @@ Future<bool> _savePlaybackProgressInWorker(
         watchedId,
       ),
     );
+  } finally {
+    store.dispose();
+  }
+});
+
+Future<bool> _patchSettingsInWorker(
+  String databasePath,
+  Map<String, dynamic> patch,
+) => Isolate.run(() async {
+  final store = await retryStoreBusy(() => AppStore.openExisting(databasePath));
+  try {
+    return await retryStoreBusy(() => store._patchSettings(patch));
   } finally {
     store.dispose();
   }

@@ -14,6 +14,7 @@ import '../data/media_presentation.dart';
 import '../data/media_technical_info.dart';
 import '../data/poster_cache.dart';
 import '../data/library_snapshot.dart';
+import '../data/library_sort.dart';
 import '../sources/source.dart';
 import 'player_page.dart';
 import 'settings_page.dart';
@@ -53,6 +54,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   int page = 0;
   final _pages = PageController();
   final _sources = SourcesController();
+  final _search = SearchHeaderController();
   bool _sourcePointerTap = false;
   late bool _navigationCollapsed;
   String query = '';
@@ -97,8 +99,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   LibrarySnapshot? _snapshot;
   Object? _snapshotVersion, _requestedSnapshotVersion;
   CancelToken? _snapshotCancel;
-  List<MapEntry<String, List<SyncRecord>>> _posters = const [],
-      _filesByGroup = const [];
+  CancelToken? _libraryRefreshCancel;
+  Future<void>? _libraryRefreshWork;
+  List<MapEntry<String, List<SyncRecord>>> _groups = const [];
   Widget? _libraryContent;
   Widget? _sourcesContent, _settingsContent;
   Object? _sourcesContentKey, _settingsContentKey;
@@ -152,6 +155,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     model.store.recordsRevision('progress'),
     model.store.locationRevision,
     query.toLowerCase(),
+    query.trim().isEmpty ? null : model.librarySearchRevision,
+    model.librarySorting,
   );
 
   bool get _canRefreshLibrary =>
@@ -187,9 +192,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         _snapshot = snapshot;
         _snapshotVersion = version;
         _media = snapshot.media;
-        _recent = snapshot.recent;
-        _posters = snapshot.posters;
-        _filesByGroup = snapshot.files;
+        _recent = snapshot.searchRecent;
+        _groups = snapshot.groups;
         _selectedMedia.removeWhere((id) => !snapshot.byId.containsKey(id));
         _libraryNeedsRefresh = false;
         _libraryContent = null;
@@ -252,6 +256,45 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     _snapshotCancel?.cancel();
     _snapshotCancel = null;
     _requestedSnapshotVersion = null;
+    _libraryRefreshCancel?.cancel();
+  }
+
+  Future<void> _refreshLibrarySources() {
+    final pending = _libraryRefreshWork;
+    if (pending != null) return pending;
+    if (!mounted ||
+        !_foreground ||
+        !_routeCurrent ||
+        page != 0 ||
+        _detailsVisible ||
+        _coveringRoutes > 0) {
+      return Future<void>.value();
+    }
+    final cancel = _libraryRefreshCancel = CancelToken();
+    return _libraryRefreshWork = _runLibraryRefresh(model, cancel);
+  }
+
+  Future<void> _runLibraryRefresh(
+    AppModel currentModel,
+    CancelToken cancel,
+  ) async {
+    try {
+      await currentModel.refreshLibrarySources(cancel: cancel);
+      cancel.check();
+      if (!mounted || model != currentModel) return;
+      _refreshUncoveredLibrary();
+    } on Cancelled {
+      // Leaving the library stops its explicit refresh immediately.
+    } catch (error) {
+      if (mounted && !cancel.cancelled && model == currentModel) {
+        showFailure(context, error);
+      }
+    } finally {
+      if (_libraryRefreshCancel == cancel) {
+        _libraryRefreshCancel = null;
+        _libraryRefreshWork = null;
+      }
+    }
   }
 
   @override
@@ -280,7 +323,10 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   }
 
   Future<T?> _pushCoveringRoute<T>(TransitionRoute<T> route) async {
+    _search.dismissFocus();
+    FocusManager.instance.primaryFocus?.unfocus();
     _coveringRoutes++;
+    _suspendLibrary();
     try {
       final result = await Navigator.of(context).push(route);
       await route.completed;
@@ -300,11 +346,14 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     _selectedMedia.clear();
     _selecting = false;
     _snapshotCancel?.cancel();
+    _libraryRefreshCancel?.cancel();
+    _libraryRefreshCancel = null;
+    _libraryRefreshWork = null;
     _snapshot = null;
     _snapshotVersion = _requestedSnapshotVersion = null;
     _libraryNeedsRefresh = true;
     _media = _recent = const [];
-    _posters = _filesByGroup = const [];
+    _groups = const [];
     _libraryDataKey = _chromeKey = null;
     _libraryContent = null;
     _sourcesContent = _settingsContent = null;
@@ -318,8 +367,10 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     model.removeListener(_changed);
     _snapshotCancel?.cancel();
+    _libraryRefreshCancel?.cancel();
     _pages.dispose();
     _sources.dispose();
+    _search.dispose();
     _navigationHidden.dispose();
     super.dispose();
   }
@@ -369,6 +420,10 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
 
   Future<void> _play(SyncRecord record) async {
     if (_openingPlayer) return;
+    // Dismiss before any async preparation or association sheet can take focus.
+    // The search controller also cancels a pending expansion focus request.
+    _search.dismissFocus();
+    FocusManager.instance.primaryFocus?.unfocus();
     _openingPlayer = true;
     try {
       if (model.store.local('location:${record.id}') == null) {
@@ -393,6 +448,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   }
 
   Future<void> _associate(SyncRecord record) async {
+    _search.dismissFocus();
+    FocusManager.instance.primaryFocus?.unfocus();
     await showGlassBottomSheet(
       context: context,
       builder: (sheet) => SafeArea(
@@ -449,9 +506,14 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   Future<void> _details(String series, List<SyncRecord> episodes) async {
     final snapshot = _snapshot;
     if (episodes.isEmpty || _detailsVisible || snapshot == null) return;
+    // Clear the route's remembered search focus before the modal takes over,
+    // otherwise touch navigation restores the keyboard when details close.
+    _search.dismissFocus();
+    FocusManager.instance.primaryFocus?.unfocus();
     final complete = snapshot.seriesFor(episodes.first);
     if (complete.isNotEmpty) episodes = complete;
     _detailsVisible = true;
+    _suspendLibrary();
     ModalRoute<dynamic>? detailsRoute;
     try {
       await showGlassBottomSheet(
@@ -513,6 +575,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       final yes = await showDialog<bool>(
         context: context,
         builder: (c) => AlertDialog(
+          titlePadding: GlassMetrics.dialogTitlePadding,
+          contentPadding: GlassMetrics.dialogContentPadding,
+          actionsPadding: GlassMetrics.dialogActionsPadding,
           title: Text(
             single
                 ? (managed ? '删除导入的视频？' : '从影视库移除？')
@@ -554,6 +619,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     final ok = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
+        titlePadding: GlassMetrics.dialogTitlePadding,
+        contentPadding: GlassMetrics.dialogContentPadding,
+        actionsPadding: GlassMetrics.dialogActionsPadding,
         title: const Text('更正影视资料'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -562,12 +630,12 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
               controller: name,
               decoration: const InputDecoration(labelText: '作品名称'),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             TextField(
               controller: season,
               decoration: const InputDecoration(labelText: '季度'),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             TextField(
               controller: episode,
               decoration: const InputDecoration(labelText: '集数 / S1 / O1'),
@@ -621,6 +689,20 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     episode.dispose();
   }
 
+  Future<void> _sortLibrary(String option) async {
+    final current = model.librarySorting;
+    final next = switch (option) {
+      'ascending' => current.copyWith(descending: false),
+      'descending' => current.copyWith(descending: true),
+      _ => current.copyWith(field: option, descending: option != 'name'),
+    };
+    try {
+      await model.setLibrarySorting(next);
+    } catch (error) {
+      if (mounted) showFailure(context, error);
+    }
+  }
+
   Widget _library(BuildContext context, bool desktop) {
     _libraryDataKey = _libraryVersion;
     final mobile = switch (Theme.of(context).platform) {
@@ -628,13 +710,16 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       _ => false,
     };
     final media = _media;
-    final posters = _posters, files = _filesByGroup;
-    final groupCount = posters.length + files.length;
+    final groups = _groups;
+    final groupCount = groups.length;
+    final posterLayout = _snapshot?.posters.isNotEmpty ?? false;
+    final sorting = model.librarySorting;
     final recent = _recent;
     final inset = desktop ? 20.0 : 12.0;
     final scale = MediaQuery.textScalerOf(context).scale(1);
-    return CustomScrollView(
+    final scroll = CustomScrollView(
       key: const PageStorageKey('library-scroll'),
+      physics: const AlwaysScrollableScrollPhysics(),
       scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
       slivers: [
         SliverPadding(
@@ -650,6 +735,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
           sliver: SliverList.list(
             children: [
               SearchHeader(
+                controller: _search,
                 title: '我的影视库',
                 hint: '搜索作品或文件名',
                 onChanged: (v) {
@@ -674,7 +760,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                 const LinearProgressIndicator(),
                 const SizedBox(height: 8),
               ],
-              if (recent.isNotEmpty && query.isEmpty) ...[
+              if (recent.isNotEmpty) ...[
                 ContinueWatchingContent(
                   key: const ValueKey('library-continue-content'),
                   model: model,
@@ -701,18 +787,44 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  TextButton.icon(
-                    onPressed:
-                        _removingSelection || (!_selecting && groupCount == 0)
-                        ? null
-                        : () => _updateSelection(() {
-                            _selecting = !_selecting;
-                            _selectedMedia.clear();
-                          }),
-                    icon: Icon(
-                      _selecting ? Icons.done_rounded : Icons.checklist_rounded,
+                  GlassMenuTheme(
+                    child: PopupMenuButton<String>(
+                      key: const ValueKey('library-sort'),
+                      tooltip: '排序',
+                      icon: const Icon(Icons.sort_rounded),
+                      onOpened: () {
+                        _search.dismissFocus();
+                        FocusManager.instance.primaryFocus?.unfocus();
+                      },
+                      onSelected: _sortLibrary,
+                      itemBuilder: (_) => [
+                        for (final option in LibrarySort.labels.entries)
+                          CheckedPopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: option.key,
+                            checked: sorting.field == option.key,
+                            child: Text(option.value),
+                          ),
+                        const PopupMenuDivider(
+                          height: GlassMetrics.menuDividerHeight,
+                        ),
+                        CheckedPopupMenuItem(
+                          height: GlassMetrics.menuItemHeight,
+                          padding: GlassMetrics.menuItemPadding,
+                          value: 'ascending',
+                          checked: !sorting.descending,
+                          child: const Text('升序'),
+                        ),
+                        CheckedPopupMenuItem(
+                          height: GlassMetrics.menuItemHeight,
+                          padding: GlassMetrics.menuItemPadding,
+                          value: 'descending',
+                          checked: sorting.descending,
+                          child: const Text('降序'),
+                        ),
+                      ],
                     ),
-                    label: Text(_selecting ? '完成' : '多选'),
                   ),
                 ],
               ),
@@ -723,10 +835,19 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                   children: [
                     Text('已选 ${_selectedMedia.length} 个视频'),
                     TextButton(
+                      onPressed: _removingSelection
+                          ? null
+                          : () => _updateSelection(() {
+                              _selecting = false;
+                              _selectedMedia.clear();
+                            }),
+                      child: const Text('完成'),
+                    ),
+                    TextButton(
                       onPressed: _removingSelection || groupCount == 0
                           ? null
                           : () => _updateSelection(() {
-                              final ids = [...posters, ...files]
+                              final ids = groups
                                   .expand((group) => group.value)
                                   .map((item) => item.id)
                                   .toSet();
@@ -738,7 +859,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                             }),
                       child: Text(
                         groupCount > 0 &&
-                                [...posters, ...files]
+                                groups
                                     .expand((group) => group.value)
                                     .every(
                                       (item) =>
@@ -806,33 +927,35 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
               ),
             ),
           )
-        else ...[
-          for (final group in [posters, files])
-            if (group.isNotEmpty)
-              SliverPadding(
-                padding: EdgeInsets.fromLTRB(inset, 0, inset, 16),
-                sliver: SliverGrid.builder(
-                  gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                    maxCrossAxisExtent: identical(group, posters)
-                        ? (scale > 1.3 ? 260 : 190)
-                        : (desktop ? 310 : 240),
-                    childAspectRatio: identical(group, posters)
-                        ? .65
-                        : (scale > 1.3 ? 1.05 : 1.27),
-                    crossAxisSpacing: 12,
-                    mainAxisSpacing: 14,
-                  ),
-                  itemCount: group.length,
-                  itemBuilder: (_, i) =>
-                      _posterCard(group[i].key, group[i].value),
-                ),
+        else
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(inset, 0, inset, 16),
+            sliver: SliverGrid.builder(
+              gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: posterLayout
+                    ? (scale > 1.3 ? 260 : 190)
+                    : (desktop ? 310 : 240),
+                childAspectRatio: posterLayout
+                    ? .65
+                    : (scale > 1.3 ? 1.05 : 1.27),
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 14,
               ),
-        ],
+              itemCount: groups.length,
+              itemBuilder: (_, i) =>
+                  _posterCard(groups[i].key, groups[i].value),
+            ),
+          ),
         SliverToBoxAdapter(
           // Keep scroll metrics stable while the floating navigation slides.
           child: SizedBox(height: desktop ? 16 : 92),
         ),
       ],
+    );
+    return RefreshIndicator(
+      key: const ValueKey('library-refresh'),
+      onRefresh: _refreshLibrarySources,
+      child: scroll,
     );
   }
 
@@ -857,6 +980,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   }
 
   Future<void> _history() async {
+    final historyQuery = query;
     await _pushCoveringRoute(
       MaterialPageRoute(
         builder: (_) => GlassBackground(
@@ -864,9 +988,10 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
             appBar: AppBar(title: const Text('观看历史')),
             body: _HistorySnapshotContent(
               model: model,
+              query: historyQuery,
               initialSnapshot: _snapshot,
               builder: (context, snapshot) {
-                final items = snapshot?.recent;
+                final items = snapshot?.searchRecent;
                 if (items == null) {
                   return const Center(child: CircularProgressIndicator());
                 }
@@ -927,6 +1052,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   }
 
   Future<void> _historyActions(SyncRecord media) async {
+    _search.dismissFocus();
+    FocusManager.instance.primaryFocus?.unfocus();
     final remove = await showGlassBottomSheet<bool>(
       context: context,
       builder: (sheet) => SafeArea(
@@ -1434,7 +1561,11 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                             _navigationHidden.value = false;
                             _scrollTravel = 0;
                           });
-                          if (value == 0) _refreshUncoveredLibrary();
+                          if (value == 0) {
+                            _refreshUncoveredLibrary();
+                          } else {
+                            _suspendLibrary();
+                          }
                         },
                         children: [
                           _RetainedTab(
@@ -1720,8 +1851,18 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
 enum _PosterAction { select, remove }
 
 const _posterActions = [
-  PopupMenuItem(value: _PosterAction.select, child: Text('多选')),
-  PopupMenuItem(value: _PosterAction.remove, child: Text('删除')),
+  PopupMenuItem(
+    height: GlassMetrics.menuItemHeight,
+    padding: GlassMetrics.menuItemPadding,
+    value: _PosterAction.select,
+    child: Text('多选'),
+  ),
+  PopupMenuItem(
+    height: GlassMetrics.menuItemHeight,
+    padding: GlassMetrics.menuItemPadding,
+    value: _PosterAction.remove,
+    child: Text('删除'),
+  ),
 ];
 
 class _PosterTile extends StatefulWidget {
@@ -1968,7 +2109,6 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   late Widget _header;
   late MediaCollectionDetails _collectionDetails;
   SyncRecord? _latest;
-  final _loading = ValueNotifier(false);
   final _cancel = CancelToken();
   Animation<double>? _entrance;
   bool _scheduled = false;
@@ -1977,7 +2117,6 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   bool _routeCurrent = true;
   bool _foreground = true, _sourceLoading = false;
   bool _sourceRefreshPending = false, _sourceRefreshScheduled = false;
-  Timer? _sourceRefreshTimer;
   CancelToken? _sourceRefreshCancel;
   bool get _canRefreshSource =>
       mounted && _routeCurrent && _foreground && !model.clearingCaches;
@@ -2030,7 +2169,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
 
   Future<void> _chooseVersion(SyncRecord item) async {
     final versions = _snapshot.versionsFor(item);
-    final selected = await showModalBottomSheet<SyncRecord>(
+    final selected = await showGlassBottomSheet<SyncRecord>(
       context: context,
       builder: (context) => SafeArea(
         child: ListView.builder(
@@ -2206,7 +2345,6 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
       latest: _latest,
       onPlay: widget.onPlay,
       onSort: _sortMenu,
-      loading: _loading,
       onMatch: () => widget.onMatch(_allEpisodes),
     );
   }
@@ -2248,8 +2386,6 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   }
 
   void _suspendSourceRefresh() {
-    _sourceRefreshTimer?.cancel();
-    _sourceRefreshTimer = null;
     _sourceRefreshCancel?.cancel();
     if (_loadStarted) _sourceRefreshPending = true;
   }
@@ -2285,19 +2421,18 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
       _sourceRefreshPending = true;
       return;
     }
-    _sourceRefreshTimer?.cancel();
-    _sourceRefreshTimer = null;
     _sourceLoading = true;
     _sourceRefreshPending = false;
     final token = _sourceRefreshCancel = CancelToken();
-    final initial = !_loadStarted;
+    // Library details already display a prepared snapshot. Refresh its source
+    // silently, including the first refresh after each time the sheet opens.
     _loadStarted = true;
-    if (initial) _loading.value = true;
     try {
       // The card snapshot can predate a commit made while this route opens.
       // Refresh once even when no further writes happen during source loading.
       await _refreshMetadata();
-      if (!mounted || _cancel.cancelled) return;
+      token.check();
+      if (!_canRefreshSource || _cancel.cancelled) return;
       await model.loadSeriesEpisodes(widget.anchor, cancel: token);
       // The loader commits episodes through its worker. Refresh from the
       // prepared snapshot so the UI never computes collection aggregates.
@@ -2307,17 +2442,9 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
       _sourceLoading = false;
       _sourceRefreshCancel = null;
       if (mounted) {
-        _loading.value = false;
         _scheduleMetadataRefresh();
-        if (_canRefreshSource) {
-          if (_sourceRefreshPending) {
-            _queueSourceRefresh();
-          } else {
-            _sourceRefreshTimer = Timer(
-              model.seriesRefreshDelay(widget.anchor),
-              _queueSourceRefresh,
-            );
-          }
+        if (_canRefreshSource && _sourceRefreshPending) {
+          _queueSourceRefresh();
         }
       }
     }
@@ -2326,12 +2453,10 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _sourceRefreshTimer?.cancel();
     _sourceRefreshCancel?.cancel();
     _cancel.cancel();
     model.removeListener(_metadataChanged);
     _entrance?.removeStatusListener(_onAnimationStatus);
-    _loading.dispose();
     super.dispose();
   }
 
@@ -2366,13 +2491,43 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
               }
             },
             itemBuilder: (_) => [
-              const PopupMenuItem(value: 'file-details', child: Text('查看文件详情')),
+              const PopupMenuItem(
+                height: GlassMetrics.menuItemHeight,
+                padding: GlassMetrics.menuItemPadding,
+                value: 'file-details',
+                child: Text('查看文件详情'),
+              ),
               if (_snapshot.versionsFor(item).length > 1)
-                const PopupMenuItem(value: 'versions', child: Text('选择视频版本')),
-              const PopupMenuItem(value: 'edit', child: Text('更正作品与集数')),
-              const PopupMenuItem(value: 'link', child: Text('重新关联视频位置')),
-              const PopupMenuItem(value: 'watched', child: Text('切换已看状态')),
-              const PopupMenuItem(value: 'delete', child: Text('从影视库移除')),
+                const PopupMenuItem(
+                  height: GlassMetrics.menuItemHeight,
+                  padding: GlassMetrics.menuItemPadding,
+                  value: 'versions',
+                  child: Text('选择视频版本'),
+                ),
+              const PopupMenuItem(
+                height: GlassMetrics.menuItemHeight,
+                padding: GlassMetrics.menuItemPadding,
+                value: 'edit',
+                child: Text('更正作品与集数'),
+              ),
+              const PopupMenuItem(
+                height: GlassMetrics.menuItemHeight,
+                padding: GlassMetrics.menuItemPadding,
+                value: 'link',
+                child: Text('重新关联视频位置'),
+              ),
+              const PopupMenuItem(
+                height: GlassMetrics.menuItemHeight,
+                padding: GlassMetrics.menuItemPadding,
+                value: 'watched',
+                child: Text('切换已看状态'),
+              ),
+              const PopupMenuItem(
+                height: GlassMetrics.menuItemHeight,
+                padding: GlassMetrics.menuItemPadding,
+                value: 'delete',
+                child: Text('从影视库移除'),
+              ),
             ],
           ),
         );
@@ -2385,11 +2540,13 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
 /// and playback labels have their own smaller presentation snapshot below it.
 class _HistorySnapshotContent extends StatefulWidget {
   final AppModel model;
+  final String query;
   final LibrarySnapshot? initialSnapshot;
   final Widget Function(BuildContext, LibrarySnapshot?) builder;
 
   const _HistorySnapshotContent({
     required this.model,
+    this.query = '',
     required this.initialSnapshot,
     required this.builder,
   });
@@ -2407,10 +2564,19 @@ class _HistorySnapshotContentState extends State<_HistorySnapshotContent>
   ValueListenable<bool>? _activity;
   bool _active = false, _foreground = true;
 
+  LibrarySnapshot? get _matchingInitialSnapshot {
+    final snapshot = widget.initialSnapshot;
+    return snapshot?.query == widget.query.trim().toLowerCase()
+        ? snapshot
+        : null;
+  }
+
   Object get _currentRevision => (
     widget.model.store.recordsRevision('media'),
     widget.model.store.recordsRevision('progress'),
     widget.model.store.locationRevision,
+    widget.query.trim().toLowerCase(),
+    widget.query.trim().isEmpty ? null : widget.model.librarySearchRevision,
   );
 
   bool get _canRead =>
@@ -2419,7 +2585,7 @@ class _HistorySnapshotContentState extends State<_HistorySnapshotContent>
   @override
   void initState() {
     super.initState();
-    _snapshot = widget.initialSnapshot;
+    _snapshot = _matchingInitialSnapshot;
     widget.model.addListener(_refresh);
     WidgetsBinding.instance.addObserver(this);
     final lifecycle = WidgetsBinding.instance.lifecycleState;
@@ -2444,11 +2610,15 @@ class _HistorySnapshotContentState extends State<_HistorySnapshotContent>
   @override
   void didUpdateWidget(covariant _HistorySnapshotContent oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.model == widget.model) return;
-    oldWidget.model.removeListener(_refresh);
-    widget.model.addListener(_refresh);
+    if (oldWidget.model == widget.model && oldWidget.query == widget.query) {
+      return;
+    }
+    if (oldWidget.model != widget.model) {
+      oldWidget.model.removeListener(_refresh);
+      widget.model.addListener(_refresh);
+    }
     _suspend();
-    _snapshot = widget.initialSnapshot;
+    _snapshot = _matchingInitialSnapshot;
     _revision = null;
     _refresh();
   }
@@ -2475,7 +2645,10 @@ class _HistorySnapshotContentState extends State<_HistorySnapshotContent>
     final cancel = _cancel = CancelToken();
     _requestedRevision = revision;
     try {
-      final snapshot = await model.loadLibrarySnapshot(cancel: cancel);
+      final snapshot = await model.loadLibrarySnapshot(
+        query: widget.query,
+        cancel: cancel,
+      );
       if (!mounted || cancel.cancelled || _cancel != cancel) return;
       _cancel = null;
       _requestedRevision = null;

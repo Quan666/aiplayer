@@ -30,6 +30,8 @@ void main() {
       'subtitleColor': '#INVALID',
       'danmuBlockedWords': '字' * 4100,
       'shortcuts': 'broken',
+      'librarySortField': 'unknown-future-order',
+      'librarySortDescending': 'yes',
     });
     expect(preferences.autoPlay, isTrue);
     expect(preferences.resumePlayback, isTrue);
@@ -49,6 +51,8 @@ void main() {
     expect(preferences.subtitleColor, '#FFFFFF');
     expect(preferences.danmuBlockedWords.length, 4000);
     expect(preferences.shortcuts, AppPreferences.defaultShortcuts);
+    expect(preferences.librarySortField, 'recent');
+    expect(preferences.librarySortDescending, isTrue);
     expect(AppPreferences({'refreshInterval': 0}).refreshInterval, 0);
     expect(AppPreferences({'refreshInterval': 99999}).refreshInterval, 3600);
   });
@@ -67,6 +71,8 @@ void main() {
       {'refreshInterval': 15},
       {'videoFit': 'stretch'},
       {'subtitleColor': '#FF0000'},
+      {'librarySortField': 'unknown-order'},
+      {'librarySortDescending': 'true'},
       {'danmuBlockedWords': '字' * 4001},
       {'shortcuts': []},
       {

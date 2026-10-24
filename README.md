@@ -2,7 +2,7 @@
 
 面向个人动漫收藏的 Flutter 播放器与可选 Go 同步服务。包含 Android、iOS/iPadOS、Windows、macOS 工程；Linux 工程用于本次环境的实际播放验证。界面默认中文、浅色，可在「设置 → 常规 → 外观与文件」切换深色，选择保存在本机。
 
-**当前源码版本为 0.5.14+20，尚未完成四端实机验收。** 本轮优化 WebDAV 播放、控件展开和影视库浏览：网络视频转发移到独立任务，控件与视频分离更新，播放器控件默认不做实时背景模糊；缓存播放列表及影视库索引，封面按可见卡片懒加载。移除同步播放，保留跨设备进度和资料同步；进度每 10 秒或暂停、切后台、退出时保存，截图仅在暂停、退出等事件按需生成。具体实现及测试边界见 [验证记录](docs/VALIDATION.md) 和 [封面说明](docs/PREVIEWS.md)。
+**当前源码版本为 0.5.15+21，尚未完成四端实机验收。** 本轮优化 WebDAV 播放、控件展开和影视库浏览：网络视频转发移到独立任务，控件与视频分离更新，播放器控件默认不做实时背景模糊；缓存播放列表及影视库索引，封面按可见卡片懒加载。移除同步播放，保留跨设备进度和资料同步；进度每 10 秒或暂停、切后台、退出时保存，截图仅在暂停、退出等事件按需生成。具体实现及测试边界见 [验证记录](docs/VALIDATION.md) 和 [封面说明](docs/PREVIEWS.md)。
 
 本轮提供 [0.5.14 Android 通用 release APK](artifacts/performance-0514/aiplayer-0.5.14-android.apk)，支持 Android 7.0+ 的 ARM32、ARM64 与 x86_64，版本号 `0.5.14+20`，大小 135,301,586 字节。沿用现有签名，0.5.4 至 0.5.13 可覆盖升级；密钥仍保存在 `.local-build/signing/debug.keystore`。[构建与 APK 校验](artifacts/performance-0514/build-android.json)、[校验和](artifacts/performance-0514/SHA256SUMS-android)。配套进度同步仍兼容现有 [0.5.3 服务包](artifacts/aiplayer-sync-0.5.3-linux-amd64.tar.gz)；服务端源码已移除同步播放接口，本轮未部署或替换运行中的服务。
 
@@ -67,7 +67,16 @@ flutter run -d <设备ID>
 
 全部构建成功的推送或 `target: all` 手动运行，在运行页面的 **Artifacts** 中只提供三个下载项：通用 `.apk`、ARM64 `.apk` 和一份包含 `aiplayer.app` 的 `.zip`。macOS 的 `.app` 是目录包，需先用 `ditto` 归档，才能在上传时保留权限和符号链接；解压一次即可得到应用。上传使用 [upload-artifact 的单文件直传](https://github.com/actions/upload-artifact#upload-an-individual-file-unzipped)，不再额外套一层 Artifact ZIP。Android 两种包均使用 `--no-android-alias`，不上传内容相同的固定名 APK 副本。
 
-CI 不再上传 DMG、`build-*.json`、`SHA256SUMS-*` 或截图产物；验证工作流的测试仍保留。下载产物保留 30 天，不自动创建 GitHub Release。相关源码变更及 `v*` 标签触发自动构建；PR 只构建 macOS，**不向 PR 代码提供 Android 签名密钥，也不生成正式 Android 包**。自动构建和手动构建都由 `packages.yml` 内的对应任务执行，不另设 macOS 工作流。
+CI 不上传 DMG、`build-*.json`、`SHA256SUMS-*` 或截图产物；验证工作流的测试仍保留。Actions Artifacts 保留 30 天。相关源码变更及 `v*` 标签触发自动构建；PR 只构建 macOS，**不向 PR 代码提供 Android 签名密钥，也不生成正式 Android 包**。自动构建和手动构建都由 `packages.yml` 内的对应任务执行，不另设 macOS 工作流。
+
+推送版本标签会在 Android、macOS 全部打包成功后自动创建 GitHub Release，上传上述三个原始文件，并生成发布说明。标签必须与 `client/pubspec.yaml` 中去掉构建号的版本一致，例如 `0.5.15+21` 对应 `v0.5.15`；不一致时在打包前失败。将本次版本修改提交并推送后执行：
+
+```bash
+git tag v0.5.15
+git push origin v0.5.15
+```
+
+普通分支和 PR 不发布 Release。手动补发已有标签可运行 `gh workflow run packages.yml --ref v0.5.15 -f target=all`，也可选 `android` 或 `macos` 仅构建并上传对应平台。所选平台任一构建失败或取消时不发布。新 Release 先创建草稿，文件上传成功后公开；上传失败可重跑，已存在的 Release 更新同名附件并保留其他附件和发布说明。预发布版本（如 `0.5.16-rc.1+22`）对应的标签会创建 Pre-release。只有发布任务获得 `contents: write`，使用内置 `GITHUB_TOKEN`，无需另配发布 Token；Release 附件不受 Artifacts 的 30 天保留期限制。
 
 Android 首次运行前，在仓库 **Settings → Secrets and variables → Actions** 配置 `ANDROID_KEYSTORE_BASE64`，内容为现有 `.local-build/signing/debug.keystore` 的 Base64。已登录 GitHub CLI 时，可在本机 Linux 项目根目录运行以下命令，将值通过标准输入上传，不打印密钥：
 
@@ -79,11 +88,11 @@ base64 -w0 .local-build/signing/debug.keystore | gh secret set ANDROID_KEYSTORE_
 
 ### GitHub Actions 打包 macOS
 
-将源码推送到 GitHub 仓库后，在 **Actions → Build packages → Run workflow** 选择分支和 `target: macos`（或 `all`）。手动入口需要该工作流已存在于默认分支。客户端、原生依赖包或打包脚本变更时自动构建；推送 `v*` 标签也会构建。本地 `origin` 指向 NAS，`github` 指向 GitHub；需要将修复同步到 GitHub 才能使用 GitHub 托管运行器。
+将源码推送到 GitHub 仓库后，在 **Actions → Build packages → Run workflow** 选择分支和 `target: macos`（或 `all`）。手动入口需要该工作流已存在于默认分支。客户端、原生依赖包或打包脚本变更时自动构建；推送 `v*` 标签也会构建并发布 Release。当前 `origin` 指向 GitHub，需要将修改推送后才能使用 GitHub 托管运行器。
 
 流程使用 macOS 15、Flutter 3.47.7、Xcode 和 CocoaPods，构建 Apple Silicon / Intel 通用包。CI 执行 `bash scripts/package_macos.sh --app-only`，只生成并上传 `aiplayer-macos-unsigned.zip`。在运行页面的 **Artifacts** 下载后，解压一次得到 `aiplayer.app`，再移到 Applications；归档保留应用包权限和符号链接。
 
-构建产物保留 30 天，不会自动发布到 GitHub Releases；需要长期留存时请下载保存。文件名中的 `unsigned` 表示无开发者证书、公证，本流程实际使用 ad-hoc 签名并验证包内签名与双架构。无需上传 Apple 证书或 Android 密钥。首次打开可能需要到「系统设置 → 隐私与安全性」允许打开。
+Actions Artifacts 保留 30 天，版本标签构建还会将应用包上传到对应 GitHub Release。文件名中的 `unsigned` 表示无开发者证书、公证，本流程实际使用 ad-hoc 签名并验证包内签名与双架构。仅构建 macOS 无需上传 Apple 证书或 Android 密钥。首次打开可能需要到「系统设置 → 隐私与安全性」允许打开。
 
 自用流程通过构建参数关闭 App Sandbox，密码与 Token 保存在应用数据目录的 `credentials/local-v1.sqlite3` 中，不再访问钥匙串，因此不会因读取这些凭据弹出钥匙串授权窗口。凭据文件未加密，通过文件权限限制为当前用户读写（文件 `0600`，所在目录 `0700`）。普通签名构建仍使用原有沙盒和钥匙串配置。
 

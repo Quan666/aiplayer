@@ -55,6 +55,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
   String? _reportedFailure;
   bool _posterInvalidated = false;
   bool _repairingPoster = false;
+  bool _posterFailed = false;
   int _posterRevision = 0;
   Listenable? _cacheCapacity;
   Future<File?>? _poster;
@@ -62,6 +63,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
   bool _imageLoadingAllowed = false;
   bool _active = true;
   bool get _enabled => _active && ArtworkLifecycle.instance.value;
+  bool get _needsPreview =>
+      _previewPending &&
+      (widget.poster.isEmpty || widget.cache == null || _posterFailed);
   ValueListenable<bool>? _scrollActivity;
   final _scrollPositions = <ScrollPosition>{};
   ModalRoute<dynamic>? _route;
@@ -121,6 +125,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
     void changed() {
       _cancelDecode();
       _failedImage = null;
+      _posterFailed = false;
       _posterWasNearby = false;
       _poster = change.file == null ? null : SynchronousFuture(change.file);
       _posterRevision++;
@@ -305,7 +310,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
         (!needsPoster &&
             _imageLoadingAllowed &&
             _queuedImage == null &&
-            (!_previewPending || _scrollActivity?.value == true)) ||
+            (!_needsPreview || _scrollActivity?.value == true)) ||
         _previewFrameScheduled) {
       return;
     }
@@ -356,9 +361,13 @@ class _MediaArtworkState extends State<MediaArtwork> {
             _poster = poster;
             _posterWasNearby = priority > 0;
           });
-          if (priority > 0) {
-            poster.then((file) {
-              if (!mounted || !identical(_poster, poster)) return;
+          poster.then((file) {
+            if (!mounted || !identical(_poster, poster)) return;
+            // Null can also mean cancelled prefetch, a paused cache or a full
+            // queue. Only an actual failure makes software video capture a
+            // useful fallback; downloaded and pending posters need no frame.
+            _posterFailed = file == null && cache.hasFailed(widget.poster);
+            if (_posterWasNearby) {
               if (file == null) {
                 // A speculative admission can be dropped after scrolling
                 // away. A later visible visit must be able to request it.
@@ -372,11 +381,12 @@ class _MediaArtworkState extends State<MediaArtwork> {
               } else {
                 _posterWasNearby = false;
               }
-            });
-          }
+            }
+            if (_needsPreview) _loadArtwork();
+          });
         }
       }
-      if (_previewPending && priority == 0 && !_deferLoading) {
+      if (_needsPreview && priority == 0 && !_deferLoading) {
         _previewPending = false;
         widget.onRequestPreview?.call();
       }
@@ -404,6 +414,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
       _reportedFailure = null;
       _posterInvalidated = false;
       _repairingPoster = false;
+      _posterFailed = false;
       _cacheCapacity?.removeListener(_loadArtwork);
       _cacheCapacity = null;
       _poster = null;
@@ -513,7 +524,15 @@ class _MediaArtworkState extends State<MediaArtwork> {
 
   void _repairPoster(String poster, File file) {
     final cache = widget.cache;
-    if (_posterInvalidated || cache == null) return;
+    if (_repairingPoster) return;
+    if (_posterInvalidated || cache == null) {
+      if (_posterFailed) return;
+      // A replacement that still cannot decode is a real failure. Retry the
+      // video fallback after layout, while preserving visibility/idle gates.
+      _posterFailed = true;
+      _loadArtwork();
+      return;
+    }
     _posterInvalidated = true;
     _repairingPoster = true;
     // A stale or corrupt disk entry must be evicted from both caches. Repair
@@ -527,6 +546,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
         _failedImage = null;
         _poster = null;
         _repairingPoster = false;
+        _posterFailed = false;
         _posterRevision++;
       }
 

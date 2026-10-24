@@ -29,16 +29,27 @@ void showGlassSuccess(BuildContext context, String message) {
         behavior: SnackBarBehavior.floating,
         width: width,
         duration: const Duration(seconds: 2),
-        elevation: 6,
-        backgroundColor: colors.surface,
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        shape: styles.toastShape,
-        content: Row(
-          children: [
-            Icon(Icons.check_circle_rounded, size: 22, color: colors.success),
-            const SizedBox(width: 10),
-            Flexible(child: Text(message, style: style)),
-          ],
+        elevation: 0,
+        backgroundColor: AppTheme.transparent,
+        padding: EdgeInsets.zero,
+        clipBehavior: Clip.none,
+        shape: styles.toastShape.copyWith(side: BorderSide.none),
+        content: DecoratedBox(
+          decoration: styles.toastDecoration,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.check_circle_rounded,
+                  size: 22,
+                  color: colors.success,
+                ),
+                const SizedBox(width: 10),
+                Flexible(child: Text(message, style: style)),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -66,11 +77,36 @@ Future<T?> showGlassBottomSheet<T>({
       tint: GlassPalette.of(context).surface,
       child: GlassBlurScope(
         enabled: false,
-        child: ArtworkScrollScope(child: builder(context)),
+        child: GlassMenuTheme(
+          child: ArtworkScrollScope(child: builder(context)),
+        ),
       ),
     ),
   ),
 );
+
+/// Applies compact rows only to menus and sheets, leaving page and player rows
+/// under their own themes. Minimum heights still allow text to grow or wrap.
+class GlassMenuTheme extends StatelessWidget {
+  final Widget child;
+  const GlassMenuTheme({super.key, required this.child});
+
+  @override
+  Widget build(BuildContext context) => Theme(
+    // Popup routes capture Theme in full. This SDK's ListTileTheme.wrap drops
+    // minTileHeight, which would silently restore 56px checked menu rows.
+    data: Theme.of(context).copyWith(
+      listTileTheme: ListTileTheme.of(context).copyWith(
+        minTileHeight: GlassMetrics.menuItemHeight,
+        minVerticalPadding: 4,
+        minLeadingWidth: 20,
+        horizontalTitleGap: 8,
+        contentPadding: GlassMetrics.menuItemPadding,
+      ),
+    ),
+    child: child,
+  );
+}
 
 class GlassBackground extends StatelessWidget {
   final Widget child;
@@ -288,49 +324,49 @@ Future<T?> showGlassChoice<T>({
       maxHeight: MediaQuery.sizeOf(sheet).height * .72,
       maxWidth: 440,
     ),
-    child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
-          child: Row(
-            children: [
-              Expanded(child: Text(title, style: AppStyles.of(sheet).title)),
-              IconButton(
-                tooltip: '关闭',
-                icon: const Icon(Icons.close_rounded),
-                onPressed: () => Navigator.pop(sheet),
-              ),
-            ],
-          ),
-        ),
-        Flexible(
-          child: ListView(
-            shrinkWrap: true,
-            padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-            children: [
-              for (final option in options)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 4),
-                  child: ListTile(
-                    selected: option.value == value,
-                    leading: option.icon == null
-                        ? null
-                        : Icon(option.icon, size: 20),
-                    title: Text(option.label),
-                    trailing: option.value == value
-                        ? Icon(
-                            Icons.check_rounded,
-                            color: GlassPalette.of(sheet).accent,
-                          )
-                        : null,
-                    onTap: () => Navigator.pop(sheet, option.value),
-                  ),
+    child: GlassMenuTheme(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 4, 0),
+            child: Row(
+              children: [
+                Expanded(child: Text(title, style: AppStyles.of(sheet).title)),
+                IconButton(
+                  tooltip: '关闭',
+                  icon: const Icon(Icons.close_rounded),
+                  onPressed: () => Navigator.pop(sheet),
                 ),
-            ],
+              ],
+            ),
           ),
-        ),
-      ],
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+              itemCount: options.length,
+              itemBuilder: (context, index) {
+                final option = options[index];
+                return ListTile(
+                  selected: option.value == value,
+                  leading: option.icon == null
+                      ? null
+                      : Icon(option.icon, size: 20),
+                  title: Text(option.label),
+                  trailing: option.value == value
+                      ? Icon(
+                          Icons.check_rounded,
+                          color: GlassPalette.of(sheet).accent,
+                        )
+                      : null,
+                  onTap: () => Navigator.pop(sheet, option.value),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
     ),
   );
   if (MediaQuery.sizeOf(context).width >= 600) {
@@ -399,6 +435,15 @@ class _GlassSelectState<T> extends State<GlassSelect<T>> {
             isFocused: opened,
             decoration: InputDecoration(
               labelText: widget.label,
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 8,
+              ),
+              suffixIconConstraints: const BoxConstraints(
+                minWidth: 36,
+                minHeight: 36,
+              ),
               enabled: widget.enabled,
               filled: false,
               border: InputBorder.none,

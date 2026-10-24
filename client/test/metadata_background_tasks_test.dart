@@ -30,6 +30,7 @@ Map<String, dynamic> _subject(String name, {String type = 'tv'}) => {
 class _BatchAi extends MediaAiRecognition {
   _BatchAi(super.store);
   final batches = <List<String>>[];
+  final folders = <List<String>>[];
   final singles = <String>[];
   final confirmations = <AiMediaIdentity>[];
   final overrides = <String, AiMediaIdentity>{};
@@ -88,6 +89,16 @@ class _BatchAi extends MediaAiRecognition {
   }
 
   @override
+  Future<Map<String, AiMediaIdentity>> analyzeFolderFilenames(
+    List<String> fileNames, {
+    required SubtitleAiConfig config,
+    required CancelToken cancel,
+  }) {
+    folders.add(fileNames.toList());
+    return analyzeFilenames(fileNames, config: config, cancel: cancel);
+  }
+
+  @override
   Future<Map<String, dynamic>?> confirm(
     AiMediaIdentity identity,
     List<Map<String, dynamic>> candidates, {
@@ -111,7 +122,10 @@ class _Catalog extends LibraryCatalog {
   final queries = <String>[], normalQueries = <String>[];
   final overrides = <String, List<Map<String, dynamic>>>{};
   int detailsCalls = 0, episodeCalls = 0, active = 0, maximum = 0;
-  Completer<void>? searchGate, normalGate, episodeGate;
+  Completer<void>? searchGate, normalGate, episodeGate, detailsGate;
+  final detailsStarted = Completer<void>();
+  bool ignoreDetailsCancellation = false;
+  Object? detailsFailure;
   final normalStarted = Completer<void>();
   final episodeStarted = Completer<void>();
   final firstSearch = Completer<void>(), thirdSearch = Completer<void>();
@@ -162,6 +176,13 @@ class _Catalog extends LibraryCatalog {
   }) async {
     cancel?.check();
     detailsCalls++;
+    if (!detailsStarted.isCompleted) detailsStarted.complete();
+    if (detailsFailure case final failure?) throw failure;
+    if (ignoreDetailsCancellation) {
+      await detailsGate?.future;
+    } else {
+      await _waitFor(detailsGate, cancel);
+    }
     return subject;
   }
 
@@ -175,7 +196,7 @@ class _Catalog extends LibraryCatalog {
     episodeCalls++;
     if (!episodeStarted.isCompleted) episodeStarted.complete();
     await _waitFor(episodeGate, cancel);
-    return {for (var i = 1; i <= 20; i++) '$i': 'Official episode $i'};
+    return {for (var i = 1; i <= 51; i++) '$i': 'Official episode $i'};
   }
 }
 
@@ -228,6 +249,172 @@ void main() {
     });
     return store.get('media', id)!;
   }
+
+  test(
+    'manual selections preserve batch history and remove only task records',
+    () async {
+      store.setLocal('settings', {
+        ...model.settings,
+        'aiMetadataEnabled': false,
+      });
+      final first = add('review-one');
+      final second = add('review-two', work: 'Second');
+      model.fakeCatalog.normalFailures.addAll(['Example', 'Second']);
+      final batch = model.startMetadataTask([first, second]);
+      await batch.done;
+      expect(batch.matched, 0);
+      expect(batch.failed, 2);
+      expect(batch.error, 'Catalogue offline');
+      expect(
+        batch.results,
+        isEmpty,
+        reason: 'Ordinary recognition has no AI results.',
+      );
+      expect(() => batch.records.clear(), throwsUnsupportedError);
+
+      final selection = model.startMetadataSelectionTask(
+        [first],
+        _subject('Chosen'),
+        season: '1',
+        parentTask: batch,
+      );
+      expect(batch.selectionTask, same(selection));
+      expect(batch.error, isEmpty);
+      expect(model.metadataTasks, [batch]);
+      await selection.done;
+      expect(batch.records.map((r) => r.id), ['review-one', 'review-two']);
+      expect(batch.isMatched(first.id), isTrue);
+      expect(batch.isMatched(second.id), isFalse);
+      expect(batch.matched, 1);
+      expect(batch.failed, 1);
+      expect(
+        batch.records.first.revision,
+        store.get('media', first.id)!.revision,
+      );
+      expect(store.get('media', second.id)!.data['bangumiId'], isNull);
+      expect(batch.status, '已匹配 1/2，其余可手动选择');
+
+      model.removeMetadataTaskRecord(batch, first.id);
+      expect(batch.records.single.id, second.id);
+      expect(batch.completed, 1);
+      expect(batch.matched, 0);
+      expect(batch.failed, 1);
+      expect(store.get('media', first.id)!.data['bangumiId'], isNotNull);
+      model.removeMetadataTask(batch);
+      expect(batch.removed, isTrue);
+      expect(model.metadataTasks, isEmpty);
+      expect(store.get('media', first.id)!.deleted, isFalse);
+      expect(store.get('media', second.id)!.deleted, isFalse);
+      expect(store.local('metadata:pending-tasks'), isEmpty);
+    },
+  );
+
+  test(
+    'a detail timeout keeps manual matching from waiting for the episode endpoint too',
+    () async {
+      final record = add('offline-details');
+      model.fakeCatalog.detailsFailure = const NetworkUnavailable(
+        '服务长时间未收到数据，请重试。',
+      );
+      model.fakeCatalog.episodeGate = Completer<void>();
+      final task = model.startMetadataSelectionTask(
+        [record],
+        _subject('Selected'),
+        season: '1',
+      );
+      await task.done.timeout(const Duration(seconds: 3));
+      expect(task.matched, 1);
+      expect(task.error, isEmpty);
+      expect(store.get('media', record.id)!.data['metadataTitle'], 'Selected');
+      expect(model.fakeCatalog.episodeCalls, 0);
+      expect(task.status, '已匹配 1 个视频');
+    },
+  );
+
+  test(
+    'deleting a batch cancels a selection and ignores its late response',
+    () async {
+      store.setLocal('settings', {
+        ...model.settings,
+        'aiMetadataEnabled': false,
+      });
+      final record = add('late-selection');
+      final batch = model.startMetadataTask([record]);
+      await batch.done;
+      model.fakeCatalog.detailsGate = Completer<void>();
+      model.fakeCatalog.ignoreDetailsCancellation = true;
+      final selection = model.startMetadataSelectionTask(
+        [record],
+        _subject('Late'),
+        season: '1',
+        parentTask: batch,
+      );
+      await model.fakeCatalog.detailsStarted.future;
+      model.removeMetadataTask(batch);
+      expect(selection.cancelled, isTrue);
+      expect(model.metadataTasks, isEmpty);
+      model.fakeCatalog.detailsGate!.complete();
+      final following = model.startMetadataTask([add('after-delete')]);
+      await following.done;
+      expect(store.get('media', record.id)!.data['bangumiId'], isNull);
+      expect(batch.isMatched(record.id), isFalse);
+      expect(model.metadataTasks, [following]);
+    },
+  );
+
+  test(
+    'matched records remain selectable and removing the last clears the task',
+    () async {
+      final record = add('rematch');
+      model.fakeCatalog.normalSubjects['Example'] = _subject('Original');
+      final batch = model.startMetadataTask([record]);
+      await batch.done;
+      expect(batch.isMatched(record.id), isTrue);
+      final selection = model.startMetadataSelectionTask(
+        batch.records,
+        _subject('Replacement'),
+        season: '2',
+        parentTask: batch,
+      );
+      await selection.done;
+      expect(selection.matched, 1);
+      expect(batch.matched, 1);
+      expect(batch.failed, 0);
+      expect(
+        store.get('media', record.id)!.data['metadataTitle'],
+        'Replacement',
+      );
+      expect(store.get('media', record.id)!.data['season'], '2');
+      model.removeMetadataTaskRecord(batch, record.id);
+      expect(batch.removed, isTrue);
+      expect(model.metadataTasks, isEmpty);
+      expect(store.get('media', record.id)!.data['bangumiId'], isNotNull);
+    },
+  );
+
+  test(
+    'manual selection reuses the reviewed filename identity without another AI request',
+    () async {
+      final record = add('known-identity');
+      final batch = model.startMetadataTask([record], ai: true);
+      await batch.done;
+      final parsed = batch.results[record.id]!.identity;
+      final calls = model.ai.batches.length;
+      model.ai.gate = Completer<void>();
+      final selection = model.startMetadataSelectionTask(
+        batch.records,
+        _subject('Manual choice'),
+        season: '2',
+        identity: parsed,
+        parentTask: batch,
+      );
+      await selection.done;
+      expect(selection.matched, 1);
+      expect(model.ai.batches.length, calls);
+      expect(store.get('media', record.id)!.data['episode'], '1');
+      expect(store.get('media', record.id)!.data['season'], '2');
+    },
+  );
 
   test(
     'automatic tasks wait for foreground and playback without blocking manual work',
@@ -550,17 +737,18 @@ void main() {
   );
 
   test(
-    'one batched parse and one work lookup preserve every episode',
+    'one whole-folder parse above 20 files preserves every episode',
     () async {
-      final records = List.generate(12, (i) => add('$i', episode: i + 1));
+      final records = List.generate(51, (i) => add('$i', episode: i + 1));
       final task = model.startMetadataTask(records, ai: true);
       await task.done;
       expect(task.running, isFalse);
-      expect(task.matched, 12);
+      expect(task.matched, 51);
       expect(task.failed, 0);
       expect(task.error, isEmpty);
       expect(model.ai.batches, hasLength(1));
-      expect(model.ai.batches.single, hasLength(12));
+      expect(model.ai.batches.single, hasLength(51));
+      expect(model.ai.folders.single, hasLength(51));
       expect(model.ai.singles, isEmpty);
       expect(model.fakeCatalog.queries, ['Example']);
       expect(model.fakeCatalog.detailsCalls, 1);

@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../data/app_model.dart';
@@ -21,7 +20,6 @@ class MediaDetailsOverview extends StatelessWidget {
   final ValueChanged<SyncRecord> onPlay;
   final VoidCallback? onMatch;
   final VoidCallback onSort;
-  final ValueListenable<bool>? loading;
 
   const MediaDetailsOverview({
     super.key,
@@ -32,28 +30,12 @@ class MediaDetailsOverview extends StatelessWidget {
     required this.onPlay,
     required this.onSort,
     this.onMatch,
-    this.loading,
   });
 
   @override
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
-      if (loading case final loading?)
-        SizedBox(
-          height: 6,
-          child: Align(
-            alignment: Alignment.topCenter,
-            child: ValueListenableBuilder<bool>(
-              valueListenable: loading,
-              builder: (_, active, _) => active
-                  ? const LinearProgressIndicator(
-                      minHeight: LibraryStyles.progressHeight,
-                    )
-                  : const SizedBox(height: 2),
-            ),
-          ),
-        ),
       MediaDetailsHeader(
         model: model,
         details: details,

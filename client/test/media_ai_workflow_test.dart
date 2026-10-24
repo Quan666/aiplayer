@@ -45,6 +45,13 @@ class _Ai extends MediaAiRecognition {
   };
 
   @override
+  Future<Map<String, AiMediaIdentity>> analyzeFolderFilenames(
+    List<String> fileNames, {
+    required SubtitleAiConfig config,
+    required CancelToken cancel,
+  }) => analyzeFilenames(fileNames, config: config, cancel: cancel);
+
+  @override
   Future<AiMediaIdentity> analyzeFilename(
     String fileName, {
     required SubtitleAiConfig config,

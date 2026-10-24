@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/credential_storage.dart';
+import 'package:aiplayer/data/preferences.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/data/sync.dart';
 import 'package:aiplayer/data/sync_profile.dart';
@@ -16,6 +17,40 @@ const _token = 'synchronization-token-at-least-24-characters';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test(
+    'all-video sorting syncs, changes and resets with scalar preferences',
+    () async {
+      final server = _SyncServer();
+      final first = _Device(server), second = _Device(server);
+      first.settings({
+        'librarySortField': 'name',
+        'librarySortDescending': false,
+      });
+      await first.sync();
+      await second.sync();
+      AppPreferences preferences(_Device device) => AppPreferences(
+        Map<String, dynamic>.from(device.store.local('settings') ?? {}),
+      );
+      expect(preferences(second).librarySortField, 'name');
+      expect(preferences(second).librarySortDescending, isFalse);
+      second.settings({
+        'librarySortField': 'modified',
+        'librarySortDescending': true,
+      });
+      await second.sync();
+      await first.sync();
+      expect(preferences(first).librarySortField, 'modified');
+      expect(preferences(first).librarySortDescending, isTrue);
+      first.store.setLocal('settings', <String, dynamic>{});
+      await first.sync();
+      await second.sync();
+      expect(preferences(second).librarySortField, 'recent');
+      expect(preferences(second).librarySortDescending, isTrue);
+      expect(first.store.conflicts, isEmpty);
+      expect(second.store.conflicts, isEmpty);
+    },
+  );
 
   test(
     'a new catalogue waits for deferred bindings before its first upload',

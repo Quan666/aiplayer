@@ -59,96 +59,58 @@ extension MediaAiIdentification on AppModel {
     required CancelToken cancel,
     void Function()? checkReady,
   }) async {
-    final found = <String, Map<String, dynamic>>{};
-    Object? failure;
-    final names = identity.searchNames.take(4).toList();
-    var next = 0;
-    Future<void> searchNames() async {
-      while (next < names.length) {
-        final name = names[next++];
-        cancel.check();
-        checkReady?.call();
-        try {
-          for (final candidate in await catalog.search(name, cancel: cancel)) {
-            found['${candidate['provider']}:${candidate['mediaType']}:${candidate['id']}'] =
-                candidate;
-          }
-        } on Cancelled {
-          rethrow;
-        } catch (error) {
-          failure = error;
-        }
-      }
-    }
-
-    await Future.wait([searchNames(), searchNames()]);
-    cancel.check();
-    checkReady?.call();
-    if (found.isEmpty && failure != null) throw failure!;
-    final candidates = found.values.toList();
-    // Do not truncate a broad result set then claim the remaining candidate
-    // is unique. Keep the complete list available for manual selection.
-    if (candidates.length > 80) {
-      return AiMetadataMatch(identity, candidates, null);
-    }
-    final selected = await mediaAi.confirm(
+    final match = await searchAiCatalogIdentity(
       identity,
-      candidates,
+      catalog: catalog,
+      mediaAi: mediaAi,
       config: config,
       cancel: cancel,
+      checkReady: checkReady,
     );
-    checkReady?.call();
-    Map<String, dynamic>? subject;
-    if (selected != null) {
-      try {
-        subject = await catalog.details(
-          selected,
-          season: identity.season,
-          cancel: cancel,
-        );
-      } on Cancelled {
-        rethrow;
-      } on AppFailure {
-        return AiMetadataMatch(identity, candidates, null);
-      }
-      checkReady?.call();
-      if (subject['provider'] == 'bangumi' &&
-          identity.season.isNotEmpty &&
-          !identity.searchNames.any(
-            (name) => subjectMatchesSeason(name, identity.season, subject!),
-          )) {
-        return AiMetadataMatch(identity, candidates, null);
-      }
-      // Details can expose a season/type contradiction absent from search.
-      final confirmed = await mediaAi.confirm(
-        identity,
-        [subject],
-        config: config,
-        cancel: cancel,
-      );
-      if (confirmed == null) subject = null;
-    }
-    cancel.check();
-    checkReady?.call();
-    return AiMetadataMatch(identity, candidates, subject);
+    return AiMetadataMatch(match.identity, match.candidates, match.subject);
   }
 
-  /// Parse filenames in batches, then search/confirm once per work and season.
+  Future<Map<String, AiMediaIdentity>> _analyzeMetadataFolderInBackground(
+    List<String> fileNames, {
+    required SubtitleAiConfig config,
+    required CancelToken cancel,
+  }) async {
+    cancel.check();
+    if (_disposed || _clearingCaches) throw const Cancelled();
+    final parsed = store.path == ':memory:'
+        ? await MediaAiRecognition(
+            store,
+          ).analyzeFolderFilenames(fileNames, config: config, cancel: cancel)
+        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+            store.path,
+          )).analyzeFolderFilenames(fileNames, config, cancel: cancel);
+    cancel.check();
+    if (_disposed || _clearingCaches) throw const Cancelled();
+    return parsed;
+  }
+
+  /// Parse a whole folder or independent batches, then confirm each work/season.
   /// Each returned identity retains its own episode number.
   Future<Map<String, AiMetadataMatch>> searchMetadataBatchWithAi(
     List<String> fileNames, {
     required CancelToken cancel,
     void Function(String)? onProgress,
     void Function()? checkReady,
+    bool wholeFolder = false,
   }) async {
     if (fileNames.isEmpty) return {};
     final config = await _metadataAiConfig();
     checkReady?.call();
-    final names = fileNames
-        .map(MediaAiRecognition.filenameOnly)
-        .toSet()
-        .toList();
-    final parsed = names.length == 1
+    final names = wholeFolder
+        ? fileNames
+        : fileNames.map(MediaAiRecognition.filenameOnly).toSet().toList();
+    final parsed = wholeFolder
+        ? await mediaAi.analyzeFolderFilenames(
+            names,
+            config: config,
+            cancel: cancel,
+          )
+        : names.length == 1
         ? {
             names.single: await mediaAi.analyzeFilename(
               names.single,
@@ -159,25 +121,20 @@ extension MediaAiIdentification on AppModel {
         : await mediaAi.analyzeFilenames(names, config: config, cancel: cancel);
     cancel.check();
     checkReady?.call();
-    final groups = <String, List<AiMediaIdentity>>{};
-    for (final identity in parsed.values) {
-      final key = jsonEncode([
-        normalizedSeries(identity.name),
-        identity.kind,
-        identity.season,
-        identity.year,
-        identity.episode.isNotEmpty,
-      ]);
-      (groups[key] ??= []).add(identity);
-    }
+    final groups = await groupAiCatalogIdentities(parsed.values.toList());
+    cancel.check();
+    checkReady?.call();
     final results = <String, AiMetadataMatch>{};
     var complete = 0;
+    var next = 0;
     Object? failure;
-    await Future.wait(
-      groups.values.map(
-        (group) => _metadataLookups.run(cancel, () async {
+    Future<void> searchGroups() async {
+      while (next < groups.length) {
+        cancel.check();
+        checkReady?.call();
+        final group = groups[next++];
+        await _metadataLookups.run(cancel, () async {
           checkReady?.call();
-          group.sort((a, b) => b.confidence.compareTo(a.confidence));
           AiMetadataMatch? match;
           try {
             match = await _searchAiIdentity(
@@ -206,9 +163,11 @@ extension MediaAiIdentification on AppModel {
           }
           complete++;
           onProgress?.call('正在搜索并核对作品 $complete/${groups.length}…');
-        }),
-      ),
-    );
+        });
+      }
+    }
+
+    await Future.wait([searchGroups(), searchGroups(), searchGroups()]);
     cancel.check();
     if (failure != null &&
         results.values.every((result) => result.candidates.isEmpty)) {
@@ -308,12 +267,13 @@ extension MediaAiIdentification on AppModel {
     final videos = entries
         .where((e) => !e.directory && isVideo(e.name))
         .toList();
-    if (videos.isEmpty || videos.length > 1000) return null;
+    if (videos.isEmpty) return null;
     AiMetadataMatch? first;
     final identities = <String, ReleaseName>{};
     final matches = await searchMetadataBatchWithAi(
       videos.map((video) => video.name).toList(),
       cancel: token,
+      wholeFolder: true,
     );
     for (final video in videos) {
       token.check();

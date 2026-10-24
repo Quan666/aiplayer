@@ -87,7 +87,7 @@ class _SyncWorkerSession {
     unawaited(
       Isolate.spawn(
             _syncWorkerMain,
-            _messages.sendPort,
+            [_messages.sendPort, ServicesBinding.rootIsolateToken],
             onError: _errors.sendPort,
             onExit: _exit.sendPort,
           )
@@ -186,7 +186,9 @@ Future<void> _serveCredentialRequest(
   }
 }
 
-void _syncWorkerMain(SendPort reply) {
+void _syncWorkerMain(List<Object?> startup) {
+  final reply = startup[0] as SendPort;
+  initializeSystemProxyWorker(startup[1] as RootIsolateToken?);
   final commands = ReceivePort();
   final state = _SyncWorkerState(reply);
   CancelToken? activeCancel;

@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../core/network.dart';
+import '../core/system_proxy.dart';
 import '../core/logger.dart';
 import 'credential_storage.dart';
 import 'poster_cache.dart';

@@ -5,6 +5,175 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test(
+    'external settings writes invalidate only their key and prefixes',
+    () async {
+      final directory = Directory.systemTemp.createTempSync(
+        'settings-revision-',
+      );
+      final first = AppStore('${directory.path}/app.db');
+      final worker = AppStore.openExisting(first.path);
+      addTearDown(() {
+        worker.dispose();
+        first.dispose();
+        directory.deleteSync(recursive: true);
+      });
+      first.setLocal('settings', {'volume': 80});
+      final media = first.recordsRevision('media');
+      final progress = first.recordsRevision('progress');
+      final location = first.locationRevision;
+      final preview = first.localPrefixRevision('preview:');
+      final otherKey = first.localKeyRevision('sources');
+      var settings = first.localKeyRevision('settings');
+      var prefix = first.localPrefixRevision('setting');
+      var allLocal = first.localPrefixRevision('');
+      var local = first.localRevision;
+      void check() {
+        expect(first.localKeyRevision('settings'), greaterThan(settings));
+        expect(first.localPrefixRevision('setting'), greaterThan(prefix));
+        expect(first.localPrefixRevision(''), greaterThan(allLocal));
+        expect(first.localRevision, greaterThan(local));
+        expect(first.recordsRevision('media'), media);
+        expect(first.recordsRevision('progress'), progress);
+        expect(first.locationRevision, location);
+        expect(first.localPrefixRevision('preview:'), preview);
+        expect(first.localKeyRevision('sources'), otherKey);
+        settings = first.localKeyRevision('settings');
+        prefix = first.localPrefixRevision('setting');
+        allLocal = first.localPrefixRevision('');
+        local = first.localRevision;
+      }
+
+      worker.setLocal('settings', {'volume': 60});
+      check();
+      worker.db.execute('UPDATE local SET value=? WHERE key=?', [
+        '{"volume":40}',
+        'settings',
+      ]);
+      check();
+      worker.db.execute('DELETE FROM local WHERE key=?', ['settings']);
+      check();
+      await first.patchSettingsInBackground({'librarySortField': 'name'});
+      check();
+      expect(first.local('settings'), {'librarySortField': 'name'});
+    },
+  );
+
+  test(
+    'renamed settings keys retain conservative cross-scope invalidation',
+    () {
+      final directory = Directory.systemTemp.createTempSync('settings-rename-');
+      final first = AppStore('${directory.path}/app.db');
+      final worker = AppStore.openExisting(first.path);
+      addTearDown(() {
+        worker.dispose();
+        first.dispose();
+        directory.deleteSync(recursive: true);
+      });
+      first.setLocal('settings', {'volume': 80});
+      for (final keys in [
+        ('settings', 'location:video'),
+        ('location:video', 'settings'),
+      ]) {
+        final settings = first.localKeyRevision('settings');
+        final location = first.locationRevision;
+        worker.db.execute('UPDATE local SET key=? WHERE key=?', [
+          keys.$2,
+          keys.$1,
+        ]);
+        expect(first.localKeyRevision('settings'), greaterThan(settings));
+        expect(first.locationRevision, greaterThan(location));
+        expect(first.local(keys.$1), isNull);
+        expect(first.local(keys.$2), {'volume': 80});
+      }
+    },
+  );
+
+  test(
+    'settings rollback invalidates local reads but never publishes remotely',
+    () {
+      final directory = Directory.systemTemp.createTempSync(
+        'settings-rollback-',
+      );
+      final first = AppStore('${directory.path}/app.db');
+      final worker = AppStore.openExisting(first.path);
+      addTearDown(() {
+        worker.dispose();
+        first.dispose();
+        directory.deleteSync(recursive: true);
+      });
+      first.setLocal('settings', {'volume': 80});
+      final remoteRevision = first.localKeyRevision('settings');
+      late int uncommitted;
+      expect(
+        () => worker.transaction(() {
+          worker.setLocal('settings', {'volume': 20});
+          uncommitted = worker.localKeyRevision('settings');
+          expect(first.local('settings'), {'volume': 80});
+          throw StateError('rollback');
+        }),
+        throwsStateError,
+      );
+      expect(worker.localKeyRevision('settings'), greaterThan(uncommitted));
+      expect(worker.local('settings'), {'volume': 80});
+      expect(first.localKeyRevision('settings'), remoteRevision);
+    },
+  );
+
+  test(
+    'version two stores replace local triggers once for settings isolation',
+    () {
+      final directory = Directory.systemTemp.createTempSync(
+        'settings-migration-',
+      );
+      final path = '${directory.path}/app.db';
+      final legacy = AppStore(path);
+      legacy.setLocal('settings', {'volume': 70});
+      for (final event in ['INSERT', 'UPDATE', 'DELETE']) {
+        final row = event == 'DELETE' ? 'OLD' : 'NEW';
+        legacy.db.execute(
+          'DROP TRIGGER store_change_local_${event.toLowerCase()}',
+        );
+        legacy.db.execute(
+          'CREATE TRIGGER store_change_local_${event.toLowerCase()} AFTER $event ON local BEGIN '
+          'INSERT INTO store_change_counters(scope,value) VALUES('
+          "CASE WHEN ($row.key='lastSync' OR substr($row.key,1,4)='sync')"
+          '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
+          " THEN 'sync' ELSE 'other' END,1) "
+          'ON CONFLICT(scope) DO UPDATE SET value=value+1; END',
+        );
+      }
+      legacy.db.execute('PRAGMA user_version=2');
+      legacy.dispose();
+      final migrated = AppStore(path);
+      final worker = AppStore.openExisting(path);
+      addTearDown(() {
+        worker.dispose();
+        migrated.dispose();
+        directory.deleteSync(recursive: true);
+      });
+      expect(
+        migrated.db.select('PRAGMA user_version').single['user_version'],
+        3,
+      );
+      expect(migrated.local('settings'), {'volume': 70});
+      final media = migrated.recordsRevision('media');
+      final settings = migrated.localKeyRevision('settings');
+      worker.setLocal('settings', {'volume': 25});
+      expect(migrated.localKeyRevision('settings'), greaterThan(settings));
+      expect(migrated.recordsRevision('media'), media);
+      final schema = migrated.db
+          .select('PRAGMA schema_version')
+          .single['schema_version'];
+      final reopened = AppStore(path);
+      expect(
+        reopened.db.select('PRAGMA schema_version').single['schema_version'],
+        schema,
+      );
+      reopened.dispose();
+    },
+  );
+
+  test(
     'prefix revisions isolate writes and detect direct SQL and rollback',
     () {
       final store = AppStore(':memory:');

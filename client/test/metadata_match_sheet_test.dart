@@ -8,6 +8,7 @@ import 'package:aiplayer/data/media_ai_recognition.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/metadata_match_dialog.dart';
+import 'package:aiplayer/ui/metadata_tasks_sheet.dart';
 import 'package:aiplayer/ui/sources_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -60,6 +61,13 @@ class _Catalog extends LibraryCatalog {
 class _Model extends AppModel {
   late final _fakeCatalog = _Catalog(store);
   _Model(super.store, super.documents);
+  bool forbidMediaReads = false;
+  @override
+  List<SyncRecord> get media {
+    if (forbidMediaReads) throw StateError('UI scanned the media library');
+    return super.media;
+  }
+
   @override
   LibraryCatalog get catalog => _fakeCatalog;
   @override
@@ -108,15 +116,23 @@ void main() {
     theme: GlassPalette.theme(),
     home: Builder(
       builder: (context) => Scaffold(
-        body: TextButton(
-          onPressed: () => showMetadataMatchDialog(
-            context,
-            model,
-            'Example',
-            season: '1',
-            mediaIds: ids,
-          ),
-          child: const Text('打开匹配'),
+        body: Column(
+          children: [
+            TextButton(
+              onPressed: () => showMetadataMatchDialog(
+                context,
+                model,
+                'Example',
+                season: '1',
+                mediaIds: ids,
+              ),
+              child: const Text('打开匹配'),
+            ),
+            TextButton(
+              onPressed: () => showMetadataTasks(context, model),
+              child: const Text('打开任务'),
+            ),
+          ],
         ),
       ),
     ),
@@ -309,7 +325,7 @@ void main() {
     model._fakeCatalog.resolveGate.complete(null);
     await tester.pumpAndSettle();
     await open(tester);
-    final choice = find.byType(DropdownButtonFormField<String>);
+    final choice = find.byKey(const ValueKey('metadata-record-choice'));
     await tester.ensureVisible(choice);
     await tester.tap(choice);
     await tester.pumpAndSettle();
@@ -320,17 +336,126 @@ void main() {
     await tester.ensureVisible(candidate);
     await tester.tap(candidate);
     await tester.pumpAndSettle();
-    final selection = model.metadataTasks.first;
+    expect(model.metadataTasks.single, same(batch));
+    final selection = batch.selectionTask!;
     expect(selection.mediaIds, {'two'});
+    expect(batch.mediaIds, {'one', 'two'});
     expect(selection.running, isTrue);
     expect(find.byKey(const ValueKey('metadata-match-sheet')), findsOneWidget);
-    model.cancelMetadataTask(selection);
+    await tester.tap(find.text('关闭'));
+    await tester.pumpAndSettle();
+    await open(tester);
+    expect(find.text('2/2  Example S01E02.mkv'), findsOneWidget);
+    expect(
+      tester.widget<TextField>(find.byType(TextField).first).enabled,
+      isFalse,
+    );
     model._fakeCatalog.detailsGate.complete(_subject);
     await tester.pumpAndSettle();
     expect(store.get('media', 'one')!.data['bangumiId'], isNull);
+    expect(store.get('media', 'two')!.data['bangumiId'], '42');
+    expect(find.text('1/2  Example S01E01.mkv'), findsOneWidget);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'unmatched files can be searched individually, advanced, revisited and removed',
+    (tester) async {
+      for (final (id, episode) in [('two', '2'), ('three', '3')]) {
+        store.save('media', id, {
+          ...media.data,
+          'fileName': 'Example S01E0$episode.mkv',
+          'episode': episode,
+        });
+      }
+      final records = [
+        media,
+        store.get('media', 'two')!,
+        store.get('media', 'three')!,
+      ];
+      await tester.pumpWidget(app(ids: {'one', 'two', 'three'}));
+      final task = model.startMetadataTask(records);
+      await tester.pump();
+      model._fakeCatalog.resolveGate.completeError(
+        const NetworkUnavailable('上一轮自动识别超时'),
+      );
+      await tester.pumpAndSettle();
+      expect(task.running, isFalse);
+      expect(task.results, isEmpty);
+      expect(task.error, '上一轮自动识别超时');
+      model.forbidMediaReads = true;
+      await open(tester);
+      expect(find.text('1/3  Example S01E01.mkv'), findsOneWidget);
+      await tester.tap(find.byTooltip('搜索资料'));
+      await tester.pumpAndSettle();
+      expect(find.text('上一轮自动识别超时'), findsNothing);
+      final candidate = find.widgetWithText(ListTile, '正式作品');
+      await tester.ensureVisible(candidate);
+      await tester.tap(candidate);
+      await tester.pumpAndSettle();
+      final selection = task.selectionTask!;
+      expect(selection.mediaIds, {'one'});
+      expect(model.metadataTasks.single, same(task));
+      model._fakeCatalog.detailsGate.complete(_subject);
+      await tester.pumpAndSettle();
+      expect(task.matched, 1);
+      expect(task.error, isEmpty);
+      expect(find.text('上一轮自动识别超时'), findsNothing);
+      expect(task.isMatched('one'), isTrue);
+      expect(store.get('media', 'one')!.data['bangumiId'], '42');
+      expect(store.get('media', 'two')!.data['bangumiId'], isNull);
+      expect(find.text('2/3  Example S01E02.mkv'), findsOneWidget);
+      await tester.ensureVisible(find.byTooltip('上一个'));
+      await tester.tap(find.byTooltip('上一个'));
+      await tester.pumpAndSettle();
+      expect(find.text('1/3  Example S01E01.mkv'), findsOneWidget);
+      expect(find.widgetWithText(ListTile, '正式作品'), findsOneWidget);
+      await tester.tap(find.byTooltip('删除识别记录'));
+      await tester.pumpAndSettle();
+      expect(task.mediaIds, {'two', 'three'});
+      expect(find.text('1/2  Example S01E02.mkv'), findsOneWidget);
+      expect(store.get('media', 'one')!.deleted, isFalse);
+      expect(store.get('media', 'one')!.data['bangumiId'], '42');
+      await tester.tap(find.byTooltip('下一个'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).first, '保留搜索名称');
+      await tester.tap(find.byTooltip('上一个'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('下一个'));
+      await tester.pumpAndSettle();
+      expect(find.text('保留搜索名称'), findsOneWidget);
+      await tester.tap(find.text('删除任务'));
+      await tester.pumpAndSettle();
+      expect(model.metadataTasks, isEmpty);
+      expect(find.byKey(const ValueKey('metadata-match-sheet')), findsNothing);
+      expect(store.get('media', 'two')!.deleted, isFalse);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'task list deletes running recognition without late application',
+    (tester) async {
+      await tester.pumpWidget(app());
+      final task = model.startMetadataTask([media]);
+      await tester.pump();
+      await tester.tap(find.text('打开任务'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.tap(find.byTooltip('删除识别任务'));
+      await tester.pumpAndSettle();
+      expect(task.cancelled, isTrue);
+      expect(task.removed, isTrue);
+      expect(model.metadataTasks, isEmpty);
+      model._fakeCatalog.resolveGate.complete(_subject);
+      await tester.pumpAndSettle();
+      expect(store.get('media', 'one')!.data['bangumiId'], isNull);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 
   testWidgets(
     'only the explicit cancel action cancels a running recognition task',

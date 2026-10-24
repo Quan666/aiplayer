@@ -24,6 +24,12 @@ abstract final class GlassMetrics {
   static const navigationInset = 4.0;
   static const navigationItemRadius = navigationRadius - navigationInset;
   static const pageTopInset = 4.0;
+  static const menuItemHeight = 36.0;
+  static const menuItemPadding = EdgeInsets.symmetric(horizontal: 12);
+  static const menuDividerHeight = 8.0;
+  static const dialogTitlePadding = EdgeInsets.fromLTRB(16, 16, 16, 8);
+  static const dialogContentPadding = EdgeInsets.fromLTRB(16, 4, 16, 12);
+  static const dialogActionsPadding = EdgeInsets.fromLTRB(12, 0, 12, 12);
 
   /// Extra space below the system safe area, shared by page headers.
   static double pageTopPadding(BuildContext context) =>
@@ -478,6 +484,7 @@ abstract final class AppTheme {
         color: c.surface,
         surfaceTintColor: Colors.transparent,
         shape: control,
+        menuPadding: const EdgeInsets.symmetric(vertical: 4),
       ),
       listTileTheme: ListTileThemeData(
         shape: control,
@@ -532,6 +539,7 @@ abstract final class AppTheme {
       ),
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
+        elevation: 2,
         backgroundColor: c.inverseSurface,
         contentTextStyle: TextStyle(
           color: c.onInverseSurface,
@@ -813,6 +821,25 @@ class AppStyles {
   RoundedRectangleBorder get toastShape => RoundedRectangleBorder(
     borderRadius: BorderRadius.circular(GlassMetrics.toast),
     side: BorderSide(color: colors.border),
+  );
+
+  ShapeDecoration get toastDecoration => ShapeDecoration(
+    color: colors.surface,
+    shape: toastShape,
+    shadows: [
+      BoxShadow(
+        color: colors.shadow.withValues(alpha: dark ? .16 : .06),
+        blurRadius: 16,
+        spreadRadius: -4,
+        offset: const Offset(0, 4),
+      ),
+      BoxShadow(
+        color: colors.shadow.withValues(alpha: dark ? .10 : .03),
+        blurRadius: 4,
+        spreadRadius: -1,
+        offset: const Offset(0, 1),
+      ),
+    ],
   );
 
   Color surfaceFill({Color? tint, required bool highContrast}) =>

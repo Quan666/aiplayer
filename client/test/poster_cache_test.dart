@@ -78,12 +78,14 @@ void main() {
       final address = url('clear-cached');
       final original = (await cache.load(address))!;
       expect(await cache.load(url('broken')), isNull);
+      expect(cache.hasFailed(url('broken')), isTrue);
       final before = requests;
       final changes = <PosterCacheChange>[];
       cache.changes.addListener(() => changes.add(cache.changes.value!));
 
       await cache.clear();
       expect(cache.resolvedFile(address), isNull);
+      expect(cache.hasFailed(url('broken')), isFalse);
       expect(await directory.list().toList(), isEmpty);
       expect(changes, hasLength(1));
       expect(changes.single.all, isTrue);
@@ -217,7 +219,7 @@ void main() {
   );
 
   test(
-    'background pause stops refilling slots and resumes the same work',
+    'background pause cancels transfers without frames and resumes the same work',
     () async {
       responseGate = Completer<void>();
       final running = [
@@ -230,16 +232,22 @@ void main() {
       cache.setActive(false);
       cache.setActive(false);
       responseGate!.complete();
-      await Future.wait(running);
       await Future<void>.delayed(const Duration(milliseconds: 40));
       expect(requests, 4);
       expect(completed, isFalse);
+      expect(await directory.list().toList(), isEmpty);
+      for (var i = 0; i < 4; i++) {
+        expect(cache.loadVisible(url('running-$i')), same(running[i]));
+        expect(cache.hasFailed(url('running-$i')), isFalse);
+      }
       expect(cache.loadVisible(url('waiting')), same(waiting));
 
       cache.setActive(true);
       cache.setActive(true);
       expect(await waiting.timeout(const Duration(seconds: 2)), isNotNull);
+      expect(await Future.wait(running), everyElement(isNotNull));
       expect(paths.where((path) => path == '/waiting'), hasLength(1));
+      expect(requests, 9);
       expect(peak, lessThanOrEqualTo(4));
     },
   );
@@ -272,6 +280,215 @@ void main() {
     expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
     expect(requests, 1);
   });
+
+  test(
+    'pause cancels a streaming body and its deadline without frames',
+    () async {
+      cache.close();
+      final origin = _ControlledOrigin();
+      cache = PosterCache(
+        directory: directory,
+        timeout: const Duration(milliseconds: 40),
+        createClient: origin.client,
+      );
+      final address = url('streaming-pause');
+      final pending = cache.loadVisible(address)!;
+      final request = await origin.request(0);
+      final response = _ControlledResponse();
+      request.response.complete(response);
+      await response.listening.future;
+      response.body.add(png.sublist(0, 10));
+      cache.setActive(false);
+      expect(request.aborted, isTrue);
+      expect(origin.clients.single.closed, isTrue);
+      await response.cancelled.future;
+      var completed = false;
+      pending.then((_) => completed = true);
+      // No pump: cancelling the request also removes its pending timeout.
+      await Future<void>.delayed(const Duration(milliseconds: 70));
+      expect(completed, isFalse);
+      expect(origin.requests, hasLength(1));
+      expect(cache.hasFailed(address), isFalse);
+      expect(await directory.list().toList(), isEmpty);
+
+      cache.setActive(true);
+      final retried = await origin.request(1);
+      expect(cache.loadVisible(address), same(pending));
+      retried.respond(png);
+      expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
+      expect(cache.hasFailed(address), isFalse);
+      expect(origin.clients, hasLength(2));
+    },
+  );
+
+  test(
+    'late opened requests cannot survive a rapid pause and resume',
+    () async {
+      cache.close();
+      final origin = _ControlledOrigin(delayOpening: true);
+      cache = PosterCache(directory: directory, createClient: origin.client);
+      final address = url('late-open');
+      final pending = cache.loadVisible(address)!;
+      final request = await origin.request(0);
+      cache.setActive(false);
+      cache.setActive(true);
+      request.opened.complete();
+      final retried = await origin.request(1);
+      expect(request.aborted, isTrue);
+      expect(request.closeCalled, isFalse);
+      expect(cache.hasFailed(address), isFalse);
+      retried.opened.complete();
+      retried.respond(png);
+      expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
+      expect(origin.requests, hasLength(2));
+    },
+  );
+
+  test(
+    'late response headers are discarded across a rapid pause and resume',
+    () async {
+      cache.close();
+      final origin = _ControlledOrigin();
+      cache = PosterCache(directory: directory, createClient: origin.client);
+      final address = url('late-headers');
+      final pending = cache.loadVisible(address)!;
+      final request = await origin.request(0);
+      await request.closing.future;
+      cache.setActive(false);
+      cache.setActive(true);
+      final staleResponse = _ControlledResponse();
+      request.response.complete(staleResponse);
+      await staleResponse.cancelled.future;
+      final retried = await origin.request(1);
+      expect(cache.hasFailed(address), isFalse);
+      expect(await directory.list().toList(), isEmpty);
+      retried.respond(png);
+      expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
+    },
+  );
+
+  test(
+    'close and clear release cancelled transfers while still suspended',
+    () async {
+      for (final clear in [true, false]) {
+        responseGate = Completer<void>();
+        final pending = cache.loadVisible(url('paused-release-$clear'))!;
+        await waitForRequests(clear ? 1 : 2);
+        cache.setActive(false);
+        if (clear) {
+          await cache.clear().timeout(const Duration(seconds: 2));
+        } else {
+          cache.close();
+        }
+        expect(await pending.timeout(const Duration(seconds: 2)), isNull);
+        expect(await directory.list().toList(), isEmpty);
+        responseGate!.complete();
+        if (clear) cache.setActive(true);
+      }
+    },
+  );
+
+  test(
+    'restoration waits while hidden and releases on clear without frames',
+    () async {
+      cache.setActive(false);
+      final first = cache.restore(
+        url('paused-restore'),
+        Uint8List.fromList(png),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(await directory.list().toList(), isEmpty);
+      await cache.clear().timeout(const Duration(seconds: 2));
+      await first;
+      final second = cache.restore(
+        url('paused-restore'),
+        Uint8List.fromList(png),
+      );
+      cache.setActive(true);
+      await second;
+      expect(
+        await (await cache.load(url('paused-restore')))!.readAsBytes(),
+        png,
+      );
+      expect(requests, 0);
+    },
+  );
+
+  test(
+    'a lifecycle microtask between restore stages cannot start a write',
+    () async {
+      cache.close();
+      final paused = Completer<void>();
+      final outerZone = Zone.current;
+      var hidden = false, wroteWhileHidden = false;
+      cache = PosterCache(
+        directory: _PauseOnCreateDirectory(directory, () {
+          hidden = true;
+          cache.setActive(false);
+          paused.complete();
+        }),
+        createClient: _client,
+      );
+      final address = url('restore-microtask-pause');
+      await IOOverrides.runZoned(
+        () async {
+          final restored = cache.restore(address, Uint8List.fromList(png));
+          var completed = false;
+          restored.then((_) => completed = true);
+          await paused.future;
+          await Future<void>.delayed(const Duration(milliseconds: 30));
+          // An already issued native write may finish. No write or rename
+          // may start after the lifecycle event, without pumping any frame.
+          expect(wroteWhileHidden, isFalse);
+          expect(await cache.cachedFile(address).exists(), isFalse);
+          expect(completed, isFalse);
+          hidden = false;
+          cache.setActive(true);
+          await restored.timeout(const Duration(seconds: 2));
+        },
+        createFile: (path) {
+          final original = outerZone.run(() => File(path));
+          return path.endsWith('.sync-part')
+              ? _ObservedWriteFile(original, () => wroteWhileHidden |= hidden)
+              : original;
+        },
+      );
+      expect(await cache.cachedFile(address).readAsBytes(), png);
+    },
+  );
+
+  test(
+    'pause lets an issued file write settle without starting its rename',
+    () async {
+      final started = Completer<void>(), release = Completer<void>();
+      final outerZone = Zone.current;
+      var intercepted = false, renames = 0;
+      await IOOverrides.runZoned(
+        () async {
+          final address = url('paused-write');
+          final pending = cache.loadVisible(address)!;
+          await started.future;
+          cache.setActive(false);
+          release.complete();
+          await Future<void>.delayed(const Duration(milliseconds: 40));
+          expect(renames, 0);
+          expect(await directory.list().toList(), isEmpty);
+          expect(cache.hasFailed(address), isFalse);
+          expect(cache.loadVisible(address), same(pending));
+          expect(requests, 1);
+          cache.setActive(true);
+          expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
+          expect(requests, 2);
+        },
+        createFile: (path) {
+          final original = outerZone.run(() => File(path));
+          if (intercepted || !path.endsWith('.part')) return original;
+          intercepted = true;
+          return _DelayedWriteFile(original, started, release, () => renames++);
+        },
+      );
+    },
+  );
 
   test('nearby work leaves a transfer slot for visible covers', () async {
     responseGate = Completer<void>();
@@ -818,6 +1035,200 @@ class _DelayedRenameFile implements File {
   @override
   Future<FileSystemEntity> delete({bool recursive = false}) =>
       delegate.delete(recursive: recursive);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _ObservedWriteFile implements File {
+  final File delegate;
+  final void Function() onWrite;
+
+  _ObservedWriteFile(this.delegate, this.onWrite);
+
+  @override
+  String get path => delegate.path;
+
+  @override
+  Future<File> writeAsBytes(
+    List<int> bytes, {
+    FileMode mode = FileMode.write,
+    bool flush = false,
+  }) {
+    onWrite();
+    return delegate.writeAsBytes(bytes, mode: mode, flush: flush);
+  }
+
+  @override
+  Future<File> rename(String newPath) => delegate.rename(newPath);
+
+  @override
+  Future<FileSystemEntity> delete({bool recursive = false}) =>
+      delegate.delete(recursive: recursive);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _PauseOnCreateDirectory implements Directory {
+  final Directory delegate;
+  final void Function() onCreated;
+
+  _PauseOnCreateDirectory(this.delegate, this.onCreated);
+
+  @override
+  String get path => delegate.path;
+
+  @override
+  Future<Directory> create({bool recursive = false}) {
+    final created = delegate.create(recursive: recursive);
+    unawaited(created.then((_) => scheduleMicrotask(onCreated)));
+    return created;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _DelayedWriteFile implements File {
+  final File delegate;
+  final Completer<void> started, release;
+  final void Function() onRename;
+
+  _DelayedWriteFile(this.delegate, this.started, this.release, this.onRename);
+
+  @override
+  String get path => delegate.path;
+
+  @override
+  Future<File> writeAsBytes(
+    List<int> bytes, {
+    FileMode mode = FileMode.write,
+    bool flush = false,
+  }) async {
+    started.complete();
+    await release.future;
+    return delegate.writeAsBytes(bytes, mode: mode, flush: flush);
+  }
+
+  @override
+  Future<File> rename(String newPath) {
+    onRename();
+    return delegate.rename(newPath);
+  }
+
+  @override
+  Future<FileSystemEntity> delete({bool recursive = false}) =>
+      delegate.delete(recursive: recursive);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _ControlledOrigin {
+  final bool delayOpening;
+  final clients = <_ControlledClient>[];
+  final requests = <_ControlledRequest>[];
+  final _requested = <int, Completer<_ControlledRequest>>{};
+
+  _ControlledOrigin({this.delayOpening = false});
+
+  HttpClient client() {
+    final client = _ControlledClient(this);
+    clients.add(client);
+    return client;
+  }
+
+  Future<_ControlledRequest> request(int index) => index < requests.length
+      ? Future.value(requests[index])
+      : (_requested[index] ??= Completer<_ControlledRequest>()).future.timeout(
+          const Duration(seconds: 2),
+        );
+
+  Future<HttpClientRequest> open() async {
+    final request = _ControlledRequest();
+    final index = requests.length;
+    requests.add(request);
+    _requested.remove(index)?.complete(request);
+    if (delayOpening) await request.opened.future;
+    return request;
+  }
+}
+
+class _ControlledClient implements HttpClient {
+  final _ControlledOrigin origin;
+  bool closed = false;
+
+  _ControlledClient(this.origin);
+
+  @override
+  Future<HttpClientRequest> openUrl(String method, Uri url) => origin.open();
+
+  @override
+  void close({bool force = false}) => closed = true;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
+}
+
+class _ControlledRequest implements HttpClientRequest {
+  final opened = Completer<void>();
+  final closing = Completer<void>();
+  final response = Completer<HttpClientResponse>();
+  bool aborted = false;
+  bool closeCalled = false;
+
+  void respond(List<int> bytes) {
+    final value = _ControlledResponse();
+    response.complete(value);
+    value.body.add(bytes);
+    unawaited(value.body.close());
+  }
+
+  @override
+  Future<HttpClientResponse> close() {
+    closeCalled = true;
+    closing.complete();
+    return response.future;
+  }
+
+  @override
+  void abort([Object? exception, StackTrace? stackTrace]) => aborted = true;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
+}
+
+class _ControlledResponse extends Stream<List<int>>
+    implements HttpClientResponse {
+  final listening = Completer<void>();
+  final cancelled = Completer<void>();
+  late final body = StreamController<List<int>>(
+    onListen: () => listening.complete(),
+    onCancel: () => cancelled.complete(),
+  );
+
+  @override
+  int get contentLength => -1;
+
+  @override
+  int get statusCode => HttpStatus.ok;
+
+  @override
+  bool get isRedirect => false;
+
+  @override
+  StreamSubscription<List<int>> listen(
+    void Function(List<int>)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) => body.stream.listen(
+    onData,
+    onError: onError,
+    onDone: onDone,
+    cancelOnError: cancelOnError,
+  );
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);

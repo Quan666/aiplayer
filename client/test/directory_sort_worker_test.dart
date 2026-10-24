@@ -1,11 +1,128 @@
 import 'dart:async';
 
+import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/directory_sort.dart';
 import 'package:aiplayer/sources/directory_sort_worker.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'search matches names and prepared titles without changing canonical order',
+    () async {
+      final worker = DirectorySortWorker();
+      const entries = [
+        SourceEntry(name: 'Episode10.mkv', path: 'ten'),
+        SourceEntry(name: 'Episode2.mkv', path: 'two'),
+        SourceEntry(name: 'Extras', path: 'extras', directory: true),
+      ];
+      final records = {
+        'two': SyncRecord(
+          kind: 'media',
+          id: 'two',
+          data: {'title': '中文片名', 'series': '系列名', 'metadataTitle': '识别片名'},
+        ),
+      };
+      final titles = {'ten': '第十集 告别'};
+      try {
+        expect(
+          (await worker.search(
+            entries,
+            'EPISODE',
+            records: records,
+            titles: titles,
+          )).map((e) => e.path),
+          ['ten', 'two'],
+        );
+        // These requests reuse the same prepared worker index.
+        expect(
+          (await worker.search(
+            entries,
+            '识别片名',
+            records: records,
+            titles: titles,
+          )).single.path,
+          'two',
+        );
+        expect(
+          (await worker.search(
+            entries,
+            '中文 系列',
+            records: records,
+            titles: titles,
+          )).single.path,
+          'two',
+        );
+        expect(
+          (await worker.search(
+            entries,
+            '告别',
+            records: records,
+            titles: titles,
+          )).single.path,
+          'ten',
+        );
+        final renamed = {'ten': '新的分集名'};
+        expect(
+          await worker.search(entries, '告别', records: records, titles: renamed),
+          isEmpty,
+        );
+        expect(
+          (await worker.search(
+            entries,
+            '新的分集名',
+            records: records,
+            titles: renamed,
+          )).single.path,
+          'ten',
+        );
+        expect(entries, hasLength(3));
+      } finally {
+        worker.close();
+      }
+    },
+  );
+
+  test(
+    'large searches keep only newest queued query and remain responsive',
+    () async {
+      final worker = DirectorySortWorker();
+      final entries = _largeListing();
+      try {
+        await worker.search(entries, 'warmup');
+        var beats = 0;
+        final timer = Timer.periodic(
+          const Duration(milliseconds: 1),
+          (_) => beats++,
+        );
+        try {
+          final results = await Future.wait([
+            for (var i = 1; i <= 20; i++)
+              worker
+                  .search(entries, 'episode-$i.mkv')
+                  .then<List<SourceEntry>?>(
+                    (value) => value,
+                    onError: (Object error) {
+                      expect(error, isA<DirectorySortCancelled>());
+                      return null;
+                    },
+                  ),
+          ]);
+          expect(beats, greaterThan(0));
+          expect(
+            results.whereType<List<SourceEntry>>().length,
+            lessThanOrEqualTo(2),
+          );
+          expect(results.last!.single.name, 'episode-20.mkv');
+        } finally {
+          timer.cancel();
+        }
+      } finally {
+        worker.close();
+      }
+    },
+  );
+
   test(
     'worker preserves directory priority, natural order and filters',
     () async {

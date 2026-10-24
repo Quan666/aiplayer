@@ -148,6 +148,66 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets(
+    'returning from mobile details preserves search without reopening the keyboard',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final observer = _RouteObserver();
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: GlassPalette.theme(),
+          navigatorObservers: [observer],
+          home: LibraryPage(model: model),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('搜索作品或文件名'));
+      await tester.pumpAndSettle();
+      final search = find.byType(TextField).first;
+      await tester.enterText(search, 'S01E20');
+      await tester.pumpAndSettle();
+      final field = tester.widget<TextField>(search);
+      expect(field.focusNode!.hasFocus, isTrue);
+      expect(tester.testTextInput.isVisible, isTrue);
+
+      for (final key in ['play:episode-1', 'details:episode-1']) {
+        await tester.tap(search);
+        await tester.pumpAndSettle();
+        expect(field.focusNode!.hasFocus, isTrue);
+        if (key.startsWith('details:')) {
+          // System keyboard dismissal can leave the search node focused.
+          tester.testTextInput.hide();
+          expect(tester.testTextInput.isVisible, isFalse);
+        }
+        await tester.tap(find.byKey(ValueKey(key)));
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('series-details-list')),
+          findsOneWidget,
+        );
+        observer.navigator!.pop();
+        await tester.pumpAndSettle();
+        expect(field.controller!.text, 'S01E20');
+        expect(field.focusNode!.hasFocus, isFalse);
+        expect(tester.testTextInput.isVisible, isFalse);
+      }
+
+      await tester.tap(search);
+      await tester.pumpAndSettle();
+      expect(field.focusNode!.hasFocus, isTrue);
+      expect(tester.testTextInput.isVisible, isTrue);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+    variant: const TargetPlatformVariant({
+      TargetPlatform.android,
+      TargetPlatform.iOS,
+    }),
+  );
+
   testWidgets('details covered during entrance load when shown again', (
     tester,
   ) async {

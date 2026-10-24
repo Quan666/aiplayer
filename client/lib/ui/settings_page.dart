@@ -36,6 +36,7 @@ class _SettingsPageState extends State<SettingsPage>
   final _chipKeys = <String, GlobalKey>{};
   int _searchGeneration = 0;
   int _cacheClearGeneration = 0;
+  bool _confirmingCacheClear = false;
   bool _clearingCaches = false;
   bool testingMetadata = false, refreshingMetadata = false;
   bool loading = true, saving = false;
@@ -95,6 +96,7 @@ class _SettingsPageState extends State<SettingsPage>
       oldWidget.model.removeListener(_modelChanged);
       model.addListener(_modelChanged);
       _cacheClearGeneration++;
+      _confirmingCacheClear = false;
       _clearingCaches = false;
     }
     if (widget.active) _settingsRevision = _revision;
@@ -219,6 +221,9 @@ class _SettingsPageState extends State<SettingsPage>
     final yes = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
+        titlePadding: GlassMetrics.dialogTitlePadding,
+        contentPadding: GlassMetrics.dialogContentPadding,
+        actionsPadding: GlassMetrics.dialogActionsPadding,
         title: const Text('重置同步关联？'),
         content: const Text('保留本机资料，下次同步将按最新修改自动合并。'),
         actions: [
@@ -245,7 +250,7 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Future<void> clearCaches() async {
-    if (_clearingCaches) return;
+    if (_confirmingCacheClear || _clearingCaches) return;
     final target = model;
     final generation = ++_cacheClearGeneration;
     bool current() =>
@@ -253,8 +258,35 @@ class _SettingsPageState extends State<SettingsPage>
         identical(model, target) &&
         generation == _cacheClearGeneration;
     bool visible() => widget.active && _foreground && _visible;
-    setState(() => _clearingCaches = true);
+    setState(() => _confirmingCacheClear = true);
     try {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          titlePadding: GlassMetrics.dialogTitlePadding,
+          contentPadding: GlassMetrics.dialogContentPadding,
+          actionsPadding: GlassMetrics.dialogActionsPadding,
+          title: const Text('清除缓存？'),
+          content: const Text('清除识别、弹幕和文件探测缓存。\n保留封面、海报、来源、影视库、播放记录和手动匹配。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('清除缓存'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !current() || !widget.active || !_foreground) {
+        return;
+      }
+      setState(() {
+        _confirmingCacheClear = false;
+        _clearingCaches = true;
+      });
       await target.clearCaches();
       if (mounted && current() && visible()) {
         showGlassSuccess(context, '缓存已清除，重新进入文件夹即可重新加载');
@@ -262,7 +294,12 @@ class _SettingsPageState extends State<SettingsPage>
     } catch (error) {
       if (mounted && current() && visible()) showFailure(context, error);
     } finally {
-      if (current()) setState(() => _clearingCaches = false);
+      if (current()) {
+        setState(() {
+          _confirmingCacheClear = false;
+          _clearingCaches = false;
+        });
+      }
     }
   }
 
@@ -270,6 +307,9 @@ class _SettingsPageState extends State<SettingsPage>
     final yes = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
+        titlePadding: GlassMetrics.dialogTitlePadding,
+        contentPadding: GlassMetrics.dialogContentPadding,
+        actionsPadding: GlassMetrics.dialogActionsPadding,
         title: const Text('恢复播放与操作设置？'),
         content: const Text('恢复播放、字幕、弹幕、手势和快捷键默认值，保留影视库、来源、主题和连接凭证。'),
         actions: [
@@ -778,7 +818,7 @@ class _SettingsPageState extends State<SettingsPage>
     const ListTile(
       leading: Icon(Icons.play_circle_outline_rounded),
       title: Text('映库 · AIPlayer'),
-      subtitle: Text('0.5.8 · 个人影视库'),
+      subtitle: Text('0.5.15 · 个人影视库'),
     ),
     ListTile(
       leading: const Icon(Icons.code_rounded),
@@ -787,7 +827,7 @@ class _SettingsPageState extends State<SettingsPage>
       onTap: () => showLicensePage(
         context: context,
         applicationName: '映库',
-        applicationVersion: '0.5.8',
+        applicationVersion: '0.5.15',
       ),
     ),
     ListTile(
@@ -798,9 +838,11 @@ class _SettingsPageState extends State<SettingsPage>
       onTap: () => Navigator.of(context).push(
         MaterialPageRoute<void>(
           builder: (_) => Scaffold(
-            appBar: AppBar(title: const Text('诊断')),
             body: const SafeArea(
-              child: Padding(padding: EdgeInsets.all(16), child: LogsView()),
+              child: Padding(
+                padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+                child: LogsView(showBackButton: true),
+              ),
             ),
           ),
         ),
@@ -810,9 +852,8 @@ class _SettingsPageState extends State<SettingsPage>
       key: const ValueKey('clear-caches'),
       leading: const Icon(Icons.cleaning_services_outlined),
       title: Text(_clearingCaches ? '清理中…' : '一键清除缓存'),
-      subtitle: const Text('识别、目录与图片缓存；保留来源、影视库、播放记录和手动匹配。'),
-      enabled: !_clearingCaches,
-      onTap: _clearingCaches ? null : clearCaches,
+      enabled: !_confirmingCacheClear && !_clearingCaches,
+      onTap: _confirmingCacheClear || _clearingCaches ? null : clearCaches,
     ),
     ListTile(
       leading: const Icon(Icons.restore_rounded),
@@ -1151,6 +1192,9 @@ class _GestureSeekDurationDialogState
 
   @override
   Widget build(BuildContext context) => AlertDialog(
+    titlePadding: GlassMetrics.dialogTitlePadding,
+    contentPadding: GlassMetrics.dialogContentPadding,
+    actionsPadding: GlassMetrics.dialogActionsPadding,
     title: const Text('手势跳转时间'),
     scrollable: true,
     content: SizedBox(
@@ -1160,7 +1204,7 @@ class _GestureSeekDurationDialogState
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text('向前 / 向后跳过使用这段时长；跳到指定位置使用从视频开始计算的这个时间。'),
-          const SizedBox(height: 20),
+          const SizedBox(height: 12),
           Row(
             children: [
               Expanded(
@@ -1176,7 +1220,7 @@ class _GestureSeekDurationDialogState
                   decoration: const InputDecoration(labelText: '分钟'),
                 ),
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: 8),
               Expanded(
                 child: TextField(
                   controller: seconds,
@@ -1192,7 +1236,7 @@ class _GestureSeekDurationDialogState
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           Text(
             error ?? '范围：1 秒至 60 分钟。默认：1 分 29 秒。',
             style: error == null
@@ -1324,6 +1368,9 @@ class _ShortcutDialogState extends State<_ShortcutDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
+    titlePadding: GlassMetrics.dialogTitlePadding,
+    contentPadding: GlassMetrics.dialogContentPadding,
+    actionsPadding: GlassMetrics.dialogActionsPadding,
     title: Text(widget.title),
     content: Focus(
       autofocus: true,
@@ -1334,10 +1381,10 @@ class _ShortcutDialogState extends State<_ShortcutDialog> {
           mainAxisSize: MainAxisSize.min,
           children: [
             const Text('按下要使用的按键或组合键'),
-            const SizedBox(height: 16),
+            const SizedBox(height: 8),
             GlassSurface(
               blur: 0,
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(8),
               child: Text(
                 shortcutLabel(value),
                 style: SettingsStyles.of(context).shortcutPreview,

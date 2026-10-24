@@ -11,9 +11,13 @@ import 'package:aiplayer/sources/source.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _OfflineSource extends SourceAdapter {
+  int requests = 0;
   @override
-  Future<List<SourceEntry>> list(String path) async =>
-      throw const AppFailure('offline');
+  Future<List<SourceEntry>> list(String path) async {
+    requests++;
+    throw const AppFailure('offline');
+  }
+
   @override
   Future<SourceEntry> stat(String path) async => throw UnimplementedError();
   @override
@@ -242,22 +246,19 @@ void main() {
       model.failCache = true;
       final loaded = await model.loadSeriesEpisodes(store.get('media', id)!);
       expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
-      expect(
-        model.seriesRefreshDelay(loaded.first),
-        const Duration(seconds: 30),
-      );
     },
   );
 
   test(
-    'automatic series retries back off and reset after the source recovers',
+    'explicit series refresh retries offline sources and recovers after cancellation',
     () async {
       final id = model.addMedia('local', entries.first);
       final record = store.get('media', id)!;
-      model.connection = _OfflineSource();
-      for (final seconds in [60, 120, 240, 240]) {
+      final offline = _OfflineSource();
+      model.connection = offline;
+      for (var attempt = 1; attempt <= 2; attempt++) {
         expect(await model.loadSeriesEpisodes(record), hasLength(1));
-        expect(model.seriesRefreshDelay(record), Duration(seconds: seconds));
+        expect(offline.requests, attempt);
       }
       final delayed = _DelayedSource();
       model.connection = delayed;
@@ -266,11 +267,10 @@ void main() {
       await delayed.started.future;
       cancel.cancel();
       await expectLater(pending, throwsA(isA<Cancelled>()));
-      expect(model.seriesRefreshDelay(record), const Duration(seconds: 240));
+      expect(delayed.closes, 1);
       delayed.listing.complete(entries);
       model.connection = null;
       expect(await model.loadSeriesEpisodes(record), hasLength(3));
-      expect(model.seriesRefreshDelay(record), const Duration(seconds: 30));
     },
   );
 

@@ -8,6 +8,8 @@ import 'package:path/path.dart' as p;
 import 'package:xml/xml.dart';
 import '../core/network.dart';
 import '../core/logger.dart';
+import '../core/system_proxy_stub.dart'
+    if (dart.library.ui) '../core/system_proxy.dart';
 
 class SourceEntry {
   final String name, path;
@@ -112,12 +114,15 @@ class HttpSource extends SourceAdapter {
   final bool webdav;
   final String user, password, displayName;
   final _client = HttpClient()..connectionTimeout = const Duration(seconds: 25);
+  final _cancel = CancelToken();
+  final SystemProxyLookup proxyResolver;
   HttpSource(
     String address, {
     this.webdav = false,
     this.user = '',
     this.password = '',
     this.displayName = '',
+    this.proxyResolver = resolveSystemProxy,
   }) : base = Uri.parse(address) {
     if (!['http', 'https'].contains(base.scheme) ||
         base.host.isEmpty ||
@@ -140,10 +145,13 @@ class HttpSource extends SourceAdapter {
     String? body,
   }) async {
     try {
-      final r = await _client
-          .openUrl(method, uri)
-          .timeout(const Duration(seconds: 25));
-      r.followRedirects = false;
+      final r = await openProxyAwareRequest(
+        _client,
+        method,
+        uri,
+        proxyResolver: proxyResolver,
+        cancel: _cancel,
+      ).timeout(const Duration(seconds: 25));
       if (user.isNotEmpty) {
         r.headers.set(
           'Authorization',
@@ -154,6 +162,7 @@ class HttpSource extends SourceAdapter {
       if (body != null) r.write(body);
       return await r.close().timeout(const Duration(seconds: 25));
     } catch (error) {
+      _cancel.check();
       throw safeFailure(error, action: '连接来源失败');
     }
   }
@@ -273,6 +282,7 @@ class HttpSource extends SourceAdapter {
 
   @override
   Future<void> close() async {
+    _cancel.cancel();
     _client.close(force: true);
   }
 }

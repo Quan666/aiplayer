@@ -1,8 +1,6 @@
 import 'dart:io';
 import 'dart:isolate';
 
-import 'package:path/path.dart' as p;
-
 import 'store.dart';
 
 const _cachePrefixes = [
@@ -10,34 +8,27 @@ const _cachePrefixes = [
   'subject-v5:',
   'episode-names:',
   'metadataEpisodeNames:',
-  'directory-preview:',
-  'directory-preview-envelope:',
   'media-ai-',
-  'preview:',
   'mediaMetadata:',
   'technical:',
 ];
 
 /// Callers stop cache producers before clearing and invalidate their in-memory
-/// snapshots afterwards. This removes only reproducible, device-local data.
+/// snapshots afterwards. Artwork files, captured-cover references and directory
+/// snapshots carrying offline poster identities are retained.
 Future<void> clearStoredCaches(AppStore store, Directory documents) {
   if (store.path == ':memory:') {
     _clearDatabaseCaches(store);
-    return _clearPreviewFiles(documents.path);
+    return Future.value();
   }
   final databasePath = store.path;
-  final documentsPath = documents.path;
-  return Isolate.run(() => _clearStoredCaches(databasePath, documentsPath));
+  return Isolate.run(() => _clearStoredCaches(databasePath));
 }
 
-Future<void> _clearStoredCaches(
-  String databasePath,
-  String documentsPath,
-) async {
+Future<void> _clearStoredCaches(String databasePath) async {
   final store = await retryStoreBusy(() => AppStore.openExisting(databasePath));
   try {
     await retryStoreBusy(() => _clearDatabaseCaches(store));
-    await _clearPreviewFiles(documentsPath);
   } finally {
     store.dispose();
   }
@@ -45,8 +36,24 @@ Future<void> _clearStoredCaches(
 
 void _clearDatabaseCaches(AppStore store) {
   store.transaction(() {
-    // Keep monotonic epochs: an older worker must never publish a preview from
-    // before this clear, even after a second clear or an application restart.
+    // Keep the saved directory's poster identity usable offline while rejecting
+    // older workers. Only current snapshots advance: stale snapshots must never
+    // become valid again. JSON work runs on this maintenance connection.
+    final directoryEpoch =
+        (store.local('directoryPreviewEpoch') as num?)?.toInt() ?? 0;
+    for (final prefix in [
+      'directory-preview:',
+      'directory-preview-envelope:',
+    ]) {
+      store.db.execute(
+        '''UPDATE local SET value=json_set(value, '\$.epoch', ?)
+           WHERE key>=? AND key<? AND CASE WHEN json_valid(value)
+             THEN json_type(value)='object'
+               AND COALESCE(json_extract(value, '\$.epoch'), 0)=?
+             ELSE 0 END''',
+        [directoryEpoch + 1, prefix, _prefixEnd(prefix), directoryEpoch],
+      );
+    }
     for (final key in ['directoryPreviewEpoch', 'cacheClearEpoch']) {
       final next = ((store.local(key) as num?)?.toInt() ?? 0) + 1;
       store.db.execute('INSERT OR REPLACE INTO local(key,value) VALUES(?,?)', [
@@ -55,30 +62,18 @@ void _clearDatabaseCaches(AppStore store) {
       ]);
     }
     for (final prefix in _cachePrefixes) {
-      final upper =
-          prefix.substring(0, prefix.length - 1) +
-          String.fromCharCode(prefix.codeUnitAt(prefix.length - 1) + 1);
       // Range deletes use the primary key without reading/decoding payloads.
       // Direct SQL deliberately creates no synced deletion or edit markers;
       // the store's triggers still invalidate snapshots across connections.
       store.db.execute('DELETE FROM local WHERE key>=? AND key<?', [
         prefix,
-        upper,
+        _prefixEnd(prefix),
       ]);
     }
     store.db.execute('DELETE FROM cache');
   });
 }
 
-Future<void> _clearPreviewFiles(String documentsPath) async {
-  final path = p.join(documentsPath, 'previews');
-  final type = await FileSystemEntity.type(path, followLinks: false);
-  if (type == FileSystemEntityType.link) {
-    // An unexpected link must never turn a cache clear into deleting user files.
-    await Link(path).delete();
-  } else if (type == FileSystemEntityType.directory) {
-    await Directory(path).delete(recursive: true);
-  } else if (type == FileSystemEntityType.file) {
-    await File(path).delete();
-  }
-}
+String _prefixEnd(String prefix) =>
+    prefix.substring(0, prefix.length - 1) +
+    String.fromCharCode(prefix.codeUnitAt(prefix.length - 1) + 1);

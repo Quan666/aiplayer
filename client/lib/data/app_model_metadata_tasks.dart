@@ -5,9 +5,14 @@ class MetadataTask extends ChangeNotifier {
   final String id, label;
   final bool ai, manual;
   final List<SyncRecord> _records;
+  late final Map<String, int> _recordPositions = {
+    for (var i = 0; i < _records.length; i++) _records[i].id: i,
+  };
   final Map<String, dynamic>? _selection;
   final String _selectionSeason;
   final AiMediaIdentity? _identity;
+  final MetadataTask? _parentTask;
+  MetadataTask? _selectionTask;
   final _cancel = CancelToken();
   CancelToken? _attemptCancel;
   CancelToken get _workCancel => _attemptCancel ?? _cancel;
@@ -16,10 +21,12 @@ class MetadataTask extends ChangeNotifier {
   DateTime _lastProgress = DateTime.fromMillisecondsSinceEpoch(0);
   final Map<String, AiMetadataMatch> results = {};
   final Set<String> _completedIds = {};
+  final Set<String> _matchedIds = {};
   final Map<String, (SyncRecord, Map<String, dynamic>)> _pendingEpisodeNames =
       {};
   int matched = 0, failed = 0;
   bool running = true, cancelled = false, _started = false;
+  bool _external = false, _removed = false;
   String status = '等待识别', error = '';
   MetadataTask._(
     this.id,
@@ -30,9 +37,28 @@ class MetadataTask extends ChangeNotifier {
     Map<String, dynamic>? selection,
     String selectionSeason = '',
     AiMediaIdentity? identity,
+    MetadataTask? parentTask,
   }) : _selection = selection,
        _selectionSeason = selectionSeason,
-       _identity = identity;
+       _identity = identity,
+       _parentTask = parentTask;
+  late final List<SyncRecord> records = UnmodifiableListView(_records);
+  bool get removed => _removed;
+  bool isMatched(String id) => _matchedIds.contains(id);
+  bool containsMedia(String id) => _recordPositions.containsKey(id);
+  MetadataTask? get selectionTask => _selectionTask;
+  void _appendRecords(List<SyncRecord> records) {
+    for (final record in records) {
+      final index = _recordPositions[record.id];
+      if (index == null) {
+        _recordPositions[record.id] = _records.length;
+        _records.add(record);
+      } else {
+        _records[index] = record;
+      }
+    }
+  }
+
   Set<String> get mediaIds => _records.map((r) => r.id).toSet();
   int get total => _records.length;
   int get completed => _completedIds.length;
@@ -104,8 +130,9 @@ class _MetadataLimiter {
 }
 
 extension MetadataBackgroundTasks on AppModel {
-  List<MetadataTask> get metadataTasks =>
-      List.unmodifiable(_metadataTasks.reversed);
+  List<MetadataTask> get metadataTasks => List.unmodifiable(
+    _metadataTasks.reversed.where((t) => t._parentTask == null),
+  );
 
   MetadataTask? metadataTaskFor(Set<String> mediaIds) => metadataTasks
       .where((task) => setEquals(task.mediaIds, mediaIds))
@@ -124,6 +151,7 @@ extension MetadataBackgroundTasks on AppModel {
     required String season,
     AiMediaIdentity? identity,
     String? label,
+    MetadataTask? parentTask,
   }) => _enqueueMetadataTask(
     records,
     ai: identity != null,
@@ -132,6 +160,7 @@ extension MetadataBackgroundTasks on AppModel {
     selection: candidate,
     selectionSeason: season,
     identity: identity,
+    parentTask: parentTask,
   );
 
   MetadataTask _enqueueMetadataTask(
@@ -142,8 +171,15 @@ extension MetadataBackgroundTasks on AppModel {
     Map<String, dynamic>? selection,
     String selectionSeason = '',
     AiMediaIdentity? identity,
+    MetadataTask? parentTask,
   }) {
     _restoreMetadataTasks();
+    if (parentTask != null &&
+        (parentTask.removed ||
+            parentTask.running ||
+            parentTask.selectionTask?.running == true)) {
+      throw const AppFailure('请等待当前识别完成后再匹配。');
+    }
     final unique = {
       for (final r in records)
         if (!r.deleted) r.id: r,
@@ -156,6 +192,7 @@ extension MetadataBackgroundTasks on AppModel {
               !task.cancelled &&
               task.ai == ai &&
               task.manual == manual &&
+              identical(task._parentTask, parentTask) &&
               _equalMetadata(task._selection, selection) &&
               task._selectionSeason == selectionSeason &&
               setEquals(task.mediaIds, ids),
@@ -174,8 +211,17 @@ extension MetadataBackgroundTasks on AppModel {
       selection: selection,
       selectionSeason: selectionSeason,
       identity: identity,
+      parentTask: parentTask,
     );
     _metadataTasks.add(task);
+    if (parentTask != null) {
+      // A new explicit choice supersedes the previous automatic attempt's
+      // error. Its own result remains on the child, scoped to the chosen file.
+      parentTask.error = '';
+      _setMetadataTaskStatus(parentTask);
+      parentTask._selectionTask = task;
+      parentTask._changed();
+    }
     _persistMetadataTasks();
     if (!_disposed) changed();
     scheduleMicrotask(_drainMetadataTasks);
@@ -183,6 +229,8 @@ extension MetadataBackgroundTasks on AppModel {
   }
 
   void cancelMetadataTask(MetadataTask task) {
+    final selection = task.selectionTask;
+    if (selection?.running == true) cancelMetadataTask(selection!);
     if (!task.running) return;
     task.cancelled = true;
     task.running = false;
@@ -193,10 +241,73 @@ extension MetadataBackgroundTasks on AppModel {
     _taskChanged(task);
   }
 
+  /// Removes only task history. Applied media information remains in the library.
+  void removeMetadataTask(MetadataTask task) {
+    if (task.removed || !_metadataTasks.contains(task)) return;
+    final removed = _metadataTasks
+        .where(
+          (item) => identical(item, task) || identical(item._parentTask, task),
+        )
+        .toList();
+    for (final item in removed) {
+      item._removed = true;
+      item._progressTimer?.cancel();
+      if (item.running) {
+        item.cancelled = true;
+        item.running = false;
+        item._cancel.cancel();
+        item._attemptCancel?.cancel();
+      }
+      if (!item._done.isCompleted) item._done.complete();
+      _metadataTasks.remove(item);
+      item._changed();
+    }
+    if (removed.any((item) => !item._external)) _persistMetadataTasks();
+    if (!_disposed) changed();
+  }
+
+  void removeMetadataTaskRecord(MetadataTask task, String id) {
+    if (task.removed || task.running || task.selectionTask?.running == true) {
+      return;
+    }
+    final index = task._records.indexWhere((record) => record.id == id);
+    if (index < 0) return;
+    task._records.removeAt(index);
+    task._recordPositions.remove(id);
+    for (var i = index; i < task._records.length; i++) {
+      task._recordPositions[task._records[i].id] = i;
+    }
+    task.results.remove(id);
+    task._pendingEpisodeNames.remove(id);
+    if (task._completedIds.remove(id)) {
+      if (task._matchedIds.remove(id)) {
+        task.matched--;
+      } else if (task.failed > 0) {
+        task.failed--;
+      }
+    }
+    if (task.total == 0) {
+      removeMetadataTask(task);
+      return;
+    }
+    _setMetadataTaskStatus(task);
+    _taskChanged(task);
+  }
+
+  void _setMetadataTaskStatus(MetadataTask task) {
+    if (task.cancelled || task.running) return;
+    if (task.matched == task.total) task.error = '';
+    task.status = task.matched == task.total
+        ? '已匹配 ${task.matched} 个视频'
+        : '已匹配 ${task.matched}/${task.total}，其余可手动选择';
+  }
+
   void _persistMetadataTasks() {
     if (_disposed) return;
     store.setLocal('metadata:pending-tasks', [
-      for (final task in _metadataTasks.where((t) => t.running && !t.cancelled))
+      for (final task in _metadataTasks.where(
+        (t) => t.running && !t.cancelled && !t._external,
+      ))
         {
           'id': task.id,
           'label': task.label,
@@ -273,6 +384,7 @@ extension MetadataBackgroundTasks on AppModel {
           )
           .._pendingEpisodeNames.addAll(pendingNames)
           .._completedIds.addAll(pendingNames.keys)
+          .._matchedIds.addAll(pendingNames.keys)
           ..matched = pendingNames.length,
       );
     }
@@ -284,7 +396,7 @@ extension MetadataBackgroundTasks on AppModel {
   }
 
   void _taskChanged(MetadataTask task) {
-    if (_disposed) return;
+    if (_disposed || task.removed) return;
     task._progressTimer?.cancel();
     final elapsed = DateTime.now().difference(task._lastProgress);
     if (task.running && elapsed < const Duration(milliseconds: 120)) {
@@ -295,26 +407,54 @@ extension MetadataBackgroundTasks on AppModel {
       return;
     }
     task._lastProgress = DateTime.now();
-    _persistMetadataTasks();
+    if (!task._external) _persistMetadataTasks();
     task._changed();
+    if (task._parentTask case final parent?) {
+      if (!parent.removed) parent._changed();
+    }
     changed();
   }
 
   void _taskCompleteRecord(MetadataTask task, SyncRecord record, bool matched) {
-    if (_disposed || task.cancelled || !task._completedIds.add(record.id)) {
+    if (_disposed ||
+        task.removed ||
+        task.cancelled ||
+        !task._completedIds.add(record.id)) {
       return;
     }
     if (matched) {
+      task._matchedIds.add(record.id);
       task.matched++;
     } else {
       task.failed++;
     }
     task.status = '已处理 ${task.completed}/${task.total} · 已匹配 ${task.matched}';
+    if (matched && task._parentTask != null) {
+      final parent = task._parentTask;
+      if (!parent.removed) {
+        final index = parent._recordPositions[record.id];
+        if (index != null) {
+          parent._records[index] =
+              task._records[task._recordPositions[record.id]!];
+          final wasCompleted = parent._completedIds.add(record.id) == false;
+          if (parent._matchedIds.add(record.id)) {
+            parent.matched++;
+            if (wasCompleted && parent.failed > 0) parent.failed--;
+          }
+          if (task.results[record.id] case final result?) {
+            parent.results[record.id] = result;
+          }
+          _setMetadataTaskStatus(parent);
+        }
+      }
+    }
     _taskChanged(task);
   }
 
   bool _taskMayApply(MetadataTask task, SyncRecord record) {
-    if (_disposed) return false;
+    if (_disposed || task.removed || task._parentTask?.removed == true) {
+      return false;
+    }
     final current = store.get('media', record.id);
     if (_disposed ||
         task._cancel.cancelled ||
@@ -365,6 +505,7 @@ extension MetadataBackgroundTasks on AppModel {
             .where(
               (t) =>
                   t.running &&
+                  !t._external &&
                   !t._started &&
                   (t.manual || (_foreground && activePlaybackMediaId == null)),
             )
@@ -376,6 +517,7 @@ extension MetadataBackgroundTasks on AppModel {
         var paused = false;
         try {
           await _runMetadataTask(task);
+          await _refreshMatchedMetadataRecords(task);
         } on _MetadataPaused {
           paused = true;
           task._started = false;
@@ -411,10 +553,43 @@ extension MetadataBackgroundTasks on AppModel {
             _taskChanged(task);
           }
           if (!paused && !task._done.isCompleted) task._done.complete();
+          if (!paused && task._parentTask != null) {
+            // The parent retains the latest selection result; hidden child
+            // jobs need no separate, ever-growing history in the queue.
+            _metadataTasks.remove(task);
+          }
         }
       }
     } finally {
       _metadataWorkerRunning = false;
+    }
+  }
+
+  Future<void> _refreshMatchedMetadataRecords(MetadataTask task) async {
+    if (task._matchedIds.isEmpty) return;
+    _checkTaskReady(task);
+    final records = store.path == ':memory:'
+        ? [
+            for (final id in task._matchedIds)
+              if (store.get('media', id) case final record?)
+                if (!record.deleted) record,
+          ]
+        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+            store.path,
+          )).readRecords(task._matchedIds, cancel: task._workCancel);
+    _checkTaskReady(task);
+    // Optional episode enrichment can write a newer media revision. Keep the
+    // review snapshots current so revisiting a completed item can match again.
+    for (final record in records) {
+      if (task._recordPositions[record.id] case final index?) {
+        task._records[index] = record;
+      }
+      final parent = task._parentTask;
+      if (parent != null && !parent.removed) {
+        if (parent._recordPositions[record.id] case final index?) {
+          parent._records[index] = record;
+        }
+      }
     }
   }
 
@@ -543,6 +718,7 @@ extension MetadataBackgroundTasks on AppModel {
     _taskChanged(task);
     final matches = await searchMetadataBatchWithAi(
       eligible.map(metadataFileName).toList(),
+      wholeFolder: task.manual && task.ai,
       cancel: token,
       checkReady: () => _checkTaskReady(task),
       onProgress: (message) {
@@ -584,23 +760,46 @@ extension MetadataBackgroundTasks on AppModel {
     final token = task._workCancel;
     task.status = '正在读取作品资料…';
     _taskChanged(task);
-    final full = await catalog.details(
+    var detailsAvailable = true;
+    final full = await catalog.selectionDetails(
       task._selection!,
       season: task._selectionSeason,
       cancel: token,
+      onFallback: () => detailsAvailable = false,
     );
-    Map<String, AiMediaIdentity> identities = {};
+    final identities = <String, AiMediaIdentity>{};
     if (task._identity != null) {
-      task.status = '正在批量解析各集文件名…';
-      _taskChanged(task);
-      final config = await _metadataAiConfig();
-      identities = await mediaAi.analyzeFilenames(
-        task._records.map(metadataFileName).toList(),
-        config: config,
-        cancel: token,
-      );
+      final unresolved = <String>[];
+      for (final record in task._records) {
+        final filename = MediaAiRecognition.filenameOnly(
+          metadataFileName(record),
+        );
+        final known =
+            task._parentTask?.results[record.id]?.identity ??
+            (task.total == 1 ? task._identity : null);
+        if (known != null && known.fileName == filename) {
+          identities[filename] = known;
+        } else {
+          unresolved.add(filename);
+        }
+      }
+      if (unresolved.isNotEmpty) {
+        task.status = '正在批量解析各集文件名…';
+        _taskChanged(task);
+        final config = await _metadataAiConfig();
+        token.check();
+        identities.addAll(
+          await mediaAi.analyzeFilenames(
+            unresolved,
+            config: config,
+            cancel: token,
+          ),
+        );
+      }
     }
     token.check();
+    task.status = '正在保存匹配资料…';
+    _taskChanged(task);
     for (final record in task._records) {
       if (_disposed) throw const Cancelled();
       var applied = false;
@@ -644,6 +843,12 @@ extension MetadataBackgroundTasks on AppModel {
       }
       _taskCompleteRecord(task, record, applied);
     }
+    // A failed optional detail request has already consumed its timeout.
+    // Keep the explicit identity and let normal catalogue enrichment retry
+    // later instead of blocking this selection on the same service again.
+    if (!detailsAvailable || task.matched == 0) return;
+    task.status = '资料已匹配，正在补充分集名称…';
+    _taskChanged(task);
     try {
       await fillEpisodeNames('', full, mediaIds: task.mediaIds, cancel: token);
     } on Cancelled {

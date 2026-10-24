@@ -328,6 +328,58 @@ void main() {
     },
   );
   test(
+    'AI completion and model list use the resolved proxy before destination DNS',
+    () async {
+      final paths = <String>[];
+      server.listen((request) async {
+        expect(request.uri.host, 'unresolvable.invalid');
+        paths.add(request.uri.path);
+        await request.drain();
+        if (request.uri.path == '/v1/models') {
+          request.response.write('{"data":[{"id":"test"}]}');
+        } else {
+          request.response.write(
+            jsonEncode({
+              'choices': [
+                {
+                  'message': {'content': 'recognized'},
+                  'finish_reason': 'stop',
+                },
+              ],
+            }),
+          );
+        }
+        await request.response.close();
+      });
+      final transport = IoSubtitleAiTransport(
+        proxyResolver: (uri, {cancel}) async =>
+            'PROXY 127.0.0.1:${server.port}',
+      );
+      expect(
+        await transport.complete(
+          SubtitleAiConfig(
+            origin: 'http://unresolvable.invalid/v1',
+            model: 'test',
+          ),
+          {'model': 'test'},
+          CancelToken(),
+        ),
+        'recognized',
+      );
+      expect(
+        await transport.models(
+          SubtitleAiConfig(
+            origin: 'http://unresolvable.invalid/v1',
+            model: 'test',
+          ),
+          CancelToken(),
+        ),
+        ['test'],
+      );
+      expect(paths, ['/v1/chat/completions', '/v1/models']);
+    },
+  );
+  test(
     'SSE fragmented Unicode and usage-only events complete without losing deltas',
     () async {
       server.listen((request) async {

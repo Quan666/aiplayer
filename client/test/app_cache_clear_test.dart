@@ -4,9 +4,12 @@ import 'dart:io';
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/library_catalog.dart';
+import 'package:aiplayer/data/media_previews.dart';
+import 'package:aiplayer/data/poster_cache.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/ui/glass.dart';
+import 'package:aiplayer/ui/media_artwork.dart';
 import 'package:aiplayer/ui/sources_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -93,25 +96,64 @@ Future<void> _wait(WidgetTester tester, bool Function() ready) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   test(
-    'model clears disk caches once without enumerating UI database',
+    'model clears temporary caches once and preserves usable artwork',
     () async {
       final root = await Directory.systemTemp.createTemp('model-cache-clear-');
       final store = _Store('${root.path}/library.db');
       final model = AppModel(store, root, backgroundWork: false);
+      ImageStream? posterStream;
+      ImageStreamListener? posterListener;
       try {
         store.save('media', 'one', {'title': 'Series', 'bangumiId': '42'});
         store.save('progress', 'one', {'position': 88});
         store.setLocal('manualMetadata:one', true);
         store.setLocal('catalog-v1:old', {'data': 'stale'});
-        store.setLocal('preview:one', {
-          'path': '${root.path}/previews/one.jpg',
+        store.setLocal('location:one', {
+          'source': 'nas',
+          'path': 'Series/one.mkv',
+          'size': 10,
         });
+        const request = MediaPreviewRequest(
+          'one',
+          'nas',
+          'Series/one.mkv',
+          10,
+          position: 88,
+        );
+        final savedPreview = {
+          'path': '${root.path}/previews/one.jpg',
+          'fingerprint': request.fingerprint,
+          'contentFingerprint': request.contentFingerprint,
+          'formatVersion': MediaPreview.formatVersion,
+        };
+        store.setLocal('preview:one', savedPreview);
         await Directory('${root.path}/previews').create();
         await File('${root.path}/previews/one.jpg').writeAsString('preview');
         await Directory('${root.path}/poster-cache-v1').create();
-        await File(
-          '${root.path}/poster-cache-v1/old.img',
-        ).writeAsString('poster');
+        const posterUrl = 'https://offline.invalid/poster.png';
+        final cache = model.posterCache;
+        await cache
+            .cachedFile(posterUrl)
+            .writeAsBytes(
+              await File('assets/branding/app_icon.png').readAsBytes(),
+            );
+        final posterFile = (await cache.load(posterUrl))!;
+        final posterRevision = posterFileRevision(posterFile);
+        final poster = artworkImage(posterFile, 64);
+        final posterKey = await poster.obtainKey(ImageConfiguration.empty);
+        final decoded = Completer<void>();
+        posterListener = ImageStreamListener((image, _) {
+          image.dispose();
+          if (!decoded.isCompleted) decoded.complete();
+        }, onError: decoded.completeError);
+        posterStream = poster.resolve(ImageConfiguration.empty)
+          ..addListener(posterListener);
+        await decoded.future;
+        final images = PaintingBinding.instance.imageCache;
+        expect(images.statusForKey(posterKey).keepAlive, isTrue);
+        expect(images.statusForKey(posterKey).live, isTrue);
+        var artworkChanges = 0;
+        cache.changes.addListener(() => artworkChanges++);
         final first = model.clearCaches();
         expect(model.clearingCaches, isTrue);
         expect(identical(first, model.clearCaches()), isTrue);
@@ -120,19 +162,31 @@ void main() {
         expect(store.enumerations, 0);
         expect(store.local('cacheClearEpoch'), 1);
         expect(store.local('catalog-v1:old'), isNull);
-        expect(store.local('preview:one'), isNull);
+        expect(store.local('preview:one'), savedPreview);
+        expect(model.thumbnailPath('one'), savedPreview['path']);
+        expect(await model.needsMediaPreview('one'), isFalse);
         expect(store.get('media', 'one')!.data['bangumiId'], '42');
         expect(store.get('progress', 'one')!.data['position'], 88);
         expect(store.local('manualMetadata:one'), isTrue);
-        expect(await Directory('${root.path}/previews').exists(), isFalse);
         expect(
-          await Directory('${root.path}/poster-cache-v1').list().isEmpty,
-          isTrue,
+          await File('${root.path}/previews/one.jpg').readAsString(),
+          'preview',
         );
+        expect(await posterFile.exists(), isTrue);
+        expect(await cache.load(posterUrl), same(posterFile));
+        expect(posterFileRevision(posterFile), posterRevision);
+        expect(images.statusForKey(posterKey).keepAlive, isTrue);
+        expect(images.statusForKey(posterKey).live, isTrue);
+        expect(artworkChanges, 0);
         expect(model.catalog.cacheMaintenance, isFalse);
         await model.clearCaches();
         expect(store.local('cacheClearEpoch'), 2);
+        expect(await cache.load(posterUrl), same(posterFile));
+        expect(model.thumbnailPath('one'), savedPreview['path']);
       } finally {
+        if (posterStream != null && posterListener != null) {
+          posterStream.removeListener(posterListener);
+        }
         model.dispose();
         store.dispose();
         await root.delete(recursive: true);

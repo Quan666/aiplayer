@@ -7,6 +7,8 @@ import 'dart:ui' as ui;
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import '../core/network.dart';
+import '../core/system_proxy.dart';
 
 // Weak file handles carry the content generation into Flutter's decoded cache.
 // No file access or image retention is needed when a widget builds.
@@ -35,6 +37,7 @@ class PosterCache {
   final int maxBytes, maxFileBytes;
   final Duration timeout;
   final HttpClient Function() createClient;
+  final SystemProxyLookup? proxyResolver;
   final _pending = <String, Future<File?>>{};
   final _invalidating = <String, Future<void>>{};
   final _resolved = <String, File>{};
@@ -54,6 +57,7 @@ class PosterCache {
   final _capacity = ValueNotifier(0);
   final _changes = ValueNotifier<PosterCacheChange?>(null);
   final _work = <Future<void>>{};
+  final _attempts = <_PosterAttempt>{};
   _PosterEpoch _epoch = _PosterEpoch();
   Future<void>? _clearing;
   int _nextTemporary = 0;
@@ -63,6 +67,7 @@ class PosterCache {
   int _active = 0;
   bool _closed = false;
   Completer<void>? _resume;
+  int _pauseRevision = 0;
 
   PosterCache({
     required this.directory,
@@ -70,7 +75,10 @@ class PosterCache {
     this.maxFileBytes = 12 * 1024 * 1024,
     this.timeout = const Duration(seconds: 15),
     HttpClient Function()? createClient,
-  }) : createClient = createClient ?? HttpClient.new;
+    SystemProxyLookup? proxyResolver,
+  }) : createClient = createClient ?? HttpClient.new,
+       proxyResolver =
+           proxyResolver ?? (createClient == null ? resolveSystemProxy : null);
 
   /// A single notification wakes visible covers deferred by a full queue.
   Listenable get capacity => _capacity;
@@ -78,13 +86,15 @@ class PosterCache {
   /// Content changes invalidate mounted covers; normal cache hits stay silent.
   ValueListenable<PosterCacheChange?> get changes => _changes;
 
-  /// Suspend queued disk lookups and transfers while the app is hidden.
-  /// Existing transfers may finish; their bounded slots are not refilled until
-  /// foregrounded. Keeping the same futures avoids duplicate work on resume.
+  /// Suspend disk lookups and abort transfers immediately while hidden.
+  /// Pending callers keep the same futures and retry interrupted work on resume.
   void setActive(bool active) {
     if (_closed) return;
     if (!active) {
-      _resume ??= Completer<void>();
+      if (_resume != null) return;
+      _resume = Completer<void>();
+      _pauseRevision++;
+      _cancelTransfers();
       return;
     }
     final resume = _resume;
@@ -92,6 +102,16 @@ class PosterCache {
     _resume = null;
     resume.complete();
     _dispatchWaiting();
+  }
+
+  void _cancelTransfers() {
+    for (final attempt in _attempts) {
+      attempt.cancel();
+    }
+    // Also cancel connections still being established, before getUrl has
+    // yielded an abortable request. Foreground work creates a fresh pool.
+    _client?.close(force: true);
+    _client = null;
   }
 
   void _dispatchWaiting() {
@@ -105,12 +125,23 @@ class PosterCache {
   bool _current(_PosterEpoch epoch) =>
       !_closed && _clearing == null && identical(_epoch, epoch);
 
-  Future<void> _waitUntilActive(_PosterEpoch epoch) async {
+  Future<T?> _whenActive<T>(
+    _PosterEpoch epoch,
+    FutureOr<T> Function() action,
+  ) async {
     // A quick foreground/background pair must not let an earlier completed
     // gate admit new work into the newer suspended period.
     while (_current(epoch) && _resume != null) {
       await _resume!.future;
     }
+    if (!_current(epoch)) return null;
+    // Start the operation in this same stack. Returning a boolean gate would
+    // allow a queued lifecycle microtask to pause before its caller resumes.
+    return action();
+  }
+
+  Future<bool> _checkpoint(_PosterEpoch epoch) async {
+    return await _whenActive(epoch, () => true) == true;
   }
 
   /// Called after another isolate atomically replaces an artwork file.
@@ -209,6 +240,10 @@ class PosterCache {
   /// Read without fetching: synchronization only shares artwork already held.
   File cachedFile(String url) => _file(url);
 
+  /// A real download/decode failure, even after its retry delay expires.
+  /// Deferred admissions and lifecycle cancellations do not count as failures.
+  bool hasFailed(String url) => _failedUntil.containsKey(url);
+
   File? resolvedFile(String url) {
     final file = _resolved.remove(url) ?? _retained[url]?.file.target;
     if (file != null) {
@@ -264,17 +299,31 @@ class PosterCache {
     _PosterEpoch epoch,
   ) async {
     final file = _file(url);
-    if (!replace && await file.exists() && await file.length() > 0) return;
-    if (!_current(epoch)) return;
-    await _validate(bytes);
-    if (!_current(epoch)) return;
-    await directory.create(recursive: true);
+    if (!replace && await _whenActive(epoch, file.exists) == true) {
+      if ((await _whenActive(epoch, file.length) ?? 0) > 0) return;
+    }
+    while (_current(epoch)) {
+      final validated = await _whenActive(epoch, () {
+        final pauseRevision = _pauseRevision;
+        return _validate(
+          bytes,
+          canContinue: () =>
+              _current(epoch) &&
+              _resume == null &&
+              pauseRevision == _pauseRevision,
+        );
+      });
+      if (validated != false) break;
+    }
+    await _whenActive(epoch, () => directory.create(recursive: true));
     if (!_current(epoch)) return;
     final temporary = File('${file.path}.${++_nextTemporary}.sync-part');
     try {
-      await temporary.writeAsBytes(bytes, flush: true);
-      if (!_current(epoch)) return;
-      await temporary.rename(file.path);
+      await _whenActive(
+        epoch,
+        () => temporary.writeAsBytes(bytes, flush: true),
+      );
+      await _whenActive(epoch, () => temporary.rename(file.path));
     } finally {
       try {
         await temporary.delete();
@@ -282,10 +331,11 @@ class PosterCache {
         // A successful atomic rename already removed the temporary file.
       }
     }
-    if (!_current(epoch)) return;
-    _failedUntil.remove(url);
-    _remember(url, file);
-    _changes.value = PosterCacheChange(url, file);
+    await _whenActive(epoch, () {
+      _failedUntil.remove(url);
+      _remember(url, file);
+      _changes.value = PosterCacheChange(url, file);
+    });
   }
 
   Future<File?> load(String url) {
@@ -307,6 +357,7 @@ class PosterCache {
               !_closed &&
               identical(_pending[url], result) &&
               !_resolved.containsKey(url)) {
+            _failedUntil.remove(url);
             _remember(url, file);
           }
           return file;
@@ -331,125 +382,183 @@ class PosterCache {
         !['http', 'https'].contains(uri.scheme) ||
         uri.host.isEmpty ||
         uri.userInfo.isNotEmpty) {
+      _failed(url);
       return null;
     }
     final file = _file(url);
     try {
-      await _waitUntilActive(epoch);
-      await _invalidating[url];
-      if (nearby?.allowed == false || !_current(epoch)) return null;
-      if (await file.exists() && await file.length() > 0) {
-        return nearby?.allowed == false || !_current(epoch) ? null : file;
-      }
-      if ((_failedUntil[url]?.isAfter(DateTime.now()) ?? false) ||
-          !_current(epoch) ||
-          nearby?.allowed == false) {
-        return null;
-      }
-      await _waitUntilActive(epoch);
-      if (!_current(epoch) || nearby?.allowed == false) return null;
-      if (_active >= 4) {
-        final waiting = _PosterWaiter(url);
-        final firstBackground = _priority.contains(url)
-            ? _waiting.indexWhere((entry) => !_priority.contains(entry.url))
-            : -1;
-        _waiting.insert(
-          firstBackground < 0 ? _waiting.length : firstBackground,
-          waiting,
-        );
-        if (!await waiting.ready.future) return null;
-      } else {
-        _active++;
-      }
-      HttpClientRequest? request;
-      StreamIterator<List<int>>? chunks;
-      var expired = false;
-      try {
-        await _waitUntilActive(epoch);
-        if (!_current(epoch) || nearby?.allowed == false) return null;
-        // One pool reuses HTTP/TLS connections across covers. Cancellation
-        // belongs to each request, never to other downloads sharing the pool.
-        final client = _client ??= createClient()
-          ..connectionTimeout = timeout
-          ..idleTimeout = const Duration(seconds: 15)
-          ..maxConnectionsPerHost = 4;
-        Future<File?> work() async {
-          final opened = request = await client.getUrl(uri);
-          if (!_current(epoch) || expired) {
-            opened.abort();
-            return null;
-          }
-          opened.maxRedirects = 3;
-          final response = await opened.close();
-          final reader = chunks = StreamIterator(response);
-          if (!_current(epoch) || expired) return null;
-          if (response.statusCode != HttpStatus.ok ||
-              response.contentLength > maxFileBytes) {
-            throw const FormatException('Invalid artwork response');
-          }
-          final bytes = BytesBuilder(copy: false);
-          while (await reader.moveNext()) {
-            bytes.add(reader.current);
-            if (bytes.length > maxFileBytes) {
-              throw const FormatException('Artwork too large');
+      while (await _checkpoint(epoch)) {
+        await _invalidating[url];
+        if (!await _checkpoint(epoch) || nearby?.allowed == false) return null;
+        if (await _whenActive(epoch, file.exists) == true) {
+          if ((await _whenActive(epoch, file.length) ?? 0) > 0) {
+            if (!await _checkpoint(epoch) || nearby?.allowed == false) {
+              return null;
             }
+            return file;
           }
-          final data = bytes.takeBytes();
-          await _validate(data);
-          if (!_current(epoch) || expired) return null;
-          await directory.create(recursive: true);
-          if (!_current(epoch) || expired) return null;
-          final temporary = File(
-            '${file.path}.${DateTime.now().microsecondsSinceEpoch}.part',
-          );
-          try {
-            await temporary.writeAsBytes(data, flush: true);
-            if (!_current(epoch) || expired) return null;
-            await temporary.rename(file.path);
-          } finally {
-            try {
-              await temporary.delete();
-            } on FileSystemException {
-              // A successful atomic rename already removed the temporary file.
-            }
-          }
-          return file;
         }
-
-        // A timeout can finish load() while native decode or file I/O is still
-        // settling. Clearing waits for that underlying work before deleting.
-        return await _track(work()).timeout(
-          timeout,
-          onTimeout: () {
-            expired = true;
-            request?.abort();
-            unawaited(chunks?.cancel());
-            throw TimeoutException('Artwork download timed out');
-          },
+        if ((_failedUntil[url]?.isAfter(DateTime.now()) ?? false) ||
+            nearby?.allowed == false) {
+          return null;
+        }
+        if (!await _checkpoint(epoch)) return null;
+        if (_active >= 4) {
+          final waiting = _PosterWaiter(url);
+          final firstBackground = _priority.contains(url)
+              ? _waiting.indexWhere((entry) => !_priority.contains(entry.url))
+              : -1;
+          _waiting.insert(
+            firstBackground < 0 ? _waiting.length : firstBackground,
+            waiting,
+          );
+          if (!await waiting.ready.future) return null;
+        } else {
+          _active++;
+        }
+        final attempt = _PosterAttempt();
+        if (_resume != null) attempt.cancel();
+        _attempts.add(attempt);
+        // Keep the slot until the underlying native decode/file operation has
+        // settled, even if its deadline has already returned to the caller.
+        final work = _track(
+          _download(uri, file, epoch, nearby, attempt).whenComplete(() async {
+            attempt.stopDeadline();
+            try {
+              await attempt.cancelChunks();
+            } finally {
+              _attempts.remove(attempt);
+              _active--;
+              _dispatchWaiting();
+            }
+          }),
         );
-      } finally {
         try {
-          await chunks?.cancel();
-        } finally {
-          _active--;
-          _dispatchWaiting();
+          final result = await attempt.withDeadline(work, timeout);
+          if (!_current(epoch)) return null;
+          if (attempt.cancelled) continue;
+          return result;
+        } catch (_) {
+          // Pausing is retryable and must not install the offline-host delay.
+          // The flag remains set across a rapid pause/resume, rejecting late
+          // responses from the previous foreground period.
+          if (attempt.cancelled && _current(epoch)) continue;
+          rethrow;
         }
       }
     } catch (_) {
       // Rebuilds or several cards for the same offline host must not retry
       // indefinitely. A later visit may try again without losing other covers.
       if (_current(epoch)) _failed(url);
-      return null;
     }
+    return null;
   }
 
-  Future<void> _validate(Uint8List bytes) async {
+  Future<File?> _download(
+    Uri uri,
+    File file,
+    _PosterEpoch epoch,
+    _PosterNearbyRequest? nearby,
+    _PosterAttempt attempt,
+  ) async {
+    if (!_current(epoch) || attempt.stopped) return null;
+    if (!await _checkpoint(epoch) || nearby?.allowed == false) return null;
+    bool canContinue() =>
+        _current(epoch) && _resume == null && !attempt.stopped;
+    if (!canContinue()) return null;
+    // One pool reuses HTTP/TLS connections across covers. An individual
+    // timeout aborts only its own request; lifecycle suspension closes all.
+    final client = _client ??= createClient()
+      ..connectionTimeout = timeout
+      ..idleTimeout = const Duration(seconds: 15)
+      ..maxConnectionsPerHost = 4;
+    late HttpClientResponse response;
+    for (var redirects = 0; ; redirects++) {
+      final opened = attempt.request = await openProxyAwareRequest(
+        client,
+        'GET',
+        uri,
+        proxyResolver: proxyResolver,
+        cancel: attempt.networkCancel,
+      );
+      if (!canContinue()) {
+        opened.abort();
+        return null;
+      }
+      response = await opened.close();
+      if (!response.isRedirect) break;
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      await response
+          .listen(null, onError: (Object _, StackTrace _) {})
+          .cancel();
+      if (!canContinue()) return null;
+      if (redirects >= 3 || location == null) {
+        throw const FormatException('Invalid artwork redirect');
+      }
+      uri = uri.resolve(location);
+      if (!['http', 'https'].contains(uri.scheme) ||
+          uri.host.isEmpty ||
+          uri.userInfo.isNotEmpty) {
+        throw const FormatException('Invalid artwork redirect');
+      }
+    }
+    final validResponse =
+        response.statusCode == HttpStatus.ok &&
+        response.contentLength <= maxFileBytes;
+    if (!canContinue() || !validResponse) {
+      // StreamIterator does not subscribe until moveNext. Cancel the response
+      // itself here so late/invalid headers cannot retain an unread body.
+      await response
+          .listen(null, onError: (Object _, StackTrace _) {})
+          .cancel();
+      if (canContinue() && !validResponse) {
+        throw const FormatException('Invalid artwork response');
+      }
+      return null;
+    }
+    final reader = attempt.chunks = StreamIterator(response);
+    final bytes = BytesBuilder(copy: false);
+    while (await reader.moveNext()) {
+      if (!canContinue()) return null;
+      bytes.add(reader.current);
+      if (bytes.length > maxFileBytes) {
+        throw const FormatException('Artwork too large');
+      }
+    }
+    if (!canContinue()) return null;
+    final data = bytes.takeBytes();
+    if (!await _validate(data, canContinue: canContinue)) return null;
+    if (!canContinue()) return null;
+    await directory.create(recursive: true);
+    if (!canContinue()) return null;
+    final temporary = File('${file.path}.${++_nextTemporary}.part');
+    try {
+      await temporary.writeAsBytes(data, flush: true);
+      if (!canContinue()) return null;
+      await temporary.rename(file.path);
+    } finally {
+      try {
+        await temporary.delete();
+      } on FileSystemException {
+        // A successful atomic rename already removed the temporary file.
+      }
+    }
+    return canContinue() ? file : null;
+  }
+
+  Future<bool> _validate(
+    Uint8List bytes, {
+    required bool Function() canContinue,
+  }) async {
+    if (!canContinue()) return false;
     final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
     ui.ImageDescriptor? descriptor;
     ui.Codec? codec;
     ui.Image? image;
     try {
+      if (!canContinue()) return false;
       descriptor = await ui.ImageDescriptor.encoded(buffer);
+      if (!canContinue()) return false;
       if (descriptor.width <= 0 ||
           descriptor.height <= 0 ||
           descriptor.width * descriptor.height > 64000000) {
@@ -465,7 +574,9 @@ class PosterCache {
         targetWidth: math.max(1, (descriptor.width * scale).round()),
         targetHeight: math.max(1, (descriptor.height * scale).round()),
       );
+      if (!canContinue()) return false;
       image = (await codec.getNextFrame()).image;
+      return canContinue();
     } finally {
       image?.dispose();
       codec?.dispose();
@@ -553,8 +664,7 @@ class PosterCache {
       _resume = Completer<void>();
       resume.complete();
     }
-    _client?.close(force: true);
-    _client = null;
+    _cancelTransfers();
     for (final waiting in _waiting) {
       waiting.ready.complete(false);
     }
@@ -606,8 +716,7 @@ class PosterCache {
     _failedUntil.clear();
     _priority.clear();
     _nearby.clear();
-    _client?.close(force: true);
-    _client = null;
+    _cancelTransfers();
     for (final waiting in _waiting) {
       waiting.ready.complete(false);
     }
@@ -643,4 +752,67 @@ class _PosterWaiter {
   final ready = Completer<bool>();
 
   _PosterWaiter(this.url);
+}
+
+/// A single foreground attempt. Cancellation survives quick lifecycle changes;
+/// decoding and asynchronous file I/O retain their slot until they settle.
+class _PosterAttempt {
+  final networkCancel = CancelToken();
+  HttpClientRequest? request;
+  StreamIterator<List<int>>? chunks;
+  Future<void>? _chunksCancelled;
+  Timer? _deadline;
+  bool cancelled = false;
+  bool expired = false;
+
+  bool get stopped => cancelled || expired;
+
+  Future<T> withDeadline<T>(Future<T> work, Duration timeout) {
+    final completed = Completer<T>();
+    if (!stopped) {
+      _deadline = Timer(timeout, () {
+        expired = true;
+        _abort();
+        if (!completed.isCompleted) {
+          completed.completeError(
+            TimeoutException('Artwork download timed out'),
+          );
+        }
+      });
+    }
+    work.then<void>(
+      (result) {
+        stopDeadline();
+        if (!completed.isCompleted) completed.complete(result);
+      },
+      onError: (Object error, StackTrace stack) {
+        stopDeadline();
+        if (!completed.isCompleted) completed.completeError(error, stack);
+      },
+    );
+    return completed.future;
+  }
+
+  void stopDeadline() => _deadline?.cancel();
+
+  void cancel() {
+    cancelled = true;
+    stopDeadline();
+    _abort();
+  }
+
+  void _abort() {
+    networkCancel.cancel();
+    request?.abort();
+    unawaited(cancelChunks());
+  }
+
+  Future<void> cancelChunks() {
+    final reader = chunks;
+    if (reader == null) return Future.value();
+    return _chunksCancelled ??= reader.cancel().then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+  }
 }

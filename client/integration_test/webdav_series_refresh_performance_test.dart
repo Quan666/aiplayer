@@ -26,7 +26,7 @@ void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized()
     ..framePolicy = LiveTestWidgetsFlutterBindingFramePolicy.fullyLive;
 
-  testWidgets('profile real WebDAV details completion and automatic refresh', (
+  testWidgets('profile real WebDAV details completion and refresh on entry', (
     tester,
   ) async {
     FlutterSecureStorage.setMockInitialValues({});
@@ -81,7 +81,7 @@ void main() {
       while (!ready()) {
         if (DateTime.now().isAfter(deadline)) fail('Timed out: $label');
         // fullyLive allows production frame scheduling while this test waits.
-        // Do not force idle frames throughout the real 30-second timer wait.
+        // Do not force idle frames while waiting for real source requests.
         await Future<void>.delayed(const Duration(milliseconds: 8));
       }
     }
@@ -135,7 +135,6 @@ void main() {
       });
       final details = find.byKey(const ValueKey('series-details-list'));
       final originalDetails = tester.element(details);
-      final originalRoute = ModalRoute.of(originalDetails);
       final first = await model.loadLibrarySnapshot();
       expect(first.media.length, unrelatedVideos + firstEpisodes);
       expect(first.series[seriesKey], hasLength(firstEpisodes));
@@ -143,22 +142,26 @@ void main() {
       expect(imports.windows.first.heartbeatIntervals, isNotEmpty);
 
       await fixture.setAvailable(finalEpisodes);
-      final addedAt = DateTime.now();
-      await measure(
-        'visible-details-real-30s-poll-imports-100-new-episodes',
-        () async {
-          await waitFor(
-            () => find
-                .textContaining('已收录 $finalEpisodes 集')
-                .evaluate()
-                .isNotEmpty,
-            'automatic WebDAV refresh to $finalEpisodes episodes',
-          );
-        },
-      );
-      final discoveryDelay = DateTime.now().difference(addedAt);
-      expect(tester.element(details), same(originalDetails));
-      expect(ModalRoute.of(tester.element(details)), same(originalRoute));
+      const idleDuration = Duration(seconds: 31);
+      await Future<void>.delayed(idleDuration);
+      expect(fixture.requests, hasLength(1));
+      expect(imports.windows, hasLength(1));
+      expect(find.textContaining('已收录 $firstEpisodes 集'), findsOneWidget);
+      late Duration discoveryDelay;
+      await measure('reopen-details-imports-100-new-episodes', () async {
+        final discovery = Stopwatch()..start();
+        Navigator.of(originalDetails).pop();
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const ValueKey('details:$firstId')));
+        await tester.pump();
+        await waitFor(
+          () =>
+              find.textContaining('已收录 $finalEpisodes 集').evaluate().isNotEmpty,
+          'WebDAV refresh on entry to $finalEpisodes episodes',
+        );
+        discoveryDelay = discovery.elapsed;
+      });
+      expect(tester.element(details), isNot(same(originalDetails)));
       final updated = await model.loadLibrarySnapshot();
       expect(updated.media.length, unrelatedVideos + finalEpisodes);
       expect(updated.series[seriesKey], hasLength(finalEpisodes));
@@ -192,14 +195,13 @@ void main() {
         'initialImportedSeriesEpisodes': 1,
         'firstServerEpisodes': firstEpisodes,
         'finalServerEpisodes': finalEpisodes,
-        'sameDetailsElementAndRouteAfterRefresh': true,
+        'refreshTrigger': 'close and reopen All Videos details',
+        'idleDurationMs': idleDuration.inMilliseconds,
+        'requestsDuringIdle': 0,
         'mainIsolate': Isolate.current.hashCode,
         'serverIsolate': fixture.isolateId,
         'snapshotPreparationIsolate': updated.preparationIsolate,
-        'configuredRefreshDelayMs': model
-            .seriesRefreshDelay(updated.byId[firstId]!)
-            .inMilliseconds,
-        'observedNewFilesToVisibleDetailsMs': discoveryDelay.inMilliseconds,
+        'observedReentryToVisibleDetailsMs': discoveryDelay.inMilliseconds,
         'requests': fixture.requests,
         'importWindows': imports.windows
             .map((window) => window.report)
@@ -209,7 +211,7 @@ void main() {
       final artifacts = Directory(
         const String.fromEnvironment(
           'WEBDAV_SERIES_ARTIFACT_DIR',
-          defaultValue: '../artifacts/webdav-series-refresh-20261023',
+          defaultValue: '../artifacts/manual-refresh-20261024',
         ),
       );
       await artifacts.create(recursive: true);

@@ -536,6 +536,7 @@ class PlayerStyles {
       ),
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
+        elevation: 2,
         backgroundColor: materialColor,
         contentTextStyle: TextStyle(color: foreground),
         actionTextColor: foreground,

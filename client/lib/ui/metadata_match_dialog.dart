@@ -14,6 +14,8 @@ Future<void> showMetadataMatchDialog(
   String title, {
   String season = '',
   Set<String>? mediaIds,
+  List<SyncRecord>? records,
+  MetadataTask? task,
   bool autoAi = false,
 }) => showGlassBottomSheet<void>(
   context: context,
@@ -23,6 +25,8 @@ Future<void> showMetadataMatchDialog(
     title: title,
     season: season,
     mediaIds: mediaIds,
+    records: records,
+    task: task,
     autoAi: autoAi,
   ),
 );
@@ -31,16 +35,37 @@ class _MetadataMatchSheet extends StatefulWidget {
   final AppModel model;
   final String title, season;
   final Set<String>? mediaIds;
+  final List<SyncRecord>? records;
+  final MetadataTask? task;
   final bool autoAi;
   const _MetadataMatchSheet({
     required this.model,
     required this.title,
     required this.season,
     this.mediaIds,
+    this.records,
+    this.task,
     this.autoAi = false,
   });
   @override
   State<_MetadataMatchSheet> createState() => _MetadataMatchSheetState();
+}
+
+class _MetadataRecordDraft {
+  final String name, season, error;
+  final AiMediaIdentity? identity;
+  final AiMetadataMatch? match;
+  final List<Map<String, dynamic>> results;
+  final bool searched;
+  const _MetadataRecordDraft({
+    required this.name,
+    required this.season,
+    required this.error,
+    required this.identity,
+    required this.match,
+    required this.results,
+    required this.searched,
+  });
 }
 
 class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
@@ -48,43 +73,95 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
   late final _season = TextEditingController(
     text: widget.season.isEmpty ? '1' : widget.season,
   );
+  final _prepareCancel = CancelToken();
+  final Map<String, _MetadataRecordDraft> _drafts = {};
+  List<SyncRecord> _records = const [];
+  Map<String, int> _recordIndexes = const {};
   MetadataTask? _task;
   CancelToken? _searchCancel;
   AiMediaIdentity? _identity;
-  String? _resultRecordId;
+  String? _resultRecordId, _advanceAfterId;
   AiMetadataMatch? _shownMatch;
   List<Map<String, dynamic>> _results = [];
   String _error = '';
-  bool _searching = false, _searched = false;
-  bool get _busy => _searching || (_task?.running ?? false);
-
-  List<SyncRecord> get _records => widget.model.media
-      .where(
-        (record) => widget.mediaIds != null
-            ? widget.mediaIds!.contains(record.id)
-            : '${record.data['series']}' == widget.title &&
-                  '${record.data['season'] ?? ''}' == widget.season,
-      )
-      .toList();
+  bool _loading = true, _searching = false, _searched = false;
+  MetadataTask? get _workTask =>
+      _task?.selectionTask?.running == true ? _task!.selectionTask : _task;
+  bool get _busy => _loading || _searching || (_workTask?.running ?? false);
 
   @override
   void initState() {
     super.initState();
-    final existing = widget.model.metadataTaskFor(
-      _records.map((record) => record.id).toSet(),
-    );
-    if (existing != null) _attachTask(existing);
-    if (widget.autoAi && existing?.running != true) {
+    final task =
+        widget.task ??
+        (widget.mediaIds == null
+            ? null
+            : widget.model.metadataTaskFor(widget.mediaIds!));
+    if (task != null) {
+      _loading = false;
+      _attachTask(task);
+      _startAutoRecognition();
+    } else if (widget.records != null) {
+      _loading = false;
+      _setRecords(widget.records!);
+      _startAutoRecognition();
+    } else {
+      _prepareRecords();
+    }
+  }
+
+  Future<void> _prepareRecords() async {
+    try {
+      final snapshot = await widget.model.loadLibrarySnapshot(
+        cancel: _prepareCancel,
+      );
+      if (!mounted || _prepareCancel.cancelled) return;
+      final ids = widget.mediaIds;
+      final records = ids != null
+          ? [for (final id in ids) ?snapshot.byId[id]]
+          : snapshot.media
+                .where(
+                  (record) =>
+                      '${record.data['series']}' == widget.title &&
+                      '${record.data['season'] ?? ''}' == widget.season,
+                )
+                .toList();
+      setState(() {
+        _loading = false;
+        _setRecords(records);
+      });
+      _startAutoRecognition();
+    } on Cancelled {
+      // Closing the sheet stops only its snapshot read.
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = safeFailure(error).message;
+        });
+      }
+    }
+  }
+
+  void _startAutoRecognition() {
+    if (widget.autoAi && _workTask?.running != true) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _recognize();
       });
     }
   }
 
+  void _setRecords(List<SyncRecord> records) {
+    _records = records;
+    _recordIndexes = {
+      for (var i = 0; i < records.length; i++) records[i].id: i,
+    };
+  }
+
   @override
   void dispose() {
-    // The model owns recognition and application jobs. Leaving this sheet only
-    // stops a transient search and detaches its progress listener.
+    // Recognition and application jobs belong to the model, not this view.
+    _prepareCancel.cancel();
     _searchCancel?.cancel();
     _task?.removeListener(_taskChanged);
     _input.dispose();
@@ -95,24 +172,54 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
   void _attachTask(MetadataTask task) {
     _task?.removeListener(_taskChanged);
     _task = task;
+    _drafts.clear();
     _shownMatch = null;
     _resultRecordId = null;
+    _advanceAfterId = null;
+    _setRecords(task.records);
+    final selection = task.selectionTask;
+    final activeId = selection?.running == true
+        ? selection!.records.firstOrNull?.id
+        : null;
+    if (activeId != null && _recordIndexes.containsKey(activeId)) {
+      _loadRecord(activeId);
+      _advanceAfterId = activeId;
+    }
     task.addListener(_taskChanged);
     _readTask();
   }
 
-  void _readTask() {
-    final task = _task;
-    if (task == null || task.results.isEmpty) return;
-    if (!task.results.containsKey(_resultRecordId)) {
-      _resultRecordId =
-          task.results.entries
-              .where((entry) => entry.value.subject == null)
-              .firstOrNull
-              ?.key ??
-          task.results.keys.first;
-    }
-    final match = task.results[_resultRecordId];
+  void _saveDraft() {
+    final id = _resultRecordId;
+    if (id == null) return;
+    _drafts[id] = _MetadataRecordDraft(
+      name: _input.text,
+      season: _season.text,
+      error: _error,
+      identity: _identity,
+      match: _shownMatch,
+      results: _results,
+      searched: _searched,
+    );
+  }
+
+  void _loadRecord(String id) {
+    _resultRecordId = id;
+    final record = _records[_recordIndexes[id]!];
+    final draft = _drafts[id];
+    _shownMatch = draft?.match;
+    _identity = draft?.identity;
+    _input.text = draft?.name ?? '${record.data['series'] ?? widget.title}';
+    final season = '${record.data['season'] ?? ''}';
+    _season.text = draft?.season ?? (season.isEmpty ? '1' : season);
+    _results = draft?.results ?? [];
+    _searched = draft?.searched ?? false;
+    _error = draft?.error ?? '';
+    _readSelectedMatch();
+  }
+
+  void _readSelectedMatch() {
+    final match = _task?.results[_resultRecordId];
     if (match == null || identical(match, _shownMatch)) return;
     _shownMatch = match;
     _identity = match.identity;
@@ -122,13 +229,111 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
     _searched = true;
   }
 
+  void _readTask() {
+    final task = _task;
+    if (task == null || task.removed) return;
+    if (_recordIndexes.length != task.records.length) {
+      _setRecords(task.records);
+    }
+    if (!_recordIndexes.containsKey(_resultRecordId)) {
+      final id =
+          _records.where((r) => !task.isMatched(r.id)).firstOrNull?.id ??
+          _records.firstOrNull?.id;
+      if (id != null) _loadRecord(id);
+    } else {
+      _readSelectedMatch();
+    }
+    final applied = _advanceAfterId;
+    if (applied != null && task.selectionTask?.running != true) {
+      _advanceAfterId = null;
+      if (task.selectionTask?.isMatched(applied) == true &&
+          task.selectionTask?.cancelled == false) {
+        _saveDraft();
+        final start = (_recordIndexes[applied] ?? -1) + 1;
+        for (var offset = 0; offset < _records.length; offset++) {
+          final next = _records[(start + offset) % _records.length];
+          if (!task.isMatched(next.id)) {
+            _loadRecord(next.id);
+            break;
+          }
+        }
+      }
+    }
+  }
+
   void _taskChanged() {
-    if (mounted) setState(_readTask);
+    if (!mounted) return;
+    if (_task?.removed == true) {
+      Navigator.pop(context);
+      return;
+    }
+    setState(_readTask);
   }
 
   String _resultName(String id) {
-    final record = widget.model.store.get('media', id);
-    return record == null ? '视频已移除' : widget.model.metadataFileName(record);
+    final index = _recordIndexes[id];
+    return index == null
+        ? '视频已移除'
+        : widget.model.metadataFileName(_records[index]);
+  }
+
+  void _selectRecord(String id) {
+    if (id == _resultRecordId) return;
+    _searchCancel?.cancel();
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _saveDraft();
+      _searching = false;
+      _advanceAfterId = null;
+      _loadRecord(id);
+    });
+  }
+
+  Future<void> _chooseRecord() async {
+    final selected = await showGlassBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheet) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.sizeOf(sheet).height * .6,
+          child: ListView.builder(
+            key: const ValueKey('metadata-record-picker'),
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            itemCount: _records.length,
+            itemBuilder: (context, index) {
+              final id = _records[index].id;
+              return ListTile(
+                selected: id == _resultRecordId,
+                leading: Icon(
+                  _task!.isMatched(id)
+                      ? Icons.check_circle_outline_rounded
+                      : Icons.radio_button_unchecked_rounded,
+                ),
+                title: Text(
+                  _resultName(id),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                onTap: () => Navigator.pop(sheet, id),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    if (mounted && selected != null) _selectRecord(selected);
+  }
+
+  void _removeRecord() {
+    final task = _task, id = _resultRecordId;
+    if (task == null || id == null || _busy) return;
+    _drafts.remove(id);
+    widget.model.removeMetadataTaskRecord(task, id);
+  }
+
+  void _removeTask() {
+    final task = _task;
+    if (task != null) widget.model.removeMetadataTask(task);
   }
 
   Future<void> _search() async {
@@ -140,8 +345,7 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
       _error = '';
       _results = [];
       _searched = false;
-      _identity = null;
-      _resultRecordId = null;
+      // Keep the selected file and its episode identity while searching.
     });
     try {
       final results = await widget.model.searchBangumi(
@@ -188,11 +392,10 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
       setState(() => _error = '请输入有效季度，特别篇使用 0。');
       return;
     }
-    final records = _records
-        .where(
-          (record) => _resultRecordId == null || record.id == _resultRecordId,
-        )
-        .toList();
+    final selectedIndex = _recordIndexes[_resultRecordId];
+    final records = selectedIndex == null
+        ? _records
+        : [_records[selectedIndex]];
     if (records.isEmpty) {
       setState(() => _error = '没有可匹配的视频，请重新打开作品详情。');
       return;
@@ -200,14 +403,19 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
     FocusScope.of(context).unfocus();
     setState(() {
       _error = '';
-      _attachTask(
-        widget.model.startMetadataSelectionTask(
-          records,
-          candidate,
-          season: useSeason ? '$number' : '',
-          identity: _identity,
-        ),
+      final parent = _task;
+      final selection = widget.model.startMetadataSelectionTask(
+        records,
+        candidate,
+        season: useSeason ? '$number' : '',
+        identity: _identity,
+        parentTask: parent,
       );
+      if (parent == null) {
+        _attachTask(selection);
+      } else {
+        _advanceAfterId = _resultRecordId;
+      }
     });
   }
 
@@ -218,6 +426,7 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
     final original = '${result['name'] ?? ''}';
     return ListTile(
       dense: true,
+      contentPadding: EdgeInsets.zero,
       title: Text(name, maxLines: 2, overflow: TextOverflow.ellipsis),
       subtitle: Text(
         [
@@ -238,7 +447,21 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
   @override
   Widget build(BuildContext context) {
     final task = _task;
-    final error = _error.isNotEmpty ? _error : task?.error ?? '';
+    final work = _workTask;
+    final selection = task?.selectionTask;
+    final selectedId = _resultRecordId;
+    final selectionApplies =
+        selectedId != null && selection?.containsMedia(selectedId) == true;
+    final error = _error.isNotEmpty
+        ? _error
+        : selectionApplies
+        ? selection!.error
+        : _searched ||
+              _searching ||
+              (selectedId != null && task?.isMatched(selectedId) == true)
+        ? ''
+        : task?.error ?? '';
+    final selectedIndex = _recordIndexes[_resultRecordId] ?? 0;
     final bottom = MediaQuery.viewInsetsOf(context).bottom;
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -257,14 +480,14 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 8),
                   Container(
                     width: 34,
                     height: 4,
                     decoration: LibraryStyles.of(context).dragHandle,
                   ),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
                     child: Row(
                       children: [
                         Expanded(
@@ -282,168 +505,199 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
                     ),
                   ),
                   Flexible(
-                    child: ListView(
+                    child: ListView.builder(
                       key: const ValueKey('metadata-match-content'),
                       shrinkWrap: true,
-                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
                       keyboardDismissBehavior:
                           ScrollViewKeyboardDismissBehavior.onDrag,
-                      children: [
-                        Row(
+                      itemCount: _results.length + 1,
+                      itemBuilder: (context, index) {
+                        if (index > 0) return _candidate(_results[index - 1]);
+                        return Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Expanded(
-                              child: TextField(
-                                controller: _input,
-                                enabled: !_busy,
-                                decoration: const InputDecoration(
-                                  labelText: '作品名称',
-                                ),
-                                textInputAction: TextInputAction.search,
-                                onSubmitted: (_) {
-                                  if (!_busy) _search();
-                                },
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            SizedBox(
-                              width: 72,
-                              child: TextField(
-                                controller: _season,
-                                enabled: !_busy,
-                                keyboardType: TextInputType.number,
-                                decoration: const InputDecoration(
-                                  labelText: '季度',
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 12),
-                        Wrap(
-                          spacing: 10,
-                          runSpacing: 8,
-                          children: [
-                            Tooltip(
-                              message: '搜索资料',
-                              child: FilledButton.icon(
-                                onPressed: _busy ? null : _search,
-                                icon: const Icon(
-                                  Icons.search_rounded,
-                                  size: LibraryStyles.iconButton,
-                                ),
-                                label: const Text('搜索'),
-                              ),
-                            ),
-                            OutlinedButton.icon(
-                              onPressed: _busy ? null : _recognize,
-                              icon: const Icon(
-                                Icons.auto_awesome_rounded,
-                                size: LibraryStyles.iconButton,
-                              ),
-                              label: const Text('AI 自动识别'),
-                            ),
-                          ],
-                        ),
-                        if (task != null) ...[
-                          const SizedBox(height: 14),
-                          Container(
-                            key: const ValueKey('metadata-task-status'),
-                            padding: const EdgeInsets.all(12),
-                            decoration: LibraryStyles.of(context).taskStatus,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(task.status),
-                                const SizedBox(height: 4),
-                                Text(
-                                  '已处理 ${task.completed}/${task.total} · 已匹配 ${task.matched} · 失败 ${task.failed}',
-                                  style: AppStyles.of(context).caption,
-                                ),
-                                if (task.running) ...[
-                                  const SizedBox(height: 10),
-                                  LinearProgressIndicator(
-                                    value: task.total > 0
-                                        ? task.completed / task.total
+                            if (task != null && _records.isNotEmpty) ...[
+                              Row(
+                                children: [
+                                  IconButton(
+                                    tooltip: '上一个',
+                                    onPressed: selectedIndex > 0
+                                        ? () => _selectRecord(
+                                            _records[selectedIndex - 1].id,
+                                          )
                                         : null,
+                                    icon: const Icon(
+                                      Icons.chevron_left_rounded,
+                                    ),
                                   ),
-                                ],
-                              ],
-                            ),
-                          ),
-                        ],
-                        if (_searching)
-                          const Padding(
-                            padding: EdgeInsets.only(top: 12),
-                            child: LinearProgressIndicator(),
-                          ),
-                        if (error.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 12),
-                            child: Text(
-                              error,
-                              style: AppStyles.of(context).error,
-                            ),
-                          ),
-                        if ((task?.results.length ?? 0) > 1)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 14),
-                            child: DropdownButtonFormField<String>(
-                              key: ValueKey(
-                                'metadata-result:${task!.id}:$_resultRecordId',
-                              ),
-                              initialValue: _resultRecordId,
-                              isExpanded: true,
-                              decoration: const InputDecoration(
-                                labelText: '查看视频识别结果',
-                              ),
-                              items: task.results.keys
-                                  .map(
-                                    (id) => DropdownMenuItem(
-                                      value: id,
+                                  Expanded(
+                                    child: TextButton(
+                                      key: const ValueKey(
+                                        'metadata-record-choice',
+                                      ),
+                                      onPressed: _records.length > 1
+                                          ? _chooseRecord
+                                          : null,
                                       child: Text(
-                                        _resultName(id),
-                                        maxLines: 1,
+                                        '${selectedIndex + 1}/${_records.length}  ${_resultName(_resultRecordId!)}',
+                                        maxLines: 2,
                                         overflow: TextOverflow.ellipsis,
                                       ),
                                     ),
-                                  )
-                                  .toList(),
-                              onChanged: (id) => setState(() {
-                                _resultRecordId = id;
-                                _shownMatch = null;
-                                _readTask();
-                              }),
+                                  ),
+                                  IconButton(
+                                    tooltip: '下一个',
+                                    onPressed:
+                                        selectedIndex + 1 < _records.length
+                                        ? () => _selectRecord(
+                                            _records[selectedIndex + 1].id,
+                                          )
+                                        : null,
+                                    icon: const Icon(
+                                      Icons.chevron_right_rounded,
+                                    ),
+                                  ),
+                                  if (task.isMatched(_resultRecordId!))
+                                    IconButton(
+                                      tooltip: '删除识别记录',
+                                      onPressed: _busy ? null : _removeRecord,
+                                      icon: const Icon(
+                                        Icons.delete_outline_rounded,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                            ],
+                            if (_loading) const LinearProgressIndicator(),
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  child: TextField(
+                                    controller: _input,
+                                    enabled: !_busy,
+                                    decoration: const InputDecoration(
+                                      labelText: '作品名称',
+                                    ),
+                                    textInputAction: TextInputAction.search,
+                                    onSubmitted: (_) {
+                                      if (!_busy) _search();
+                                    },
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                SizedBox(
+                                  width: 72,
+                                  child: TextField(
+                                    controller: _season,
+                                    enabled: !_busy,
+                                    keyboardType: TextInputType.number,
+                                    decoration: const InputDecoration(
+                                      labelText: '季度',
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
-                          ),
-                        if (_identity != null)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 12),
-                            child: Text(
-                              [
-                                '识别：${_identity!.name}',
-                                if (_identity!.season.isNotEmpty &&
-                                    _identity!.season != '1')
-                                  _identity!.season == '0'
-                                      ? '特别篇'
-                                      : '第 ${_identity!.season} 季',
-                                if (_identity!.episode.isNotEmpty)
-                                  '第 ${_identity!.episode} 集',
-                              ].join(' · '),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 4,
+                              children: [
+                                Tooltip(
+                                  message: '搜索资料',
+                                  child: FilledButton.icon(
+                                    onPressed: _busy ? null : _search,
+                                    icon: const Icon(
+                                      Icons.search_rounded,
+                                      size: LibraryStyles.iconButton,
+                                    ),
+                                    label: const Text('搜索'),
+                                  ),
+                                ),
+                                OutlinedButton.icon(
+                                  onPressed: _busy ? null : _recognize,
+                                  icon: const Icon(
+                                    Icons.auto_awesome_rounded,
+                                    size: LibraryStyles.iconButton,
+                                  ),
+                                  label: const Text('AI 自动识别'),
+                                ),
+                              ],
                             ),
-                          ),
-                        if (_searched && _results.isEmpty)
-                          const Padding(
-                            padding: EdgeInsets.only(top: 12),
-                            child: Text('未找到作品，可尝试其他译名或 AI 自动识别。'),
-                          ),
-                        ..._results.map(_candidate),
-                      ],
+                            if (task != null) ...[
+                              const SizedBox(height: 8),
+                              Container(
+                                key: const ValueKey('metadata-task-status'),
+                                padding: const EdgeInsets.all(8),
+                                decoration: LibraryStyles.of(
+                                  context,
+                                ).taskStatus,
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(work?.status ?? task.status),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '已处理 ${task.completed}/${task.total} · 已匹配 ${task.matched} · 失败 ${task.failed}',
+                                      style: AppStyles.of(context).caption,
+                                    ),
+                                    if (work?.running == true) ...[
+                                      const SizedBox(height: 8),
+                                      LinearProgressIndicator(
+                                        value: work!.total > 0
+                                            ? work.completed / work.total
+                                            : null,
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            ],
+                            if (_searching)
+                              const Padding(
+                                padding: EdgeInsets.only(top: 8),
+                                child: LinearProgressIndicator(),
+                              ),
+                            if (error.isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: Text(
+                                  error,
+                                  style: AppStyles.of(context).error,
+                                ),
+                              ),
+                            if (_identity != null)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: Text(
+                                  [
+                                    '识别：${_identity!.name}',
+                                    if (_identity!.season.isNotEmpty &&
+                                        _identity!.season != '1')
+                                      _identity!.season == '0'
+                                          ? '特别篇'
+                                          : '第 ${_identity!.season} 季',
+                                    if (_identity!.episode.isNotEmpty)
+                                      '第 ${_identity!.episode} 集',
+                                  ].join(' · '),
+                                ),
+                              ),
+                            if (_searched && _results.isEmpty)
+                              const Padding(
+                                padding: EdgeInsets.only(top: 8),
+                                child: Text('未找到作品，可尝试其他译名或 AI 自动识别。'),
+                              ),
+                          ],
+                        );
+                      },
                     ),
                   ),
                   const Divider(height: 1),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                    padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
                     child: OverflowBar(
                       alignment: MainAxisAlignment.end,
                       spacing: 4,
@@ -452,10 +706,15 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
                           onPressed: () => Navigator.pop(context),
                           child: const Text('关闭'),
                         ),
-                        if (task?.running == true) ...[
+                        if (task != null)
+                          TextButton(
+                            onPressed: _removeTask,
+                            child: const Text('删除任务'),
+                          ),
+                        if (work?.running == true) ...[
                           TextButton(
                             onPressed: () =>
-                                widget.model.cancelMetadataTask(task!),
+                                widget.model.cancelMetadataTask(work!),
                             child: const Text('取消任务'),
                           ),
                           FilledButton(

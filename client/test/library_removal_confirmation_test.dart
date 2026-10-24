@@ -46,7 +46,11 @@ void main() {
       try {
         await tester.pumpWidget(AIPlayerApp(model: model));
         await tester.pumpAndSettle();
+        await tester.longPress(find.byKey(const ValueKey('play:1')));
+        await tester.pumpAndSettle();
         await tester.tap(find.text('多选'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const ValueKey('select:1')));
         await tester.pumpAndSettle();
         expect(
           tester

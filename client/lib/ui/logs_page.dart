@@ -7,7 +7,8 @@ import 'search_header.dart';
 
 class LogsView extends StatefulWidget {
   final AppLog? log;
-  const LogsView({super.key, this.log});
+  final bool showBackButton;
+  const LogsView({super.key, this.log, this.showBackButton = false});
   @override
   State<LogsView> createState() => _LogsViewState();
 }
@@ -20,6 +21,9 @@ class _LogsViewState extends State<LogsView> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
+        titlePadding: GlassMetrics.dialogTitlePadding,
+        contentPadding: GlassMetrics.dialogContentPadding,
+        actionsPadding: GlassMetrics.dialogActionsPadding,
         title: const Text('清空本机日志？'),
         actions: [
           TextButton(
@@ -99,34 +103,45 @@ class _LogsViewState extends State<LogsView> {
               : MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SearchHeader(
-              title: '运行日志',
-              titleSize: SettingsStyles.compactSearchTitleSize,
-              hint: '搜索日志',
-              onChanged: (v) => setState(() => search = v),
-              trailing: PopupMenuButton<String>(
-                tooltip: '日志操作',
-                onSelected: (value) async {
-                  if (value == 'clear') {
-                    await clear();
-                    return;
-                  }
-                  await _copy(entries.map((e) => e.text).join('\n'));
-                },
-                itemBuilder: (_) => [
-                  PopupMenuItem(
-                    value: 'copy',
-                    enabled: entries.isNotEmpty,
-                    child: const Text('复制当前日志'),
+            Row(
+              children: [
+                if (widget.showBackButton) const BackButton(),
+                Expanded(
+                  child: SearchHeader(
+                    title: '运行日志',
+                    titleSize: SettingsStyles.compactSearchTitleSize,
+                    hint: '搜索日志',
+                    onChanged: (v) => setState(() => search = v),
+                    trailing: PopupMenuButton<String>(
+                      tooltip: '日志操作',
+                      onSelected: (value) async {
+                        if (value == 'clear') {
+                          await clear();
+                          return;
+                        }
+                        await _copy(entries.map((e) => e.text).join('\n'));
+                      },
+                      itemBuilder: (_) => [
+                        PopupMenuItem(
+                          height: GlassMetrics.menuItemHeight,
+                          padding: GlassMetrics.menuItemPadding,
+                          value: 'copy',
+                          enabled: entries.isNotEmpty,
+                          child: const Text('复制当前日志'),
+                        ),
+                        PopupMenuItem(
+                          height: GlassMetrics.menuItemHeight,
+                          padding: GlassMetrics.menuItemPadding,
+                          value: 'clear',
+                          enabled: log.entries.isNotEmpty,
+                          child: const Text('清空日志'),
+                        ),
+                      ],
+                      icon: const Icon(Icons.more_horiz_rounded, size: 20),
+                    ),
                   ),
-                  PopupMenuItem(
-                    value: 'clear',
-                    enabled: log.entries.isNotEmpty,
-                    child: const Text('清空日志'),
-                  ),
-                ],
-                icon: const Icon(Icons.more_horiz_rounded, size: 20),
-              ),
+                ),
+              ],
             ),
             Wrap(
               spacing: 6,

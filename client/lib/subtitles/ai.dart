@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
 import '../core/network.dart';
+import '../core/system_proxy_stub.dart'
+    if (dart.library.ui) '../core/system_proxy.dart';
 import 'document.dart';
 
 const defaultSubtitlePrompt =
@@ -65,10 +67,14 @@ abstract interface class SubtitleAiTransport {
 class IoSubtitleAiTransport implements SubtitleAiTransport {
   final Duration inactivity;
   final HttpClient Function() createClient;
+  final SystemProxyLookup? proxyResolver;
   IoSubtitleAiTransport({
     this.inactivity = const Duration(seconds: 120),
     HttpClient Function()? createClient,
-  }) : createClient = createClient ?? HttpClient.new;
+    SystemProxyLookup? proxyResolver,
+  }) : createClient = createClient ?? HttpClient.new,
+       proxyResolver =
+           proxyResolver ?? (createClient == null ? resolveSystemProxy : null);
   Future<Object> _request(
     SubtitleAiConfig config,
     String route,
@@ -79,10 +85,20 @@ class IoSubtitleAiTransport implements SubtitleAiTransport {
     final client = createClient()
       ..connectionTimeout = const Duration(seconds: 25);
     var done = false;
+    var resolvingProxy = false;
     Future<Object> work() async {
+      final uri = config.endpoint(route);
+      if (proxyResolver != null) {
+        resolvingProxy = true;
+        final proxy = await proxyResolver!(uri, cancel: cancel);
+        cancel.check();
+        if (proxy != null) client.findProxy = (_) => proxy;
+        resolvingProxy = false;
+      }
       final request = await client
-          .openUrl(body == null ? 'GET' : 'POST', config.endpoint(route))
+          .openUrl(body == null ? 'GET' : 'POST', uri)
           .timeout(const Duration(seconds: 25));
+      cancel.check();
       request.followRedirects = false;
       request.headers.set(
         HttpHeaders.acceptHeader,
@@ -99,6 +115,7 @@ class IoSubtitleAiTransport implements SubtitleAiTransport {
         request.write(jsonEncode(body));
       }
       final response = await request.close().timeout(inactivity);
+      cancel.check();
       final status = response.statusCode;
       if (status >= 300 && status < 400) {
         throw AppFailure('AI 服务返回重定向，已阻止发送凭证。请填写最终 API 地址。', status);
@@ -213,6 +230,10 @@ class IoSubtitleAiTransport implements SubtitleAiTransport {
     } on AppFailure {
       rethrow;
     } on TimeoutException {
+      cancel.check();
+      if (resolvingProxy) {
+        throw const AppFailure('读取系统代理超时，请检查 Android 代理设置。');
+      }
       throw const AppFailure('AI 服务长时间未返回数据，已停止等待。已完成的批次已缓存。');
     } on FormatException {
       throw const AppFailure('AI 服务返回无效 JSON 或 UTF-8，请检查是否为兼容的聊天 API。');

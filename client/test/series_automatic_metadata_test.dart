@@ -22,8 +22,15 @@ const _subject = {
 };
 
 class _Directory extends SourceAdapter {
+  final _Model owner;
+  _Directory(this.owner);
   @override
-  Future<List<SourceEntry>> list(String path) async => _entries;
+  Future<List<SourceEntry>> list(String path) async {
+    owner.listingRequests++;
+    if (owner.listingFails) throw const AppFailure('offline');
+    return owner.entries;
+  }
+
   @override
   Future<SourceEntry> stat(String path) async => throw UnimplementedError();
   @override
@@ -72,11 +79,14 @@ class _Catalog extends LibraryCatalog {
 
 class _Model extends AppModel {
   _Model(super.store, super.documents) : super(backgroundWork: false);
+  List<SourceEntry> entries = _entries;
+  int listingRequests = 0;
+  bool listingFails = false;
   late final testCatalog = _Catalog(store);
   @override
   LibraryCatalog get catalog => testCatalog;
   @override
-  Future<SourceAdapter> adapter(String id) async => _Directory();
+  Future<SourceAdapter> adapter(String id) async => _Directory(this);
 }
 
 void main() {
@@ -137,6 +147,55 @@ void main() {
   }
 
   test(
+    'each explicit series load lists its shared source directory once and recovers new episodes',
+    () async {
+      store.setLocal('settings', {'metadataStrategy': 'off'});
+      seed();
+      final anchor = store.get('media', 'first')!;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        final before = model.listingRequests;
+        expect(await model.loadSeriesEpisodes(anchor), hasLength(3));
+        expect(model.listingRequests, before + 1);
+      }
+      model.listingFails = true;
+      expect(await model.loadSeriesEpisodes(anchor), hasLength(3));
+      expect(model.listingRequests, 4);
+      model.listingFails = false;
+      model.entries = [
+        ..._entries,
+        const SourceEntry(
+          name: 'Series E04.mkv',
+          path: 'Series/Series E04.mkv',
+        ),
+      ];
+      final updated = await model.loadSeriesEpisodes(anchor);
+      expect(updated, hasLength(4));
+      expect(model.listingRequests, 5);
+    },
+  );
+
+  for (final movie in [false, true]) {
+    test(
+      'details without a source series do not request directory listings, movie=$movie',
+      () async {
+        seed();
+        if (movie) {
+          final anchor = store.get('media', 'first')!;
+          store.save('media', anchor.id, {
+            ...anchor.data,
+            'metadataType': 'movie',
+          });
+        } else {
+          store.removeLocal('location:first');
+        }
+        final anchor = store.get('media', 'first')!;
+        await model.loadSeriesEpisodes(anchor);
+        expect(model.listingRequests, 0);
+      },
+    );
+  }
+
+  test(
     'episode name failure retains matched series and is retried on next detail load',
     () async {
       seed();
@@ -146,10 +205,6 @@ void main() {
       );
       expect(partial, hasLength(3));
       expect(partial.every((r) => r.data['bangumiId'] == '42'), isTrue);
-      expect(
-        model.seriesRefreshDelay(partial.first),
-        const Duration(seconds: 60),
-      );
       model.testCatalog.failNames = false;
       final completed = await model.loadSeriesEpisodes(
         store.get('media', 'first')!,

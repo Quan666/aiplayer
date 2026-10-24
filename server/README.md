@@ -43,9 +43,9 @@ SYNC_ADDR=127.0.0.1:8080 SYNC_DB=./aiplayer.db ./aiplayer-sync
 
 新建 version=0，后续携带最后已知版本。成功返回 200 和版本递增后的完整记录；过期返回 409 及 current。删除用 deleted=true 墓碑。记录可携带 `modifiedAt`（UTC RFC3339）、`deviceId` 与 `deviceName`。客户端按实际修改时间自动选择较新记录并重试；时间相同时删除优先，再按稳定设备 ID 排序，无需逐条选择。设置、来源、收藏等按项保留修改时间，不把同步时间当作修改时间。
 
-新版客户端需要配套更新服务端以接受上述字段。启动时自动为旧 SQLite 数据库添加字段，保留原有记录和 Token；未携带这些字段的旧客户端仍可使用版本接口。
+服务启动时自动为旧 SQLite 数据库添加上述来源信息字段，保留原有记录和 Token；未携带这些字段的旧客户端仍可使用版本接口。
 
-| kind | data 允许字段 |
+| kind | data 已有字段约定 |
 | --- | --- |
 | media | title、series、season、episode、episodeTitle、bangumiId、poster、summary、fileName、size、duration、metadataProvider、tmdbId、metadataTitle、rating、ratingCount、airDate、totalEpisodes、totalSeasons、genres、metadataType |
 | match | provider、episodeId、label、shift、offset |
@@ -53,7 +53,17 @@ SYNC_ADDR=127.0.0.1:8080 SYNC_DB=./aiplayer.db ./aiplayer-sync
 | watched | watched |
 | vault | algorithm、nonce、ciphertext、mac |
 
-季度、集数及服务集数 ID 均为字符串；size、duration、position、shift、offset 为数字；watched 为布尔。fileName 不接受路径；match.provider 为 HTTPS origin。genres 为最多 32 项的字符串数组；rating 为 0–10 的数字，ratingCount、totalEpisodes、totalSeasons 为非负整数，以上资料数字也允许 null。metadataProvider 为 bangumi 或 tmdb，metadataType 为 tv 或 movie。未知字段、嵌套对象被拒绝，公开资料记录仍不接受 API Key、来源地址、密码或文件路径。
+季度、集数及服务集数 ID 均为字符串；size、duration、position、shift、offset 为数字；watched 为布尔。fileName 不接受路径；match.provider 为 HTTPS origin。genres 为最多 32 项的字符串数组；rating 为 0–10 的数字，ratingCount、totalEpisodes、totalSeasons 为非负整数，以上资料数字也允许 null。metadataProvider 为 bangumi 或 tmdb，metadataType 为 tv 或 movie。保留这些已有字段的校验，避免改变类型后使旧客户端无法读取。
+
+### 客户端数据扩展
+
+服务端对公开业务数据采用可扩展存储：允许新增 `kind`、新增 `data` 字段及嵌套对象、数组，原始 JSON 直接持久化，不删减未知字段、不转换数值精度。上传响应、版本冲突中的 `current`、增量历史和重启后的数据均保留这些内容。`id` 与 `kind` 均为 1–200 个字母、数字或 `_.:-` 字符，`data` 仍须是对象，嵌套深度最多 32 层且不接受重复键，整个请求仍限制 256 KiB。
+
+公开扩展内容会递归检查常见凭证、路径与私密来源字段，包括 `apiKey`、`token`、`password`、`credentials`、`path`、`url`、`address` 及大小写、分隔符变体；任何层级的 `fileName` 都不能包含路径。这是误传检查，不能识别任意业务字段是否敏感。客户端必须继续把私密数据放入加密 `vault`，不能依靠服务器猜测字段含义来保护隐私。
+
+本次升级后，新增公开业务字段或记录类型通常不再要求同步服务跟随客户端升级；设置（包括全部视频的排序偏好）继续使用已有 `vault`，其内部业务格式始终由客户端解释。`/v1` 的传输外壳字段、版本冲突语义与 `vault` 加密外壳仍是稳定协议，不能任意改变。已有字段改类型、改含义或改变加密算法仍需客户端迁移；可以在 `data` 中声明业务版本，或采用新的 `kind`。旧客户端不一定理解新功能，不能把服务可存储等同于旧客户端可使用。
+
+每次 PUT 仍替换完整记录，不自动合并对象。客户端更新记录时应保留不认识的字段，遇到未知记录类型应保留或跳过；否则旧客户端重新上传时仍可能覆盖新字段。该扩展无需数据库迁移，只需一次更新服务程序并保留原数据库。此前严格校验公开字段的旧服务仍会拒绝新增公开字段。
 
 ### 加密记录 vault
 

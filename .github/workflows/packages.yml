@@ -35,7 +35,7 @@ permissions:
 
 concurrency:
   group: packages-${{ github.workflow }}-${{ github.ref }}-${{ inputs.target || 'automatic' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   FLUTTER_SUPPRESS_ANALYTICS: 'true'
@@ -43,7 +43,20 @@ env:
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Match the release tag to the source version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python3 scripts/publish_release.py --tag "$GITHUB_REF_NAME" --check-only
+
   android:
+    needs: validate
     # Never pass the persistent signing key to pull request code.
     if: github.event_name != 'pull_request' && (inputs.target == '' || inputs.target == 'all' || inputs.target == 'android')
     name: Android (${{ matrix.abi }})
@@ -277,6 +290,7 @@ jobs:
   #         EOF
 
   macos:
+    needs: validate
     if: inputs.target == '' || inputs.target == 'all' || inputs.target == 'macos'
     name: macOS universal (Apple Silicon + Intel)
     runs-on: macos-15
@@ -324,3 +338,40 @@ jobs:
           未同步的凭据需重新填写。旧钥匙串条目保留，程序不会读取或迁移这些条目。
           CI 打包通过不代表播放、网络来源和本地凭据读写已完成实机验收。
           EOF
+
+  release:
+    name: Publish GitHub Release
+    needs: [validate, android, macos]
+    if: >-
+      !cancelled() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.validate.result == 'success' &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+      (needs.macos.result == 'success' || needs.macos.result == 'skipped') &&
+      (needs.android.result == 'success' || needs.macos.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Download packages from this run
+        uses: actions/download-artifact@v8
+        with:
+          pattern: aiplayer-*
+          path: release-assets
+          merge-multiple: true
+          # APKs and the macOS ZIP are already packaged; keep their bytes intact.
+          skip-decompress: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TARGET: ${{ inputs.target || 'all' }}
+        run: python3 scripts/publish_release.py --tag "$GITHUB_REF_NAME" --target "$RELEASE_TARGET" --artifacts release-assets

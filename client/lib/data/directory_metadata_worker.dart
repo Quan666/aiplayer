@@ -3,16 +3,21 @@ import 'dart:convert';
 import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 
 import '../core/network.dart';
 import '../core/logger.dart';
+import '../core/system_proxy.dart';
 import '../danmaku/release_name.dart';
 import '../sources/configuration.dart';
 import '../sources/directory_sort.dart';
 import '../sources/source.dart';
+import '../subtitles/ai.dart';
 import 'library_catalog.dart';
+import 'media_ai_catalog.dart';
+import 'media_ai_recognition.dart';
 import 'media_presentation.dart';
 import 'source_preview.dart';
 import 'store.dart';
@@ -22,6 +27,25 @@ class DirectoryMetadataResult {
   final bool changed;
   final List<String> mediaIds;
   const DirectoryMetadataResult(this.collection, this.changed, this.mediaIds);
+}
+
+/// Keeps a manual library refresh attached to an existing device binding,
+/// independently of the optional series identity used to recognize siblings.
+class DirectoryListingGuard {
+  final String id, source, path;
+  const DirectoryListingGuard(this.id, this.source, this.path);
+
+  void check(AppStore store) {
+    final record = store.get('media', id);
+    final location = store.local('location:$id');
+    if (record == null ||
+        record.deleted ||
+        location is! Map ||
+        location['source'] != source ||
+        location['path'] != path) {
+      throw const Cancelled();
+    }
+  }
 }
 
 String _exclusionKey(String source, String path) =>
@@ -207,9 +231,13 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
   String? anchorId,
   List<SourceEntry>? donorVideos,
   DirectoryMetadataDonorCache? donorCache,
+  bool replaceAutomaticMetadata = false,
+  Map<String, (String, int)?>? expectedRecords,
+  DirectoryListingGuard? guard,
 }) {
   late DirectoryMetadataResult result;
   store.transaction(() {
+    guard?.check(store);
     if (anchorId != null && store.get('media', anchorId)?.deleted != false) {
       result = DirectoryMetadataResult(value, false, const []);
       return;
@@ -218,8 +246,9 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
         donorCache?._read(store, sourceId) ??
         _readDirectoryDonors(store, sourceId, donorVideos ?? value.videos);
     final keys = evidence.keys;
+    final replaceAutomatic = replaceAutomaticMetadata && value.subject != null;
     var resolved = value;
-    if (keys.length == 1) {
+    if (keys.length == 1 && (!replaceAutomatic || evidence.manual)) {
       final donor = evidence.first!;
       final incoming = value.subject == null
           ? null
@@ -268,7 +297,7 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
         episodeTitles: names,
         episodeCount: value.episodeCount,
       );
-    } else if (keys.length > 1) {
+    } else if (keys.length > 1 && !replaceAutomatic) {
       resolved = value.withMetadata(null, {});
     }
     var changed = false;
@@ -276,6 +305,17 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
     final imported = <String>[];
     for (final entry in resolved.videos) {
       var record = _sourceRecord(store, sourceId, entry.path);
+      if (expectedRecords != null) {
+        final expected = expectedRecords[entry.path];
+        if (expected == null
+            ? record != null
+            : record == null ||
+                  record.id != expected.$1 ||
+                  record.revision != expected.$2) {
+          if (record != null) ids.add(record.id);
+          continue;
+        }
+      }
       if (record == null) {
         if (!(importMissing ?? resolved.subject != null) ||
             store.local(_exclusionKey(sourceId, entry.path)) == true) {
@@ -310,7 +350,8 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
       }
       ids.add(record.id);
       if (store.local('manualMetadata:${record.id}') == true) continue;
-      if (keys.length > 1 &&
+      if (!replaceAutomatic &&
+          keys.length > 1 &&
           (record.data['tmdbId'] != null || record.data['bangumiId'] != null)) {
         continue;
       }
@@ -321,13 +362,17 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
       if (subject != null) {
         final incoming = subjectMediaFields(subject);
         final oldId = data['tmdbId'] ?? data['bangumiId'];
-        if (oldId != null &&
+        final differentSubject =
+            oldId != null &&
             (data['tmdbId'] != incoming['tmdbId'] ||
                 data['bangumiId'] != incoming['bangumiId'] ||
                 (data['tmdbId'] != null &&
                     (data['metadataType'] ?? 'tv') !=
-                        incoming['metadataType']))) {
-          continue;
+                        incoming['metadataType']));
+        if (differentSubject) {
+          if (!replaceAutomatic) continue;
+          data.remove('episodeTitle');
+          store.removeLocal('episodeTitle:${record.id}');
         }
         data.remove('tmdbId');
         data.remove('bangumiId');
@@ -378,8 +423,10 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
   required bool hideHidden,
   String? anchorId,
   CancelToken? cancel,
+  DirectoryListingGuard? guard,
 }) async {
   cancel?.check();
+  guard?.check(store);
   final visible = entries
       .where((entry) => !hideHidden || !isHiddenEntry(entry))
       .toList();
@@ -562,6 +609,7 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
         importMissing: true,
         anchorId: anchorId,
         donorCache: donors,
+        guard: guard,
       );
     });
     changed |= result.changed;
@@ -674,11 +722,22 @@ ReleaseName _mediaIdentity(SourceEntry entry, {ReleaseName? fallback}) {
 
 class DirectoryRecognitionProgress {
   final int folders, videos, matched, failed;
+  final String error;
+
+  /// Only the latest committed batch crosses the isolate boundary. The model
+  /// accumulates these snapshots without reading the library on the UI isolate.
+  final List<SyncRecord> records;
+  final Set<String> matchedIds;
+  final Map<String, MediaAiCatalogMatch> aiResults;
   const DirectoryRecognitionProgress({
     this.folders = 0,
     this.videos = 0,
     this.matched = 0,
     this.failed = 0,
+    this.error = '',
+    this.records = const [],
+    this.matchedIds = const {},
+    this.aiResults = const {},
   });
 }
 
@@ -741,7 +800,7 @@ class DirectoryMetadataWorker {
     unawaited(
       Isolate.spawn(
         _directoryWorkerMain,
-        [databasePath, _messages.sendPort],
+        [databasePath, _messages.sendPort, ServicesBinding.rootIsolateToken],
         onError: _errors.sendPort,
         onExit: _exit.sendPort,
       ).then<void>((_) {}, onError: (Object _, StackTrace _) => stopped()),
@@ -820,12 +879,14 @@ class DirectoryMetadataWorker {
     required bool hideHidden,
     String? anchorId,
     CancelToken? cancel,
+    DirectoryListingGuard? guard,
   }) => _call('listing', [
     sourceId,
     path,
     entries,
     hideHidden,
     anchorId,
+    guard,
   ], cancel: cancel);
 
   Future<DirectoryRecognitionProgress> recognize(
@@ -837,10 +898,20 @@ class DirectoryMetadataWorker {
     required bool hideHidden,
     required String strategy,
     required CancelToken cancel,
+    SubtitleAiConfig? aiConfig,
     void Function(DirectoryRecognitionProgress)? onProgress,
   }) => _call(
     'recognize',
-    [sourceId, root, source, password, tmdbCredential, hideHidden, strategy],
+    [
+      sourceId,
+      root,
+      source,
+      password,
+      tmdbCredential,
+      hideHidden,
+      strategy,
+      aiConfig,
+    ],
     cancel: cancel,
     onProgress: onProgress,
   );
@@ -854,6 +925,17 @@ class DirectoryMetadataWorker {
   }) =>
       _call('episodeNames', [anchor, subject, names, mediaIds], cancel: cancel);
 
+  Future<List<SyncRecord>> readRecords(
+    Set<String> ids, {
+    CancelToken? cancel,
+  }) => _call('records', [ids], cancel: cancel);
+
+  Future<Map<String, AiMediaIdentity>> analyzeFolderFilenames(
+    List<String> fileNames,
+    SubtitleAiConfig config, {
+    required CancelToken cancel,
+  }) => _call('analyzeFilenames', [fileNames, config], cancel: cancel);
+
   Future<void> close() {
     if (!_closing) {
       _closing = true;
@@ -864,10 +946,12 @@ class DirectoryMetadataWorker {
 }
 
 void _directoryWorkerMain(List<dynamic> startup) async {
+  initializeSystemProxyWorker(startup[2] as RootIsolateToken?);
   final store = await retryStoreBusy(
     () => AppStore.openExisting(startup[0] as String),
   );
   final reply = startup[1] as SendPort;
+  final mediaAi = MediaAiRecognition(store);
   final commands = ReceivePort();
   final active = <int, CancelToken>{};
   var scanning = false, closing = false;
@@ -896,7 +980,25 @@ void _directoryWorkerMain(List<dynamic> startup) async {
     try {
       if (closing) throw const Cancelled();
       dynamic result;
-      if (row[0] == 'inspect') {
+      if (row[0] == 'analyzeFilenames') {
+        final config = row[3] as SubtitleAiConfig;
+        AppLog.instance.rememberSecret(config.token);
+        result = await mediaAi.analyzeFolderFilenames(
+          row[2] as List<String>,
+          config: config,
+          cancel: cancel,
+        );
+      } else if (row[0] == 'records') {
+        final records = <SyncRecord>[];
+        var processed = 0;
+        for (final recordId in row[2] as Set<String>) {
+          if (processed++ % 128 == 0) await Future<void>.delayed(Duration.zero);
+          cancel.check();
+          final record = store.get('media', recordId);
+          if (record != null && !record.deleted) records.add(record);
+        }
+        result = records;
+      } else if (row[0] == 'inspect') {
         await Future<void>.delayed(Duration.zero);
         cancel.check();
         result = prepareDirectoryInspection(
@@ -960,6 +1062,7 @@ void _directoryWorkerMain(List<dynamic> startup) async {
           row[4] as List<SourceEntry>,
           hideHidden: row[5] as bool,
           anchorId: row[6] as String?,
+          guard: row[7] as DirectoryListingGuard?,
           cancel: cancel,
         );
       } else if (row[0] == 'episodeNames') {
@@ -987,6 +1090,8 @@ void _directoryWorkerMain(List<dynamic> startup) async {
             tmdbCredential: row[6] as String,
             hideHidden: row[7] as bool,
             strategy: row[8] as String,
+            aiConfig: row[9] as SubtitleAiConfig?,
+            ai: mediaAi,
             cancel: cancel,
             onProgress: (progress) => reply.send(['progress', id, progress]),
           );
@@ -1023,18 +1128,31 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
   required bool hideHidden,
   required String strategy,
   required CancelToken cancel,
+  SubtitleAiConfig? aiConfig,
   void Function(DirectoryRecognitionProgress)? onProgress,
   SourceAdapter? adapter,
   LibraryCatalog? catalog,
+  MediaAiRecognition? ai,
 }) async {
   SourceAdapter? connection = adapter;
   var folders = 0, videos = 0, matched = 0, failed = 0;
-  DirectoryRecognitionProgress progress() => DirectoryRecognitionProgress(
+  var failureMessage = '';
+  DirectoryRecognitionProgress progress({
+    List<SyncRecord> records = const [],
+    Set<String> matchedIds = const {},
+    Map<String, MediaAiCatalogMatch> aiResults = const {},
+  }) => DirectoryRecognitionProgress(
     folders: folders,
     videos: videos,
     matched: matched,
     failed: failed,
+    error: failureMessage,
+    records: records,
+    matchedIds: matchedIds,
+    aiResults: aiResults,
   );
+  final recognizer = aiConfig == null ? null : ai ?? MediaAiRecognition(store);
+  if (aiConfig != null) AppLog.instance.rememberSecret(aiConfig.token);
   final service =
       catalog ??
       LibraryCatalog(
@@ -1125,6 +1243,33 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
           visible.add(entry);
         }
       }
+      // Snapshot before either AI or catalogue IO. A result cannot overwrite an
+      // edit or recreate a deletion that occurred while either request waited.
+      final expectedRecords = <String, (String, int)?>{
+        for (final entry in visible)
+          entry.path: switch (_sourceRecord(store, sourceId, entry.path)) {
+            final record? => (record.id, record.revision),
+            null => null,
+          },
+      };
+      var parsed = const <String, AiMediaIdentity>{};
+      if (recognizer != null && visible.isNotEmpty) {
+        try {
+          // This is deliberately before grouping. The complete physical
+          // folder supplies context, including names already cached alone.
+          parsed = await recognizer.analyzeFolderFilenames(
+            [for (final entry in visible) entry.name],
+            config: aiConfig!,
+            cancel: cancel,
+          );
+          cancel.check();
+        } on Cancelled {
+          rethrow;
+        } catch (error) {
+          failed++;
+          failureMessage = safeFailure(error).message;
+        }
+      }
       final folderIdentity = directoryIdentity(path, rootPath: identityRoot);
       final identified = identifyDirectory(
         path,
@@ -1133,18 +1278,44 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
       );
       final groups = <String, List<SourceEntry>>{};
       final identities = <String, ReleaseName>{};
+      final aiIdentities = <String, AiMediaIdentity>{};
       for (final entry in visible) {
-        final identity =
-            identified?.identities[entry.path] ??
-            _mediaIdentity(entry, fallback: folderIdentity);
+        final aiIdentity = parsed[entry.name.trim()];
+        if (aiIdentity != null) aiIdentities[entry.path] = aiIdentity;
+        final identity = aiIdentity == null
+            ? identified?.identities[entry.path] ??
+                  _mediaIdentity(entry, fallback: folderIdentity)
+            : ReleaseName(
+                aiIdentity.name,
+                aiIdentity.kind == 'movie' ? '' : aiIdentity.season,
+                aiIdentity.kind == 'movie' ? '' : aiIdentity.episode,
+              );
         identities[entry.path] = identity;
-        (groups['${normalizedSeries(identity.anime)}:${identity.season}'] ??=
-                [])
-            .add(entry);
+        final key = aiIdentity == null
+            ? 'parsed:${normalizedSeries(identity.anime)}:${identity.season}'
+            : jsonEncode([
+                normalizedSeries(aiIdentity.name),
+                aiIdentity.kind,
+                aiIdentity.season,
+                aiIdentity.year,
+                aiIdentity.episode.isNotEmpty,
+                aiIdentity.confidence >= mediaAiAutomaticConfidence,
+              ]);
+        (groups[key] ??= []).add(entry);
       }
       for (final group in groups.values) {
         cancel.check();
         final identity = identities[group.first.path]!;
+        AiMediaIdentity? representative;
+        for (final entry in group) {
+          final candidate = aiIdentities[entry.path];
+          if (candidate != null &&
+              (representative == null ||
+                  candidate.confidence > representative.confidence)) {
+            representative = candidate;
+          }
+        }
+        MediaAiCatalogMatch? aiMatch;
         var collection = DirectoryCollection(
           title: identity.anime,
           season: identity.season,
@@ -1159,12 +1330,25 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
           }.length,
         );
         try {
-          final subject = await service.resolve(
-            identity.anime,
-            identity.season,
-            cancel: cancel,
-            force: true,
-          );
+          Map<String, dynamic>? subject;
+          if (recognizer == null) {
+            subject = await service.resolve(
+              identity.anime,
+              identity.season,
+              cancel: cancel,
+              force: true,
+            );
+          } else if (representative != null &&
+              representative.confidence >= mediaAiAutomaticConfidence) {
+            aiMatch = await searchAiCatalogIdentity(
+              representative,
+              catalog: service,
+              mediaAi: recognizer,
+              config: aiConfig!,
+              cancel: cancel,
+            );
+            subject = aiMatch.subject;
+          }
           cancel.check();
           if (subject != null) {
             collection = collection.withMetadata(subject, const {});
@@ -1178,8 +1362,11 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
           }
         } on Cancelled {
           rethrow;
-        } catch (_) {
+        } catch (error) {
           failed++;
+          if (collection.subject == null) {
+            failureMessage = safeFailure(error).message;
+          }
         }
         // A giant single series still commits only bounded batches. Reuse the
         // full group's evidence until an external edit invalidates its snapshot.
@@ -1204,15 +1391,47 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
               ),
               importMissing: true,
               donorCache: donorCache,
+              replaceAutomaticMetadata: true,
+              expectedRecords: expectedRecords,
             );
           });
           // Excluded files still exist in the folder. Count discovery
           // independently from importing so they cannot become "no videos".
           videos += batch.length;
-          if (result.collection.subject != null) {
-            matched += result.mediaIds.length;
+          final records = [
+            for (final id in result.mediaIds) ?store.get('media', id),
+          ];
+          final matchedIds = {
+            for (final record in records)
+              if (record.data['tmdbId'] != null ||
+                  record.data['bangumiId'] != null)
+                record.id,
+          };
+          matched += matchedIds.length;
+          final aiResults = <String, MediaAiCatalogMatch>{};
+          if (recognizer != null) {
+            final ids = result.mediaIds.toSet();
+            for (final entry in batch) {
+              final parsedIdentity = aiIdentities[entry.path];
+              if (parsedIdentity == null) continue;
+              final id = store.locationFor(sourceId, entry.path)?['id'];
+              if (id is! String || !ids.contains(id)) continue;
+              aiResults[id] = MediaAiCatalogMatch(
+                parsedIdentity,
+                aiMatch?.candidates ?? const [],
+                parsedIdentity.confidence >= mediaAiAutomaticConfidence
+                    ? aiMatch?.subject
+                    : null,
+              );
+            }
           }
-          onProgress?.call(progress());
+          onProgress?.call(
+            progress(
+              records: records,
+              matchedIds: matchedIds,
+              aiResults: aiResults,
+            ),
+          );
         }
       }
       onProgress?.call(progress());

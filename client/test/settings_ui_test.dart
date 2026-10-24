@@ -71,6 +71,11 @@ void main() {
         await tester.tap(find.text('运行日志'));
         await tester.pumpAndSettle();
         expect(find.byTooltip('搜索日志'), findsOneWidget);
+        final logTitle = tester.getRect(find.text('运行日志'));
+        final backButton = tester.getRect(find.byType(BackButton));
+        final safeTop = tester.view.padding.top / tester.view.devicePixelRatio;
+        expect(logTitle.top - safeTop, lessThan(32));
+        expect(logTitle.center.dy, closeTo(backButton.center.dy, 1));
         await tester.pageBack();
         await tester.pumpAndSettle();
         await tester.ensureVisible(search);

@@ -155,6 +155,11 @@ void main() {
           expect(find.textContaining('已收录 3 集'), findsOneWidget);
           expect(find.text('当前作品'), findsOneWidget);
           expect(find.text('历史其他作品'), findsNothing);
+          await tester.tap(find.byTooltip('文件夹选项'));
+          await tester.pumpAndSettle();
+          expect(find.text('重新识别信息'), findsOneWidget);
+          Navigator.of(tester.element(find.text('重新识别信息'))).pop();
+          await tester.pumpAndSettle();
           expect(fixture.plays, 0);
           expect(fixture.store.records('progress'), isEmpty);
           expect(tester.takeException(), isNull);

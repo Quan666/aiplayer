@@ -294,61 +294,72 @@ class _ModelPickerState extends State<_ModelPicker> {
           maxWidth: 480,
           maxHeight: MediaQuery.sizeOf(context).height * .72,
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '选择翻译模型',
-                      style: Theme.of(context).textTheme.titleLarge,
+        child: GlassMenuTheme(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 4, 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '选择翻译模型',
+                        style: Theme.of(context).textTheme.titleLarge,
+                      ),
                     ),
-                  ),
-                  IconButton(
-                    tooltip: '关闭',
-                    onPressed: () => Navigator.pop(context),
-                    icon: const Icon(Icons.close_rounded),
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-              child: TextField(
-                decoration: const InputDecoration(
-                  hintText: '搜索模型',
-                  prefixIcon: Icon(Icons.search_rounded),
+                    IconButton(
+                      tooltip: '关闭',
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
                 ),
-                onChanged: (value) => setState(() => query = value),
               ),
-            ),
-            Flexible(
-              child: filtered.isEmpty
-                  ? const Padding(
-                      padding: EdgeInsets.all(24),
-                      child: Text('没有匹配的模型'),
-                    )
-                  : ListView.builder(
-                      shrinkWrap: true,
-                      padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-                      itemCount: filtered.length,
-                      itemBuilder: (_, index) {
-                        final name = filtered[index];
-                        return ListTile(
-                          selected: name == widget.selected,
-                          title: Text(name),
-                          trailing: name == widget.selected
-                              ? const Icon(Icons.check_rounded)
-                              : null,
-                          onTap: () => Navigator.pop(context, name),
-                        );
-                      },
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: TextField(
+                  decoration: const InputDecoration(
+                    hintText: '搜索模型',
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
                     ),
-            ),
-          ],
+                    prefixIconConstraints: BoxConstraints(
+                      minWidth: 36,
+                      minHeight: 36,
+                    ),
+                    prefixIcon: Icon(Icons.search_rounded),
+                  ),
+                  onChanged: (value) => setState(() => query = value),
+                ),
+              ),
+              Flexible(
+                child: filtered.isEmpty
+                    ? const Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Text('没有匹配的模型'),
+                      )
+                    : ListView.builder(
+                        shrinkWrap: true,
+                        padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+                        itemCount: filtered.length,
+                        itemBuilder: (_, index) {
+                          final name = filtered[index];
+                          return ListTile(
+                            selected: name == widget.selected,
+                            title: Text(name),
+                            trailing: name == widget.selected
+                                ? const Icon(Icons.check_rounded)
+                                : null,
+                            onTap: () => Navigator.pop(context, name),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
         ),
       ),
     );

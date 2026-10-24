@@ -5,7 +5,7 @@ extension _CacheMaintenance on AppModel {
     final previews = _previews;
     final watchingSync = _syncWatch != null;
     try {
-      // Stop old producers before deleting their outputs. This state change is
+      // Stop old producers before clearing their outputs. This state change is
       // synchronous, including for retained pages that will not draw a frame.
       catalog.cacheMaintenance = true;
       catalog.invalidateMemoryCaches();
@@ -36,23 +36,17 @@ extension _CacheMaintenance on AppModel {
       await flushPlaybackPreviews();
       _metadataCancel.check();
       previews?.clearPending();
-      // A reused cache owns its in-flight requests and drains their writes.
-      // The database and remaining cache directory are cleared in a worker.
-      await posterCache.clear();
-      _metadataCancel.check();
+      // Artwork stays available offline: keep downloaded posters, captured
+      // covers and their decoded images. Database maintenance runs in a worker.
       await clearStoredCaches(store, documents);
       _metadataCancel.check();
       catalog.invalidateMemoryCaches();
       mediaAi.invalidate();
-      _seriesRefreshFailures.clear();
       _previewDiagnostics.clear();
       _previewFileChecks.clear();
       _librarySnapshotRevision = null;
       _continueWatchingRevision = null;
-      PaintingBinding.instance.imageCache
-        ..clear()
-        ..clearLiveImages();
-      AppLog.instance.info('缓存', '已清除识别、目录、图片、弹幕与文件探测缓存。');
+      AppLog.instance.info('缓存', '已清除识别、弹幕与文件探测缓存，保留封面和海报。');
     } finally {
       catalog.cacheMaintenance = false;
       _clearingCaches = false;

@@ -116,6 +116,34 @@ void main() {
     }
   });
 
+  testWidgets('sort updates while paused wait for resume without another frame', (
+    tester,
+  ) async {
+    await tester.pumpWidget(AIPlayerApp(model: model));
+    await tester.pumpAndSettle();
+    final reads = model.libraryReads;
+    final library = find.byKey(const PageStorageKey('library-scroll'));
+    final original = tester.widget<CustomScrollView>(library);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    // Deliberately do not pump after paused: Android may never draw that frame.
+    for (final field in ['size', 'modified', 'updated', 'name']) {
+      store.setLocal('settings', {
+        'librarySortField': field,
+        'librarySortDescending': false,
+      });
+      model.changed();
+      await tester.idle();
+    }
+    expect(model.libraryReads, reads);
+    expect(tester.widget<CustomScrollView>(library), same(original));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(model.libraryReads, reads + 1);
+    expect(model.librarySorting.field, 'name');
+    expect(model.librarySorting.descending, isFalse);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('unrelated status changes do not rebuild the sources root', (
     tester,
   ) async {

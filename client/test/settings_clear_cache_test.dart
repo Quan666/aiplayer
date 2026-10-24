@@ -51,6 +51,7 @@ void main() {
         widget.decoration?.labelText == 'TMDB API Key / 读取令牌',
   );
   const success = '缓存已清除，重新进入文件夹即可重新加载';
+  final confirm = find.widgetWithText(FilledButton, '清除缓存');
 
   Future<void> mount(
     WidgetTester tester, {
@@ -84,6 +85,12 @@ void main() {
     await tester.ensureVisible(action);
   }
 
+  Future<void> confirmClearing(WidgetTester tester) async {
+    await tester.pumpAndSettle();
+    await tester.tap(confirm);
+    await tester.pumpAndSettle();
+  }
+
   testWidgets('cache action is searchable, guarded and preserves drafts', (
     tester,
   ) async {
@@ -95,12 +102,22 @@ void main() {
 
     await searchFor(tester, '缓存');
     expect(find.text('关于与维护'), findsOneWidget);
-    expect(find.text('识别、目录与图片缓存；保留来源、影视库、播放记录和手动匹配。'), findsOneWidget);
     final callback = tester.widget<ListTile>(action).onTap!;
     await tester.tap(action);
     // A second event can arrive before Flutter rebuilds the disabled tile.
     callback();
-    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog), findsOneWidget);
+    expect(find.text('清除缓存？'), findsOneWidget);
+    expect(
+      find.text('清除识别、弹幕和文件探测缓存。\n保留封面、海报、来源、影视库、播放记录和手动匹配。'),
+      findsOneWidget,
+    );
+    expect(model.operations, isEmpty);
+    expect(find.text('清理中…'), findsNothing);
+    expect(tester.widget<ListTile>(action).enabled, isFalse);
+    await confirmClearing(tester);
+    callback();
     expect(model.operations, hasLength(1));
     expect(find.text('清理中…'), findsOneWidget);
     expect(tester.widget<ListTile>(action).enabled, isFalse);
@@ -126,6 +143,89 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  for (final dismissal in ['cancel', 'back', 'barrier']) {
+    testWidgets('$dismissal leaves caches untouched and allows retry', (
+      tester,
+    ) async {
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await mount(tester);
+      await searchFor(tester, '缓存');
+      await tester.tap(action);
+      await tester.pumpAndSettle();
+      expect(model.operations, isEmpty);
+
+      switch (dismissal) {
+        case 'cancel':
+          await tester.tap(find.widgetWithText(TextButton, '取消'));
+        case 'back':
+          await tester.binding.handlePopRoute();
+        case 'barrier':
+          await tester.tapAt(const Offset(5, 5));
+      }
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(model.operations, isEmpty);
+      expect(tester.widget<ListTile>(action).enabled, isTrue);
+
+      await tester.tap(action);
+      await confirmClearing(tester);
+      expect(model.operations, hasLength(1));
+      model.operations.single.complete();
+      await tester.pumpAndSettle();
+      expect(find.text(success), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
+  testWidgets('confirmation from an old model cannot clear either model', (
+    tester,
+  ) async {
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final replacementStore = AppStore(':memory:');
+    final replacement = _CacheModel(replacementStore, root);
+    addTearDown(() {
+      replacement.dispose();
+      replacementStore.dispose();
+    });
+    await mount(tester);
+    await searchFor(tester, '缓存');
+    await tester.tap(action);
+    await tester.pumpAndSettle();
+    await mount(tester, replacement: replacement);
+    await confirmClearing(tester);
+    expect(model.operations, isEmpty);
+    expect(replacement.operations, isEmpty);
+    expect(tester.widget<ListTile>(action).enabled, isTrue);
+
+    await tester.tap(action);
+    await confirmClearing(tester);
+    expect(replacement.operations, hasLength(1));
+    replacement.operations.single.complete();
+    await tester.pumpAndSettle();
+    expect(find.text(success), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('inactive settings ignore pending confirmation', (tester) async {
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await mount(tester);
+    await searchFor(tester, '缓存');
+    await tester.tap(action);
+    await tester.pumpAndSettle();
+    await mount(tester, active: false);
+    await confirmClearing(tester);
+    expect(model.operations, isEmpty);
+    await mount(tester);
+    expect(tester.widget<ListTile>(action).enabled, isTrue);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('failed cache clearing is reported and can be retried', (
     tester,
   ) async {
@@ -134,11 +234,15 @@ void main() {
     await mount(tester);
     await searchFor(tester, '缓存');
     await tester.tap(action);
+    await confirmClearing(tester);
     model.operations.single.completeError(const AppFailure('缓存清理测试失败'));
     await tester.pumpAndSettle();
     expect(find.text('缓存清理测试失败'), findsOneWidget);
     expect(tester.widget<ListTile>(action).enabled, isTrue);
     await tester.tap(action);
+    await tester.pumpAndSettle();
+    expect(model.operations, hasLength(1));
+    await confirmClearing(tester);
     expect(model.operations, hasLength(2));
     model.operations.last.complete();
     await tester.pumpAndSettle();
@@ -156,6 +260,7 @@ void main() {
     await mount(tester);
     await searchFor(tester, '缓存');
     await tester.tap(action);
+    await confirmClearing(tester);
     await tester.pumpWidget(const SizedBox());
     model.operations.single.completeError(const AppFailure('已离开的操作失败'));
     await tester.pumpAndSettle();
@@ -177,11 +282,11 @@ void main() {
     await mount(tester);
     await searchFor(tester, '缓存');
     await tester.tap(action);
-    await tester.pump();
+    await confirmClearing(tester);
     await mount(tester, replacement: replacement);
     expect(tester.widget<ListTile>(action).enabled, isTrue);
     await tester.tap(action);
-    await tester.pump();
+    await confirmClearing(tester);
     expect(replacement.operations, hasLength(1));
 
     model.operations.single.complete();
@@ -204,6 +309,7 @@ void main() {
     await mount(tester);
     await searchFor(tester, '缓存');
     await tester.tap(action);
+    await confirmClearing(tester);
     await mount(tester, active: false);
     model.operations.single.complete();
     await tester.pumpAndSettle();

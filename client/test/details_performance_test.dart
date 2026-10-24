@@ -94,7 +94,7 @@ void main() {
   }
 
   testWidgets(
-    'details show existing data first, build visible episodes and coalesce hidden-library changes',
+    'details refresh existing data silently, build visible episodes and coalesce hidden-library changes',
     (tester) async {
       for (var i = 1; i <= 200; i++) {
         episode(i);
@@ -129,6 +129,16 @@ void main() {
       );
       await tester.pump(const Duration(milliseconds: 200));
       expect(model.loads, 1);
+      final headerLoading = find.descendant(
+        of: find.byType(MediaDetailsOverview),
+        matching: find.byType(LinearProgressIndicator),
+      );
+      await tester.pump(const Duration(seconds: 1));
+      expect(
+        headerLoading,
+        findsNothing,
+        reason: 'existing details stay usable while their source is pending',
+      );
       for (var i = 0; i < 20; i++) {
         model.changed();
       }
@@ -170,6 +180,19 @@ void main() {
             'then obtains updated aggregates after the mocked loader; '
             'the uncovered library then reuses that snapshot',
       );
+
+      model._loaded = null;
+      await tester.tap(find.byKey(const ValueKey('details:episode-1')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(seconds: 1));
+      expect(model.loads, 2);
+      expect(headerLoading, findsNothing);
+      expect(find.textContaining('已收录 201 集'), findsOneWidget);
+      model.loaded.completeError(StateError('source offline'));
+      await tester.pumpAndSettle();
+      expect(headerLoading, findsNothing);
+      expect(find.textContaining('已收录 201 集'), findsOneWidget);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
     },

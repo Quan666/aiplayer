@@ -2,13 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
 
-import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
 
 import '../core/network.dart';
-import '../subtitles/ai.dart';
 import 'media_presentation.dart';
 import 'media_previews.dart';
+import 'media_title_translation.dart';
 import 'store.dart';
 
 /// Everything a history card needs, prepared before its lazy UI build.
@@ -243,19 +242,7 @@ _Presentations _prepare(
   dynamic Function(String key) local,
 ) {
   final settings = local('settings') as Map? ?? const {};
-  var origin = '${settings['aiSubtitleOrigin'] ?? 'https://api.openai.com/v1'}';
-  try {
-    origin = SubtitleAiConfig.normalizeOrigin(origin).toString();
-  } on AppFailure {
-    // Match MediaTitleTranslations.profile for invalid configuration too.
-  }
-  String hash(Object value) =>
-      sha256.convert(utf8.encode(jsonEncode(value))).toString();
-  final profile = hash([
-    origin,
-    settings['aiSubtitleModel'] ?? '',
-    settings['aiSubtitleTarget'] ?? '简体中文',
-  ]);
+  final profile = MediaTitleTranslations.profileFor(settings);
   final deviceId = '${local('syncDevice:id') ?? ''}';
   final titleStates = <String, Map>{};
   String display(String series, String original) {
@@ -263,15 +250,10 @@ _Presentations _prepare(
     final state = titleStates.putIfAbsent(
       series,
       () =>
-          local('media-title-display:${hash([series, profile])}') as Map? ??
+          local(MediaTitleTranslations.stateKeyFor(series, profile)) as Map? ??
           const {},
     );
-    final translated = (state['titles'] as Map?)?[original];
-    return state['visible'] == true &&
-            translated is String &&
-            translated.isNotEmpty
-        ? translated
-        : original;
+    return MediaTitleTranslations.displayFrom(state, original);
   }
 
   final result = <String, ContinueWatchingPresentation>{};

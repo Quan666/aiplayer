@@ -42,9 +42,12 @@ void main() {
         await tester.pumpAndSettle();
         await tester.tap(find.byTooltip('文件夹选项'));
         await tester.pumpAndSettle();
-        expect(find.text('识别此文件夹及子文件夹'), findsOneWidget);
-        await tester.tap(find.text('识别此文件夹及子文件夹'));
-        await tester.pumpAndSettle();
+        expect(find.text('识别信息'), findsOneWidget);
+        await tester.tap(find.text('识别信息'));
+        await tester.pump();
+        expect(model.metadataTasks, hasLength(1));
+        expect(model.metadataTasks.single.label, '当前文件夹');
+        expect(find.text('识别任务'), findsOneWidget);
         for (var i = 0; i < 500 && model.recognizingDirectory; i++) {
           await tester.runAsync(
             () => Future<void>.delayed(const Duration(milliseconds: 10)),
@@ -55,6 +58,18 @@ void main() {
         expect(model.recognizingDirectory, false);
         expect(model.status, '此文件夹及子文件夹中没有视频。');
         expect(model.directoryRecognitionProgress.folders, 1);
+        expect(model.metadataTasks.single.running, isFalse);
+        expect(model.metadataTasks.single.status, model.status);
+        final retry = model.recognizeDirectory('local', directory.path);
+        final deletedTask = model.metadataTasks.first;
+        expect(deletedTask.running, isTrue);
+        model.removeMetadataTask(deletedTask);
+        await tester.runAsync(() => retry);
+        await tester.pumpAndSettle();
+        expect(deletedTask.removed, isTrue);
+        expect(deletedTask.cancelled, isTrue);
+        expect(model.metadataTasks, hasLength(1));
+        expect(model.recognizingDirectory, isFalse);
         expect(tester.takeException(), isNull);
       } finally {
         await tester.pumpWidget(const SizedBox());
@@ -143,6 +158,18 @@ void main() {
         expect(find.text('匹配影视资料'), findsOneWidget);
         await tester.tap(find.text('AI 自动识别'));
         await tester.pumpAndSettle();
+        // Folder preparation may still be running outside the widget test's
+        // fake event loop after the dialog has stopped animating.
+        for (
+          var attempt = 0;
+          attempt < 250 && model.metadataTasks.any((task) => task.running);
+          attempt++
+        ) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
         expect(find.text('匹配影视资料'), findsOneWidget);
         expect(find.text('请先在设置 → AI 翻译中配置模型。'), findsOneWidget);
         expect(tester.takeException(), isNull);

@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"math"
@@ -127,12 +126,7 @@ func send(w http.ResponseWriter, status int, v any) {
 func fail(w http.ResponseWriter, status int, message string) {
 	if status == http.StatusBadRequest {
 		// Never log request bodies, credentials, or client-controlled field names.
-		reason := message
-		if strings.HasPrefix(reason, "unsupported field:") {
-			keyHash := sha256.Sum256([]byte(strings.TrimPrefix(reason, "unsupported field: ")))
-			reason = fmt.Sprintf("unsupported field (key hash %x)", keyHash[:6])
-		}
-		log.Printf("sync request rejected: status=400 reason=%q", reason)
+		log.Printf("sync request rejected: status=400 reason=%q", message)
 	}
 	send(w, status, map[string]string{"error": message})
 }
@@ -254,19 +248,25 @@ func validate(rec Record) error {
 		return errors.New("invalid device identity")
 	}
 
-	if !identifier.MatchString(rec.ID) || fields[rec.Kind] == nil || rec.Version < 0 {
+	if !identifier.MatchString(rec.ID) || !identifier.MatchString(rec.Kind) || rec.Version < 0 || rec.Version == math.MaxInt64 {
 		return errors.New("invalid record")
 	}
-	var data map[string]any
-	if json.Unmarshal(rec.Data, &data) != nil || data == nil {
-		return errors.New("data must be an object")
+	data, err := decodeRecordData(rec.Data)
+	if err != nil {
+		return err
 	}
 	if rec.Kind == "vault" {
 		return validateVault(rec, data)
 	}
+	if err := validatePublicData(data); err != nil {
+		return err
+	}
 	for key, value := range data {
 		if !fields[rec.Kind][key] {
-			return fmt.Errorf("unsupported field: %s", key)
+			// Additive business fields and new record kinds are opaque to the
+			// server. Keep legacy field contracts for existing readers, but do
+			// not require a server release whenever clients add public data.
+			continue
 		}
 		if key == "genres" {
 			items, ok := value.([]any)
@@ -286,20 +286,20 @@ func validate(rec Record) error {
 			if value == nil {
 				continue
 			}
-			n, ok := value.(float64)
+			n, ok := recordNumber(value)
 			if !ok || math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || (key == "rating" && n > 10) || (key != "rating" && n != math.Trunc(n)) {
 				return errors.New("invalid metadata number")
 			}
 			continue
 		}
 		switch value.(type) {
-		case string, float64, bool, nil:
+		case string, json.Number, bool, nil:
 		default:
 			return errors.New("nested data is not accepted")
 		}
 		numeric := key == "size" || key == "duration" || key == "position" || key == "shift" || key == "offset"
 		if numeric {
-			n, ok := value.(float64)
+			n, ok := recordNumber(value)
 			if !ok || math.IsNaN(n) || math.IsInf(n, 0) || ((key == "size" || key == "duration" || key == "position") && n < 0) {
 				return errors.New("invalid numeric field")
 			}

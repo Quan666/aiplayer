@@ -7,9 +7,11 @@ import 'dart:typed_data';
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/directory_metadata_worker.dart';
 import 'package:aiplayer/data/library_catalog.dart';
+import 'package:aiplayer/data/media_ai_recognition.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/danmaku/release_name.dart';
 import 'package:aiplayer/sources/source.dart';
+import 'package:aiplayer/subtitles/ai.dart';
 import 'package:aiplayer_smb/aiplayer_smb.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -166,6 +168,8 @@ String _webDavListing(String directory, List<String> children) {
 
 class _Catalog extends LibraryCatalog {
   final queries = <String>[];
+  final unmatched = <String>{};
+  void Function()? onResolve;
   bool failNames = false;
   _Catalog(
     super.store, {
@@ -182,6 +186,8 @@ class _Catalog extends LibraryCatalog {
   }) async {
     queries.add(title);
     cancel?.check();
+    onResolve?.call();
+    if (unmatched.contains(title)) return null;
     return _subject(title);
   }
 
@@ -197,7 +203,146 @@ class _Catalog extends LibraryCatalog {
   }
 }
 
+class _FolderAi extends MediaAiRecognition {
+  final Map<String, AiMediaIdentity> identities;
+  final calls = <List<String>>[];
+  Future<void> Function()? beforeResponse;
+  _FolderAi(super.store, this.identities);
+
+  @override
+  Future<Map<String, AiMediaIdentity>> analyzeFolderFilenames(
+    List<String> fileNames, {
+    required SubtitleAiConfig config,
+    required CancelToken cancel,
+  }) async {
+    calls.add(List.of(fileNames));
+    await beforeResponse?.call();
+    cancel.check();
+    return {for (final name in fileNames) name: ?identities[name]};
+  }
+
+  @override
+  Future<Map<String, dynamic>?> confirm(
+    AiMediaIdentity identity,
+    List<Map<String, dynamic>> candidates, {
+    required SubtitleAiConfig config,
+    required CancelToken cancel,
+  }) async {
+    cancel.check();
+    return candidates.firstOrNull;
+  }
+}
+
+class _AiCatalog extends _Catalog {
+  final searches = <String>[];
+  _AiCatalog(super.store);
+
+  @override
+  Future<List<Map<String, dynamic>>> search(
+    String name, {
+    String? source,
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    searches.add(name);
+    return [
+      _subject(name, id: name == 'Second work' ? '8' : '7', provider: 'tmdb'),
+    ];
+  }
+
+  @override
+  Future<Map<String, dynamic>> details(
+    Map<String, dynamic> subject, {
+    String season = '',
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    return subject;
+  }
+}
+
 void main() {
+  test(
+    'folder analysis uses the reusable worker and shares its complete cache',
+    () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'folder-ai-worker-',
+      );
+      final store = AppStore('${directory.path}/library.db');
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final requests = <List<String>>[];
+      server.listen((request) async {
+        final body = jsonDecode(await utf8.decoder.bind(request).join()) as Map;
+        final messages = body['messages'] as List;
+        final content =
+            jsonDecode((messages.last as Map)['content'] as String) as Map;
+        final items = (content['items'] as List).cast<Map>();
+        requests.add([for (final item in items) item['fileName'] as String]);
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({
+            'choices': [
+              {
+                'message': {
+                  'content': jsonEncode({
+                    'items': [
+                      for (final item in items)
+                        {
+                          'id': item['id'],
+                          'identity': {
+                            'name': 'Worker Show',
+                            'titles': {'zh': '', 'en': '', 'ja': ''},
+                            'aliases': [],
+                            'kind': 'tv',
+                            'season': 1,
+                            'episode': item['fileName'] == 'part-a.mkv' ? 1 : 2,
+                            'year': null,
+                            'confidence': .99,
+                          },
+                        },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+        );
+        await request.response.close();
+      });
+      final worker = DirectoryMetadataWorker(store.path);
+      final config = SubtitleAiConfig(
+        origin: 'http://127.0.0.1:${server.port}/v1',
+        model: 'worker-test',
+        token: 'worker-only-test-token',
+      );
+      try {
+        final first = await worker.analyzeFolderFilenames(
+          ['part-b.mkv', 'part-a.mkv'],
+          config,
+          cancel: CancelToken(),
+        );
+        final second = await worker.analyzeFolderFilenames(
+          ['part-a.mkv', 'part-b.mkv'],
+          config,
+          cancel: CancelToken(),
+        );
+        expect(requests, [
+          ['part-a.mkv', 'part-b.mkv'],
+        ]);
+        expect(first['part-a.mkv']?.episode, '1');
+        expect(second['part-b.mkv']?.episode, '2');
+        final cached = store.localEntries('media-ai-folder-v1:');
+        expect(cached, hasLength(1));
+        expect(jsonEncode(cached), isNot(contains(config.token)));
+      } finally {
+        await worker.close();
+        await server.close(force: true);
+        store.dispose();
+        await directory.delete(recursive: true);
+      }
+    },
+  );
+
   test(
     'cold directory previews retain all offline episodes without UI payload reads',
     () async {
@@ -752,6 +897,275 @@ void main() {
   );
 
   test(
+    'folder AI receives every visible filename once before deduplicated work lookups',
+    () async {
+      final store = AppStore(':memory:');
+      final files = [
+        for (var i = 1; i <= 25; i++)
+          SourceEntry(
+            name: 'mixed-release-$i.mkv',
+            path: 'root/mixed-release-$i.mkv',
+          ),
+      ];
+      final identities = {
+        for (var i = 1; i <= 25; i++)
+          'mixed-release-$i.mkv': AiMediaIdentity(
+            fileName: 'mixed-release-$i.mkv',
+            name: i <= 20 ? 'First work' : 'Second work',
+            kind: 'tv',
+            season: '1',
+            episode: '${i <= 20 ? i : i - 20}',
+            confidence: .99,
+          ),
+        'child.mkv': const AiMediaIdentity(
+          fileName: 'child.mkv',
+          name: 'Child work',
+          kind: 'movie',
+          confidence: .99,
+        ),
+      };
+      final ai = _FolderAi(store, identities);
+      final catalog = _AiCatalog(store);
+      final progress = <DirectoryRecognitionProgress>[];
+      try {
+        final result = await recognizeDirectoryTree(
+          store,
+          'nas',
+          'root',
+          source: {},
+          password: '',
+          tmdbCredential: '',
+          hideHidden: true,
+          strategy: 'off',
+          cancel: CancelToken(),
+          aiConfig: SubtitleAiConfig(model: 'folder-test'),
+          ai: ai,
+          catalog: catalog,
+          adapter: _Folders({
+            'root': [
+              ...files,
+              const SourceEntry(name: '.hidden.mkv', path: 'root/.hidden.mkv'),
+              const SourceEntry(name: 'readme.txt', path: 'root/readme.txt'),
+              const SourceEntry(
+                name: 'Nested',
+                path: 'root/Nested',
+                directory: true,
+              ),
+            ],
+            'root/Nested': [
+              const SourceEntry(
+                name: 'child.mkv',
+                path: 'root/Nested/child.mkv',
+              ),
+            ],
+          }),
+          onProgress: progress.add,
+        );
+        expect(ai.calls, [
+          files.map((entry) => entry.name).toList(),
+          ['child.mkv'],
+        ]);
+        expect(
+          catalog.queries,
+          isEmpty,
+          reason: 'AI identities must not be replaced by regex lookup',
+        );
+        expect(catalog.searches, ['First work', 'Second work', 'Child work']);
+        expect(result.videos, 26);
+        expect(result.matched, 26);
+        final records = store.all('media');
+        expect(records, hasLength(26));
+        for (final record in records) {
+          final parsed = identities[record.data['fileName']]!;
+          expect(record.data['series'], parsed.name);
+          expect(record.data['episode'], parsed.episode);
+        }
+        final delivered = progress
+            .expand((value) => value.aiResults.values)
+            .toList();
+        expect(delivered, hasLength(26));
+        expect(
+          delivered.map((match) => match.identity.fileName).toSet(),
+          identities.keys.toSet(),
+        );
+      } finally {
+        store.dispose();
+      }
+    },
+  );
+
+  test(
+    'folder AI cancellation prevents writes and late analyses preserve edits',
+    () async {
+      for (final cancelDuringAnalysis in [false, true]) {
+        final store = AppStore(':memory:');
+        final group = _collection(count: 2);
+        final cancel = CancelToken();
+        final ids = synchronizeDirectoryCollection(
+          store,
+          'nas',
+          group,
+          importMissing: true,
+        ).mediaIds;
+        final ai =
+            _FolderAi(store, {
+                for (final entry in group.videos)
+                  entry.name: AiMediaIdentity(
+                    fileName: entry.name,
+                    name: 'Second work',
+                    kind: 'tv',
+                    season: '1',
+                    episode: '9',
+                    confidence: .99,
+                  ),
+              })
+              ..beforeResponse = () async {
+                if (cancelDuringAnalysis) {
+                  cancel.cancel();
+                } else {
+                  store.save('media', ids.first, {
+                    ...store.get('media', ids.first)!.data,
+                    'metadataTitle': 'Newer edit',
+                  });
+                }
+              };
+        try {
+          final work = recognizeDirectoryTree(
+            store,
+            'nas',
+            'root',
+            source: {},
+            password: '',
+            tmdbCredential: '',
+            hideHidden: true,
+            strategy: 'off',
+            cancel: cancel,
+            aiConfig: SubtitleAiConfig(model: 'folder-test'),
+            ai: ai,
+            catalog: _AiCatalog(store),
+            adapter: _Folders({'root': group.videos}),
+          );
+          if (cancelDuringAnalysis) {
+            await expectLater(work, throwsA(isA<Cancelled>()));
+            expect(
+              store
+                  .all('media')
+                  .every((record) => record.data['bangumiId'] == '7'),
+              isTrue,
+            );
+          } else {
+            await work;
+            expect(
+              store.get('media', ids.first)!.data['metadataTitle'],
+              'Newer edit',
+            );
+            expect(store.get('media', ids.last)!.data['tmdbId'], '8');
+            expect(store.get('media', ids.last)!.data['episode'], '9');
+          }
+          expect(ai.calls, hasLength(1));
+        } finally {
+          store.dispose();
+        }
+      }
+    },
+  );
+
+  test(
+    'uncertain or missing folder AI identities stay available for manual matching',
+    () async {
+      final store = AppStore(':memory:');
+      final group = _collection(count: 3);
+      final ai = _FolderAi(store, {
+        for (var i = 0; i < 2; i++)
+          group.videos[i].name: AiMediaIdentity(
+            fileName: group.videos[i].name,
+            name: 'First work',
+            kind: 'tv',
+            season: '1',
+            episode: '${i + 1}',
+            confidence: i == 0 ? .99 : .4,
+          ),
+      });
+      final catalog = _AiCatalog(store);
+      try {
+        final result = await recognizeDirectoryTree(
+          store,
+          'nas',
+          'root',
+          source: {},
+          password: '',
+          tmdbCredential: '',
+          hideHidden: true,
+          strategy: 'off',
+          cancel: CancelToken(),
+          aiConfig: SubtitleAiConfig(model: 'folder-test'),
+          ai: ai,
+          catalog: catalog,
+          adapter: _Folders({'root': group.videos}),
+        );
+        expect(result.videos, 3);
+        expect(result.matched, 1);
+        expect(store.all('media'), hasLength(3));
+        expect(catalog.searches, ['First work']);
+        expect(catalog.queries, isEmpty);
+        expect(
+          store.all('media').where((record) => record.data['tmdbId'] == null),
+          hasLength(2),
+        );
+      } finally {
+        store.dispose();
+      }
+    },
+  );
+
+  test(
+    'folder AI failure imports review records without falling back to automatic catalogue matching',
+    () async {
+      final store = AppStore(':memory:');
+      final group = _collection(count: 3);
+      final catalog = _AiCatalog(store);
+      final ai = _FolderAi(store, {})
+        ..beforeResponse = () async => throw const AppFailure('AI unavailable');
+      try {
+        final result = await recognizeDirectoryTree(
+          store,
+          'nas',
+          'root',
+          source: {},
+          password: '',
+          tmdbCredential: '',
+          hideHidden: true,
+          strategy: 'conservative',
+          cancel: CancelToken(),
+          aiConfig: SubtitleAiConfig(model: 'folder-test'),
+          ai: ai,
+          catalog: catalog,
+          adapter: _Folders({'root': group.videos}),
+        );
+        expect(result.videos, 3);
+        expect(result.matched, 0);
+        expect(result.failed, 1);
+        expect(result.error, 'AI unavailable');
+        expect(store.all('media'), hasLength(3));
+        expect(catalog.searches, isEmpty);
+        expect(catalog.queries, isEmpty);
+        expect(
+          store
+              .all('media')
+              .every(
+                (record) =>
+                    record.data['tmdbId'] == null &&
+                    record.data['bangumiId'] == null,
+              ),
+          isTrue,
+        );
+      } finally {
+        store.dispose();
+      }
+    },
+  );
+
+  test(
     'recursive recognition handles nested series, deduplicates folders and respects hidden entries',
     () async {
       final store = AppStore(':memory:');
@@ -823,6 +1237,153 @@ void main() {
           'Departure',
         });
         expect(adapter.closes, 1);
+      } finally {
+        store.dispose();
+      }
+    },
+  );
+
+  test(
+    'explicit recognition replaces old automatic metadata and stale episode titles',
+    () async {
+      final store = AppStore(':memory:');
+      final group = _collection(subject: _subject('Wrong show', id: '88'));
+      try {
+        final imported = synchronizeDirectoryCollection(
+          store,
+          'nas',
+          group,
+          importMissing: true,
+        );
+        expect(
+          store.get('media', imported.mediaIds.first)!.data['bangumiId'],
+          '88',
+        );
+        final progress = await recognizeDirectoryTree(
+          store,
+          'nas',
+          'root',
+          source: {},
+          password: '',
+          tmdbCredential: '',
+          hideHidden: true,
+          strategy: 'off',
+          cancel: CancelToken(),
+          adapter: _Folders({'root': group.videos}),
+          catalog: _Catalog(store)..failNames = true,
+        );
+        expect(progress.matched, 2);
+        for (final id in imported.mediaIds) {
+          final record = store.get('media', id)!;
+          expect(record.data['bangumiId'], '7');
+          expect(record.data['metadataTitle'], 'Show');
+          expect(record.data['episodeTitle'], isNull);
+          expect(store.local('episodeTitle:$id'), isNull);
+        }
+      } finally {
+        store.dispose();
+      }
+    },
+  );
+
+  test(
+    'explicit recognition preserves revisions changed or deleted during lookup',
+    () async {
+      final store = AppStore(':memory:');
+      final group = _collection(count: 3, subject: _subject('Old', id: '88'));
+      try {
+        final ids = synchronizeDirectoryCollection(
+          store,
+          'nas',
+          group,
+          importMissing: true,
+        ).mediaIds;
+        final catalog = _Catalog(store)
+          ..onResolve = () {
+            store.save('media', ids[1], {
+              ...store.get('media', ids[1])!.data,
+              'bangumiId': '99',
+              'metadataTitle': 'A newer edit',
+            });
+            store.save(
+              'media',
+              ids[2],
+              store.get('media', ids[2])!.data,
+              deleted: true,
+            );
+          };
+        await recognizeDirectoryTree(
+          store,
+          'nas',
+          'root',
+          source: {},
+          password: '',
+          tmdbCredential: '',
+          hideHidden: true,
+          strategy: 'off',
+          cancel: CancelToken(),
+          adapter: _Folders({'root': group.videos}),
+          catalog: catalog,
+        );
+        expect(store.get('media', ids[0])!.data['bangumiId'], '7');
+        expect(store.get('media', ids[1])!.data['bangumiId'], '99');
+        expect(
+          store.get('media', ids[1])!.data['metadataTitle'],
+          'A newer edit',
+        );
+        expect(store.get('media', ids[2])!.deleted, isTrue);
+        expect(store.all('media'), hasLength(2));
+      } finally {
+        store.dispose();
+      }
+    },
+  );
+
+  test(
+    'recursive recognition delivers bounded matched and unmatched record snapshots',
+    () async {
+      final store = AppStore(':memory:');
+      final catalog = _Catalog(store)..unmatched.add('Unknown');
+      final batches = <DirectoryRecognitionProgress>[];
+      try {
+        final result = await recognizeDirectoryTree(
+          store,
+          'nas',
+          'root',
+          source: {},
+          password: '',
+          tmdbCredential: '',
+          hideHidden: true,
+          strategy: 'off',
+          cancel: CancelToken(),
+          adapter: _Folders({
+            'root': [
+              ..._collection(title: 'Known', count: 130).videos,
+              ..._collection(title: 'Unknown', count: 3).videos,
+            ],
+          }),
+          catalog: catalog,
+          onProgress: (progress) {
+            if (progress.records.isNotEmpty) batches.add(progress);
+          },
+        );
+        final records = batches.expand((batch) => batch.records).toList();
+        final matchedIds = batches.expand((batch) => batch.matchedIds).toSet();
+        expect(result.videos, 133);
+        expect(result.matched, 130);
+        expect(result.records, isEmpty);
+        expect(batches.every((batch) => batch.records.length <= 128), isTrue);
+        expect(records.map((record) => record.id).toSet(), hasLength(133));
+        expect(matchedIds, hasLength(130));
+        expect(
+          records
+              .where((record) => !matchedIds.contains(record.id))
+              .map((record) => record.data['series']),
+          everyElement('Unknown'),
+        );
+        for (final record in records) {
+          expect(record.revision, store.get('media', record.id)!.revision);
+        }
       } finally {
         store.dispose();
       }

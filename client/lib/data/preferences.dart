@@ -1,3 +1,5 @@
+import 'library_sort.dart';
+
 /// Player preferences, also included in the optional synchronization profile. API credentials and source locations are
 /// deliberately outside this schema and never reset with player preferences.
 class AppPreferences {
@@ -64,6 +66,8 @@ class AppPreferences {
     'metadataStrategy': 'conservative',
     'aiMetadataEnabled': false,
     'tmdbNameAssist': true,
+    'librarySortField': 'recent',
+    'librarySortDescending': true,
   };
   static const defaultShortcuts = <String, String>{
     'playPause': 'Space',
@@ -127,6 +131,7 @@ class AppPreferences {
     'none',
   ];
   static const _enums = <String, List<String>>{
+    'librarySortField': LibrarySort.fields,
     'metadataProvider': ['bangumi', 'tmdb'],
     'metadataStrategy': ['off', 'conservative', 'balanced'],
     'videoFit': ['contain', 'cover', 'fill'],
@@ -243,6 +248,8 @@ class AppPreferences {
   String get metadataProvider => _choice('metadataProvider');
   String get metadataStrategy => _choice('metadataStrategy');
   bool get aiMetadataEnabled => _bool('aiMetadataEnabled');
+  String get librarySortField => _choice('librarySortField');
+  bool get librarySortDescending => _bool('librarySortDescending');
 
   Map<String, String> get shortcuts {
     final stored = _values['shortcuts'];

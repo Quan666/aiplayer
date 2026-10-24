@@ -15,23 +15,30 @@ class MediaTitleTranslations {
   int revision = 0;
   MediaTitleTranslations(this.store, {required this.settings});
 
-  String get profile {
-    final value = settings();
-    var origin = '${value['aiSubtitleOrigin'] ?? 'https://api.openai.com/v1'}';
+  String get profile => profileFor(settings());
+
+  static (String, String, String) profileInputs(Map value) => (
+    '${value['aiSubtitleOrigin'] ?? 'https://api.openai.com/v1'}',
+    '${value['aiSubtitleModel'] ?? ''}',
+    '${value['aiSubtitleTarget'] ?? '简体中文'}',
+  );
+
+  /// Shared with background readers so visible labels and search use the same
+  /// configured language and translation cache identity.
+  static String profileFor(Map value) {
+    final (configuredOrigin, model, target) = profileInputs(value);
+    var origin = configuredOrigin;
     try {
       origin = SubtitleAiConfig.normalizeOrigin(origin).toString();
     } on AppFailure {
       // Invalid settings simply have no matching display cache.
     }
-    return _hash([
-      origin,
-      value['aiSubtitleModel'] ?? '',
-      value['aiSubtitleTarget'] ?? '简体中文',
-    ]);
+    return _hash([origin, model, target]);
   }
 
-  String _stateKey(String seriesKey) =>
+  static String stateKeyFor(String seriesKey, String profile) =>
       'media-title-display:${_hash([seriesKey, profile])}';
+  String _stateKey(String seriesKey) => stateKeyFor(seriesKey, profile);
   Map<dynamic, dynamic> _state(String seriesKey) =>
       store.local(_stateKey(seriesKey)) as Map? ?? const {};
   bool isVisible(String seriesKey) => _state(seriesKey)['visible'] == true;
@@ -40,7 +47,11 @@ class MediaTitleTranslations {
 
   String display(String seriesKey, String original) {
     if (original.isEmpty) return original;
-    final state = _state(seriesKey);
+    return displayFrom(_state(seriesKey), original);
+  }
+
+  static String displayFrom(Map state, String original) {
+    if (original.isEmpty) return original;
     final value = (state['titles'] as Map?)?[original];
     return state['visible'] == true && value is String && value.isNotEmpty
         ? value

@@ -7,6 +7,7 @@ import 'package:aiplayer/data/cache_maintenance.dart';
 import 'package:aiplayer/data/library_catalog.dart';
 import 'package:aiplayer/data/media_ai_recognition.dart';
 import 'package:aiplayer/data/store.dart';
+import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/subtitles/ai.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -67,6 +68,29 @@ class _AiTransport implements SubtitleAiTransport {
   ) async => [];
 }
 
+class _DirectoryCatalog extends LibraryCatalog {
+  _DirectoryCatalog(super.store);
+
+  @override
+  Future<Map<String, dynamic>?> resolve(
+    String title,
+    String season, {
+    CancelToken? cancel,
+    bool force = false,
+  }) async => {
+    'id': '7',
+    'name': 'Series',
+    'images': {'large': 'https://offline.invalid/poster.png'},
+  };
+
+  @override
+  Future<Map<String, String>> episodeNames(
+    String subjectId, {
+    Map<String, dynamic>? subject,
+    CancelToken? cancel,
+  }) async => {'1': 'Saved episode'};
+}
+
 const _identity = {
   'name': 'Example',
   'titles': {'zh': '', 'en': 'Example', 'ja': ''},
@@ -91,7 +115,7 @@ void main() {
   });
 
   test(
-    'disk clear preserves user data and translations without UI scans',
+    'disk clear preserves user data, artwork and translations without UI scans',
     () async {
       final protected = <String, dynamic>{
         'settings': {'metadataStrategy': 'conservative'},
@@ -104,6 +128,7 @@ void main() {
         'location:item': {'source': 'dav', 'path': 'series/1.mkv'},
         'browse:item': {'source': 'dav', 'path': 'series/1.mkv'},
         'manualMetadata:item': true,
+        'preview:item': {'path': '${directory.path}/previews/frame.jpg'},
         'episodeTitle:item': 'Saved title',
         'externalSource:other': {'kind': 'webdav'},
         'automatic-import-excluded:removed': true,
@@ -139,11 +164,8 @@ void main() {
         'subject-v5:',
         'episode-names:',
         'metadataEpisodeNames:',
-        'directory-preview:',
-        'directory-preview-envelope:',
         'media-ai-filename:',
         'media-ai-confirmation:',
-        'preview:',
         'mediaMetadata:',
         'technical:',
       ]) {
@@ -166,7 +188,7 @@ void main() {
       ]) {
         final file = File('${directory.path}/$path');
         file.parent.createSync(recursive: true);
-        file.writeAsStringSync('keep unless preview');
+        file.writeAsStringSync('keep');
       }
       final revision = store.localRevision;
       store.prohibitMaintenance = true;
@@ -190,8 +212,8 @@ void main() {
       expect(store.db.select('SELECT * FROM cache'), isEmpty);
       expect(store.local('cacheClearEpoch'), 1);
       expect(store.local('directoryPreviewEpoch'), 1);
-      expect(Directory('${directory.path}/previews').existsSync(), isFalse);
       for (final path in [
+        'previews/frame.jpg',
         'media/video.mp4',
         'credentials/source',
         'subtitle-cache/translated.srt',
@@ -210,35 +232,101 @@ void main() {
     },
   );
 
-  test('old directory worker preview cannot return after clear', () async {
-    const preview = DirectoryPreview(
-      collection: null,
-      context: 'context',
-      fingerprint: 'files',
-      updatedAt: 1,
-      modified: 1,
-    );
-    persistDirectoryPreview(store, 'dav', 'series', preview);
-    expect(readDirectoryPreview(store, 'dav', 'series'), isNotNull);
-    await clearStoredCaches(store, directory);
-    final workerStore = AppStore.openExisting(store.path);
-    try {
-      persistDirectoryPreview(workerStore, 'dav', 'series', preview);
-    } finally {
-      workerStore.dispose();
-    }
-    expect(readDirectoryPreview(store, 'dav', 'series'), isNull);
-  });
+  test(
+    'retained directory poster rejects an older worker after clear',
+    () async {
+      const preview = DirectoryPreview(
+        collection: null,
+        context: 'context',
+        fingerprint: 'files',
+        updatedAt: 1,
+        modified: 1,
+      );
+      persistDirectoryPreview(store, 'dav', 'series', preview);
+      expect(readDirectoryPreview(store, 'dav', 'series'), isNotNull);
+      await clearStoredCaches(store, directory);
+      final retained = readDirectoryPreview(store, 'dav', 'series')!;
+      expect(retained.cacheEpoch, 1);
+      expect(retained.fingerprint, 'files');
+      final workerStore = AppStore.openExisting(store.path);
+      try {
+        persistDirectoryPreview(workerStore, 'dav', 'series', preview);
+      } finally {
+        workerStore.dispose();
+      }
+      expect(readDirectoryPreview(store, 'dav', 'series')!.cacheEpoch, 1);
+      await clearStoredCaches(store, directory);
+      expect(readDirectoryPreview(store, 'dav', 'series')!.cacheEpoch, 2);
+    },
+  );
 
   test(
-    'preview directory link does not remove its user-owned target',
+    'directory poster remains discoverable offline after clearing',
+    () async {
+      final catalog = _DirectoryCatalog(store);
+      await catalog.inspect('dav', 'Series', const [
+        SourceEntry(name: 'Series E01.mkv', path: 'Series/Series E01.mkv'),
+      ]);
+      final before = catalog.directoryPreview('dav', 'Series')!;
+      expect(before.collection!.poster, 'https://offline.invalid/poster.png');
+      final transport = _JsonTransport();
+      for (var epoch = 1; epoch <= 2; epoch++) {
+        await clearStoredCaches(store, directory);
+        final offline = LibraryCatalog(
+          store,
+          transport: transport,
+          readDirectory: (sourceId, path, cancel) async =>
+              readDirectoryPreview(store, sourceId, path),
+        );
+        expect(
+          offline.directoryPreview('dav', 'Series')!.collection!.poster,
+          before.collection!.poster,
+        );
+        final full = (await offline.loadDirectoryPreview('dav', 'Series'))!;
+        expect(full.collection!.poster, before.collection!.poster);
+        expect(full.cacheEpoch, epoch);
+        expect(full.collection!.videos, hasLength(1));
+        expect(transport.started.isCompleted, isFalse);
+      }
+    },
+  );
+
+  test(
+    'clearing never revives stale or malformed directory snapshots',
+    () async {
+      store.setLocal('directoryPreviewEpoch', 2);
+      for (final prefix in [
+        'directory-preview:',
+        'directory-preview-envelope:',
+      ]) {
+        store.setLocal('${prefix}stale', {'epoch': 1, 'collection': null});
+        store.setLocal('${prefix}current', {'epoch': 2, 'collection': null});
+        store.db.execute('INSERT INTO local(key,value) VALUES(?,?)', [
+          '${prefix}broken',
+          'invalid payload',
+        ]);
+      }
+      await clearStoredCaches(store, directory);
+      for (final prefix in [
+        'directory-preview:',
+        'directory-preview-envelope:',
+      ]) {
+        expect(store.local('${prefix}stale')['epoch'], 1);
+        expect(store.local('${prefix}current')['epoch'], 3);
+      }
+      expect(store.local('directoryPreviewEpoch'), 3);
+    },
+  );
+
+  test(
+    'preview directory link and its user-owned target are retained',
     () async {
       final owned = Directory('${directory.path}/media')..createSync();
       final file = File('${owned.path}/video.mp4')..writeAsStringSync('video');
       Link('${directory.path}/previews').createSync(owned.path);
       await clearStoredCaches(store, directory);
       expect(file.readAsStringSync(), 'video');
-      expect(Link('${directory.path}/previews').existsSync(), isFalse);
+      expect(Link('${directory.path}/previews').existsSync(), isTrue);
     },
   );
 

@@ -123,6 +123,83 @@ void main() {
   });
 
   testWidgets(
+    'short empty long polls back off and stop without another background frame',
+    (tester) async {
+      final f = await _Fixture.create(tester, backgroundWork: true);
+      final replies = <Completer<bool>>[];
+      f.client.waitReply = () {
+        final reply = Completer<bool>();
+        replies.add(reply);
+        return reply.future;
+      };
+      unawaited(f.model.synchronize(quiet: true));
+      await tester.pump();
+      f.client.requests.single.complete();
+      await tester.pump();
+      for (final seconds in [20, 40, 80]) {
+        final polls = f.client.waits;
+        await tester.pump(const Duration(seconds: 2));
+        replies.last.complete(false);
+        await tester.idle();
+        await tester.pump(Duration(seconds: seconds - 3));
+        expect(f.client.waits, polls);
+        await tester.pump(const Duration(seconds: 1));
+        expect(f.client.waits, polls + 1);
+      }
+
+      // A late reply cannot restart the watcher after the app stops drawing.
+      f.model.setForeground(false);
+      final polls = f.client.waits;
+      replies.last.complete(false);
+      await tester.idle();
+      expect(f.client.waits, polls);
+      expect(f.model.realtimeConnected, false);
+      expect(tester.binding.hasScheduledFrame, false);
+      f.model.setForeground(true);
+      await tester.pump();
+      f.client.requests.last.complete();
+      await tester.pump();
+      expect(f.client.waits, polls + 1);
+      replies.last.complete(false);
+      await tester.idle();
+      await tester.pump(const Duration(seconds: 20));
+      expect(
+        f.client.waits,
+        polls + 2,
+        reason: 'resume starts a fresh watcher',
+      );
+      f.disposeModel();
+      replies.last.complete(false);
+      await tester.idle();
+    },
+  );
+
+  testWidgets('healthy long polls immediately renew after empty responses', (
+    tester,
+  ) async {
+    final f = await _Fixture.create(tester, backgroundWork: true);
+    final replies = <Completer<bool>>[];
+    f.client.waitReply = () {
+      final reply = Completer<bool>();
+      replies.add(reply);
+      return reply.future;
+    };
+    unawaited(f.model.synchronize(quiet: true));
+    await tester.pump();
+    f.client.requests.single.complete();
+    await tester.pump();
+    for (var i = 0; i < 3; i++) {
+      await tester.pump(const Duration(seconds: 20));
+      replies.last.complete(false);
+      await tester.idle();
+      expect(f.client.waits, i + 2);
+    }
+    f.disposeModel();
+    replies.last.complete(false);
+    await tester.idle();
+  });
+
+  testWidgets(
     'quiet unchanged sync does not rebuild the model for lastSync bookkeeping',
     (tester) async {
       final f = await _Fixture.create(tester);
@@ -699,6 +776,7 @@ class _Request {
 class _Client extends SyncClient {
   final requests = <_Request>[];
   AppFailure? waitFailure;
+  Future<bool> Function()? waitReply;
   int active = 0, maxActive = 0, waits = 0;
   _Client(super.store);
   @override
@@ -755,6 +833,6 @@ class _Client extends SyncClient {
   }) async {
     waits++;
     if (waitFailure != null) throw waitFailure!;
-    return false;
+    return await waitReply?.call() ?? false;
   }
 }

@@ -539,7 +539,7 @@ void main() {
       await assertion;
       await expectLater(
         transport.send(Uri.parse('http://127.0.0.1:${server.port}/stall')),
-        throwsA(isA<AppFailure>()),
+        throwsA(isA<NetworkUnavailable>()),
       );
       await server.close(force: true);
     },

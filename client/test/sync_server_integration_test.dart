@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:aiplayer/core/network.dart';
+import 'package:aiplayer/data/preferences.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/data/sync.dart';
 import 'package:aiplayer/data/sync_profile.dart';
@@ -174,6 +175,128 @@ void main() {
       expect(allChanges, contains('local-only'));
       expect(allChanges, isNot(contains('/device/private.mkv')));
       expect(allChanges, isNot(contains('local-only:8')));
+    },
+    skip: skip,
+  );
+
+  test(
+    'real server syncs all-video sorting in both directions across restart and reset',
+    () async {
+      final server = await _GoServer.start();
+      final first = _Device(server, 'first');
+      final second = _Device(server, 'second');
+      AppPreferences preferences(_Device device) => AppPreferences(
+        Map<String, dynamic>.from(device.store.local('settings') ?? {}),
+      );
+
+      first.settings({
+        'librarySortField': 'name',
+        'librarySortDescending': false,
+      });
+      await first.sync();
+      await second.sync();
+      expect(preferences(second).librarySortField, 'name');
+      expect(preferences(second).librarySortDescending, isFalse);
+      final published = (await server.changes())['changes'] as List;
+      expect(published, hasLength(2));
+      expect(published.every((row) => row['kind'] == 'vault'), isTrue);
+      expect(jsonEncode(published), isNot(contains('librarySortField')));
+
+      second.settings({
+        'librarySortField': 'modified',
+        'librarySortDescending': true,
+      });
+      await second.sync();
+      await first.sync();
+      expect(preferences(first).librarySortField, 'modified');
+      expect(preferences(first).librarySortDescending, isTrue);
+
+      await server.restart(_token);
+      final fresh = _Device(server, 'fresh');
+      await fresh.sync();
+      expect(preferences(fresh).librarySortField, 'modified');
+      expect(preferences(fresh).librarySortDescending, isTrue);
+
+      first.store.setLocal('settings', <String, dynamic>{});
+      await first.sync();
+      await second.sync();
+      await fresh.sync();
+      for (final device in [first, second, fresh]) {
+        expect(preferences(device).librarySortField, 'recent');
+        expect(preferences(device).librarySortDescending, isTrue);
+        expect(device.store.conflicts, isEmpty);
+      }
+    },
+    skip: skip,
+  );
+
+  test(
+    'real server preserves new public metadata and unknown kinds through client sync',
+    () async {
+      final server = await _GoServer.start();
+      final first = _Device(server, 'first')..seedRemote();
+      final second = _Device(server, 'second');
+      const details = {
+        'schemaRevision': 2,
+        'chapters': [
+          {'name': 'Opening', 'begin': 0},
+          {'name': 'Episode', 'begin': 90},
+        ],
+        'publicId': 9007199254740993,
+      };
+      first.store.save('media', 'remote-video', {
+        ...first.store.get('media', 'remote-video')!.data,
+        'publicDetails': details,
+      });
+      await first.sync();
+      await second.sync();
+      expect(
+        second.store.get('media', 'remote-video')!.data['publicDetails'],
+        details,
+      );
+
+      second.store.save('media', 'remote-video', {
+        ...second.store.get('media', 'remote-video')!.data,
+        'title': 'Updated title',
+      });
+      await second.sync();
+      await first.sync();
+      expect(
+        first.store.get('media', 'remote-video')!.data['publicDetails'],
+        details,
+      );
+      expect(
+        first.store.get('media', 'remote-video')!.data['title'],
+        'Updated title',
+      );
+
+      await IoJsonTransport().send(
+        Uri.parse('${server.origin}/v1/records'),
+        method: 'PUT',
+        headers: {'Authorization': 'Bearer $_token'},
+        body: {
+          'id': 'future-collection',
+          'kind': 'collection.v2',
+          'version': 0,
+          'data': details,
+        },
+      );
+      await server.restart(_token);
+      final fresh = _Device(server, 'fresh');
+      await fresh.sync();
+      expect(
+        fresh.store.get('media', 'remote-video')!.data['publicDetails'],
+        details,
+      );
+      expect(
+        fresh.store.get('collection.v2', 'future-collection')!.data,
+        details,
+      );
+      expect(
+        fresh.store.local('syncCursor:${server.origin}'),
+        (await server.changes())['cursor'],
+      );
+      expect(fresh.store.conflicts, isEmpty);
     },
     skip: skip,
   );

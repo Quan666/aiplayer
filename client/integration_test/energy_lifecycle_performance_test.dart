@@ -13,6 +13,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:crypto/crypto.dart';
+import 'package:image/image.dart' as images;
 import 'package:integration_test/integration_test.dart';
 
 // Full-app lifecycle/idle workload, not a battery or mobile FPS measurement.
@@ -38,7 +40,8 @@ void main() {
       'scope':
           'Full AIPlayerApp, 3000 media records, disk database, independent '
           'bounded background progress writer, idle/lifecycle/scroll/9 tab switches. '
-          'Linux Xvfb software rendering; no media decoding, artwork, real server '
+          '12 cached posters, non-playback video-preview request counter. '
+          'Linux Xvfb software rendering; no media decoding, real server '
           'sync or mobile battery measurement; no before-change comparison.',
     };
     try {
@@ -173,6 +176,8 @@ void main() {
       await tester.pumpAndSettle();
       report['historyResumeLibraryReads'] = model.reads - historyReads;
       expect(model.reads, historyReads + 1);
+      report['unnecessaryVideoPreviewRequests'] = model.previewRequests;
+      expect(model.previewRequests, 0);
       expect(tester.takeException(), isNull);
       binding.reportData = report;
       debugPrint(jsonEncode(report));
@@ -193,6 +198,15 @@ void main() {
 class _Model extends AppModel {
   _Model(super.store, super.documents) : super(backgroundWork: false);
   int reads = 0;
+  int previewRequests = 0;
+  @override
+  void ensureMediaPreview(String id) {
+    // Continue-watching covers intentionally prefer a progress screenshot.
+    // Count only poster cards without a playback position to capture.
+    if ((int.tryParse(id) ?? 0) >= 100) previewRequests++;
+    super.ensureMediaPreview(id);
+  }
+
   @override
   Future<LibrarySnapshot> loadLibrarySnapshot({
     String query = '',
@@ -212,6 +226,24 @@ Future<void> _wait(bool Function() ready) async {
 }
 
 Future<void> _seed(String path) => Isolate.run(() {
+  final posters = Directory('$path/poster-cache-v1')
+    ..createSync(recursive: true);
+  for (var i = 0; i < 12; i++) {
+    final image = images.Image(width: 320, height: 180)
+      ..clear(images.ColorRgb8(40 + i * 15, 90, 160));
+    images.fillRect(
+      image,
+      x1: 40,
+      y1: 30,
+      x2: 180,
+      y2: 140,
+      color: images.ColorRgb8(220, 180 - i * 8, 80),
+    );
+    final name = sha256.convert(utf8.encode('https://artwork.invalid/$i.jpg'));
+    File(
+      '${posters.path}/$name.image',
+    ).writeAsBytesSync(images.encodeJpg(image));
+  }
   final store = AppStore('$path/library.db');
   try {
     store.setLocal('settings', {
@@ -224,6 +256,7 @@ Future<void> _seed(String path) => Isolate.run(() {
           'title': '视频 $i.mp4',
           'series': '未分类',
           'size': i + 1,
+          'poster': 'https://artwork.invalid/${i % 12}.jpg',
         });
       }
       for (var i = 0; i < 100; i++) {

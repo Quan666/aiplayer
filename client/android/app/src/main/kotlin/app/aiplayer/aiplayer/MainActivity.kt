@@ -22,6 +22,7 @@ import java.net.Inet4Address
 class MainActivity : FlutterActivity() {
     private var windowModeChannel: MethodChannel? = null
     private var externalVideos: ExternalVideoHandler? = null
+    private var systemProxy: SystemProxyHandler? = null
     private var deviceInfoChannel: MethodChannel? = null
     private var displayChannel: MethodChannel? = null
     private var discoveryChannel: MethodChannel? = null
@@ -49,6 +50,8 @@ class MainActivity : FlutterActivity() {
         }
         externalVideos = ExternalVideoHandler(this, flutterEngine.dartExecutor.binaryMessenger)
         externalVideos?.accept(intent)
+        systemProxy?.close()
+        systemProxy = SystemProxyHandler(flutterEngine.dartExecutor.binaryMessenger)
         displayChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "app.aiplayer/display"
@@ -306,6 +309,8 @@ class MainActivity : FlutterActivity() {
         deviceInfoChannel = null
         externalVideos?.close()
         externalVideos = null
+        systemProxy?.close()
+        systemProxy = null
         watchOrientation(false)
         applyImmersiveBars(false)
         restoreBrightness()

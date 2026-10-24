@@ -204,7 +204,7 @@ class _MediaFileDetailsSheetState extends State<MediaFileDetailsSheet>
       child: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(20, 8, 8, 0),
+            padding: const EdgeInsets.fromLTRB(16, 4, 4, 0),
             child: Row(
               children: [
                 Expanded(
@@ -228,12 +228,12 @@ class _MediaFileDetailsSheetState extends State<MediaFileDetailsSheet>
                     child: _error == null
                         ? const CircularProgressIndicator()
                         : Padding(
-                            padding: const EdgeInsets.all(24),
+                            padding: const EdgeInsets.all(16),
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 Text(_error!, textAlign: TextAlign.center),
-                                const SizedBox(height: 12),
+                                const SizedBox(height: 8),
                                 TextButton(
                                   onPressed: _retry,
                                   child: const Text('重新读取'),
@@ -348,13 +348,13 @@ class _FileParametersState extends State<_FileParameters> {
   Widget build(BuildContext context) {
     return ListView.builder(
       key: const ValueKey('file-parameter-list'),
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
       itemCount: _ends.last,
       itemBuilder: (context, index) {
         final row = _row(index);
         if (row.value == null) {
           return Padding(
-            padding: const EdgeInsets.only(top: 20, bottom: 8),
+            padding: const EdgeInsets.only(top: 12, bottom: 4),
             child: Text(
               row.label,
               style: Theme.of(context).textTheme.titleMedium,
@@ -362,7 +362,7 @@ class _FileParametersState extends State<_FileParameters> {
           );
         }
         return Padding(
-          padding: const EdgeInsets.symmetric(vertical: 7),
+          padding: const EdgeInsets.symmetric(vertical: 4),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -373,7 +373,7 @@ class _FileParametersState extends State<_FileParameters> {
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 8),
               Expanded(child: SelectableText(row.value!)),
             ],
           ),

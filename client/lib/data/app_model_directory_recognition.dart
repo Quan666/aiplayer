@@ -9,15 +9,29 @@ extension AppModelDirectoryRecognition on AppModel {
     String sourceId,
     String root, {
     CancelToken? cancel,
+    String? label,
   }) async {
     if (_disposed || recognizingDirectory) return;
-    final ownCancel = _directoryRecognitionCancel = CancelToken();
+    final folderName = p.posix.basename(root.replaceAll('\\', '/'));
+    final task =
+        MetadataTask._(
+            const Uuid().v4(),
+            label ??
+                (folderName.isEmpty || folderName == '.' ? '文件夹' : folderName),
+            [],
+            ai: preferences.aiMetadataEnabled,
+            manual: true,
+          )
+          .._started = true
+          .._external = true
+          ..status = '正在读取文件夹…';
+    _restoreMetadataTasks();
+    _metadataTasks.add(task);
+    final ownCancel = _directoryRecognitionCancel = task._cancel;
     recognizingDirectory = true;
     directoryRecognitionProgress = const DirectoryRecognitionProgress();
     status = '正在识别文件夹…';
     changed();
-    final progressClock = Stopwatch()..start();
-    var lastProgressAt = -150;
     unawaited(cancel?.whenCancelled.then((_) => ownCancel.cancel()));
     try {
       cancel?.check();
@@ -35,6 +49,7 @@ extension AppModelDirectoryRecognition on AppModel {
           ? ''
           : await secrets.read(key: 'source:$sourceId') ?? '';
       final credential = await secrets.read(key: 'tmdb.apiKey') ?? '';
+      final aiConfig = task.ai ? await _metadataAiConfig() : null;
       ownCancel.check();
       if (_disposed) throw const Cancelled();
       final worker = _directoryMetadataWorker ??= DirectoryMetadataWorker(
@@ -48,6 +63,7 @@ extension AppModelDirectoryRecognition on AppModel {
         tmdbCredential: credential,
         hideHidden: preferences.hideHiddenFiles,
         strategy: preferences.metadataStrategy,
+        aiConfig: aiConfig,
         cancel: ownCancel,
         onProgress: (value) {
           if (_disposed || ownCancel.cancelled) return;
@@ -59,13 +75,32 @@ extension AppModelDirectoryRecognition on AppModel {
             return;
           }
           directoryRecognitionProgress = value;
+          if (value.error.isNotEmpty) task.error = value.error;
+          task._appendRecords(value.records);
+          for (final entry in value.aiResults.entries) {
+            final match = entry.value;
+            task.results[entry.key] = AiMetadataMatch(
+              match.identity,
+              match.candidates,
+              match.subject,
+            );
+          }
+          for (final record in value.records) {
+            if (!task._completedIds.add(record.id)) continue;
+            if (value.matchedIds.contains(record.id)) {
+              task._matchedIds.add(record.id);
+              task.matched++;
+            } else {
+              task.failed++;
+            }
+          }
           status = '已识别 ${value.matched} / ${value.videos} 个视频';
-          if (progressClock.elapsedMilliseconds - lastProgressAt < 150) return;
-          lastProgressAt = progressClock.elapsedMilliseconds;
-          changed();
+          task.status = status;
+          _taskChanged(task);
         },
       );
       if (_disposed) return;
+      ownCancel.check();
       directoryRecognitionProgress = result;
       status = result.videos == 0
           ? result.failed > 0
@@ -74,11 +109,18 @@ extension AppModelDirectoryRecognition on AppModel {
           : '识别完成，${result.matched} / ${result.videos} 个视频'
                 '${result.failed > 0 ? '，${result.failed} 项未完成，可重试' : ''}';
       AppLog.instance.info('影视资料', status);
+      task.status = status;
     } on Cancelled {
-      if (!_disposed) status = '识别已取消，已完成的资料保留。';
+      if (!_disposed) {
+        status = '识别已取消，已完成的资料保留。';
+        task.cancelled = true;
+        task.status = '已取消';
+      }
     } catch (error) {
       if (!_disposed) {
         status = '识别未完成：${safeFailure(error).message}';
+        task.error = safeFailure(error).message;
+        task.status = '识别未完成';
         AppLog.instance.warning('影视资料', status);
       }
     } finally {
@@ -86,7 +128,15 @@ extension AppModelDirectoryRecognition on AppModel {
       if (identical(_directoryRecognitionCancel, ownCancel)) {
         _directoryRecognitionCancel = null;
       }
-      if (!_disposed) changed();
+      task.running = false;
+      if (!task._done.isCompleted) task._done.complete();
+      if (!_disposed) {
+        if (task.removed) {
+          changed();
+        } else {
+          _taskChanged(task);
+        }
+      }
     }
   }
 }

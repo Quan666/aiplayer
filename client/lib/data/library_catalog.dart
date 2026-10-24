@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:isolate';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
+import '../core/logger.dart';
 import '../core/network.dart';
 import '../danmaku/release_name.dart';
 import '../sources/source.dart';
@@ -722,8 +723,39 @@ class LibraryCatalog {
     tmdb = TmdbCatalog(this.transport, this.tmdbCredential, store: store);
   }
   static const headers = {
-    'User-Agent': 'AIPlayer/0.5.1 (personal anime library)',
+    'User-Agent': 'AIPlayer/0.5.15 (personal anime library)',
   };
+
+  Future<Map<String, dynamic>> _bangumiRequest(
+    Uri uri, {
+    required String operation,
+    CancelToken? cancel,
+  }) async {
+    try {
+      return await transport.send(uri, headers: headers, cancel: cancel);
+    } on NetworkUnavailable catch (error) {
+      cancel?.check();
+      final diagnostic = error.diagnostic;
+      AppLog.instance.warning(
+        'Bangumi $operation',
+        diagnostic == null
+            ? '请求不可用，传输层未提供阶段信息。'
+            : '阶段=${diagnostic.phase.name} 原因=${diagnostic.reason.name} '
+                  '总耗时=${diagnostic.elapsed.inMilliseconds}ms '
+                  '阶段耗时=${diagnostic.phaseElapsed.inMilliseconds}ms '
+                  '超时限制=${diagnostic.inactivity.inMilliseconds}ms '
+                  '已接收=${diagnostic.receivedBytes}B'
+                  '${diagnostic.statusCode == null ? '' : ' HTTP=${diagnostic.statusCode}'}'
+                  '${diagnostic.osErrorCode == null ? '' : ' 系统错误=${diagnostic.osErrorCode}'}',
+      );
+      // Keep the typed failure so explicit selections can use their already
+      // fetched search result, while automatic recognition remains strict.
+      throw NetworkUnavailable(
+        'Bangumi $operation：${error.message}',
+        diagnostic: diagnostic,
+      );
+    }
+  }
 
   String _directoryKey(String sourceId, String path) =>
       _directoryPreviewKey(sourceId, path);
@@ -940,6 +972,10 @@ class LibraryCatalog {
       ...subject,
       'provider': 'bangumi',
       'mediaType': movie ? 'movie' : 'tv',
+      if (subject['date'] == null && subject['air_date'] is String)
+        'date': subject['air_date'],
+      if (subject['total_episodes'] == null && subject['eps_count'] is num)
+        'total_episodes': subject['eps_count'],
       if (!movie && seasons.length == 1) 'season': seasons.single,
     };
   }
@@ -954,13 +990,13 @@ class LibraryCatalog {
     return _cache.load<List<Map<String, dynamic>>>(
       'catalog-v1:bangumi:search:${sha256.convert(utf8.encode(query))}',
       fetch: (token) async {
-        final data = await transport.send(
+        final data = await _bangumiRequest(
           Uri.https('api.bgm.tv', '/search/subject/$query', {
             'type': '2',
             'responseGroup': 'large',
             'max_results': '20',
           }),
-          headers: headers,
+          operation: '搜索',
           cancel: token,
         );
         token.check();
@@ -1223,6 +1259,39 @@ class LibraryCatalog {
     return found;
   }
 
+  /// A user's explicit choice can use the existing Bangumi search data when
+  /// optional detail enrichment is unavailable. Automatic recognition still
+  /// requires [details], including its identity/type validation.
+  Future<Map<String, dynamic>> selectionDetails(
+    Map<String, dynamic> subject, {
+    String season = '',
+    CancelToken? cancel,
+    void Function()? onFallback,
+  }) async {
+    try {
+      return await details(subject, season: season, cancel: cancel);
+    } on Cancelled {
+      rethrow;
+    } on AppFailure catch (error) {
+      cancel?.check();
+      final unavailable =
+          error is NetworkUnavailable || (error.status ?? 0) >= 500;
+      final validCandidate =
+          subject['provider'] == 'bangumi' &&
+          (subject['type'] == null || '${subject['type']}' == '2') &&
+          RegExp(r'^[1-9]\d*$').hasMatch('${subject['id']}') &&
+          [
+            subject['name'],
+            subject['name_cn'],
+          ].any((name) => name is String && name.trim().isNotEmpty);
+      if (cacheMaintenance || !unavailable || !validCandidate) rethrow;
+      // Do not put this partial response into the full-details cache. A later
+      // successful request must still be able to fill the remaining fields.
+      onFallback?.call();
+      return _bangumiSubject(subject);
+    }
+  }
+
   Future<Map<String, dynamic>> details(
     Map<String, dynamic> subject, {
     String season = '',
@@ -1238,9 +1307,9 @@ class LibraryCatalog {
     return _cache.load<Map<String, dynamic>>(
       'catalog-v1:bangumi:details:$id',
       fetch: (token) async {
-        final raw = await transport.send(
+        final raw = await _bangumiRequest(
           Uri.https('api.bgm.tv', '/v0/subjects/$id'),
-          headers: headers,
+          operation: '作品详情',
           cancel: token,
         );
         token.check();
@@ -1419,14 +1488,14 @@ class LibraryCatalog {
       fetch: (token) async {
         final names = <String, String>{};
         for (var offset = 0; offset < 1000; offset += 100) {
-          final page = await transport.send(
+          final page = await _bangumiRequest(
             Uri.https('api.bgm.tv', '/v0/episodes', {
               'subject_id': subjectId,
               'type': '0',
               'limit': '100',
               'offset': '$offset',
             }),
-            headers: headers,
+            operation: '分集信息',
             cancel: token,
           );
           token.check();

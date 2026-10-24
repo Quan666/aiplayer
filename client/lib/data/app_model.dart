@@ -1,10 +1,10 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
-import 'package:flutter/painting.dart' show PaintingBinding;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
@@ -27,6 +27,7 @@ import 'media_previews.dart';
 import 'library_catalog.dart';
 import 'cache_maintenance.dart';
 import 'library_snapshot.dart';
+import 'library_sort.dart';
 import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
 import 'media_presentation.dart';
@@ -34,12 +35,14 @@ import 'media_title_translation.dart';
 import 'poster_cache.dart';
 import 'source_preview.dart';
 import 'media_ai_recognition.dart';
+import 'media_ai_catalog.dart';
 import '../subtitles/ai.dart';
 
 part 'app_model_metadata_ai.dart';
 part 'app_model_metadata_tasks.dart';
 part 'app_model_directory_recognition.dart';
 part 'app_model_cache.dart';
+part 'app_model_library_refresh.dart';
 
 Duration _syncRetryDelay(int failures) {
   const seconds = [3, 6, 12, 24, 48, 96, 180, 300];
@@ -160,11 +163,48 @@ class AppModel extends ChangeNotifier {
     changed();
   }
 
+  LibrarySort get librarySorting => LibrarySort(
+    field: preferences.librarySortField,
+    descending: preferences.librarySortDescending,
+  );
+
+  LibrarySort? _pendingLibrarySorting;
+  Future<void>? _librarySortingWork;
+
+  Future<void> setLibrarySorting(LibrarySort value) {
+    if (_disposed) return Future.error(const Cancelled());
+    if (!LibrarySort.fields.contains(value.field)) {
+      return Future.error(ArgumentError.value(value.field, 'field'));
+    }
+    _pendingLibrarySorting = value;
+    return _librarySortingWork ??= _saveLibrarySorting().whenComplete(
+      () => _librarySortingWork = null,
+    );
+  }
+
+  Future<void> _saveLibrarySorting() async {
+    // At most one write and one latest choice wait for SQLite. The worker
+    // merges under its own transaction so sync cannot lose unrelated settings.
+    while (!_disposed && _pendingLibrarySorting != null) {
+      final value = _pendingLibrarySorting!;
+      _pendingLibrarySorting = null;
+      final changed = await store.patchSettingsInBackground({
+        'librarySortField': value.field,
+        'librarySortDescending': value.descending,
+      });
+      if (_disposed) return;
+      if (changed) notifyListeners();
+    }
+  }
+
   late final titleTranslations = MediaTitleTranslations(
     store,
     settings: () => settings,
   );
-  late final MediaAiRecognition mediaAi = MediaAiRecognition(store);
+  late final MediaAiRecognition mediaAi = MediaAiRecognition(
+    store,
+    folderAnalyzer: _analyzeMetadataFolderInBackground,
+  );
   late final SyncProfile syncProfile = SyncProfile(
     store,
     secrets,
@@ -425,7 +465,21 @@ class AppModel extends ChangeNotifier {
   }
   Future<void>? _backgroundStart;
   bool _foreground = true;
+  Future<void>? _librarySourceRefreshWork;
+  CancelToken? _librarySourceRefreshCancel;
   Completer<void>? _automaticReady;
+
+  /// Refresh only directories already represented in the library. The worker's
+  /// folder index supplies the deduplicated targets; this never scans a source.
+  Future<void> refreshLibrarySources({CancelToken? cancel}) {
+    if (_disposed || !_foreground || _clearingCaches) {
+      return Future.error(const Cancelled());
+    }
+    cancel?.check();
+    return _librarySourceRefreshWork ??= _refreshLibrarySources(
+      cancel,
+    ).whenComplete(() => _librarySourceRefreshWork = null);
+  }
 
   /// The app starts this after its first frame, keeping library repair and
   /// task restoration out of the launch path. Other hosts can await readiness.
@@ -457,6 +511,7 @@ class AppModel extends ChangeNotifier {
     _foreground = foreground;
     _posterCache?.setActive(foreground && !_clearingCaches);
     if (!foreground) {
+      _librarySourceRefreshCancel?.cancel();
       _directoryEnrichmentCancel.cancel();
       _directoryEnrichmentCancel = CancelToken();
       _pauseAutomaticMetadataTasks();
@@ -538,6 +593,7 @@ class AppModel extends ChangeNotifier {
   LibrarySnapshotReader? _librarySnapshotReader;
   LibrarySnapshot? _librarySnapshot;
   (int, int, int)? _librarySnapshotRevision;
+  LibrarySearchRevision? _librarySnapshotSearchRevision;
   Future<void>? _librarySnapshotWork;
   ContinueWatchingPresentationReader? _continueWatchingReader;
   Object? _continueWatchingRevision;
@@ -590,24 +646,42 @@ class AppModel extends ChangeNotifier {
     store.locationRevision,
   );
 
+  /// Local display overrides affect active searches, never the structural
+  /// media snapshot or an unfiltered library refresh.
+  LibrarySearchRevision get librarySearchRevision {
+    _refreshSettingsSnapshot();
+    return (
+      store.localPrefixRevision('episodeTitle:'),
+      store.localPrefixRevision('media-title-display:'),
+      MediaTitleTranslations.profileInputs(_settingsSnapshot),
+    );
+  }
+
   /// Prepare all library reads, history sorting and search grouping away from
   /// the UI isolate. Keep a single worker request even if multiple tabs ask.
   Future<LibrarySnapshot> loadLibrarySnapshot({
     String query = '',
     CancelToken? cancel,
   }) async {
-    final search = query.toLowerCase();
+    final search = query.trim().toLowerCase();
     while (true) {
       cancel?.check();
       if (_disposed) throw const Cancelled();
       final revision = _libraryReadRevision;
+      final searchRevision = search.isEmpty ? null : librarySearchRevision;
+      final sort = librarySorting;
       final cached = _librarySnapshot;
-      if (_librarySnapshotRevision == revision && cached?.query == search) {
+      if (_librarySnapshotRevision == revision &&
+          _librarySnapshotSearchRevision == searchRevision &&
+          cached?.query == search &&
+          cached?.sort == sort) {
         return cached!;
       }
       final work = _librarySnapshotWork ??= _prepareLibrarySnapshot(
         search,
         revision,
+        sort,
+        searchRevision,
       ).whenComplete(() => _librarySnapshotWork = null);
       await Future.any<void>([
         work,
@@ -620,18 +694,31 @@ class AppModel extends ChangeNotifier {
   Future<void> _prepareLibrarySnapshot(
     String query,
     (int, int, int) revision,
+    LibrarySort sort,
+    LibrarySearchRevision? searchRevision,
   ) async {
     final reader = _librarySnapshotReader ??= LibrarySnapshotReader(store);
-    final snapshot = await reader.read(query: query, revision: revision);
-    if (_disposed || revision != _libraryReadRevision) return;
+    final snapshot = await reader.read(
+      query: query,
+      revision: revision,
+      sort: sort,
+      searchRevision: searchRevision,
+    );
+    if (_disposed ||
+        revision != _libraryReadRevision ||
+        (query.isNotEmpty && searchRevision != librarySearchRevision) ||
+        sort != librarySorting) {
+      return;
+    }
     _librarySnapshot = snapshot;
     _librarySnapshotRevision = revision;
+    _librarySnapshotSearchRevision = searchRevision;
     // Business readers can reuse the worker's immutable media snapshot too.
     _mediaSnapshot = snapshot.media;
     _mediaSnapshotRevision = revision.$1;
   }
 
-  Map<String, dynamic> get settings {
+  void _refreshSettingsSnapshot() {
     final revision = store.localKeyRevision('settings');
     if (_settingsRevision != revision) {
       _settingsSnapshot = Map<String, dynamic>.from(
@@ -639,6 +726,10 @@ class AppModel extends ChangeNotifier {
       );
       _settingsRevision = revision;
     }
+  }
+
+  Map<String, dynamic> get settings {
+    _refreshSettingsSnapshot();
     // Callers edit a detached draft before saving, including nested shortcuts.
     return _copyJson(_settingsSnapshot) as Map<String, dynamic>;
   }
@@ -1246,13 +1337,9 @@ class AppModel extends ChangeNotifier {
           .toList()
         ..sort(compareMediaEpisodes);
 
-  final _seriesRefreshFailures = <String, int>{};
-
-  Duration seriesRefreshDelay(SyncRecord record) =>
-      Duration(seconds: 30 * (1 << (_seriesRefreshFailures[record.id] ?? 0)));
-
   /// Older libraries only stored played files. Complete their source directory
-  /// before showing details so the two entry points expose the same episodes.
+  /// when opening or explicitly refreshing details so both entry points expose
+  /// the same episodes without polling unchanged source directories.
   Future<List<SyncRecord>> loadSeriesEpisodes(
     SyncRecord record, {
     CancelToken? cancel,
@@ -1264,7 +1351,6 @@ class AppModel extends ChangeNotifier {
     if (current == null) return const [];
     final existing = snapshot.seriesFor(current);
     final directories = <String>{};
-    var attempted = 0, refreshed = 0;
     for (final item in existing) {
       cancel?.check();
       final location = snapshot.locations[item.id];
@@ -1272,7 +1358,6 @@ class AppModel extends ChangeNotifier {
       final sourceId = '${location['source']}';
       final path = p.posix.dirname('${location['path']}'.replaceAll('\\', '/'));
       if (!directories.add('$sourceId:$path')) continue;
-      attempted++;
       SourceAdapter? connection;
       try {
         // An already recognized folder is usable even while its source is
@@ -1316,20 +1401,19 @@ class AppModel extends ChangeNotifier {
         // File discovery is published by the worker before optional network
         // metadata. Imported siblings also need recognition and episode names;
         // they never pass through addMedia's playback-triggered task queue.
-        if (collection == null ||
-            await _enrichSeriesDirectory(
-              sourceId,
-              collection,
-              anchorId: item.id,
-              cancel: cancel ?? _metadataCancel,
-            )) {
-          refreshed++;
+        if (collection != null) {
+          await _enrichSeriesDirectory(
+            sourceId,
+            collection,
+            anchorId: item.id,
+            cancel: cancel ?? _metadataCancel,
+          );
         }
       } on Cancelled {
         rethrow;
       } catch (error) {
-        // Retain offline content, but preserve diagnostics and back off the
-        // visible detail's automatic retries instead of hiding listing errors.
+        // Keep offline content usable and retry on the next entry or explicit
+        // refresh instead of repeatedly waking an unchanged details page.
         AppLog.instance.warning('系列目录刷新', safeFailure(error).message);
       } finally {
         try {
@@ -1340,20 +1424,11 @@ class AppModel extends ChangeNotifier {
       }
     }
     cancel?.check();
-    if (!_disposed && attempted > 0) {
-      final failures = _seriesRefreshFailures.remove(record.id) ?? 0;
-      if (_seriesRefreshFailures.length >= 32) {
-        _seriesRefreshFailures.remove(_seriesRefreshFailures.keys.first);
-      }
-      _seriesRefreshFailures[record.id] = refreshed == attempted
-          ? 0
-          : (failures + 1).clamp(0, 3);
-    }
     final updated = await loadLibrarySnapshot(cancel: cancel);
     return updated.seriesFor(updated.byId[record.id] ?? record);
   }
 
-  Future<bool> _enrichSeriesDirectory(
+  Future<void> _enrichSeriesDirectory(
     String sourceId,
     DirectoryCollection collection, {
     required String anchorId,
@@ -1361,9 +1436,9 @@ class AppModel extends ChangeNotifier {
   }) async {
     cancel.check();
     _metadataCancel.check();
-    if (preferences.metadataStrategy == 'off') return true;
+    if (preferences.metadataStrategy == 'off') return;
     if (_disposed || !_foreground || activePlaybackMediaId != null) {
-      return false;
+      return;
     }
     Map<String, dynamic>? sourceConfiguration() {
       if (sourceId == 'local') return null;
@@ -1409,11 +1484,10 @@ class AppModel extends ChangeNotifier {
             cancel: cancel,
           );
       checkCurrent();
-      if (subject == null) return false;
+      if (subject == null) return;
       if (_disposed || !_foreground || activePlaybackMediaId != null) {
-        return false;
+        return;
       }
-      var complete = true;
       var names = collection.episodeTitles;
       try {
         names = await catalog.collectionEpisodeNames(
@@ -1426,24 +1500,18 @@ class AppModel extends ChangeNotifier {
             season: collection.season,
           ),
         );
-        complete = await catalog.collectionEpisodeNamesCovered(
-          collection,
-          names,
-          cancel: cancel,
-        );
       } on Cancelled {
         rethrow;
       } catch (error) {
         // A temporary episode endpoint failure must not throw away a successful
-        // series match. The visible details retry using their existing backoff.
-        complete = false;
+        // series match. Opening or explicitly refreshing details retries it.
         AppLog.instance.warning('系列分集资料', safeFailure(error).message);
       }
       checkCurrent();
       if (_disposed || !_foreground || activePlaybackMediaId != null) {
-        return false;
+        return;
       }
-      if (preferences.metadataStrategy == 'off') return true;
+      if (preferences.metadataStrategy == 'off') return;
       await synchronizeCollectionInBackground(
         sourceId,
         collection.withMetadata(subject, names),
@@ -1451,7 +1519,6 @@ class AppModel extends ChangeNotifier {
         anchorId: anchorId,
         cancel: cancel,
       );
-      return complete;
     } finally {
       for (final subscription in subscriptions) {
         unawaited(subscription.cancel());
@@ -2623,6 +2690,7 @@ class AppModel extends ChangeNotifier {
 
     unawaited(() async {
       var failures = 0;
+      var earlyEmptyReplies = 0;
       while (!_disposed && !cancel.cancelled) {
         final started = _syncClock();
         try {
@@ -2632,6 +2700,15 @@ class AppModel extends ChangeNotifier {
             cancel: cancel,
           );
           if (cancel.cancelled || _disposed) return;
+          final pollElapsed = _syncClock().difference(started);
+          // A proxy can end a long poll after a few seconds, not just return
+          // immediately. Repeated empty short replies must become a bounded
+          // fallback; healthy long polls and actual changes restore realtime.
+          final earlyEmpty =
+              !changed && pollElapsed < const Duration(seconds: 20);
+          earlyEmptyReplies = earlyEmpty
+              ? (earlyEmptyReplies + 1).clamp(0, 5)
+              : 0;
           failures = 0;
           if (!realtimeConnected) {
             realtimeConnected = true;
@@ -2642,10 +2719,13 @@ class AppModel extends ChangeNotifier {
           final retry = _nextSyncAttempt?.difference(_syncClock());
           if (retry != null && retry > Duration.zero) {
             await pause(retry);
+          } else if (earlyEmpty) {
+            final interval = Duration(
+              seconds: (20 * (1 << (earlyEmptyReplies - 1))).clamp(20, 300),
+            );
+            await pause(interval - pollElapsed);
           } else if (_syncClock().difference(started).inMilliseconds < 1000) {
-            // Older servers/proxies can return immediately. Empty responses
-            // must not turn a long poll into a one-request-per-second loop.
-            await pause(Duration(seconds: changed ? 1 : 20));
+            await pause(const Duration(seconds: 1));
           }
         } on Cancelled {
           return;
@@ -2867,6 +2947,7 @@ class AppModel extends ChangeNotifier {
   void dispose() {
     if (backgroundWork && _metadataTasksRestored) _persistMetadataTasks();
     _disposed = true;
+    _librarySourceRefreshCancel?.cancel();
     for (final task in _metadataTasks) {
       task._progressTimer?.cancel();
       task._cancel.cancel();
