@@ -1,0 +1,22 @@
+# Container Station → Applications → Create: paste this file and set SYNC_TOKEN.
+# The image must first be published by the Build server workflow.
+services:
+  sync:
+    image: ghcr.io/quan666/aiplayer-sync:latest
+    ports:
+      - "48080:8080"
+    environment:
+      SYNC_TOKEN: "" # Required: paste your own random token (at least 24 characters).
+      SYNC_ADDR: ":8080"
+      SYNC_DB: /data/aiplayer.db
+    volumes:
+      - sync-data:/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sync-data:

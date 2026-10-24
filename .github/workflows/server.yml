@@ -1,0 +1,162 @@
+name: Build server
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths:
+      - 'server/**'
+      - 'scripts/sync_smoke.py'
+      - '.github/workflows/server.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+      - 'scripts/sync_smoke.py'
+      - '.github/workflows/server.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # Keep the downloads focused on the actual server packages.
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
+
+jobs:
+  build:
+    name: Test and package Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Test Go and SQLite on the target architecture
+        uses: docker/build-push-action@v7
+        with:
+          context: server
+          target: test
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=server-test-${{ matrix.arch }}
+          cache-to: type=gha,scope=server-test-${{ matrix.arch }},mode=max
+      - name: Build the runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: server
+          target: runtime
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: aiplayer-sync:ci
+          cache-from: type=gha,scope=server-image-${{ matrix.arch }}
+          cache-to: type=gha,scope=server-image-${{ matrix.arch }},mode=max
+      - name: Check authentication, SQLite writes and persistent data
+        run: python3 scripts/sync_smoke.py --image aiplayer-sync:ci --platform linux/${{ matrix.arch }}
+      - name: Export the standalone binary
+        uses: docker/build-push-action@v7
+        with:
+          context: server
+          target: binary
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=server-dist
+      - name: Package the binary and checksum
+        env:
+          SERVER_ARCH: ${{ matrix.arch }}
+        run: |
+          binary="aiplayer-sync-linux-$SERVER_ARCH"
+          mv server-dist/aiplayer-sync "server-dist/$binary"
+          # Fail if an interpreter or shared library dependency slipped in.
+          program_headers="$(readelf -l "server-dist/$binary")"
+          dynamic_entries="$(readelf -d "server-dist/$binary")"
+          if grep -q INTERP <<< "$program_headers"; then
+            echo 'The server binary must be statically linked.' >&2
+            exit 1
+          fi
+          if grep -q NEEDED <<< "$dynamic_entries"; then
+            echo 'The server binary must not depend on shared libraries.' >&2
+            exit 1
+          fi
+          cp server/README.md server-dist/README.md
+          cd server-dist
+          sha256sum "$binary" > SHA256SUMS
+          tar -czf "$binary.tar.gz" "$binary" SHA256SUMS README.md
+      - name: Upload the standalone server package
+        uses: actions/upload-artifact@v7
+        with:
+          path: server-dist/aiplayer-sync-linux-${{ matrix.arch }}.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish multi-platform server image
+    needs: build
+    # PRs and manually selected feature branches only build and test.
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Set the registry image name
+        id: image
+        run: printf 'name=ghcr.io/%s-sync\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Set image tags and source labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=sha,format=long
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          labels: |
+            org.opencontainers.image.title=AIPlayer Sync
+            org.opencontainers.image.description=Optional AIPlayer metadata synchronization server
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tested architectures
+        uses: docker/build-push-action@v7
+        with:
+          context: server
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=server-image-amd64
+            type=gha,scope=server-image-arm64
+      - name: Show published image tags
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          printf 'Published server images:\n\n```text\n%s\n```\n' "$IMAGE_TAGS" >> "$GITHUB_STEP_SUMMARY"

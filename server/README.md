@@ -2,7 +2,49 @@
 
 单用户 Go + SQLite。同步影视库资料、弹幕匹配、已看和播放记录，以及客户端加密后的设置、API Key、远程来源及其凭证、媒体位置关联、收藏、海报与视频封面截图。客户端还可通过加密记录同步已有的单集标题、资料与字幕翻译缓存、目录资料、视频时长及有效技术参数。服务不接收视频文件，不访问客户端来源。
 
-## 启动
+## 威联通 Container Station
+
+使用 [compose.qnap.yaml](compose.qnap.yaml)，无需在 NAS 安装 Go、下载源码或编译。镜像支持 Intel / AMD 的 `linux/amd64` 和 64 位 ARM 的 `linux/arm64`，Docker 自动选择对应架构；旧款 32 位 ARM NAS 暂不提供镜像。
+
+1. 先完成下方「CI 打包」的首次发布，确认镜像可以拉取。本次新增工作流需要推送并成功运行后才会有镜像。
+2. 生成并保存一个随机 Token，例如在本机或 NAS SSH 执行 `openssl rand -hex 32`。已有服务升级时继续使用原 Token。
+3. 打开 **Container Station → 应用程序 → 创建**，应用名称填写 `aiplayer-sync`，粘贴 `compose.qnap.yaml` 的全部内容，将 `SYNC_TOKEN: ""` 的空值替换为该 Token。模板不依赖 `.env`，未填写 Token 时服务不会启动。
+4. 点击验证 YAML，再创建。浏览器访问 `http://NAS局域网IP:18080/healthz`，应返回 `{"ok":true}`。
+5. 在各设备客户端填写 `http://NAS局域网IP:18080` 和同一 Token；地址不带 `/healthz` 或 `/v1`。服务没有管理网页，访问根路径不会显示后台。
+
+操作入口参考 [QNAP Container Station 3 官方教程](https://www.qnap.com/en/how-to/tutorial/article/how-to-use-container-station-3)。示例使用 `18080:8080` 避开 NAS 常用管理端口；如果 18080 已占用，只改冒号左侧端口。该配置允许局域网设备访问；公网接入使用 HTTPS 反向代理，不直接转发 HTTP 端口。
+
+数据库保存在 `sync-data` 命名卷的 `/data/aiplayer.db` 中，实际卷名带有应用名称前缀。容器以 UID/GID `10001:10001` 运行，新命名卷会继承镜像内 `/data` 的权限。保留应用名称、卷及 Token，重建容器不会清空数据。不要执行 `docker compose down -v`，也不要在 Container Station 删除应用时勾选删除数据卷。
+
+如果希望数据库直接放在共享文件夹中，可把 `sync-data:/data` 改为 `/share/Container/aiplayer-sync:/data`（使用自己 NAS 的真实路径）。先创建这个专用目录，授予 UID/GID `10001:10001` 读写权限，例如管理员通过 SSH 执行 `mkdir -p /share/Container/aiplayer-sync` 和 `chown 10001:10001 /share/Container/aiplayer-sync`；已有文件也需该用户可写，QNAP 共享文件夹 ACL 需允许访问。挂载整个目录，不只挂载 `.db` 文件。由已有命名卷改为目录映射前，停止服务并迁移完整数据库目录，否则看到的是新空库。
+
+升级时先备份数据库，在 Container Station「镜像」中为该镜像执行 **Pull / 拉取**，再到原应用的编辑下拉菜单选择 **Recreate / 重新创建 → Update / 更新**，使用原 YAML、Token 和数据卷。仅重启容器不会更新镜像。也可在保存了同一 YAML 的原 Compose 项目目录执行：
+
+```bash
+docker compose -f compose.qnap.yaml pull
+docker compose -f compose.qnap.yaml up -d
+```
+
+不要换一个项目目录或应用名创建升级实例，否则默认会生成另一份卷。若从旧 `compose.yaml` 升级，继续使用原项目和卷；不要直接创建新应用替代旧应用。
+
+## CI 打包
+
+仓库的 **Actions → Build server → Run workflow** 可独立构建服务，不需要客户端构建或 Android 签名密钥。手动入口需要工作流已在默认分支。服务、部署检查脚本或工作流变更时自动构建，`v*` 标签也触发构建。
+
+- 在原生 amd64 / arm64 Linux 运行器执行 Go race 测试、构建镜像，并验证认证、SQLite 写入、冲突、重启和数据卷重建后的持久化。
+- 在运行页面的 **Artifacts** 下载 `aiplayer-sync-linux-amd64.tar.gz` 或 `aiplayer-sync-linux-arm64.tar.gz`，包内含二进制、`SHA256SUMS` 和说明文件，保留 30 天。二进制保留 SQLite 所需的 CGO，无需 NAS 安装 Go 或 SQLite。
+- 默认分支的推送或手动运行成功后发布 `ghcr.io/quan666/aiplayer-sync:latest`。版本标签发布对应版本镜像；其他分支和 PR 只构建、测试，不发布。镜像路径使用仓库名的小写形式加 `-sync`，Fork 仓库需修改 YAML 的镜像地址。
+- 发布使用内置 `GITHUB_TOKEN` 的 `packages: write` 权限，无需额外 Docker Hub 密钥。仓库或组织策略需允许 GitHub Actions 发布 Packages。
+
+**首次发布后**，到 GitHub 个人或组织的 **Packages → aiplayer-sync → Package settings → Change visibility → Public**，之后 NAS 可直接拉取。GHCR 首次创建包默认私有，即使源码仓库公开也需要检查；见 [GitHub Container registry 说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。若保持私有，在 Container Station 添加 `ghcr.io` 仓库凭据，使用 GitHub 用户名及具有 `read:packages` 权限的 classic PAT，SSH 部署也可通过 `docker login ghcr.io` 登录。这个 PAT 与客户端同步 Token 是两回事。
+
+`latest` 随默认分支更新；需要固定版本时改用成功发布的版本标签或镜像 digest。CI 的二进制包保留在 Actions Artifacts，不与客户端 GitHub Release 工作流合并。
+
+常见问题：`denied` / `unauthorized` 先检查镜像可见性或仓库登录；`manifest unknown` 检查是否已完成首次发布及标签是否存在；`no matching manifest` 检查 NAS 是否为支持的 64 位架构；`unable to open database file` 检查 `/data` 映射和目录写权限。部署成功但客户端无法连接时，检查宿主端口、NAS 防火墙和客户端所填 IP。
+
+## 从源码启动
+
+在 `server/` 目录执行：
 
 ```bash
 export SYNC_TOKEN="$(openssl rand -hex 32)"
@@ -10,16 +52,17 @@ docker compose up -d --build
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-数据库位于 `sync-data` 卷。容器以 UID 10001 运行；宿主映射默认仅回环地址。跨设备使用自己的 HTTPS 反向代理；客户端填服务根地址和同一 Token。
+原有 `compose.yaml` 保留源码构建方式，默认仅暴露 `127.0.0.1:8080`，跨设备通过自己的 HTTPS 反向代理接入。首次生成 Token 后安全保存，后续启动加载同一个值。NAS 直接部署用上方独立的 `compose.qnap.yaml`。
 
-发布包中的 `aiplayer-sync-linux-amd64` 是 Linux x86-64 静态二进制，无需安装 Go 或 SQLite。设置好上述 `SYNC_TOKEN` 后可直接运行：
+从 CI 下载并解压对应架构的静态二进制包后，也可直接运行。例如 x86-64：
 
 ```bash
+export SYNC_TOKEN='替换为已生成并保存的同一个Token'
 chmod +x aiplayer-sync-linux-amd64
 SYNC_ADDR=127.0.0.1:8080 SYNC_DB=./aiplayer.db ./aiplayer-sync-linux-amd64
 ```
 
-升级现有实例时先停止旧进程，替换二进制，再用原来的 Token、数据库路径和监听配置启动；Docker 实例则重新构建并保留 `sync-data` 卷。单纯升级程序无需更换 Token。
+ARM64 使用 `aiplayer-sync-linux-arm64`。升级现有实例时先停止旧进程，替换二进制，再用原来的 Token、数据库路径和监听配置启动；源码 Docker 实例重新构建，镜像部署拉取后重建容器，均保留原数据卷。单纯升级程序无需更换 Token。
 
 本机开发：
 
