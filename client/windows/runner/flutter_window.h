@@ -11,6 +11,7 @@
 #include <string>
 
 #include "win32_window.h"
+#include "system_proxy.h"
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -31,6 +32,7 @@ class FlutterWindow : public Win32Window {
   flutter::DartProject project_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> window_channel_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> desktop_channel_;
+  std::unique_ptr<SystemProxyHandler> system_proxy_;
   bool desktop_ready_ = false;
   bool close_requested_ = false;
   bool video_fullscreen_ = false;

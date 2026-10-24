@@ -723,7 +723,7 @@ class LibraryCatalog {
     tmdb = TmdbCatalog(this.transport, this.tmdbCredential, store: store);
   }
   static const headers = {
-    'User-Agent': 'AIPlayer/0.5.15 (personal anime library)',
+    'User-Agent': 'AIPlayer/0.5.16 (personal anime library)',
   };
 
   Future<Map<String, dynamic>> _bangumiRequest(

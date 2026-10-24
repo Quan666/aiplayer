@@ -66,10 +66,13 @@ abstract interface class SubtitleAiTransport {
 
 class IoSubtitleAiTransport implements SubtitleAiTransport {
   final Duration inactivity;
+  // SSE keepalives reset the socket inactivity timer without completing work.
+  final Duration requestTimeout;
   final HttpClient Function() createClient;
   final SystemProxyLookup? proxyResolver;
   IoSubtitleAiTransport({
     this.inactivity = const Duration(seconds: 120),
+    this.requestTimeout = const Duration(minutes: 3),
     HttpClient Function()? createClient,
     SystemProxyLookup? proxyResolver,
   }) : createClient = createClient ?? HttpClient.new,
@@ -189,6 +192,10 @@ class IoSubtitleAiTransport implements SubtitleAiTransport {
         await for (final line in stream.transform(const LineSplitter())) {
           if (line.isEmpty) {
             consume();
+            // A completed SSE response need not close its HTTP connection.
+            // Stop at the protocol terminator instead of waiting for EOF (or
+            // indefinitely accepting a gateway's keepalive comments).
+            if (finished) break;
           } else if (line.startsWith('data:')) {
             data.add(line.substring(5).trimLeft());
           }
@@ -226,15 +233,15 @@ class IoSubtitleAiTransport implements SubtitleAiTransport {
           if (!done) client.close(force: true);
           throw const Cancelled();
         }),
-      ]);
+      ]).timeout(requestTimeout);
     } on AppFailure {
       rethrow;
     } on TimeoutException {
       cancel.check();
       if (resolvingProxy) {
-        throw const AppFailure('读取系统代理超时，请检查 Android 代理设置。');
+        throw const AppFailure('读取系统代理超时，请检查系统代理设置。');
       }
-      throw const AppFailure('AI 服务长时间未返回数据，已停止等待。已完成的批次已缓存。');
+      throw const AppFailure('AI 服务长时间未完成响应，已停止等待。已完成的批次已缓存。');
     } on FormatException {
       throw const AppFailure('AI 服务返回无效 JSON 或 UTF-8，请检查是否为兼容的聊天 API。');
     } catch (_) {

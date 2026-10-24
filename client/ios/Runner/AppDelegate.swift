@@ -9,6 +9,7 @@ import AVKit
   private var deviceInfoChannel: FlutterMethodChannel?
   private var displayChannel: FlutterMethodChannel?
   private var discoveryChannel: FlutterMethodChannel?
+  private var systemProxy: SystemProxyHandler?
   private let discovery = LocalServiceDiscovery()
   private let pictureInPicture = PlayerPictureInPicture()
   private var originalBrightness: CGFloat?
@@ -42,6 +43,8 @@ import AVKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    systemProxy?.close()
+    systemProxy = SystemProxyHandler(messenger: engineBridge.applicationRegistrar.messenger())
     ExternalVideoInbox.shared.bind(engineBridge.applicationRegistrar.messenger())
     pictureInPicture.bind(engineBridge.applicationRegistrar.messenger())
     let deviceInfo = FlutterMethodChannel(
@@ -138,6 +141,7 @@ import AVKit
   }
 
   deinit {
+    systemProxy?.close()
     for observer in displayObservers {
       NotificationCenter.default.removeObserver(observer)
     }

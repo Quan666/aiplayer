@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
 
@@ -9,18 +10,38 @@ import 'network.dart';
 typedef SystemProxyLookup =
     Future<String?> Function(Uri uri, {CancelToken? cancel});
 
-/// Call once at an Android worker entry point using the token captured on the
-/// root isolate before spawning it. No channel work is needed on other hosts.
-void initializeSystemProxyWorker(RootIsolateToken? token) {
-  if (Platform.isAndroid && token != null) {
-    BackgroundIsolateBinaryMessenger.ensureInitialized(token);
+/// Captured before spawning a worker so every network isolate uses the same
+/// platform policy and can reach the native resolver through its messenger.
+class SystemProxyWorkerConfiguration {
+  final RootIsolateToken? token;
+  final String operatingSystem;
+
+  SystemProxyWorkerConfiguration.capture()
+    : token = ServicesBinding.rootIsolateToken,
+      operatingSystem = _systemProxyResolver.operatingSystem;
+}
+
+void initializeSystemProxyWorker(SystemProxyWorkerConfiguration configuration) {
+  _systemProxyResolver = SystemProxyResolver(
+    operatingSystem: configuration.operatingSystem,
+  );
+  if (_systemProxyResolver.supported && configuration.token != null) {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(configuration.token!);
   }
 }
 
-final _systemProxyResolver = SystemProxyResolver();
+var _systemProxyResolver = SystemProxyResolver();
 
-/// Returns null outside Android so callers retain their existing environment or
-/// custom proxy policy. Android resolves each URL using the current selector.
+/// Unit tests have no native runner. Keep that choice explicit and propagate it
+/// to workers; a missing plugin in a real app must never silently bypass proxy.
+@visibleForTesting
+void overrideSystemProxyPlatformForTesting(String operatingSystem) {
+  _systemProxyResolver.dispose();
+  _systemProxyResolver = SystemProxyResolver(operatingSystem: operatingSystem);
+}
+
+/// Resolves each URL using current OS settings. Linux can return null when no
+/// system resolver is installed, retaining HttpClient's environment policy.
 Future<String?> resolveSystemProxy(
   Uri uri, {
   CancelToken? cancel,
@@ -30,15 +51,23 @@ Future<String?> resolveSystemProxy(
 class SystemProxyResolver {
   static const channel = MethodChannel('app.aiplayer/system_proxy');
   final MethodChannel _channel;
-  final bool _android;
+  final String operatingSystem;
   final String _client = const Uuid().v4();
   final Map<String, Completer<void>> _pending = {};
   int _serial = 0;
   bool _disposed = false;
 
-  SystemProxyResolver({MethodChannel? methodChannel, bool? isAndroid})
+  SystemProxyResolver({MethodChannel? methodChannel, String? operatingSystem})
     : _channel = methodChannel ?? channel,
-      _android = isAndroid ?? Platform.isAndroid;
+      operatingSystem = operatingSystem ?? Platform.operatingSystem;
+
+  bool get supported => const {
+    'android',
+    'ios',
+    'macos',
+    'windows',
+    'linux',
+  }.contains(operatingSystem);
 
   Future<String?> resolve(
     Uri uri, {
@@ -47,7 +76,7 @@ class SystemProxyResolver {
   }) async {
     cancel?.check();
     if (_disposed) throw const Cancelled();
-    if (!_android || (uri.scheme != 'http' && uri.scheme != 'https')) {
+    if (!supported || (uri.scheme != 'http' && uri.scheme != 'https')) {
       return null;
     }
     if (_pending.length >= 32) {
@@ -59,7 +88,7 @@ class SystemProxyResolver {
     var nativeFinished = false;
     try {
       // PAC can depend on path/query, but never needs credentials or fragments.
-      // These values are sent only to Android's selector and are never logged.
+      // These values are sent only to the OS selector and are never logged.
       final target = uri.replace(userInfo: '').removeFragment().toString();
       final request = _channel
           .invokeMethod<String>('resolve', {'id': id, 'url': target})
@@ -72,12 +101,17 @@ class SystemProxyResolver {
       ]);
       cancel?.check();
       if (_disposed) throw const Cancelled();
+      if (value == null && operatingSystem == 'linux') {
+        // Explicit environment result also clears a previous native route on
+        // pooled clients if the desktop resolver disappears or is disabled.
+        return HttpClient.findProxyFromEnvironment(uri);
+      }
       if (value == null || !_validProxyConfiguration(value)) {
-        throw const AppFailure('系统代理配置无效，请检查 Android 网络设置。');
+        throw const AppFailure('系统代理配置无效，请检查系统网络设置。');
       }
       return value;
     } on MissingPluginException {
-      throw const AppFailure('无法读取 Android 系统代理，请重新启动应用。');
+      throw const AppFailure('无法读取系统代理，请重新启动应用。');
     } on PlatformException catch (error) {
       cancel?.check();
       if (_disposed ||
@@ -85,10 +119,13 @@ class SystemProxyResolver {
           error.code == 'proxy_disposed') {
         throw const Cancelled();
       }
+      if (error.code == 'proxy_timeout') {
+        throw TimeoutException('读取系统代理超时。', timeout);
+      }
       throw AppFailure(switch (error.code) {
         'proxy_unsupported' => '系统代理类型暂不支持，请使用 HTTP 代理。',
         'proxy_busy' => '系统代理查询繁忙，请稍后重试。',
-        _ => '无法解析 Android 系统代理，请检查网络设置。',
+        _ => '无法解析系统代理，请检查网络设置。',
       });
     } finally {
       _pending.remove(id);

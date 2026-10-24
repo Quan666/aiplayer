@@ -1755,21 +1755,32 @@ class _ContinueWatchingCarouselState extends State<_ContinueWatchingCarousel> {
                   child: InkWell(
                     onTap: widget.onOpenHistory,
                     borderRadius: LibraryStyles.compactRadius,
+                    hoverColor: Colors.transparent,
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 8,
-                      ),
+                      padding: const EdgeInsets.symmetric(vertical: 8),
                       child: Row(
                         children: [
                           Text(
                             '继续观看',
-                            style: LibraryStyles.of(context).sectionTitle,
+                            style: LibraryStyles.of(context).sectionTitle
+                                .copyWith(
+                                  height: 1,
+                                  leadingDistribution:
+                                      TextLeadingDistribution.even,
+                                ),
                           ),
                           const SizedBox(width: 4),
-                          const Icon(
-                            Icons.chevron_right_rounded,
-                            size: LibraryStyles.iconHeading,
+                          Padding(
+                            // Center on the title's visible glyphs, which sit
+                            // slightly below the font's line-box center.
+                            padding: EdgeInsets.only(
+                              top: MediaQuery.textScalerOf(context).scale(2),
+                            ),
+                            child: const Icon(
+                              Icons.chevron_right_rounded,
+                              size: LibraryStyles.iconHeading,
+                              applyTextScaling: true,
+                            ),
                           ),
                         ],
                       ),

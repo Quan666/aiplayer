@@ -124,6 +124,7 @@ extension MediaAiIdentification on AppModel {
     final groups = await groupAiCatalogIdentities(parsed.values.toList());
     cancel.check();
     checkReady?.call();
+    onProgress?.call('正在搜索并核对作品 0/${groups.length}…');
     final results = <String, AiMetadataMatch>{};
     var complete = 0;
     var next = 0;

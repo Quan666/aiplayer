@@ -8,6 +8,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var originalLevel: NSWindow.Level = .normal
   private var fileChannel: FlutterMethodChannel?
   private var discoveryChannel: FlutterMethodChannel?
+  private var systemProxy: SystemProxyHandler?
   private let discovery = LocalServiceDiscovery()
   private var accessed: [URL] = []
   private var desktopPlayerChannel: FlutterMethodChannel?
@@ -44,6 +45,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     self.title = "映库"
 
     RegisterGeneratedPlugins(registry: flutterViewController)
+    systemProxy?.close()
+    systemProxy = SystemProxyHandler(messenger: flutterViewController.engine.binaryMessenger)
     ExternalVideoInbox.shared.bind(flutterViewController.engine.binaryMessenger)
     delegate = self
     desktopPlayerChannel = FlutterMethodChannel(name: "app.aiplayer/desktop_player",
@@ -131,6 +134,13 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     restoreFlutterInput()
     initialFirstResponder = firstResponder as? NSView
   }
+
+  func windowWillClose(_ notification: Notification) {
+    systemProxy?.close()
+    systemProxy = nil
+  }
+
+  deinit { systemProxy?.close() }
 
   fileprivate func handleFileCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     var bookmarks = UserDefaults.standard.dictionary(forKey: "aiplayerBookmarks") as? [String: Data] ?? [:]

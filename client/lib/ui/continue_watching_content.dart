@@ -64,6 +64,16 @@ class _ContinueWatchingContentState extends State<ContinueWatchingContent>
       if (data is SliverMultiBoxAdaptorParentData && data.keptAlive) {
         return false;
       }
+      // Predictive back reparents this retained subtree beneath new route
+      // transforms. Our own box can still have a size before those ancestors
+      // are laid out, so localToGlobal is not safe until the whole path is ready.
+      if (!ancestor.attached ||
+          (ancestor is RenderBox && !ancestor.hasSize) ||
+          (ancestor is RenderSliver && ancestor.geometry == null) ||
+          (data is SliverLogicalParentData && data.layoutOffset == null)) {
+        _checkAfterLayout();
+        return false;
+      }
       ancestor = ancestor.parent;
     }
     var visible = box.localToGlobal(Offset.zero) & box.size;

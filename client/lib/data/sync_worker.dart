@@ -87,7 +87,7 @@ class _SyncWorkerSession {
     unawaited(
       Isolate.spawn(
             _syncWorkerMain,
-            [_messages.sendPort, ServicesBinding.rootIsolateToken],
+            [_messages.sendPort, SystemProxyWorkerConfiguration.capture()],
             onError: _errors.sendPort,
             onExit: _exit.sendPort,
           )
@@ -188,7 +188,7 @@ Future<void> _serveCredentialRequest(
 
 void _syncWorkerMain(List<Object?> startup) {
   final reply = startup[0] as SendPort;
-  initializeSystemProxyWorker(startup[1] as RootIsolateToken?);
+  initializeSystemProxyWorker(startup[1] as SystemProxyWorkerConfiguration);
   final commands = ReceivePort();
   final state = _SyncWorkerState(reply);
   CancelToken? activeCancel;
@@ -202,6 +202,9 @@ void _syncWorkerMain(List<Object?> startup) {
     await active;
     await state.close();
     commands.close();
+    // The native messenger's ReceivePort outlives the command port. Exit only
+    // after the active result/cancellation reply and resource cleanup finish.
+    Isolate.exit();
   }
 
   commands.listen((dynamic message) {

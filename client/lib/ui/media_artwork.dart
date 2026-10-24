@@ -242,6 +242,21 @@ class _MediaArtworkState extends State<MediaArtwork> {
     }
     final box = context.findRenderObject();
     if (box is! RenderBox || !box.attached || !box.hasSize) return -1;
+    RenderObject? ancestor = box;
+    while (ancestor != null) {
+      final data = ancestor.parentData;
+      // A retained cover can already have a size while predictive back has
+      // inserted an unlaid-out route transform above it. Retry via the existing
+      // layout/route callbacks; do not cache this temporary lack of geometry.
+      if (!ancestor.attached ||
+          (ancestor is RenderBox && !ancestor.hasSize) ||
+          (ancestor is RenderSliver && ancestor.geometry == null) ||
+          (data is SliverMultiBoxAdaptorParentData && data.keptAlive) ||
+          (data is SliverLogicalParentData && data.layoutOffset == null)) {
+        return -1;
+      }
+      ancestor = ancestor.parent;
+    }
     final bounds = box.localToGlobal(Offset.zero) & box.size;
     // Retained sliver children have no paint transform while offscreen.
     // NaN rectangles can pass overlaps(), so reject them before prioritizing.
@@ -251,7 +266,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
         ? Offset.zero & screen
         : bounds;
     var hasViewport = false;
-    RenderObject? ancestor = box.parent;
+    ancestor = box.parent;
     while (!viewport.isEmpty && ancestor != null) {
       if (ancestor is RenderAbstractViewport) {
         hasViewport = true;

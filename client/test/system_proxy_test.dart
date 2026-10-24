@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/core/system_proxy.dart';
@@ -16,7 +18,7 @@ void main() {
 
   setUp(() {
     calls = [];
-    resolver = SystemProxyResolver(isAndroid: true);
+    resolver = SystemProxyResolver(operatingSystem: 'android');
   });
   tearDown(() {
     resolver.dispose();
@@ -61,8 +63,68 @@ void main() {
     },
   );
 
+  for (final platform in ['android', 'macos', 'ios', 'windows', 'linux']) {
+    test(
+      '$platform resolves OS routes and fails closed without its plugin',
+      () async {
+        final host = SystemProxyResolver(operatingSystem: platform);
+        addTearDown(host.dispose);
+        binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+          call,
+        ) async {
+          calls.add(call);
+          return 'PROXY localhost:7890';
+        });
+        expect(await host.resolve(uri), 'PROXY localhost:7890');
+        expect(
+          calls.single.arguments['url'],
+          'https://api.bgm.tv/v0/subjects/611077?lang=zh',
+        );
+        binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
+        await expectLater(host.resolve(uri), throwsA(isA<AppFailure>()));
+      },
+    );
+  }
+
   test(
-    'non-Android and non-HTTP transports do not invoke the platform',
+    'only Linux may explicitly defer to current environment settings',
+    () async {
+      binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        (_) async => null,
+      );
+      for (final platform in ['android', 'macos', 'ios', 'windows', 'linux']) {
+        final host = SystemProxyResolver(operatingSystem: platform);
+        addTearDown(host.dispose);
+        if (platform == 'linux') {
+          expect(
+            await host.resolve(uri),
+            HttpClient.findProxyFromEnvironment(uri),
+          );
+        } else {
+          await expectLater(host.resolve(uri), throwsA(isA<AppFailure>()));
+        }
+      }
+    },
+  );
+
+  test(
+    'worker startup carries the selected proxy policy across isolates',
+    () async {
+      final configuration = SystemProxyWorkerConfiguration.capture();
+      final result = await Isolate.run(() async {
+        initializeSystemProxyWorker(configuration);
+        return resolveSystemProxy(Uri.parse('https://worker.example/video'));
+      });
+      // Unit tests deliberately select a host without a native runner. Native
+      // integration tests exercise the same startup with the real OS token.
+      expect(configuration.operatingSystem, 'unit-test');
+      expect(result, isNull);
+    },
+  );
+
+  test(
+    'unsupported hosts and non-HTTP transports do not invoke the platform',
     () async {
       binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
         call,
@@ -70,7 +132,7 @@ void main() {
         calls.add(call);
         return 'DIRECT';
       });
-      final desktop = SystemProxyResolver(isAndroid: false);
+      final desktop = SystemProxyResolver(operatingSystem: 'unsupported');
       expect(await desktop.resolve(uri), isNull);
       expect(await resolver.resolve(Uri.parse('file:///private.mkv')), isNull);
       expect(calls, isEmpty);
@@ -112,6 +174,20 @@ void main() {
       response.complete('PROXY late.example:8080');
       await Future<void>.delayed(Duration.zero);
       expect(calls, hasLength(2));
+    },
+  );
+
+  test(
+    'native PAC deadline remains a timeout for transport diagnostics',
+    () async {
+      binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        (_) async => throw PlatformException(code: 'proxy_timeout'),
+      );
+      await expectLater(
+        resolver.resolve(uri),
+        throwsA(isA<TimeoutException>()),
+      );
     },
   );
 
@@ -220,7 +296,7 @@ void main() {
           ),
         ),
       );
-      final second = SystemProxyResolver(isAndroid: true);
+      final second = SystemProxyResolver(operatingSystem: 'android');
       final other = second.resolve(uri);
       await Future<void>.delayed(Duration.zero);
       final ids = calls

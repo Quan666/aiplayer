@@ -36,7 +36,7 @@ Future<void> main(List<String> arguments) async {
     final documents = await getApplicationSupportDirectory();
     await documents.create(recursive: true);
     await AppLog.instance.initialize(documents);
-    AppLog.instance.info('应用', '映库 0.5.15 启动');
+    AppLog.instance.info('应用', '映库 0.5.16 启动');
     final model = AppModel(
       await AppStore.open(p.join(documents.path, 'library.db')),
       documents,

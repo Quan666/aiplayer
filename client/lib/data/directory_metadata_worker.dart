@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 
@@ -800,7 +799,11 @@ class DirectoryMetadataWorker {
     unawaited(
       Isolate.spawn(
         _directoryWorkerMain,
-        [databasePath, _messages.sendPort, ServicesBinding.rootIsolateToken],
+        [
+          databasePath,
+          _messages.sendPort,
+          SystemProxyWorkerConfiguration.capture(),
+        ],
         onError: _errors.sendPort,
         onExit: _exit.sendPort,
       ).then<void>((_) {}, onError: (Object _, StackTrace _) => stopped()),
@@ -946,7 +949,7 @@ class DirectoryMetadataWorker {
 }
 
 void _directoryWorkerMain(List<dynamic> startup) async {
-  initializeSystemProxyWorker(startup[2] as RootIsolateToken?);
+  initializeSystemProxyWorker(startup[2] as SystemProxyWorkerConfiguration);
   final store = await retryStoreBusy(
     () => AppStore.openExisting(startup[0] as String),
   );
@@ -959,6 +962,9 @@ void _directoryWorkerMain(List<dynamic> startup) async {
     if (!closing || active.isNotEmpty) return;
     store.dispose();
     commands.close();
+    // The platform messenger retains its own ReceivePort. All job replies and
+    // database cleanup are complete, so explicitly terminate this worker too.
+    Isolate.exit();
   }
 
   commands.listen((dynamic message) async {

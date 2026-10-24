@@ -78,6 +78,8 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  system_proxy_ = std::make_unique<SystemProxyHandler>(
+      flutter_controller_->engine()->messenger(), GetHandle());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
   window_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       flutter_controller_->engine()->messenger(), "app.aiplayer/window_mode",
@@ -157,6 +159,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  system_proxy_.reset();
   window_channel_.reset();
   desktop_channel_.reset();
   if (flutter_controller_) {
@@ -209,6 +212,10 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == SystemProxyHandler::kCompletedMessage) {
+    if (system_proxy_) system_proxy_->Complete();
+    return 0;
+  }
   // Keep the main engine alive until Dart saves progress and closes playback.
   if (message == WM_CLOSE && desktop_ready_) {
     if (!close_requested_) {

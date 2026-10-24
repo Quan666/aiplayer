@@ -373,6 +373,33 @@ void main() {
   );
 
   test(
+    'folder progress leaves parsing while shared catalogue work is pending',
+    () async {
+      final names = [for (var i = 1; i <= 13; i++) 'Example S01E$i.mkv'];
+      model.fakeCatalog.detailGate = Completer<void>();
+      final progress = <String>[];
+      final pending = model.searchMetadataBatchWithAi(
+        names,
+        cancel: CancelToken(),
+        wholeFolder: true,
+        onProgress: progress.add,
+      );
+      await model.fakeCatalog.detailsStarted.future;
+      expect(progress, ['正在搜索并核对作品 0/1…']);
+      expect(model.fakeCatalog.queries, ['Example']);
+      expect(model.fakeCatalog.detailsCalls, 1);
+      model.fakeCatalog.detailGate!.complete();
+      final matches = await pending;
+      expect(matches, hasLength(13));
+      expect(matches.values.map((match) => match.identity.episode).toSet(), {
+        for (var i = 1; i <= 13; i++) '$i',
+      });
+      expect(progress, ['正在搜索并核对作品 0/1…', '正在搜索并核对作品 1/1…']);
+      expect(model.ai.confirmations, hasLength(2));
+    },
+  );
+
+  test(
     'cancellation during filename analysis prevents searches and writes',
     () async {
       final record = add('one');

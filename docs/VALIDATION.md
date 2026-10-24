@@ -1,5 +1,22 @@
 # 验证记录
 
+## 2026-10-24：安卓观看历史侧滑返回白屏
+
+- 使用真实 `flutter/backgesture` 入站消息复现：进入“观看历史”，取消一次系统侧滑，再侧滑完成返回；旧版在 `ContinueWatchingContent._inViewport` 中对尚未布局的 `RenderFractionalTranslation` 调用坐标转换，随后触发 sliver 子节点顺序异常。[组件失败日志](../artifacts/history-return-20261024/predictive-back-baseline.log)与 [Linux 原生 profile 失败日志](../artifacts/history-return-20261024/predictive-native-before.log)保留；普通页面返回按钮没有触发此路径。
+- 继续观看和封面优先级检查在转换坐标前验证完整祖先链的布局、挂载及 sliver 状态；尚未就绪时等待既有布局后 / 路由事件重试，不缓存临时不可见结果，不新增轮询或持续请求帧。后台暂停仍立即取消工作，保留图片缓存、搜索和滚动位置。
+- [68 项针对性回归通过](../artifacts/history-return-20261024/regressions.log)，覆盖侧滑取消 / 提交、连续返回与滚动、快速返回、后台不 pump、图片恢复及队列限制。[修复后原生 profile](../artifacts/history-return-20261024/predictive-native-after.log)完成三轮取消 / 提交，标题位置与 2px 进度条正常，无框架错误。对照截图：[修复前白屏](../artifacts/history-return-20261024/predictive-before/predictive-returned-0.png)、[修复后第三次返回](../artifacts/history-return-20261024/predictive-after/predictive-returned-2.png)。
+- 原生验证环境为 Linux / Xvfb，显式 Android 主题并模拟系统手势消息，截图使用测试库占位封面；未连接 Android 真机，不能据此宣称真实设备手势投递、帧率或功耗已验证。本轮未制作或发布安装包。
+
+## 2026-10-24：匹配等待与各端系统代理
+
+- 修复 AI SSE 收到正常完成标记或 `[DONE]` 后仍等待 HTTP 连接关闭的问题。用原始传输实现运行“完成后保持连接”的两个用例均超时，见[原版复现](../artifacts/matching-proxy-20261024/sse-original-baseline.log)；修复版在完成标记处结束，并以单次请求 3 分钟总期限约束持续心跳。保留整批校验、缓存及用户取消语义，不保证整个文件夹任务在 3 分钟内完成。
+- 文件名解析结束即显示搜索 / 核对阶段。13 个同作品文件仍共用一次作品检索和详情，保留每集身份。[匹配与字幕回归 68 项通过](../artifacts/matching-proxy-20261024/recognition-tests.log)。没有用户现场的请求日志，因此不能断言截图中的这次等待必定由 SSE 触发。
+- 系统代理从仅 Android 扩展到 macOS / iOS CFNetwork、Windows 当前用户设置 / WinHTTP、Linux GIO。覆盖 HTTP 代理、HTTPS CONNECT、排除项与 PAC；不支持的 SOCKS / TLS-to-proxy 明确失败。Linux deb 声明动态加载后端 `glib-networking`，缺少后端时沿用环境代理。各端原生解析不占 UI 线程，最多 2 个在途解析，队列有界，配置按请求重新读取；Windows 不复用按主机缓存的 PAC 执行结果，并用持久事件避免取消时丢失唤醒。
+- 后台识别、同步及视频读取 isolate 传递宿主平台与根 isolate token，真实应用缺失原生通道会报错，不静默直连。`flutter_tester` 没有平台 Runner，在测试配置中显式选择无原生宿主；独立代理测试模拟各端通道，Linux 集成测试使用真实通道。[代理、HTTP 路由及 worker 回归 82 项](../artifacts/system-proxy-tests-20261024.log)与[面板、生命周期及海报回归 95 项](../artifacts/system-proxy-lifecycle-tests-20261024.log)通过，两批包含代理用例的重复复验；覆盖取消迟到请求、代理改变后的 CONNECT、逐跳重定向、paused 后不 pump 及恢复。
+- 原生 messenger 自身持有接收端口，仅关闭工作命令端口会留下 isolate：Linux [修复前实际复现](../artifacts/matching-proxy-20261024/native-worker-lifecycle-baseline.log)识别 worker、同步 worker 和 HTTP 读取 worker 不能及时退出。现在完成在途结果、数据库 / 网络清理后显式退出；[修复后 5 项真实原生集成测试通过](../artifacts/matching-proxy-20261024/native-worker-lifecycle-fixed.log)，覆盖这三类关闭、后台联网和启动失败；[49 项相关 worker 回归](../artifacts/matching-proxy-20261024/worker-lifecycle-tests.log)再次通过。HTTP 读取关闭无需等两秒强杀兜底。
+- [Linux 完整应用构建](../artifacts/system-proxy-linux-build-20261024.log)、[原生通道及后台 isolate 联网](../artifacts/system-proxy-linux-integration-20261024.log)、[Linux 原生线程 / 路由 / 取消检查](../artifacts/system-proxy-linux-host-20261024.log)、[Android 原生编译与 JVM 代理检查](../artifacts/system-proxy-android-host-20261024.log)、[Windows 可移植配置解析检查](../artifacts/system-proxy-windows-host-20261024.log)通过。[全项目静态分析](../artifacts/system-proxy-analyze-20261024.log)、打包脚本现有测试及 `git diff --check` 通过。
+- macOS 已添加 CFNetwork 配置、PAC、绕过和取消测试，Windows 已添加原生取消事件测试，但本机没有 Apple / Windows SDK，未执行这两端原生构建或系统实测，iOS 同样未实测。Linux 验证使用 Xvfb、回环 HTTP 和受控 GIO 配置；未验证用户真实代理、外网服务延迟、实际匹配面板 profile 帧耗时或 Android 真机长时间功耗，不把协议回归耗时当成真机帧率或续航改善。本轮未制作或发布安装包。
+
 ## 2026-10-24：进入时检查来源与下拉刷新
 
 - 取消来源目录与影视库详情的 30–300 秒定时轮询，取代下方“未播放时的空闲耗电排查”中的目录退避策略。点击进入目录、从全部视频打开详情、恢复可见或配置改变时检查；无任务停留不再安排来源检查定时器。详情保留拖动关闭手势，重新打开会检查一次。

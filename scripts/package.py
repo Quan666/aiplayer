@@ -107,7 +107,9 @@ def linux_dependencies(bundle: Path, temporary: Path) -> str:
     )
     for line in result.splitlines():
         if line.startswith("shlibs:Depends="):
-            return line.removeprefix("shlibs:Depends=")
+            # GIO loads the desktop/PAC proxy backend dynamically, so ELF
+            # dependency scanning alone cannot discover this requirement.
+            return line.removeprefix("shlibs:Depends=") + ", glib-networking"
     raise RuntimeError("dpkg-shlibdeps did not return dependencies")
 
 
@@ -132,7 +134,7 @@ def linux_package(output: Path, version: str) -> tuple[list[Path], dict]:
         shutil.copy2(CLIENT / f"linux/runner/resources/{APPLICATION_ID}.desktop", stage / f"{APPLICATION_ID}.desktop")
         if shutil.which("dpkg-deb") and shutil.which("dpkg-shlibdeps"):
             dependencies = linux_dependencies(stage, temporary)
-        write(stage / "RUNTIME.txt", f"映库 {version} / Linux {arch}\n\nLaunch: ./launch.sh\nBuild host: {platform.platform()}\nSystem packages: {dependencies or 'GTK 3, libmpv 2, libsecret 1 and a compatible glibc/libstdc++'}\nCredentials require a running Secret Service (for example GNOME Keyring).\nThis bundle includes Flutter and application plugins; system libraries are not bundled.\n")
+        write(stage / "RUNTIME.txt", f"映库 {version} / Linux {arch}\n\nLaunch: ./launch.sh\nBuild host: {platform.platform()}\nSystem packages: {dependencies or 'GTK 3, libmpv 2, libsecret 1, glib-networking and a compatible glibc/libstdc++'}\nCredentials require a running Secret Service (for example GNOME Keyring).\nSystem proxy and PAC settings require a GIO desktop proxy backend (glib-networking).\nThis bundle includes Flutter and application plugins; system libraries are not bundled.\n")
         archive = output / f"aiplayer-linux-{arch}.tar.gz"
         with tarfile.open(archive, "w:gz") as target:
             target.add(stage, arcname=stage.name)

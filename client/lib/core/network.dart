@@ -297,7 +297,7 @@ class IoJsonTransport implements JsonTransport {
 }
 
 String _timeoutMessage(NetworkPhase phase) => switch (phase) {
-  NetworkPhase.proxyResolution => '读取系统代理超时，请检查 Android 代理设置。',
+  NetworkPhase.proxyResolution => '读取系统代理超时，请检查系统代理设置。',
   NetworkPhase.connecting => '连接服务超时，请检查网络和服务地址。',
   NetworkPhase.responseHeaders => '等待服务响应超时，请重试。',
   NetworkPhase.responseBody => '接收服务数据超时，请重试。',

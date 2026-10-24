@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
-import 'package:flutter/services.dart';
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../core/system_proxy.dart';
@@ -242,7 +241,7 @@ class _HttpBridgeWorker {
           source.displayName,
           path,
           entry,
-          ServicesBinding.rootIsolateToken,
+          SystemProxyWorkerConfiguration.capture(),
         ),
         onError: messages.sendPort,
         onExit: messages.sendPort,
@@ -312,7 +311,7 @@ class _HttpBridgeConfiguration {
   final String address, user, password, displayName, path;
   final bool webdav;
   final SourceEntry? entry;
-  final RootIsolateToken? rootIsolateToken;
+  final SystemProxyWorkerConfiguration systemProxy;
   const _HttpBridgeConfiguration(
     this.reply,
     this.address,
@@ -322,12 +321,12 @@ class _HttpBridgeConfiguration {
     this.displayName,
     this.path,
     this.entry,
-    this.rootIsolateToken,
+    this.systemProxy,
   );
 }
 
 Future<void> _serveHttpBridge(_HttpBridgeConfiguration configuration) async {
-  initializeSystemProxyWorker(configuration.rootIsolateToken);
+  initializeSystemProxyWorker(configuration.systemProxy);
   final commands = ReceivePort();
   final stopped = Completer<void>();
   HttpSource? source;
@@ -367,5 +366,8 @@ Future<void> _serveHttpBridge(_HttpBridgeConfiguration configuration) async {
     commands.close();
     await bridge?.close();
     await source?.close();
+    // Native proxy lookup initializes a messenger with its own ReceivePort.
+    // Release the worker after sockets close, without waiting for a force kill.
+    Isolate.exit();
   }
 }

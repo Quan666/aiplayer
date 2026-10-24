@@ -438,6 +438,78 @@ void main() {
       ),
     );
   });
+  for (final terminator in [
+    'data: {"choices":[{"delta":{"content":"complete"},"finish_reason":"stop"}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"complete"}}]}\n\ndata: [DONE]\n\n',
+  ]) {
+    test(
+      'SSE completion returns before the server closes the stream: '
+      '${terminator.contains('[DONE]') ? '[DONE]' : 'finish_reason'}',
+      () async {
+        server.listen((request) async {
+          await request.drain();
+          request.response.headers.contentType = ContentType(
+            'text',
+            'event-stream',
+          );
+          request.response.bufferOutput = false;
+          request.response.write(terminator);
+          // Trailing bytes must not modify an already completed result. Leave
+          // the connection open, like gateways that continue sending keepalives.
+          request.response.write(
+            'data: {"choices":[{"delta":{"content":"unexpected"}}]}\n\n',
+          );
+          await request.response.flush();
+        });
+        expect(
+          await IoSubtitleAiTransport(
+            requestTimeout: const Duration(seconds: 1),
+          ).complete(config(), {}, CancelToken()),
+          'complete',
+        );
+      },
+    );
+  }
+  test(
+    'keepalive traffic cannot extend the overall AI request deadline',
+    () async {
+      Timer? heartbeat;
+      var heartbeats = 0;
+      server.listen((request) async {
+        await request.drain();
+        request.response.headers.contentType = ContentType(
+          'text',
+          'event-stream',
+        );
+        request.response.bufferOutput = false;
+        request.response.write(': waiting\n\n');
+        await request.response.flush();
+        heartbeat = Timer.periodic(const Duration(milliseconds: 20), (_) {
+          heartbeats++;
+          request.response.write(': waiting\n\n');
+          unawaited(request.response.flush().catchError((Object _) {}));
+        });
+      });
+      try {
+        await expectLater(
+          IoSubtitleAiTransport(
+            inactivity: const Duration(milliseconds: 100),
+            requestTimeout: const Duration(milliseconds: 250),
+          ).complete(config(), {}, CancelToken()),
+          throwsA(
+            isA<AppFailure>().having(
+              (e) => e.message,
+              'message',
+              contains('长时间'),
+            ),
+          ),
+        );
+        expect(heartbeats, greaterThan(2));
+      } finally {
+        heartbeat?.cancel();
+      }
+    },
+  );
   test('redirect is blocked rather than forwarding API credentials', () async {
     var requests = 0;
     server.listen((request) async {
