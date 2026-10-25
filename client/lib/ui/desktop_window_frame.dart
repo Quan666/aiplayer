@@ -3,17 +3,55 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 
 import '../playback/desktop_window.dart';
 import 'glass.dart';
 
 /// Window chrome shares the page's background. Only interactive content is
 /// inset; artwork and video can continue underneath the transparent drag area.
-class DesktopWindowFrame extends StatelessWidget {
+class DesktopWindowFrame extends StatefulWidget {
   static const titlebarHeight = 36.0;
   final Widget child;
 
   const DesktopWindowFrame({super.key, required this.child});
+
+  @override
+  State<DesktopWindowFrame> createState() => _DesktopWindowFrameState();
+}
+
+class _DesktopWindowFrameState extends State<DesktopWindowFrame> {
+  bool _controlsVisible = DesktopWindow.controlsVisible.value;
+  bool _refreshScheduled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    DesktopWindow.controlsVisible.addListener(_controlsChanged);
+  }
+
+  void _controlsChanged() {
+    _controlsVisible = DesktopWindow.controlsVisible.value;
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      // A route can release its controls while the Navigator is building.
+      // Defer only the visual rebuild; native visibility is already updated.
+      if (_refreshScheduled) return;
+      _refreshScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _refreshScheduled = false;
+        if (mounted) setState(() {});
+      });
+    } else {
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    DesktopWindow.controlsVisible.removeListener(_controlsChanged);
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -22,7 +60,7 @@ class DesktopWindowFrame extends StatelessWidget {
         (platform != TargetPlatform.macOS &&
             platform != TargetPlatform.windows &&
             platform != TargetPlatform.linux)) {
-      return child;
+      return widget.child;
     }
     final macOS = platform == TargetPlatform.macOS;
     // The frame sits outside the Navigator; provide an overlay for its window
@@ -30,10 +68,13 @@ class DesktopWindowFrame extends StatelessWidget {
     return Overlay.wrap(
       child: ValueListenableBuilder<DesktopWindowState>(
         valueListenable: DesktopWindow.state,
-        child: child,
+        child: widget.child,
         builder: (context, state, child) {
           final media = MediaQuery.of(context);
-          final inset = state.fullscreen ? 0.0 : titlebarHeight;
+          // Hiding controls must not resize the video or shift player input.
+          final inset = state.fullscreen
+              ? 0.0
+              : DesktopWindowFrame.titlebarHeight;
           return Stack(
             fit: StackFit.expand,
             children: [
@@ -48,12 +89,12 @@ class DesktopWindowFrame extends StatelessWidget {
                 ),
                 child: child!,
               ),
-              if (!state.fullscreen)
+              if (!state.fullscreen && _controlsVisible)
                 Positioned(
                   top: 0,
                   left: 0,
                   right: 0,
-                  height: titlebarHeight,
+                  height: DesktopWindowFrame.titlebarHeight,
                   child: Row(
                     // Window controls stay on the platform's physical side,
                     // independently of the application's text direction.

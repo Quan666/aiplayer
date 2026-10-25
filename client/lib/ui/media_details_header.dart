@@ -21,12 +21,14 @@ class MediaDetailsHeader extends StatelessWidget {
   final MediaCollectionDetails details;
   final List<SyncRecord> records;
   final VoidCallback? onMatch;
+  final String? availabilityLabel;
   const MediaDetailsHeader({
     super.key,
     required this.model,
     required this.details,
     this.records = const [],
     this.onMatch,
+    this.availabilityLabel,
   });
 
   @override
@@ -135,7 +137,7 @@ class MediaDetailsHeader extends StatelessWidget {
               if (details.year.isNotEmpty) badge(details.year, palette.muted),
               for (final genre in details.genres) badge(genre, palette.muted),
               Text(
-                details.availability,
+                availabilityLabel ?? details.availability,
                 style: LibraryStyles.of(context).availability,
               ),
             ],

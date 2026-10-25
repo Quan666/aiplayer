@@ -24,23 +24,35 @@ abstract final class PlayerTheme {
   );
   static const menuMaxHeight = 420.0;
   static const menuGap = 8.0;
-  static const menuRowHeight = 42.0;
-  static const choiceRowHeight = 40.0;
-  static const compactChoiceRowHeight = 36.0;
-  static const choiceTrackRowHeight = 44.0;
-  static const choiceRowWithSubtitleHeight = 56.0;
-  static const playlistRowHeight = 48.0;
+  static const choiceRowHeight = 32.0;
+  static const choiceRowWithSubtitleHeight = 40.0;
+  static const menuRowHeight = choiceRowHeight;
+  static const choiceTrackRowHeight = choiceRowWithSubtitleHeight;
+  static const playlistRowHeight = choiceRowWithSubtitleHeight;
   static const choiceContentPadding = EdgeInsets.symmetric(horizontal: 16);
   static const choiceTilePadding = EdgeInsets.symmetric(
     horizontal: 8,
-    vertical: 4,
+    vertical: 3,
   );
   static const choiceTitleGap = 4.0;
   static const choiceIconSize = 20.0;
   static const menuLabelPadding = 76.0;
   static const viewportInset = 12.0;
   static const controlsEntranceMilliseconds = 240;
-  static const choiceMenuPadding = EdgeInsets.all(6);
+  static const choiceMenuPadding = EdgeInsets.symmetric(
+    horizontal: 6,
+    vertical: 4,
+  );
+
+  /// Fixed extents keep long menus lazy and centered on the selected item.
+  /// Scale with the actual label size, including nonlinear accessibility scaling.
+  static double choiceExtent(BuildContext context, {bool twoLines = false}) {
+    final scale = (MediaQuery.textScalerOf(context).scale(14) / 14).clamp(
+      1.0,
+      double.infinity,
+    );
+    return (twoLines ? choiceRowWithSubtitleHeight : choiceRowHeight) * scale;
+  }
 
   static const blurSigma = 14.0;
   static const glassEdgeWidth = .8;

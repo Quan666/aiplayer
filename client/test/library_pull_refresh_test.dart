@@ -8,6 +8,7 @@ import 'package:aiplayer/data/library_sort.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/library_page.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -81,8 +82,11 @@ void main() {
     });
   }
 
-  Future<void> mount(WidgetTester tester) async {
-    tester.view.physicalSize = const Size(390, 844);
+  Future<void> mount(
+    WidgetTester tester, {
+    Size size = const Size(390, 844),
+  }) async {
+    tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
@@ -97,6 +101,98 @@ void main() {
 
   final libraryScroll = find.byKey(const PageStorageKey('library-scroll'));
   final refresh = find.byKey(const ValueKey('library-refresh'));
+
+  for (final device in [
+    (
+      name: 'desktop mouse',
+      size: const Size(1280, 900),
+      platform: TargetPlatform.macOS,
+      kind: PointerDeviceKind.mouse,
+    ),
+    (
+      name: 'mobile touch',
+      size: const Size(390, 844),
+      platform: TargetPlatform.android,
+      kind: PointerDeviceKind.touch,
+    ),
+  ]) {
+    Future<void> doubleTapLibrary(WidgetTester tester) async {
+      final tab = find.byKey(const ValueKey('nav-item-0'));
+      await tester.tap(tab, kind: device.kind);
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.tap(tab, kind: device.kind);
+      await tester.pump();
+    }
+
+    testWidgets(
+      '${device.name} library tab selects immediately and double tap refreshes',
+      (tester) async {
+        episode(1);
+        await mount(tester, size: device.size);
+        model.refreshed = () => episode(2, title: 'Example Two');
+        await tester.tap(
+          find.byKey(const ValueKey('nav-item-2')),
+          kind: device.kind,
+        );
+        await tester.pumpAndSettle();
+        final tab = find.byKey(const ValueKey('nav-item-0'));
+
+        await tester.tap(tab, kind: device.kind);
+        await tester.pump(const Duration(milliseconds: 16));
+        expect(
+          tester.widget<PageView>(find.byType(PageView).first).controller!.page,
+          0,
+        );
+        expect(model.libraryRefreshes, 0);
+        await tester.pump(const Duration(milliseconds: 84));
+        await tester.tap(tab, kind: device.kind);
+        await tester.pumpAndSettle();
+        expect(model.libraryRefreshes, 1);
+        expect(find.byKey(const ValueKey('play:episode-2')), findsOneWidget);
+
+        await tester.tap(tab, kind: device.kind);
+        await tester.pumpAndSettle();
+        await tester.pump(const Duration(minutes: 10));
+        expect(model.libraryRefreshes, 1);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox());
+      },
+      variant: TargetPlatformVariant.only(device.platform),
+    );
+
+    testWidgets(
+      '${device.name} double refresh shares work and cancels without a frame',
+      (tester) async {
+        await mount(tester, size: device.size);
+        model.libraryGate = Completer<void>();
+        await doubleTapLibrary(tester);
+        expect(model.libraryRefreshes, 1);
+        final firstCancel = model.libraryCancel;
+        await tester.pump(const Duration(milliseconds: 350));
+        await doubleTapLibrary(tester);
+        expect(model.libraryRefreshes, 1);
+        expect(identical(model.libraryCancel, firstCancel), isTrue);
+
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+        expect(firstCancel!.cancelled, isTrue);
+        model.libraryGate!.complete();
+        await tester.idle();
+        expect(model.libraryRefreshes, 1);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pumpAndSettle();
+        expect(model.libraryRefreshes, 1);
+        model.libraryGate = null;
+        await doubleTapLibrary(tester);
+        await tester.pumpAndSettle();
+        expect(model.libraryRefreshes, 2);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox());
+      },
+      variant: TargetPlatformVariant.only(device.platform),
+    );
+  }
 
   testWidgets('empty library pulls sources once and stays idle afterward', (
     tester,

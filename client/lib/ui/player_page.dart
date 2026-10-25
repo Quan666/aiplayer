@@ -10,7 +10,6 @@ import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../danmaku/overlay.dart';
-import '../data/media_identity.dart';
 import '../data/app_model.dart';
 import '../data/store.dart';
 import '../playback/session.dart';
@@ -26,6 +25,7 @@ import 'cast_sheet.dart';
 import '../core/logger.dart';
 import '../subtitles/tools_panel.dart';
 import 'player_controls_settings.dart';
+import 'player_danmaku_panel.dart';
 import 'player_loading.dart';
 import 'player_model_changes.dart';
 import 'player_seek_readout.dart';
@@ -615,7 +615,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                   SubtitleToolsPanel(session: session),
                   ListTile(
                     dense: true,
-                    minTileHeight: 42,
+                    minTileHeight: PlayerTheme.choiceRowWithSubtitleHeight,
                     title: const Text('时间偏移'),
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -651,7 +651,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                   ),
                   ListTile(
                     dense: true,
-                    minTileHeight: 42,
+                    minTileHeight: PlayerTheme.choiceRowHeight,
                     leading: const Icon(Icons.file_open_outlined, size: 19),
                     title: const Text('选择本地外挂字幕'),
                     onTap: () async {
@@ -761,9 +761,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                   (track) => track.id == current.player.state.track.audio.id,
                 ) +
                 1,
-            itemExtent:
-                PlayerTheme.compactChoiceRowHeight *
-                MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+            itemExtent: PlayerTheme.choiceExtent(c),
             padding: PlayerTheme.choiceMenuPadding,
             itemCount: tracks.isEmpty ? 2 : tracks.length + 1,
             itemBuilder: (_, index) {
@@ -813,9 +811,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       builder: (c) => PlayerMenuList(
         key: const ValueKey('player-speed-popup'),
         selectedIndex: rates.indexOf(current.player.state.rate) + 1,
-        itemExtent:
-            PlayerTheme.compactChoiceRowHeight *
-            MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+        itemExtent: PlayerTheme.choiceExtent(c),
         padding: PlayerTheme.choiceMenuPadding,
         itemCount: rates.length + 1,
         itemBuilder: (_, index) {
@@ -853,10 +849,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       );
       return;
     }
-    final identity = session.danmakuIdentity;
-    final title = TextEditingController(text: identity.anime),
-        season = TextEditingController(text: identity.season),
-        episode = TextEditingController(text: identity.episode);
     await showModalBottomSheet(
       context: PlayerTheme.routeContext(context),
       isScrollControlled: true,
@@ -864,151 +856,10 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       barrierColor: PlayerTheme.of(context).barrierColor,
       builder: (c) => _playerSurface(
         PlayerSheet(
-          child: AnimatedBuilder(
-            animation: d,
-            builder: (_, _) => ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        '弹幕',
-                        style: PlayerTheme.of(context).panelTitleStyle,
-                      ),
-                    ),
-                    Switch(
-                      value: d.visible,
-                      onChanged: (v) {
-                        session.updateSettings({'danmuVisible': v});
-                      },
-                    ),
-                  ],
-                ),
-                if (d.label.isNotEmpty)
-                  Text(d.label, style: PlayerTheme.of(context).mutedStyle),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: title,
-                  decoration: const InputDecoration(labelText: '作品名称'),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: season,
-                        decoration: const InputDecoration(labelText: '季度'),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextField(
-                        controller: episode,
-                        decoration: const InputDecoration(
-                          labelText: '集数 / S1 / O1',
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 12,
-                  children: [
-                    FilledButton(
-                      onPressed: d.busy
-                          ? null
-                          : () => d.identify(
-                              ReleaseName(
-                                title.text.trim(),
-                                season.text.trim(),
-                                episode.text.trim(),
-                              ),
-                              restore: false,
-                            ),
-                      child: const Text('按名称识别'),
-                    ),
-                    OutlinedButton(
-                      onPressed: d.busy
-                          ? null
-                          : () => d.search(
-                              title.text.trim(),
-                              episode.text.trim(),
-                            ),
-                      child: const Text('搜索候选'),
-                    ),
-                  ],
-                ),
-                if (d.busy) const LinearProgressIndicator(),
-                if (d.error.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    child: Text(d.error),
-                  ),
-                for (final match in d.candidates)
-                  ListTile(
-                    title: Text(match.label),
-                    onTap: () => d.select(match),
-                  ),
-                ListTile(
-                  title: const Text('弹幕偏移'),
-                  subtitle: Text(
-                    '${d.offset.toStringAsFixed(1)} 秒 · 匹配偏移 ${d.shift.toStringAsFixed(1)} 秒',
-                  ),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        onPressed: () => d.setOffset(d.offset - .5),
-                        icon: const Icon(Icons.remove),
-                      ),
-                      IconButton(
-                        onPressed: () => d.setOffset(d.offset + .5),
-                        icon: const Icon(Icons.add),
-                      ),
-                    ],
-                  ),
-                ),
-                for (final option in [
-                  ('danmuFontSize', '字号', 14.0, 42.0, 22.0),
-                  ('danmuOpacity', '透明度', .1, 1.0, .8),
-                  ('danmuArea', '显示区域', .2, 1.0, .65),
-                  ('danmuDensity', '密度', .1, 1.0, .7),
-                ])
-                  StatefulBuilder(
-                    builder: (context, set) {
-                      final value =
-                          (widget.model.settings[option.$1] as num?)
-                              ?.toDouble() ??
-                          option.$5;
-                      return Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(option.$2),
-                          Slider(
-                            min: option.$3,
-                            max: option.$4,
-                            value: value.clamp(option.$3, option.$4),
-                            onChanged: (v) {
-                              session.updateSettings({option.$1: v});
-                              set(() {});
-                              _changed();
-                            },
-                          ),
-                        ],
-                      );
-                    },
-                  ),
-              ],
-            ),
-          ),
+          child: PlayerDanmakuPanel(session: session, danmaku: d),
         ),
       ),
     );
-    title.dispose();
-    season.dispose();
-    episode.dispose();
   }
 
   Future<void> quickSettings() async {
@@ -1041,7 +892,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         ];
         return PlayerMenuList(
           key: const ValueKey('player-settings-popup'),
-          padding: const EdgeInsets.symmetric(vertical: 8),
+          padding: PlayerTheme.choiceMenuPadding,
           itemCount: entries.length,
           itemBuilder: (_, index) => entries[index],
         );
@@ -1285,6 +1136,7 @@ class _PlayerControls extends StatefulWidget {
 class _PlayerControlsState extends State<_PlayerControls>
     with WidgetsBindingObserver {
   bool show = true, locked = false;
+  DesktopPlaybackControls? _windowControls;
   final tapIntent = PlaybackTapIntent();
   SeekPreviewController? seekPreview;
   late final seekTimeline = PlaybackSeekTimeline(
@@ -1352,6 +1204,7 @@ class _PlayerControlsState extends State<_PlayerControls>
     s.addListener(update);
     FocusManager.instance.addEarlyKeyEventHandler(_keyEvent);
     if (!mobile) {
+      _windowControls = DesktopWindow.beginPlaybackControls();
       GestureBinding.instance.pointerRouter.addGlobalRoute(_desktopPointer);
     }
     widget.display.orientation.addListener(_gravityChanged);
@@ -1418,7 +1271,7 @@ class _PlayerControlsState extends State<_PlayerControls>
   }) async {
     _cancelSurfaceTaps();
     hideTimer.hold();
-    if (mounted && revealControls) setState(() => show = true);
+    if (mounted && revealControls) setState(() => _setControlsVisible(true));
     try {
       return await open();
     } finally {
@@ -1919,8 +1772,13 @@ class _PlayerControlsState extends State<_PlayerControls>
     return KeyEventResult.handled;
   }
 
+  void _setControlsVisible(bool visible) {
+    show = visible;
+    _windowControls?.setVisible(visible && !locked);
+  }
+
   void _hideControls() {
-    show = false;
+    _setControlsVisible(false);
     hideTimer.configure(
       playing: false,
       seconds: widget.model.preferences.controlsHideSeconds,
@@ -1928,7 +1786,7 @@ class _PlayerControlsState extends State<_PlayerControls>
   }
 
   void reveal() {
-    show = true;
+    _setControlsVisible(true);
     hideTimer.configure(
       playing: _controlsCanAutoHide,
       seconds: widget.model.preferences.controlsHideSeconds,
@@ -2009,6 +1867,7 @@ class _PlayerControlsState extends State<_PlayerControls>
     if (!mobile) {
       GestureBinding.instance.pointerRouter.removeGlobalRoute(_desktopPointer);
     }
+    _windowControls?.dispose();
     hideTimer.dispose();
     final preview = seekPreview;
     if (preview != null) PlayerPage._trackDisposal(preview.close());
@@ -2188,9 +2047,7 @@ class _PlayerControlsState extends State<_PlayerControls>
           key: const ValueKey('player-playlist-popup'),
           selectedIndex:
               items.indexWhere((media) => media.id == s.media.id) + 1,
-          itemExtent:
-              PlayerTheme.playlistRowHeight *
-              MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+          itemExtent: PlayerTheme.choiceExtent(c, twoLines: true),
           padding: PlayerTheme.choiceMenuPadding,
           itemCount: items.length + 1,
           itemBuilder: (_, index) {
@@ -3038,7 +2895,7 @@ class _OptionRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ListTile(
     dense: true,
-    minTileHeight: 44,
+    minTileHeight: PlayerTheme.choiceRowHeight,
     leading: Icon(icon, color: PlayerTheme.of(context).foreground, size: 21),
     title: Text(label, style: PlayerTheme.of(context).optionLabelStyle),
     trailing: Row(

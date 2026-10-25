@@ -55,7 +55,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   final _pages = PageController();
   final _sources = SourcesController();
   final _search = SearchHeaderController();
-  bool _sourcePointerTap = false;
+  final _pointerSelectedTabs = <int>{};
   late bool _navigationCollapsed;
   String query = '';
   bool importing = false;
@@ -1281,30 +1281,32 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       child: Tooltip(
         message: labels[i],
         child: Listener(
-          onPointerDown: i == 1
+          onPointerDown: i < 2
               ? (_) {
-                  _sourcePointerTap = true;
-                  _selectPage(1);
+                  _pointerSelectedTabs.add(i);
+                  _selectPage(i);
                 }
               : null,
+          onPointerCancel: (_) => _pointerSelectedTabs.remove(i),
           child: Material(
             color: Colors.transparent,
             child: InkWell(
               borderRadius: BorderRadius.circular(radius),
               onTap: () {
-                // The pointer already selected Sources immediately. Its delayed
-                // single-tap callback must not undo a subsequent tab selection.
-                if (i == 1 && _sourcePointerTap) {
-                  _sourcePointerTap = false;
-                  return;
-                }
+                // Tabs with double-tap actions select immediately on pointer
+                // down. Their delayed tap must not undo a later selection.
+                if (_pointerSelectedTabs.remove(i)) return;
                 _selectPage(i);
               },
-              onDoubleTap: i == 1
+              onDoubleTap: i < 2
                   ? () {
-                      _sourcePointerTap = false;
-                      _selectPage(1);
-                      _sources.showRoot();
+                      _pointerSelectedTabs.remove(i);
+                      _selectPage(i);
+                      if (i == 0) {
+                        unawaited(_refreshLibrarySources());
+                      } else {
+                        _sources.showRoot();
+                      }
                     }
                   : null,
               child: AnimatedContainer(

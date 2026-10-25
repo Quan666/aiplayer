@@ -64,6 +64,194 @@ String _episodeTitle(AppStore store, SyncRecord record) {
   return local is String ? local : '${record.data['episodeTitle'] ?? ''}';
 }
 
+/// Resolve file membership with verified per-file identities on the worker.
+/// A partially parseable folder must not hide an already identified sibling,
+/// or undo a user's corrected episode number just because its filename stayed
+/// unchanged. Unknown extras remain outside the episode collection.
+DirectoryCollection? identifyStoredDirectory(
+  AppStore store,
+  String sourceId,
+  String path,
+  List<SourceEntry> entries, {
+  Map<String, SyncRecord>? recordsByPath,
+}) => _mergeStoredDirectory(
+  store,
+  sourceId,
+  entries,
+  identifyDirectory(
+    path,
+    entries,
+    folderIdentity: recordsByPath == null
+        ? sourceDirectoryIdentity(store, sourceId, path)
+        : directoryIdentity(path),
+  ),
+  recordsByPath: recordsByPath,
+);
+
+DirectoryCollection? _mergeStoredDirectory(
+  AppStore store,
+  String sourceId,
+  List<SourceEntry> entries,
+  DirectoryCollection? parsed, {
+  Map<String, SyncRecord>? recordsByPath,
+  Map<String, SyncRecord>? verifiedEvidence,
+}) {
+  final videos = entries
+      .where((entry) => !entry.directory && isVideo(entry.name))
+      .toList();
+  if (videos.isEmpty) return null;
+  final verified = <String, SyncRecord>{};
+  for (final entry in videos) {
+    final record = recordsByPath == null
+        ? _sourceRecord(store, sourceId, entry.path)
+        : recordsByPath[entry.path];
+    if (record != null &&
+        (record.data['tmdbId'] != null || record.data['bangumiId'] != null)) {
+      verified[entry.path] = record;
+    }
+  }
+  verifiedEvidence?.addAll(verified);
+  if (verified.isEmpty) return parsed;
+  final donors = parsed == null
+      ? verified.values.toList()
+      : [for (final entry in parsed.videos) ?verified[entry.path]];
+  String season(String value) => value.isEmpty ? '1' : value;
+  if (parsed != null && donors.isEmpty) {
+    // A lone identified opaque file can join parsed siblings only when its
+    // title and season independently agree. Provider IDs alone cannot assign
+    // an unrelated extra to an otherwise unrecognized group.
+    donors.addAll(
+      verified.values.where((record) {
+        final title = normalizedSeries(parsed.title);
+        return (normalizedSeries('${record.data['series'] ?? ''}') == title ||
+                normalizedSeries('${record.data['metadataTitle'] ?? ''}') ==
+                    title) &&
+            season('${record.data['season'] ?? ''}') == season(parsed.season);
+      }),
+    );
+  }
+  if (donors.isEmpty) return parsed;
+  final keys = donors.map(mediaSeriesKey).toSet();
+  if (keys.length != 1) return null;
+  if (parsed == null && verified.length != videos.length) return null;
+  final key = keys.single;
+  final first = donors.first;
+  final title = '${first.data['series'] ?? parsed?.title ?? ''}';
+  final collectionSeason = '${first.data['season'] ?? parsed?.season ?? ''}';
+  final selected = <SourceEntry>[];
+  final identities = <String, ReleaseName>{};
+  final names = <String, String>{};
+  for (final entry in videos) {
+    final record = verified[entry.path];
+    final original = parsed?.identities[entry.path];
+    String episode;
+    if (record != null) {
+      if (mediaSeriesKey(record) != key) continue;
+      // A UI snapshot was already reconciled by its worker. Rendering must
+      // not perform location/record/override lookups for every folder row.
+      final manual =
+          recordsByPath != null ||
+          store.local('manualMetadata:${record.id}') == true;
+      // A verified work ID alone does not verify an old automatic episode
+      // guess. Explicit current filename evidence wins unless the user edited
+      // this file's identity, while opaque names reuse their saved identity.
+      episode = !manual && original?.episode.isNotEmpty == true
+          ? original!.episode
+          : '${record.data['episode'] ?? ''}';
+      if (episode.isEmpty) episode = original?.episode ?? '';
+      if (episode.isEmpty && parsed != null) continue;
+      final name = recordsByPath == null
+          ? _episodeTitle(store, record)
+          : '${record.data['episodeTitle'] ?? ''}';
+      if (name.isNotEmpty) names[episode] = name;
+    } else {
+      if (original == null ||
+          season(original.season) != season(collectionSeason)) {
+        continue;
+      }
+      episode = original.episode;
+    }
+    selected.add(entry);
+    identities[entry.path] = ReleaseName(title, collectionSeason, episode);
+  }
+  if (selected.isEmpty) return null;
+  selected.sort((a, b) {
+    final x = double.tryParse(identities[a.path]!.episode);
+    final y = double.tryParse(identities[b.path]!.episode);
+    return x != null && y != null ? x.compareTo(y) : a.name.compareTo(b.name);
+  });
+  return DirectoryCollection(
+    title: title,
+    season: collectionSeason,
+    videos: selected,
+    identities: identities,
+    subject: mediaFieldsSubject(first.data),
+    episodeTitles: names,
+    episodeCount: identities.values
+        .map((identity) => identity.episode)
+        .where((episode) => episode.isNotEmpty)
+        .toSet()
+        .length,
+    listedVideoCount: videos.length,
+  );
+}
+
+DirectoryInspection prepareStoredDirectoryInspection(
+  AppStore store,
+  String sourceId,
+  String path,
+  String context,
+  List<SourceEntry> entries,
+) {
+  final prepared = prepareDirectoryInspection(
+    sourceId,
+    path,
+    context,
+    entries,
+    folderIdentity: sourceDirectoryIdentity(store, sourceId, path),
+  );
+  final verified = <String, SyncRecord>{};
+  final collection = _mergeStoredDirectory(
+    store,
+    sourceId,
+    entries,
+    prepared.collection,
+    verifiedEvidence: verified,
+  );
+  // Only facts used by this directory participate; unrelated media/progress
+  // writes must not invalidate every preview. Direct SQL and other worker
+  // connections are observed through the store's indexed record reads.
+  final fingerprint = sha256
+      .convert(
+        utf8.encode(
+          jsonEncode([
+            prepared.fingerprint,
+            collection?.title,
+            collection?.season,
+            collection?.subject?['provider'],
+            collection?.subject?['id'],
+            collection?.subject?['mediaType'],
+            for (final entry in verified.entries)
+              [
+                entry.key,
+                mediaSeriesKey(entry.value),
+                entry.value.data['episode'],
+                store.local('manualMetadata:${entry.value.id}') == true,
+              ],
+            if (collection != null)
+              for (final entry in collection.videos)
+                [entry.path, collection.identities[entry.path]?.episode],
+          ]),
+        ),
+      )
+      .toString();
+  return DirectoryInspection(
+    fingerprint,
+    collection,
+    prepared.preparationIsolate,
+  );
+}
+
 bool persistDirectoryEpisodeNames(
   AppStore store,
   SyncRecord anchor,
@@ -295,11 +483,27 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
             : mediaFieldsSubject(donor.data),
         episodeTitles: names,
         episodeCount: value.episodeCount,
+        listedVideoCount: value.listedVideoCount,
+        membershipComplete: value.membershipComplete,
       );
     } else if (keys.length > 1 && !replaceAutomatic) {
       resolved = value.withMetadata(null, {});
     }
     var changed = false;
+    final manualEpisodes = <String, String>{};
+    final resolvedKey = resolved.subject == null
+        ? null
+        : mediaSeriesKey(
+            SyncRecord(
+              kind: 'media',
+              id: 'directory',
+              data: {
+                'series': resolved.title,
+                'season': resolved.season,
+                ...subjectMediaFields(resolved.subject!),
+              },
+            ),
+          );
     final ids = <String>[];
     final imported = <String>[];
     for (final entry in resolved.videos) {
@@ -348,7 +552,15 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
         changed = true;
       }
       ids.add(record.id);
-      if (store.local('manualMetadata:${record.id}') == true) continue;
+      if (store.local('manualMetadata:${record.id}') == true) {
+        final episode = '${record.data['episode'] ?? ''}';
+        if (resolvedKey != null &&
+            mediaSeriesKey(record) == resolvedKey &&
+            resolved.identities[entry.path]?.episode != episode) {
+          manualEpisodes[entry.path] = episode;
+        }
+        continue;
+      }
       if (!replaceAutomatic &&
           keys.length > 1 &&
           (record.data['tmdbId'] != null || record.data['bangumiId'] != null)) {
@@ -404,6 +616,10 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
       };
       store.setLocal(key, bindings.toList());
     }
+    resolved = resolved.withEpisodeOverrides(
+      manualEpisodes,
+      completeIdentities: value.identities,
+    );
     result = DirectoryMetadataResult(resolved, changed, List.unmodifiable(ids));
     donorCache?._checkpoint(store);
   });
@@ -467,7 +683,7 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
   // renamed or the source is rooted at S02. identifyDirectory can return just
   // the named files in that case, so anchored details must inspect every file.
   var collection = anchorId == null
-      ? identifyDirectory(path, visible, folderIdentity: folderIdentity)
+      ? identifyStoredDirectory(store, sourceId, path, visible)
       : null;
   if (collection == null && anchorId != null) {
     if (anchor == null || anchor.deleted || location is! Map) return null;
@@ -561,21 +777,11 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
             .map((value) => value.episode)
             .toSet()
             .length,
+        listedVideoCount: visible
+            .where((entry) => !entry.directory && isVideo(entry.name))
+            .length,
       );
     }
-  }
-  // A manual or synced match can identify files whose basenames carry no
-  // useful episode information. Reuse those verified identities on first
-  // open, before playback can trigger a separate model refresh. Require every
-  // listed video to belong to the same work/season; an unknown or conflicting
-  // file must not inherit its neighbours' metadata.
-  if (collection == null && anchorId == null) {
-    collection = await _identifiedDirectoryCollection(
-      store,
-      sourceId,
-      visible,
-      cancel,
-    );
   }
   if (collection == null) return null;
   final donors = DirectoryMetadataDonorCache(sourceId, collection.videos);
@@ -604,6 +810,8 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
           subject: collection.subject,
           episodeTitles: collection.episodeTitles,
           episodeCount: collection.episodeCount,
+          listedVideoCount: collection.listedVideoCount,
+          membershipComplete: collection.membershipComplete,
         ),
         importMissing: true,
         anchorId: anchorId,
@@ -627,62 +835,11 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
       subject: resolved.subject,
       episodeTitles: names,
       episodeCount: collection.episodeCount,
+      listedVideoCount: collection.listedVideoCount,
+      membershipComplete: collection.membershipComplete,
     ),
     changed,
     List.unmodifiable(ids),
-  );
-}
-
-Future<DirectoryCollection?> _identifiedDirectoryCollection(
-  AppStore store,
-  String sourceId,
-  List<SourceEntry> entries,
-  CancelToken? cancel,
-) async {
-  final videos = <SourceEntry>[];
-  final identities = <String, ReleaseName>{};
-  final names = <String, String>{};
-  SyncRecord? first;
-  String? seriesKey;
-  for (var index = 0; index < entries.length; index++) {
-    if (index % 128 == 0) {
-      await Future<void>.delayed(Duration.zero);
-      cancel?.check();
-    }
-    final entry = entries[index];
-    if (entry.directory || !isVideo(entry.name)) continue;
-    final record = _sourceRecord(store, sourceId, entry.path);
-    if (record == null ||
-        (record.data['bangumiId'] == null && record.data['tmdbId'] == null)) {
-      return null;
-    }
-    final key = mediaSeriesKey(record);
-    if (seriesKey != null && seriesKey != key) return null;
-    seriesKey = key;
-    first ??= record;
-    final episode = '${record.data['episode'] ?? ''}';
-    videos.add(entry);
-    identities[entry.path] = ReleaseName(
-      '${first.data['series'] ?? ''}',
-      '${first.data['season'] ?? ''}',
-      episode,
-    );
-    final name = _episodeTitle(store, record);
-    if (name.isNotEmpty) names[episode] = name;
-  }
-  if (first == null) return null;
-  return DirectoryCollection(
-    title: '${first.data['series'] ?? ''}',
-    season: '${first.data['season'] ?? ''}',
-    videos: videos,
-    identities: identities,
-    subject: mediaFieldsSubject(first.data),
-    episodeTitles: names,
-    episodeCount: identities.values
-        .map((identity) => identity.episode)
-        .where((episode) => episode.isNotEmpty)
-        .toSet()
-        .length,
   );
 }
 
@@ -974,16 +1131,12 @@ void _directoryWorkerMain(List<dynamic> startup) async {
       } else if (row[0] == 'inspect') {
         await Future<void>.delayed(Duration.zero);
         cancel.check();
-        result = prepareDirectoryInspection(
+        result = prepareStoredDirectoryInspection(
+          store,
           row[2] as String,
           row[3] as String,
           row[4] as String,
           row[5] as List<SourceEntry>,
-          folderIdentity: sourceDirectoryIdentity(
-            store,
-            row[2] as String,
-            row[3] as String,
-          ),
         );
       } else if (row[0] == 'episodeCoverage') {
         cancel.check();
@@ -1361,6 +1514,8 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
                 subject: collection.subject,
                 episodeTitles: collection.episodeTitles,
                 episodeCount: collection.episodeCount,
+                listedVideoCount: collection.listedVideoCount,
+                membershipComplete: collection.membershipComplete,
               ),
               importMissing: true,
               donorCache: donorCache,

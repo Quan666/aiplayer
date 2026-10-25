@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -16,11 +17,18 @@ abstract final class DesktopWindow {
     maximized: false,
   ));
   static ValueListenable<DesktopWindowState> get state => _state;
+  static final _controlsVisible = ValueNotifier(true);
+  static ValueListenable<bool> get controlsVisible => _controlsVisible;
+  static DesktopPlaybackControls? _playbackControls;
   static bool get supported =>
       Platform.isMacOS || Platform.isWindows || Platform.isLinux;
 
   static void watchClose(Future<void> Function()? onClose) {
     if (!supported) return;
+    if (onClose == null) {
+      _playbackControls = null;
+      _setControlsVisible(true);
+    }
     _state.value = (fullscreen: false, maximized: false);
     channel.setMethodCallHandler(
       onClose == null
@@ -56,13 +64,29 @@ abstract final class DesktopWindow {
     );
   }
 
-  static Future<void> _control(String method) async {
+  static Future<void> _control(String method, [Object? arguments]) async {
     if (!supported) return;
     try {
-      await channel.invokeMethod<void>(method);
+      await channel.invokeMethod<void>(method, arguments);
     } on MissingPluginException {
       // Tests and an engine detaching during close have no native controls.
     }
+  }
+
+  /// A replacement player owns visibility immediately. Late callbacks or
+  /// disposal from the previous player cannot reveal its window controls.
+  static DesktopPlaybackControls beginPlaybackControls() {
+    final controls = DesktopPlaybackControls._();
+    _playbackControls = controls;
+    _setControlsVisible(true);
+    return controls;
+  }
+
+  static void _setControlsVisible(bool visible) {
+    if (_controlsVisible.value == visible) return;
+    _controlsVisible.value = visible;
+    // Native traffic lights and hit testing update even without another frame.
+    unawaited(_control('setControlsVisible', {'visible': visible}));
   }
 
   static Future<void> startDrag() => _control('startDrag');
@@ -83,5 +107,22 @@ abstract final class DesktopWindow {
           'enabled': enabled,
         }) ??
         false;
+  }
+}
+
+/// Lifetime of a player's control overlay; uses its existing hide timer.
+final class DesktopPlaybackControls {
+  DesktopPlaybackControls._();
+
+  void setVisible(bool visible) {
+    if (identical(DesktopWindow._playbackControls, this)) {
+      DesktopWindow._setControlsVisible(visible);
+    }
+  }
+
+  void dispose() {
+    if (!identical(DesktopWindow._playbackControls, this)) return;
+    DesktopWindow._playbackControls = null;
+    DesktopWindow._setControlsVisible(true);
   }
 }

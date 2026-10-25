@@ -315,12 +315,12 @@ class AppModel extends ChangeNotifier {
     cancel?.check();
     if (_disposed) throw const Cancelled();
     final result = store.path == ':memory:'
-        ? prepareDirectoryInspection(
+        ? prepareStoredDirectoryInspection(
+            store,
             sourceId,
             path,
             context,
             entries,
-            folderIdentity: sourceDirectoryIdentity(store, sourceId, path),
           )
         : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
             store.path,
@@ -1089,44 +1089,15 @@ class AppModel extends ChangeNotifier {
   DirectoryCollection? collectionFromEntries(
     String sourceId,
     String path,
-    List<SourceEntry> entries,
-  ) {
-    final identified = identifyDirectory(path, entries);
-    if (identified != null) return identified;
-    final videos = entries
-        .where((entry) => !entry.directory && isVideo(entry.name))
-        .toList();
-    if (videos.isEmpty) return null;
-    final records = [
-      for (final entry in videos) ?sourceMedia(sourceId, entry.path),
-    ];
-    if (records.length != videos.length ||
-        records.map(mediaSeriesKey).toSet().length != 1 ||
-        (records.first.data['bangumiId'] == null &&
-            records.first.data['tmdbId'] == null)) {
-      return null;
-    }
-    final first = records.first;
-    return DirectoryCollection(
-      title: '${first.data['series']}',
-      season: '${first.data['season'] ?? ''}',
-      videos: videos,
-      identities: {
-        for (final entry in videos)
-          entry.path: ReleaseName(
-            '${first.data['series']}',
-            '${first.data['season'] ?? ''}',
-            '${sourceMedia(sourceId, entry.path)?.data['episode'] ?? ''}',
-          ),
-      },
-      subject: mediaFieldsSubject(first.data),
-      episodeTitles: {
-        for (final item in records)
-          '${item.data['episode']}':
-              '${store.local('episodeTitle:${item.id}') ?? ''}',
-      },
-    );
-  }
+    List<SourceEntry> entries, {
+    Map<String, SyncRecord>? recordsByPath,
+  }) => identifyStoredDirectory(
+    store,
+    sourceId,
+    path,
+    entries,
+    recordsByPath: recordsByPath,
+  );
 
   /// Catalogue and source browsing share the same records, including episodes
   /// that have not been played yet. Recognized collections import missing
@@ -1192,12 +1163,26 @@ class AppModel extends ChangeNotifier {
             ? {...mediaFieldsSubject(donor.data), ...value.subject!}
             : mediaFieldsSubject(donor.data),
         episodeTitles: names,
+        episodeCount: value.episodeCount,
+        listedVideoCount: value.listedVideoCount,
+        membershipComplete: value.membershipComplete,
       );
     }
     if (keys.length > 1) resolved = value.withMetadata(null, {});
     var changed = false;
+    final manualIds = manual.map((record) => record.id).toSet();
+    final manualEpisodes = <String, String>{};
     for (final entry in resolved.videos) {
       final existing = sourceMedia(sourceId, entry.path);
+      if (existing != null &&
+          manualIds.contains(existing.id) &&
+          keys.length == 1 &&
+          mediaSeriesKey(existing) == keys.single) {
+        final episode = '${existing.data['episode'] ?? ''}';
+        if (resolved.identities[entry.path]?.episode != episode) {
+          manualEpisodes[entry.path] = episode;
+        }
+      }
       if (existing == null &&
           (!(importMissing ?? resolved.subject != null) ||
               store.local(_sourceExclusionKey(sourceId, entry.path)) == true)) {
@@ -1210,7 +1195,10 @@ class AppModel extends ChangeNotifier {
       }
     }
     if (changed) notifyListeners();
-    return resolved;
+    return resolved.withEpisodeOverrides(
+      manualEpisodes,
+      completeIdentities: value.identities,
+    );
   }
 
   List<SyncRecord> collectionRecords(

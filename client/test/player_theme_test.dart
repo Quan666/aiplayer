@@ -166,6 +166,142 @@ void main() {
     );
   }
 
+  for (final lines in [1, 2]) {
+    testWidgets(
+      'compact $lines-line selectors fit text at accessibility scales',
+      (tester) async {
+        final title = lines == 1 ? '1.25×' : '第一行\n第二行';
+        for (final (scaler, factor) in [
+          (TextScaler.linear(1), 1.0),
+          (TextScaler.linear(1.5), 1.5),
+          (TextScaler.linear(2.5), 2.5),
+          (const _MenuTextScaler(), 2.5),
+        ]) {
+          await tester.pumpWidget(
+            MaterialApp(
+              builder: (context, child) => MediaQuery(
+                data: MediaQuery.of(context).copyWith(textScaler: scaler),
+                child: child!,
+              ),
+              home: PlayerTheme.surface(
+                Scaffold(
+                  body: Center(
+                    child: SizedBox(
+                      width: 240,
+                      child: PlayerSelect<String>(
+                        label: '选择',
+                        maxLines: lines,
+                        value: 'one',
+                        options: [GlassOption('one', title)],
+                        onChanged: (_) {},
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.tap(find.byType(PlayerSelect<String>));
+          await tester.pumpAndSettle();
+          final choice = find.descendant(
+            of: find.byType(PlayerSheet),
+            matching: find.widgetWithText(PlayerChoiceTile, title),
+          );
+          final row = tester.getRect(choice);
+          final text = tester.getRect(
+            find.descendant(of: choice, matching: find.text(title)),
+          );
+          expect(row.height, (lines == 1 ? 32 : 40) * factor);
+          expect(text.top, greaterThanOrEqualTo(row.top + 3));
+          expect(text.bottom, lessThanOrEqualTo(row.bottom - 3));
+          expect(text.center.dy, closeTo(row.center.dy, .1));
+          expect(tester.takeException(), isNull);
+          await tester.tap(choice);
+          await tester.pumpAndSettle();
+          await tester.pumpWidget(const SizedBox());
+        }
+      },
+    );
+  }
+
+  testWidgets(
+    'compact playlist rows keep progress readable and the selection centered at large text sizes',
+    (tester) async {
+      for (final scale in [1.0, 1.5, 2.5]) {
+        final built = <int>[];
+        const selected = 600;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: MediaQuery(
+              data: MediaQueryData(textScaler: TextScaler.linear(scale)),
+              child: PlayerTheme.surface(
+                Builder(
+                  builder: (context) => Center(
+                    child: SizedBox(
+                      width: 360,
+                      height: 280,
+                      child: PlayerMenuList(
+                        key: ValueKey(scale),
+                        selectedIndex: selected,
+                        itemExtent: PlayerTheme.choiceExtent(
+                          context,
+                          twoLines: true,
+                        ),
+                        itemCount: 1000,
+                        itemBuilder: (_, index) {
+                          built.add(index);
+                          return PlayerChoiceTile(
+                            key: ValueKey(index),
+                            selected: index == selected,
+                            title: Text(
+                              '第 $index 集',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: PlayerTheme.of(
+                                context,
+                              ).playlistItemStyle(selected: index == selected),
+                            ),
+                            subtitle: index.isEven
+                                ? Text(
+                                    '12:34 / 24:00 · 52%',
+                                    key: ValueKey('progress-$index'),
+                                    style: PlayerTheme.of(
+                                      context,
+                                    ).playlistProgressStyle,
+                                  )
+                                : null,
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(built.length, lessThan(30));
+        final viewport = tester.getRect(find.byType(ListView));
+        final row = tester.getRect(find.byKey(const ValueKey(selected)));
+        final previous = tester.getRect(
+          find.byKey(const ValueKey(selected - 1)),
+        );
+        final title = tester.getRect(find.text('第 $selected 集'));
+        final progress = tester.getRect(
+          find.byKey(const ValueKey('progress-$selected')),
+        );
+        expect(row.height, 40 * scale);
+        expect(previous.height, row.height);
+        expect(row.center.dy, closeTo(viewport.center.dy, .1));
+        expect(title.top, greaterThanOrEqualTo(row.top + 4));
+        expect(title.bottom, lessThanOrEqualTo(progress.top));
+        expect(progress.bottom, lessThanOrEqualTo(row.bottom - 4));
+        expect(tester.takeException(), isNull);
+      }
+    },
+  );
+
   testWidgets(
     'player controls retain glass styling without filtering live video',
     (tester) async {
@@ -1118,6 +1254,16 @@ class _SettingsModel extends ChangeNotifier implements AppModel {
   AppPreferences get preferences => AppPreferences(values);
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _MenuTextScaler extends TextScaler {
+  const _MenuTextScaler();
+
+  @override
+  double scale(double fontSize) => fontSize * (fontSize < 10 ? 1 : 2.5);
+
+  @override
+  double get textScaleFactor => 2.5;
 }
 
 class _SettingsPlayer extends Fake implements Player {}

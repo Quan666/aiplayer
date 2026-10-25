@@ -246,6 +246,39 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(controller.mouseTrackingMode, .inActiveApp)
   }
 
+  func testHiddenWindowControlsSurviveFullscreenWithoutMovingWindow() throws {
+    guard NSScreen.main != nil else { throw XCTSkip("Fullscreen needs a display") }
+    let (window, input) = makeWindow()
+    defer { window.close() }
+    window.styleMask.insert(.miniaturizable)
+    window.configureImmersiveTitlebar()
+    XCTAssertTrue(window.makeFirstResponder(input))
+    let originalFrame = window.frame
+    let originalStyle = window.styleMask
+    let types: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+
+    window.setControlsVisible(false)
+    for type in types {
+      XCTAssertTrue(try XCTUnwrap(window.standardWindowButton(type)).isHidden)
+    }
+    XCTAssertEqual(window.frame, originalFrame)
+    XCTAssertEqual(window.styleMask, originalStyle)
+    XCTAssertTrue(window.firstResponder === input)
+
+    window.setVideoFullscreen(true)
+    window.setVideoFullscreen(false)
+    for type in types {
+      XCTAssertTrue(try XCTUnwrap(window.standardWindowButton(type)).isHidden)
+    }
+    window.setControlsVisible(true)
+    for type in types {
+      XCTAssertFalse(try XCTUnwrap(window.standardWindowButton(type)).isHidden)
+    }
+    XCTAssertEqual(window.frame, originalFrame)
+    XCTAssertEqual(window.styleMask, originalStyle)
+    XCTAssertTrue(window.firstResponder === input)
+  }
+
   func testFloatingWindowFollowsSpacesWithoutLosingItsOriginalWindowState() {
     let (window, input) = makeWindow()
     defer { window.close() }

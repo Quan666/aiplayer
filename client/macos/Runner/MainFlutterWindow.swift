@@ -22,6 +22,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var fullscreenLevel: NSWindow.Level = .normal
   private var lastWindowState: [String: Bool]?
   private var dragMouseDown: NSEvent?
+  private var controlsVisible = true
+  private var forwardedTitlebarButtons: Set<Int> = []
   private var nativeFullscreenTransition = false
   private var nativeFullscreenEntering = false
   private enum PendingWindowAction {
@@ -80,6 +82,13 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
         self.desktopReady = true
         self.lastWindowState = self.desktopWindowState
         result(self.desktopWindowState)
+      case "setControlsVisible":
+        guard let visible = (call.arguments as? [String: Any])?["visible"] as? Bool else {
+          result(FlutterError(code: "invalid_arguments", message: "Missing controls visibility", details: nil))
+          return
+        }
+        self.setControlsVisible(visible)
+        result(nil)
       case "startDrag":
         if self.desktopWindowState["fullscreen"] != true,
            NSEvent.pressedMouseButtons & 1 != 0,
@@ -179,6 +188,21 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     // Leave AppKit's traffic lights, resize edges and titlebar gestures intact.
     // Background dragging outside the dedicated strip would steal player input.
     isMovableByWindowBackground = false
+    applyControlsVisibility()
+  }
+
+  func setControlsVisible(_ visible: Bool) {
+    guard controlsVisible != visible else { return }
+    controlsVisible = visible
+    applyControlsVisibility()
+  }
+
+  private func applyControlsVisibility() {
+    for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+      if let button = standardWindowButton(type), button.isHidden == controlsVisible {
+        button.isHidden = !controlsVisible
+      }
+    }
   }
 
   var desktopWindowState: [String: Bool] {
@@ -188,6 +212,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   }
 
   private func publishWindowState() {
+    // AppKit may recreate the standard buttons when restoring a window style.
+    applyControlsVisibility()
     guard desktopReady else { return }
     let state = desktopWindowState
     guard state != lastWindowState else { return }
@@ -196,12 +222,50 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   }
 
   override func sendEvent(_ event: NSEvent) {
+    if forwardHiddenTitlebarEvent(event) { return }
     if event.type == .leftMouseDown {
       dragMouseDown = event
     } else if event.type == .leftMouseUp {
       dragMouseDown = nil
     }
     super.sendEvent(event)
+  }
+
+  private func forwardHiddenTitlebarEvent(_ event: NSEvent) -> Bool {
+    guard let controller = contentViewController as? FlutterViewController,
+          let content = contentView else { return false }
+    let point = content.convert(event.locationInWindow, from: nil)
+    let top = content.isFlipped ? content.bounds.minY : content.bounds.maxY - 36
+    let hiddenTitlebar = !controlsVisible && desktopWindowState["fullscreen"] != true &&
+      NSRect(x: content.bounds.minX, y: top, width: content.bounds.width, height: 36).contains(point)
+    // The transparent AppKit titlebar can still consume pointer events. Route
+    // its hidden strip to the existing Flutter view, without changing styles
+    // or moving focus. Keep a press routed through release even if hover or
+    // pointer-down reveals the native buttons underneath it.
+    switch event.type {
+    case .mouseMoved where hiddenTitlebar:
+      controller.mouseMoved(with: event)
+    case .scrollWheel where hiddenTitlebar:
+      controller.scrollWheel(with: event)
+    case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+      guard hiddenTitlebar else { return false }
+      forwardedTitlebarButtons.insert(event.buttonNumber)
+      if event.type == .leftMouseDown { controller.mouseDown(with: event) }
+      else if event.type == .rightMouseDown { controller.rightMouseDown(with: event) }
+      else { controller.otherMouseDown(with: event) }
+    case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+      guard forwardedTitlebarButtons.contains(event.buttonNumber) else { return false }
+      if event.type == .leftMouseDragged { controller.mouseDragged(with: event) }
+      else if event.type == .rightMouseDragged { controller.rightMouseDragged(with: event) }
+      else { controller.otherMouseDragged(with: event) }
+    case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+      guard forwardedTitlebarButtons.remove(event.buttonNumber) != nil else { return false }
+      if event.type == .leftMouseUp { controller.mouseUp(with: event) }
+      else if event.type == .rightMouseUp { controller.rightMouseUp(with: event) }
+      else { controller.otherMouseUp(with: event) }
+    default: return false
+    }
+    return true
   }
 
   private func releaseFlutterMouseBeforeDrag(_ down: NSEvent) {

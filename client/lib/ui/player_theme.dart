@@ -236,13 +236,15 @@ class PlayerSelect<T> extends StatelessWidget {
   final T value;
   final List<GlassOption<T>> options;
   final ValueChanged<T> onChanged;
+  final int maxLines;
   const PlayerSelect({
     super.key,
     required this.label,
     required this.value,
     required this.options,
     required this.onChanged,
-  });
+    this.maxLines = 2,
+  }) : assert(maxLines == 1 || maxLines == 2);
 
   @override
   Widget build(BuildContext context) => InkWell(
@@ -258,9 +260,7 @@ class PlayerSelect<T> extends StatelessWidget {
             padding: PlayerTheme.choiceMenuPadding,
             selectedIndex:
                 options.indexWhere((option) => option.value == value) + 1,
-            itemExtent:
-                PlayerTheme.choiceTrackRowHeight *
-                MediaQuery.textScalerOf(c).scale(1).clamp(1, 2),
+            itemExtent: PlayerTheme.choiceExtent(c, twoLines: maxLines > 1),
             itemCount: options.length + 1,
             itemBuilder: (_, index) {
               if (index == 0) {
@@ -273,7 +273,11 @@ class PlayerSelect<T> extends StatelessWidget {
               }
               final option = options[index - 1];
               return PlayerChoiceTile(
-                title: Text(option.label),
+                title: Text(
+                  option.label,
+                  maxLines: maxLines,
+                  overflow: TextOverflow.ellipsis,
+                ),
                 selected: option.value == value,
                 onTap: () => Navigator.pop(c, option.value),
               );
@@ -291,7 +295,7 @@ class PlayerSelect<T> extends StatelessWidget {
       child: Text(
         options.where((option) => option.value == value).firstOrNull?.label ??
             '',
-        maxLines: 2,
+        maxLines: maxLines,
         overflow: TextOverflow.ellipsis,
       ),
     ),

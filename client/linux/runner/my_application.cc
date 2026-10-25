@@ -195,6 +195,10 @@ static void desktop_player_call(FlMethodChannel* channel, FlMethodCall* call, gp
   } else if (g_strcmp0(method, "startDrag") == 0) {
     start_window_drag(self);
     fl_method_call_respond_success(call, nullptr, nullptr);
+  } else if (g_strcmp0(method, "setControlsVisible") == 0) {
+    // The zero-height GTK titlebar has no buttons or caption hit region;
+    // Flutter owns visibility and input for the entire window-control strip.
+    fl_method_call_respond_success(call, nullptr, nullptr);
   } else if (g_strcmp0(method, "minimize") == 0) {
     if (self->main_window) gtk_window_iconify(self->main_window);
     fl_method_call_respond_success(call, nullptr, nullptr);

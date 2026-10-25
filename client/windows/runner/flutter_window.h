@@ -35,6 +35,7 @@ class FlutterWindow : public Win32Window {
   std::unique_ptr<SystemProxyHandler> system_proxy_;
   bool desktop_ready_ = false;
   bool close_requested_ = false;
+  bool controls_visible_ = true;
   bool video_fullscreen_ = false;
   RECT fullscreen_bounds_{};
   LONG_PTR fullscreen_ex_style_ = 0;

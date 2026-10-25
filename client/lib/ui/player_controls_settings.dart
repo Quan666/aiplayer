@@ -161,6 +161,7 @@ class _PlayerQuickSettingsState extends State<PlayerQuickSettings> {
         ),
         PlayerSelect<String>(
           label: '画面适配',
+          maxLines: 1,
           value: p.videoFit,
           options: const [
             GlassOption('contain', '完整显示'),

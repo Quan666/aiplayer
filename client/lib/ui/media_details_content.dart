@@ -20,6 +20,7 @@ class MediaDetailsOverview extends StatelessWidget {
   final ValueChanged<SyncRecord> onPlay;
   final VoidCallback? onMatch;
   final VoidCallback onSort;
+  final String? availabilityLabel;
 
   const MediaDetailsOverview({
     super.key,
@@ -30,6 +31,7 @@ class MediaDetailsOverview extends StatelessWidget {
     required this.onPlay,
     required this.onSort,
     this.onMatch,
+    this.availabilityLabel,
   });
 
   @override
@@ -41,6 +43,7 @@ class MediaDetailsOverview extends StatelessWidget {
         details: details,
         records: records,
         onMatch: onMatch,
+        availabilityLabel: availabilityLabel,
       ),
       MediaDetailsContinue(model: model, latest: latest, onPlay: onPlay),
       MediaDetailsPlaylistHeader(onSort: onSort),

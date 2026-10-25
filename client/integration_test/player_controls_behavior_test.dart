@@ -7,9 +7,11 @@ import 'package:aiplayer/danmaku/api.dart';
 import 'package:aiplayer/danmaku/session.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/store.dart';
+import 'package:aiplayer/playback/desktop_window.dart';
 import 'package:aiplayer/playback/session.dart';
 import 'package:aiplayer/playback/subtitle_fonts.dart';
 import 'package:aiplayer/ui/player_page.dart';
+import 'package:aiplayer/ui/desktop_window_frame.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -52,19 +54,32 @@ void main() {
     );
     await preparePlaybackFonts(root);
     final boundary = GlobalKey();
+    final navigator = GlobalKey<NavigatorState>();
     final actions = <String>[];
     final previews = <Map<String, Object?>>[];
     final mouse = await tester.createGesture(kind: ui.PointerDeviceKind.mouse);
     const artifact = String.fromEnvironment('CONTROLS_ARTIFACT_DIR');
     try {
+      DesktopWindow.watchClose(() async {});
       await tester.pumpWidget(
         MaterialApp(
-          home: RepaintBoundary(
-            key: boundary,
-            child: PlayerPage(model: model, media: store.get('media', id)!),
+          navigatorKey: navigator,
+          builder: (context, child) => DesktopWindowFrame(child: child!),
+          home: const Scaffold(body: Center(child: Text('影视库'))),
+        ),
+      );
+      await DesktopWindow.ready();
+      unawaited(
+        navigator.currentState!.push<void>(
+          MaterialPageRoute(
+            builder: (context) => RepaintBoundary(
+              key: boundary,
+              child: PlayerPage(model: model, media: store.get('media', id)!),
+            ),
           ),
         ),
       );
+      await tester.pump(const Duration(milliseconds: 350));
       final dynamic page = tester.state(find.byType(PlayerPage));
       final session = page.session as PlaybackSession;
       final native = session.player.platform as NativePlayer;
@@ -102,6 +117,10 @@ void main() {
       expect(hiddenAfterMs, inInclusiveRange(1750, 2900));
       await tester.pump(const Duration(milliseconds: 250));
       _expectChrome(tester, visible: false);
+      expect(DesktopWindow.state.value.fullscreen, isFalse);
+      expect(find.byKey(const ValueKey('desktop-window-drag')), findsNothing);
+      expect(find.byTooltip('关闭窗口'), findsNothing);
+      actions.add('windowed auto hide also hides window controls');
 
       Future<void> hiddenKey(
         LogicalKeyboardKey key,
@@ -243,6 +262,10 @@ void main() {
       await mouse.moveTo(const Offset(32, 24));
       await tester.pump(const Duration(milliseconds: 300));
       _expectChrome(tester, visible: true);
+      expect(find.byKey(const ValueKey('desktop-window-drag')), findsOneWidget);
+      if (!Platform.isMacOS) {
+        expect(find.byTooltip('关闭窗口'), findsOneWidget);
+      }
       actions.add('mouse movement reveals controls');
 
       final first = await _dragPreview(
@@ -291,6 +314,16 @@ void main() {
       );
       expect(session.error, isEmpty);
       expect(tester.takeException(), isNull);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await _until(
+        () => find.byType(PlayerPage).evaluate().isEmpty,
+        'return to library',
+      );
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(DesktopWindow.controlsVisible.value, isTrue);
+      expect(find.text('影视库'), findsOneWidget);
+      expect(find.byKey(const ValueKey('desktop-window-drag')), findsOneWidget);
+      actions.add('leaving playback restores window controls');
       final report = <String, Object?>{
         'platform': Platform.operatingSystem,
         'scope':
@@ -311,6 +344,7 @@ void main() {
     } finally {
       await mouse.removePointer();
       await tester.pumpWidget(const SizedBox());
+      DesktopWindow.watchClose(null);
       await PlayerPage.waitForDisposals();
       await model.flushPlaybackPreviews();
       model.dispose();
@@ -343,6 +377,13 @@ bool _chromeHidden(WidgetTester tester) =>
     _chromeGroups.every((name) => _opacity(tester, name) == 0);
 
 void _expectChrome(WidgetTester tester, {required bool visible}) {
+  if (DesktopWindow.supported) {
+    expect(
+      DesktopWindow.controlsVisible.value,
+      visible,
+      reason: 'window controls follow playback controls',
+    );
+  }
   for (final name in _chromeGroups) {
     expect(
       _opacity(tester, name),

@@ -121,6 +121,8 @@ class DirectoryCollection {
   /// The available subject can be shown while the missing stage is retried.
   final bool metadataComplete;
   final int? _preparedEpisodeCount;
+  final int? _listedVideoCount;
+  final bool? _membershipComplete;
   const DirectoryCollection({
     required this.title,
     required this.season,
@@ -130,7 +132,14 @@ class DirectoryCollection {
     this.episodeTitles = const {},
     this.metadataComplete = true,
     int? episodeCount,
-  }) : _preparedEpisodeCount = episodeCount;
+    int? listedVideoCount,
+    bool? membershipComplete,
+  }) : _preparedEpisodeCount = episodeCount,
+       _listedVideoCount = listedVideoCount,
+       _membershipComplete = membershipComplete;
+  int get listedVideoCount => _listedVideoCount ?? videos.length;
+  bool get membershipComplete =>
+      _membershipComplete ?? videos.length == listedVideoCount;
   String get displayName =>
       '${subject?['name_cn']?.toString().isNotEmpty == true ? subject!['name_cn'] : subject?['name'] ?? title}';
   String get poster =>
@@ -185,7 +194,47 @@ class DirectoryCollection {
     episodeTitles: names,
     metadataComplete: metadataComplete,
     episodeCount: _preparedEpisodeCount,
+    listedVideoCount: listedVideoCount,
+    membershipComplete: membershipComplete,
   );
+
+  /// Reconcile manual episode edits on the worker without reducing a batched
+  /// collection's count to just the current batch's identities.
+  DirectoryCollection withEpisodeOverrides(
+    Map<String, String> episodes, {
+    required Map<String, ReleaseName> completeIdentities,
+  }) {
+    if (episodes.isEmpty) return this;
+    final updated = {...identities};
+    final complete = {...completeIdentities};
+    for (final entry in episodes.entries) {
+      final identity = identities[entry.key];
+      if (identity == null) continue;
+      final replacement = ReleaseName(
+        identity.anime,
+        identity.season,
+        entry.value,
+      );
+      updated[entry.key] = replacement;
+      complete[entry.key] = replacement;
+    }
+    return DirectoryCollection(
+      title: title,
+      season: season,
+      videos: videos,
+      identities: updated,
+      subject: subject,
+      episodeTitles: episodeTitles,
+      metadataComplete: metadataComplete,
+      episodeCount: complete.values
+          .map((identity) => identity.episode)
+          .where((episode) => episode.isNotEmpty)
+          .toSet()
+          .length,
+      listedVideoCount: listedVideoCount,
+      membershipComplete: membershipComplete,
+    );
+  }
 }
 
 /// Run on the directory worker when checking a production collection. Numeric
@@ -265,6 +314,8 @@ void persistDirectoryPreview(
               'title': collection.title,
               'season': collection.season,
               'episodeCount': collection.episodeCount,
+              'listedVideoCount': collection.listedVideoCount,
+              'membershipComplete': collection.membershipComplete,
               'videos': [
                 for (final entry in collection.videos)
                   {
@@ -332,6 +383,8 @@ DirectoryPreview? _decodeDirectoryPreview(dynamic json) {
             : Map<String, dynamic>.from(raw['subject']),
         episodeTitles: Map<String, String>.from(raw['episodeTitles']),
         metadataComplete: raw['metadataComplete'] != false,
+        listedVideoCount: (raw['listedVideoCount'] as num?)?.toInt(),
+        membershipComplete: raw['membershipComplete'] as bool?,
         episodeCount:
             (raw['episodeCount'] as num?)?.toInt() ??
             (raw['identities'] as Map).values
@@ -374,9 +427,11 @@ DirectoryCollection? identifyDirectory(
   final parsedVideos = <(SourceEntry, ReleaseName)>[];
   String? explicitTitle, explicitSeason;
   String? title, season;
+  var listedVideoCount = 0;
   String seasonKey(String value) => value.isEmpty ? '1' : value;
   for (final video in entries) {
     if (video.directory || !isVideo(video.name)) continue;
+    listedVideoCount++;
     final parsed = parseReleaseName(video.name, allowBareEpisode: true);
     // Extras without episode evidence do not prevent the actual series from
     // opening its details. Distinct episodic titles still make it ambiguous.
@@ -472,6 +527,7 @@ DirectoryCollection? identifyDirectory(
         .map((identity) => identity.episode)
         .toSet()
         .length,
+    listedVideoCount: listedVideoCount,
   );
 }
 
@@ -705,7 +761,7 @@ class LibraryCatalog {
     tmdb = TmdbCatalog(this.transport, this.tmdbCredential, store: store);
   }
   static const headers = {
-    'User-Agent': 'AIPlayer/0.5.19 (personal anime library)',
+    'User-Agent': 'AIPlayer/0.5.20 (personal anime library)',
   };
 
   Future<Map<String, dynamic>> _bangumiRequest(
@@ -768,7 +824,7 @@ class LibraryCatalog {
         .convert(
           utf8.encode(
             jsonEncode([
-              'catalog-v5',
+              'catalog-v6',
               mediaIdentityRevision,
               source,
               strategy(),
@@ -1669,17 +1725,45 @@ class LibraryCatalog {
       modified: directoryModified,
       cancel: cancel,
     );
+    // Cache metadata can describe an earlier interpretation of these same
+    // filenames. The worker's current membership/episode identities remain
+    // authoritative after a manual correction or a parser update.
+    // When filenames contain no usable identity, an AI result can still be
+    // reused for this exact listing fingerprint. The versioned context keeps
+    // previews written before membership completeness was recorded out.
+    final cachedCollection = cached?.collection;
+    final currentCollection = prepared.collection;
+    // AI can identify the opaque siblings that filename parsing deliberately
+    // leaves out. Keep that complete result only for the exact same listing
+    // and saved-identity fingerprint. A manual correction or removed file
+    // changes that fingerprint and must use the fresh worker result instead.
+    final completeCachedMembership =
+        cached?.fingerprint == key &&
+        cachedCollection?.membershipComplete == true &&
+        currentCollection?.membershipComplete == false &&
+        cachedCollection!.listedVideoCount ==
+            currentCollection!.listedVideoCount;
+    final currentWithCachedMetadata = cachedCollection?.subject == null
+        ? null
+        : completeCachedMembership
+        ? cachedCollection
+        : currentCollection?.withMetadata(
+                cachedCollection!.subject,
+                cachedCollection.episodeTitles,
+                metadataComplete: cachedCollection.metadataComplete,
+              ) ??
+              cachedCollection;
     if (cached != null &&
         cached.fingerprint == key &&
-        cached.collection?.subject != null &&
+        currentWithCachedMetadata != null &&
         await collectionEpisodeNamesCovered(
-          cached.collection!,
-          cached.collection!.episodeTitles,
+          currentWithCachedMetadata,
+          currentWithCachedMetadata.episodeTitles,
           cancel: cancel,
         )) {
       cancel?.check();
-      onPoster?.call(cached.collection!.poster);
-      return cached.collection;
+      onPoster?.call(currentWithCachedMetadata.poster);
+      return currentWithCachedMetadata;
     }
     Future<DirectoryCollection?> inspectFresh() async {
       final collection = prepared.collection;

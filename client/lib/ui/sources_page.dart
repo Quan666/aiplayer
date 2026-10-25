@@ -272,7 +272,12 @@ DirectoryCollection? _knownCollection(
       preview ??
       (folder == null
           ? null
-          : model.collectionFromEntries(sourceId, path, folder.entries));
+          : model.collectionFromEntries(
+              sourceId,
+              path,
+              folder.entries,
+              recordsByPath: folder.recordsByPath,
+            ));
   if (value == null || folder == null) return value;
   final paths = value.videos.map((entry) => entry.path).toSet();
   final records = [
@@ -2714,11 +2719,20 @@ class _SourceBrowserState extends State<SourceBrowser>
           !token.cancelled &&
           ticket == generation &&
           current == directory) {
-        // Catalogue caches supply presentation metadata. The current listing
-        // remains authoritative even if that cache knows fewer episode paths.
+        // A complete recognition can identify videos the filename parser
+        // omitted. Retain those identities, while an older subset must never
+        // replace the newly listed membership. The worker preserves manual
+        // per-file identities when applying the complete result.
+        final membership =
+            resolved != null &&
+                !resolved.membershipComplete &&
+                value?.membershipComplete == true &&
+                value!.listedVideoCount == resolved.listedVideoCount
+            ? value
+            : resolved;
         final enriched = value == null || value.subject == null
-            ? resolved ?? collection ?? value
-            : resolved?.withMetadata(value.subject, value.episodeTitles) ??
+            ? membership ?? collection ?? value
+            : membership?.withMetadata(value.subject, value.episodeTitles) ??
                   value;
         final updated = value == null || (!reconcile && value.subject == null)
             ? enriched
@@ -2915,6 +2929,13 @@ class _SourceBrowserState extends State<SourceBrowser>
                           widget.source['id'],
                           item.entry.path,
                           visible,
+                          recordsByPath:
+                              knownFolders[_folderKey(
+                                    widget.source['id'],
+                                    item.entry.path,
+                                  )]
+                                  ?.recordsByPath ??
+                              const {},
                         )
                       : null);
               token.check();
@@ -2981,6 +3002,8 @@ class _SourceBrowserState extends State<SourceBrowser>
                 value.seasonLabel,
                 value.episodeCount,
                 value.videos.length,
+                value.listedVideoCount,
+                value.membershipComplete,
                 value.poster,
               );
         var changed = false;
@@ -3164,6 +3187,11 @@ class _SourceBrowserState extends State<SourceBrowser>
       child: MediaDetailsOverview(
         model: widget.model,
         details: details,
+        // The library may only contain the files recognition understood.
+        // Until every video is identified, report the actual listing size.
+        availabilityLabel: value.membershipComplete
+            ? null
+            : '${value.listedVideoCount} 个视频',
         records: seriesRecords,
         latest: latest,
         onMatch: () async {
@@ -3641,18 +3669,18 @@ class _SourceBrowserState extends State<SourceBrowser>
       );
       if (!mounted) return;
       if (entry.directory) {
-        final value = widget.model.collectionFromEntries(
-          widget.source['id'],
-          entry.path,
-          found,
-        );
-        if (value != null) {
-          final resolved = await widget.model.synchronizeCollectionInBackground(
-            widget.source['id'],
-            value,
-            cancel: _directoryCancel,
-          );
-          if (mounted) setState(() => folderCollections[entry.path] = resolved);
+        final resolved = await widget.model
+            .synchronizeDirectoryEntriesInBackground(
+              widget.source['id'],
+              entry.path,
+              found,
+              cancel: _directoryCancel,
+            );
+        if (mounted) {
+          setState(() {
+            _listedFolders.add(entry.path);
+            folderCollections[entry.path] = resolved;
+          });
         }
       } else if (collection != null) {
         final resolved = await widget.model.synchronizeCollectionInBackground(
@@ -3671,6 +3699,9 @@ class _SourceBrowserState extends State<SourceBrowser>
             );
         if (mounted) setState(() => _setCollection(resolved));
       }
+    } on Cancelled {
+      // Closing the matching route can replace the directory refresh token.
+      // The new visible listing owns reconciliation of any committed edits.
     } catch (failure) {
       if (mounted) await _sourceFailure(context, failure, '匹配影视资料失败');
     }
@@ -4035,9 +4066,15 @@ class _SourceBrowserState extends State<SourceBrowser>
                                     ? [
                                         if (group.seasonLabel.isNotEmpty)
                                           group.seasonLabel,
-                                        group.episodeCount > 0
+                                        group.membershipComplete &&
+                                                group.episodeCount > 0
                                             ? '${group.episodeCount} 集'
-                                            : '${group.videos.length} 个视频',
+                                            : '${group.listedVideoCount} 个视频',
+                                        if (group.membershipComplete &&
+                                            group.episodeCount > 0 &&
+                                            group.listedVideoCount >
+                                                group.episodeCount)
+                                          '${group.listedVideoCount} 个视频',
                                       ].join(' · ')
                                     : entry.directory
                                     ? ''

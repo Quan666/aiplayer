@@ -14,6 +14,7 @@ void main() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
   const codec = StandardMethodCodec();
   final calls = <String>[];
+  final nativeCalls = <MethodCall>[];
 
   Future<void> nativeState({bool fullscreen = false, bool maximized = false}) {
     final reply = Completer<void>();
@@ -38,9 +39,11 @@ void main() {
 
   setUp(() {
     calls.clear();
+    nativeCalls.clear();
     DesktopWindow.watchClose(() async {});
     messenger.setMockMethodCallHandler(DesktopWindow.channel, (call) async {
       calls.add(call.method);
+      nativeCalls.add(call);
       return null;
     });
   });
@@ -151,4 +154,144 @@ void main() {
     await tester.pump();
     expect(find.byKey(const ValueKey('desktop-window-drag')), findsNothing);
   }, variant: TargetPlatformVariant.only(TargetPlatform.linux));
+
+  testWidgets('windowed playback hides controls without moving page content', (
+    tester,
+  ) async {
+    await tester.pumpWidget(app(const TextField()));
+    await tester.enterText(find.byType(TextField), '保留搜索');
+    final fieldState = tester.state(find.byType(TextField));
+    final fieldBounds = tester.getRect(find.byType(TextField));
+    final playback = DesktopWindow.beginPlaybackControls();
+    playback.setVisible(false);
+    await tester.pump();
+    expect(DesktopWindow.state.value.fullscreen, isFalse);
+    expect(find.byKey(const ValueKey('desktop-window-drag')), findsNothing);
+    expect(find.byTooltip('关闭窗口'), findsNothing);
+    expect(tester.getRect(find.byType(TextField)), fieldBounds);
+    playback.setVisible(true);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('desktop-window-drag')), findsOneWidget);
+    expect(tester.state(find.byType(TextField)), same(fieldState));
+    expect(find.text('保留搜索'), findsOneWidget);
+    playback.dispose();
+    expect(tester.takeException(), isNull);
+  }, variant: TargetPlatformVariant.desktop());
+
+  testWidgets(
+    'replaced players cannot revive or hide current window controls',
+    (tester) async {
+      await tester.pumpWidget(app(const Text('内容')));
+      final oldPlayback = DesktopWindow.beginPlaybackControls();
+      oldPlayback.setVisible(false);
+      final playback = DesktopWindow.beginPlaybackControls();
+      expect(DesktopWindow.controlsVisible.value, isTrue);
+      playback.setVisible(false);
+      oldPlayback.dispose();
+      oldPlayback.setVisible(true);
+      expect(DesktopWindow.controlsVisible.value, isFalse);
+      playback.setVisible(false);
+      await tester.idle();
+      expect(
+        nativeCalls
+            .where((call) => call.method == 'setControlsVisible')
+            .map((call) => call.arguments),
+        [
+          {'visible': false},
+          {'visible': true},
+          {'visible': false},
+        ],
+      );
+      playback.dispose();
+      await tester.pump();
+      expect(DesktopWindow.controlsVisible.value, isTrue);
+      expect(find.byTooltip('关闭窗口'), findsOneWidget);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.linux),
+  );
+
+  testWidgets('playback disposal restores the frame during parent navigation', (
+    tester,
+  ) async {
+    final playing = ValueNotifier(true);
+    addTearDown(playing.dispose);
+    await tester.pumpWidget(
+      app(
+        ValueListenableBuilder<bool>(
+          valueListenable: playing,
+          builder: (context, active, child) =>
+              active ? const _HiddenPlaybackControls() : const Text('影视库'),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.byTooltip('关闭窗口'), findsNothing);
+    expect(tester.takeException(), isNull);
+    playing.value = false;
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('影视库'), findsOneWidget);
+    expect(find.byTooltip('关闭窗口'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.linux));
+
+  testWidgets('native control updates do not wait for a background frame', (
+    tester,
+  ) async {
+    await tester.pumpWidget(app(const Text('内容')));
+    final playback = DesktopWindow.beginPlaybackControls();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    playback.setVisible(false);
+    playback.setVisible(false);
+    await tester.idle();
+    expect(
+      nativeCalls
+          .where((call) => call.method == 'setControlsVisible')
+          .map((call) => call.arguments),
+      [
+        {'visible': false},
+      ],
+    );
+    playback.dispose();
+    await tester.idle();
+    expect(
+      nativeCalls
+          .where((call) => call.method == 'setControlsVisible')
+          .map((call) => call.arguments),
+      [
+        {'visible': false},
+        {'visible': true},
+      ],
+    );
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+    expect(find.byTooltip('关闭窗口'), findsOneWidget);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.linux));
+}
+
+class _HiddenPlaybackControls extends StatefulWidget {
+  const _HiddenPlaybackControls();
+
+  @override
+  State<_HiddenPlaybackControls> createState() =>
+      _HiddenPlaybackControlsState();
+}
+
+class _HiddenPlaybackControlsState extends State<_HiddenPlaybackControls> {
+  late final playback = DesktopWindow.beginPlaybackControls();
+
+  @override
+  void initState() {
+    super.initState();
+    playback.setVisible(false);
+  }
+
+  @override
+  void dispose() {
+    playback.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => const Text('播放画面');
 }

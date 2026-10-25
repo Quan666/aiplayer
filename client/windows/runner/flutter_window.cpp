@@ -156,6 +156,17 @@ bool FlutterWindow::OnCreate() {
       last_maximized_ = IsZoomed(GetHandle()) != FALSE;
       window_state_sent_ = true;
       result->Success(WindowState());
+    } else if (call.method_name() == "setControlsVisible") {
+      const auto* args = call.arguments()
+          ? std::get_if<flutter::EncodableMap>(call.arguments()) : nullptr;
+      const auto* value = Argument(args, "visible");
+      const auto* visible = value ? std::get_if<bool>(value) : nullptr;
+      if (!visible) {
+        result->Error("invalid_arguments", "Missing window controls visibility");
+        return;
+      }
+      controls_visible_ = *visible;
+      result->Success();
     } else if (call.method_name() == "startDrag") {
       result->Success();
       if (!video_fullscreen_) {
@@ -290,6 +301,9 @@ LRESULT FlutterWindow::FrameHitTest(LPARAM position) {
     if (left) return HTLEFT;
     if (right) return HTRIGHT;
   }
+  // Hidden playback chrome must pass movement and clicks to Flutter so the
+  // player can reveal its controls. Resize edges above stay native.
+  if (!controls_visible_) return HTCLIENT;
   POINT client = cursor;
   ScreenToClient(window, &client);
   RECT content{};
