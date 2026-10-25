@@ -8,6 +8,7 @@ import '../sources/favorites.dart';
 import 'credential_storage.dart';
 import 'store.dart';
 import 'preferences.dart';
+import 'media_identity.dart';
 import 'media_previews.dart';
 import 'sync_artwork.dart';
 
@@ -1352,6 +1353,7 @@ class SyncProfile {
           utf8.encode(
             jsonEncode([
               'catalog-v5',
+              mediaIdentityRevision,
               source,
               settings['metadataStrategy'] ?? 'conservative',
               aiContext,

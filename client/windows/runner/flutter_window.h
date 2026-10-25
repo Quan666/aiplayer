@@ -44,9 +44,18 @@ class FlutterWindow : public Win32Window {
   RECT saved_bounds_{};
   WINDOWPLACEMENT floating_placement_{};
   bool floating_was_topmost_ = false;
+  bool window_state_sent_ = false;
+  bool last_fullscreen_ = false;
+  bool last_maximized_ = false;
 
   void SetVideoFullscreen(bool enabled);
   void ExitFloating();
+  flutter::EncodableValue WindowState();
+  void PublishWindowState();
+  LRESULT FrameHitTest(LPARAM position);
+  static LRESULT CALLBACK ContentSubclassProc(
+      HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+      UINT_PTR subclass_id, DWORD_PTR reference_data);
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;

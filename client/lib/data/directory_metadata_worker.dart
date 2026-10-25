@@ -9,7 +9,7 @@ import 'package:uuid/uuid.dart';
 import '../core/network.dart';
 import '../core/logger.dart';
 import '../core/system_proxy.dart';
-import '../danmaku/release_name.dart';
+import 'media_identity.dart';
 import '../sources/configuration.dart';
 import '../sources/directory_sort.dart';
 import '../sources/source.dart';
@@ -322,7 +322,7 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
         }
         final id = const Uuid().v4();
         final identity =
-            resolved.identities[entry.path] ?? _mediaIdentity(entry);
+            resolved.identities[entry.path] ?? sourceEntryIdentity(entry);
         store.save('media', id, {
           'title': entry.name,
           'fileName': entry.name,
@@ -471,7 +471,7 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
       : null;
   if (collection == null && anchorId != null) {
     if (anchor == null || anchor.deleted || location is! Map) return null;
-    final originalEvidence = _mediaIdentity(
+    final originalEvidence = sourceEntryIdentity(
       SourceEntry(
         name: '${anchor.data['fileName'] ?? anchor.data['title'] ?? ''}',
         path: '${location['path']}',
@@ -683,39 +683,6 @@ Future<DirectoryCollection?> _identifiedDirectoryCollection(
         .where((episode) => episode.isNotEmpty)
         .toSet()
         .length,
-  );
-}
-
-ReleaseName _mediaIdentity(SourceEntry entry, {ReleaseName? fallback}) {
-  var folder = directoryIdentity(
-    p.posix.dirname(entry.path.replaceAll('\\', '/')),
-  );
-  if (folder.anime.isEmpty && fallback != null) folder = fallback;
-  var guess = parseReleaseName(entry.name);
-  if (guess.episode.isEmpty && folder.anime.isNotEmpty) {
-    final bare = RegExp(
-      r'^(?:EP?)?(\d{1,4})(?:[ ._-].*)?$',
-      caseSensitive: false,
-    ).firstMatch(p.basenameWithoutExtension(entry.name));
-    if (bare != null) {
-      guess = ReleaseName(
-        folder.anime,
-        folder.season,
-        '${int.parse(bare[1]!)}',
-      );
-    }
-  }
-  final compatible =
-      guess.anime.isEmpty ||
-      normalizedSeries(guess.anime) == normalizedSeries(folder.anime);
-  return ReleaseName(
-    guess.anime.isEmpty ? folder.anime : guess.anime,
-    guess.season.isNotEmpty
-        ? guess.season
-        : compatible
-        ? folder.season
-        : '',
-    guess.episode,
   );
 }
 
@@ -1290,7 +1257,7 @@ Future<DirectoryRecognitionProgress> recognizeDirectoryTree(
         if (aiIdentity != null) aiIdentities[entry.path] = aiIdentity;
         final identity = aiIdentity == null
             ? identified?.identities[entry.path] ??
-                  _mediaIdentity(entry, fallback: folderIdentity)
+                  sourceEntryIdentity(entry, fallback: folderIdentity)
             : ReleaseName(
                 aiIdentity.name,
                 aiIdentity.kind == 'movie' ? '' : aiIdentity.season,

@@ -9,6 +9,50 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('sort snapshots follow writes, rollback, SQL and other connections', () {
+    final directory = Directory.systemTemp.createTempSync(
+      'library-sort-cache-',
+    );
+    final store = AppStore('${directory.path}/app.db');
+    final other = AppStore.openExisting(store.path);
+    final model = AppModel(store, directory, backgroundWork: false);
+    addTearDown(() {
+      model.dispose();
+      other.dispose();
+      store.dispose();
+      directory.deleteSync(recursive: true);
+    });
+
+    final initial = model.librarySorting;
+    store.setLocal('preview:video', {'path': '/cover.png'});
+    expect(model.librarySorting, same(initial));
+    store.setLocal('settings', {
+      'librarySortField': 'name',
+      'librarySortDescending': false,
+    });
+    const name = LibrarySort(field: 'name', descending: false);
+    expect(model.librarySorting, name);
+    expect(
+      () => store.transaction(() {
+        store.setLocal('settings', {'librarySortField': 'size'});
+        expect(model.librarySorting.field, 'size');
+        throw StateError('rollback');
+      }),
+      throwsStateError,
+    );
+    expect(model.librarySorting, name);
+
+    store.db.execute('UPDATE local SET value=? WHERE key=?', [
+      '{"librarySortField":"updated"}',
+      'settings',
+    ]);
+    expect(model.librarySorting.field, 'updated');
+    other.setLocal('settings', {'librarySortField': 'modified'});
+    expect(model.librarySorting.field, 'modified');
+    other.removeLocal('settings');
+    expect(model.librarySorting, const LibrarySort());
+  });
+
   test('startup schema preparation waits away from the UI isolate', () async {
     final directory = Directory.systemTemp.createTempSync('library-schema-');
     final path = '${directory.path}/app.db';

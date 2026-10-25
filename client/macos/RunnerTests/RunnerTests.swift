@@ -194,12 +194,14 @@ class RunnerTests: XCTestCase {
     guard NSScreen.main != nil else { throw XCTSkip("Fullscreen needs a display") }
     let (window, input) = makeWindow()
     defer { window.close() }
+    window.configureImmersiveTitlebar()
     let originalFrame = window.frame
     let originalStyle = window.styleMask
     XCTAssertTrue(window.makeFirstResponder(input))
 
     window.setVideoFullscreen(true)
     XCTAssertFalse(window.styleMask.contains(.titled))
+    XCTAssertEqual(window.desktopWindowState["fullscreen"], true)
     XCTAssertTrue(window.firstResponder === input)
 
     // Recovery also works if AppKit leaves the window itself as first responder.
@@ -207,7 +209,32 @@ class RunnerTests: XCTestCase {
     window.setVideoFullscreen(false)
     XCTAssertEqual(window.styleMask, originalStyle)
     XCTAssertEqual(window.frame, originalFrame)
+    XCTAssertEqual(window.desktopWindowState["fullscreen"], false)
+    XCTAssertTrue(window.titlebarAppearsTransparent)
+    XCTAssertEqual(window.titleVisibility, .hidden)
     XCTAssertTrue(window.firstResponder === input)
+  }
+
+  func testImmersiveTitlebarKeepsNativeWindowControls() {
+    let window = MainFlutterWindow(
+      contentRect: NSRect(x: 100, y: 100, width: 640, height: 360),
+      styleMask: [.titled, .closable, .miniaturizable, .resizable],
+      backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+
+    window.configureImmersiveTitlebar()
+
+    XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
+    XCTAssertTrue(window.titlebarAppearsTransparent)
+    XCTAssertEqual(window.titleVisibility, .hidden)
+    XCTAssertNotNil(window.standardWindowButton(.closeButton))
+    XCTAssertNotNil(window.standardWindowButton(.miniaturizeButton))
+    XCTAssertNotNil(window.standardWindowButton(.zoomButton))
+    XCTAssertFalse(window.isMovableByWindowBackground)
+    if #available(macOS 11.0, *) {
+      XCTAssertEqual(window.titlebarSeparatorStyle, .none)
+    }
   }
 
   func testApplicationTracksHoverWhileItsWindowChangesFocus() throws {

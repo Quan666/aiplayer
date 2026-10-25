@@ -584,6 +584,67 @@ void main() {
     expect(session.notice, isEmpty);
   });
 
+  test(
+    'danmaku uses the recognized title without cleaning its symbols',
+    () async {
+      const title = '用【循环利息】强制收回借出的魔力 / Another: World?!';
+      final model = _Model();
+      final session = _Session(
+        model,
+        data: {
+          'fileName': 'Different.Release.S02E03.mkv',
+          'series': '用 强制收回借出的魔力',
+          'metadataTitle': title,
+          'metadataProvider': 'bangumi',
+          'bangumiId': '42',
+          'season': '2',
+          'episode': '3',
+        },
+      );
+      final api = _Api();
+      _cleanup(model, session);
+      model.source.complete(_Source());
+      model.credentials.complete(api);
+
+      await session.open();
+      await api.searchStarted.future;
+      await Future<void>.delayed(Duration.zero);
+
+      expect(api.searches, ['$title / 3']);
+      expect(api.matches, ['$title S02E03']);
+      expect(api.titleMatches, [true]);
+      expect(session.danmakuIdentity.anime, title);
+    },
+  );
+
+  test('danmaku retry picks up an AI identity saved during playback', () async {
+    final model = _Model();
+    final session = _Session(model);
+    final api = _Api();
+    _cleanup(model, session);
+    model.source.complete(_Source());
+    model.credentials.complete(api);
+    await session.open();
+    await api.searchStarted.future;
+    await Future<void>.delayed(Duration.zero);
+    await session.updateSettings({'danmuVisible': false});
+    // AI recognition commits the official catalogue title plus its parsed
+    // season / episode into the same media record as manual recognition.
+    model.store.save('media', 'video', {
+      'series': 'AI original title',
+      'metadataTitle': '用【循环利息】强制收回借出的魔力',
+      'season': '1',
+      'episode': '4',
+    });
+
+    await session.updateSettings({'danmuVisible': true});
+    await Future<void>.delayed(Duration.zero);
+
+    expect(api.searches, ['Example / 01', '用【循环利息】强制收回借出的魔力 / 4']);
+    expect(session.danmakuIdentity.anime, '用【循环利息】强制收回借出的魔力');
+    expect(session.danmakuIdentity.episode, '4');
+  });
+
   test('a danmaku credential failure does not fail video startup', () async {
     final model = _Model();
     final session = _Session(model);
@@ -668,13 +729,13 @@ void _cleanup(_Model model, _Session session) {
 }
 
 class _Session extends PlaybackSession {
-  _Session(AppModel model)
+  _Session(AppModel model, {Map<String, dynamic>? data})
     : super(
         model,
         SyncRecord(
           id: 'video',
           kind: 'media',
-          data: {'series': 'Example', 'episode': '01'},
+          data: data ?? {'series': 'Example', 'episode': '01'},
         ),
       );
 
@@ -760,6 +821,8 @@ class _WorkerHttpSource extends HttpSource {
 
 class _Api implements DanmuApiClient {
   final searches = <String>[];
+  final matches = <String>[];
+  final titleMatches = <bool>[];
   final searchStarted = Completer<void>();
   @override
   final origin = Uri.parse('https://danmaku.example');
@@ -777,8 +840,14 @@ class _Api implements DanmuApiClient {
   @override
   Future<({bool matched, List<EpisodeMatch> matches})> match(
     String fileName, {
+    bool isTitle = false,
     CancelToken? cancel,
-  }) async => (matched: false, matches: <EpisodeMatch>[]);
+  }) async {
+    matches.add(fileName);
+    titleMatches.add(isTitle);
+    return (matched: false, matches: <EpisodeMatch>[]);
+  }
+
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
@@ -789,6 +858,7 @@ class _GatedApi extends _Api {
   @override
   Future<({bool matched, List<EpisodeMatch> matches})> match(
     String fileName, {
+    bool isTitle = false,
     CancelToken? cancel,
   }) async {
     matchRequests.add(cancel!);

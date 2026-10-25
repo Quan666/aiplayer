@@ -133,10 +133,12 @@ void main() {
         await post.drain<void>();
         expect(methods.length, upstreamCount);
         await Future.wait([bridge.close(), bridge.close()]);
-        await expectLater(
-          client.getUrl(bridge.uri),
-          throwsA(isA<SocketException>()),
-        );
+        // A pooled keep-alive connection may not have consumed its close event
+        // yet. Require the complete request to fail, not request allocation.
+        await expectLater(() async {
+          final response = await (await client.getUrl(bridge!.uri)).close();
+          await response.drain<void>();
+        }(), throwsA(anyOf(isA<SocketException>(), isA<HttpException>())));
       } finally {
         client.close(force: true);
         await bridge?.close();

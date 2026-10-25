@@ -578,7 +578,14 @@ Future<void> _runPlaybackSync(
   );
   final reply = messages.sendPort;
   try {
-    await _spawnPlaybackSync(path, address, token, withProfile, reply);
+    await _spawnPlaybackSync(
+      path,
+      address,
+      token,
+      withProfile,
+      reply,
+      SystemProxyWorkerConfiguration.capture(),
+    );
     cancel?.check();
   } finally {
     finished = true;
@@ -594,8 +601,16 @@ Future<void> _spawnPlaybackSync(
   String token,
   bool withProfile,
   SendPort reply,
+  SystemProxyWorkerConfiguration proxyConfiguration,
 ) => Isolate.run(
-  () => _playbackSyncWorker(path, address, token, withProfile, reply),
+  () => _playbackSyncWorker(
+    path,
+    address,
+    token,
+    withProfile,
+    reply,
+    proxyConfiguration,
+  ),
 );
 
 Future<void> _playbackSyncWorker(
@@ -604,7 +619,9 @@ Future<void> _playbackSyncWorker(
   String token,
   bool withProfile,
   SendPort reply,
+  SystemProxyWorkerConfiguration proxyConfiguration,
 ) async {
+  initializeSystemProxyWorker(proxyConfiguration);
   final commands = ReceivePort();
   final cancel = CancelToken();
   commands.listen((_) => cancel.cancel());
@@ -626,8 +643,8 @@ Future<void> _playbackSyncWorker(
             )
           : null,
     );
-    // This path uses only database ownership checks, with no plugin calls,
-    // secret reads, image processing or profile snapshot construction.
+    // Ownership checks use only the database. The network transport may resolve
+    // the system proxy, but needs no secrets, images or profile snapshots.
     await client._uploadPlayback(address, token, cancel);
   } finally {
     store?.dispose();

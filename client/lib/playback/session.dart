@@ -12,8 +12,8 @@ import '../data/app_model.dart';
 import '../data/preferences.dart';
 import '../data/store.dart';
 import '../data/media_technical_info.dart';
+import '../data/media_identity.dart';
 import '../danmaku/session.dart';
-import '../danmaku/release_name.dart';
 import '../sources/source.dart';
 import '../sources/range_bridge.dart';
 import 'resume.dart';
@@ -985,17 +985,17 @@ class PlaybackSession extends ChangeNotifier {
     }
   }
 
+  /// Reuse catalogue / AI identity, including corrections made during playback.
+  ReleaseName get danmakuIdentity {
+    final current = model.store.get('media', media.id);
+    return mediaRecordIdentity(
+      current != null && !current.deleted ? current.data : media.data,
+    );
+  }
+
   void _identifyDanmaku() {
     _danmakuStarted = true;
-    unawaited(
-      danmaku!.identify(
-        ReleaseName(
-          '${media.data['series']}',
-          '${media.data['season'] ?? ''}',
-          '${media.data['episode'] ?? ''}',
-        ),
-      ),
-    );
+    unawaited(danmaku!.identify(danmakuIdentity));
   }
 
   Future<void> _findSubtitles(String path) async {

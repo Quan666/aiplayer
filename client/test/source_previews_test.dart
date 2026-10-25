@@ -1,4 +1,5 @@
 import 'package:aiplayer/ui/media_artwork.dart';
+import 'dart:async';
 import 'dart:io';
 
 import 'package:aiplayer/core/network.dart';
@@ -75,15 +76,22 @@ void main() {
         final calls = fixture.model.childReads;
         await tester.tap(find.byTooltip('返回'));
         await tester.pumpAndSettle();
+        final revalidation = fixture.model.childReadGate = Completer<void>();
         await tester.tap(find.text('NAS'));
         await tester.pump();
         await tester.pump();
         expect(_posters(tester).toSet(), {
           for (final name in _names) 'https://posters.example/$name.jpg',
         });
-        expect(fixture.model.childReads, calls);
         await tester.pumpAndSettle();
-        expect(fixture.model.childReads, calls);
+        expect(revalidation.isCompleted, isFalse);
+        expect(fixture.model.childReads, calls + 4);
+        revalidation.complete();
+        await tester.pumpAndSettle();
+        expect(fixture.model.childReads, calls + 4);
+        expect(_posters(tester).toSet(), {
+          for (final name in _names) 'https://posters.example/$name.jpg',
+        });
         expect(tester.takeException(), isNull);
       } finally {
         await fixture.close(tester);
@@ -265,6 +273,7 @@ class _PreviewCatalog extends LibraryCatalog {
 
 class _PreviewModel extends AppModel {
   int childReads = 0;
+  Completer<void>? childReadGate;
   _PreviewModel(super.store, super.documents);
   late final _testCatalog = _PreviewCatalog(store);
   @override
@@ -290,6 +299,7 @@ class _PreviewAdapter extends SourceAdapter {
       ];
     }
     model.childReads++;
+    await model.childReadGate?.future;
     return _files(int.parse(path.split('/').first));
   }
 

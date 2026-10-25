@@ -157,8 +157,8 @@ void main() {
       );
       expect(
         model.source.seriesReads,
-        0,
-        reason: 'the cached series already contains all episode paths',
+        1,
+        reason: 'visible cached folders still validate their current listing',
       );
       expect(store.records('progress'), isEmpty);
 
@@ -235,7 +235,7 @@ void main() {
         );
         await tester.pumpAndSettle();
         expect(model.media, isEmpty);
-        expect(model.source.seriesReads, 0);
+        expect(model.source.seriesReads, 1);
         expect(find.byType(MediaDetailsOverview), findsNothing);
 
         await tester.tap(find.text('已识别作品'));

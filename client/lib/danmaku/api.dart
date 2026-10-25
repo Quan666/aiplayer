@@ -250,9 +250,14 @@ class DanmuApiClient {
 
   Future<({bool matched, List<EpisodeMatch> matches})> match(
     String fileName, {
+    bool isTitle = false,
     CancelToken? cancel,
   }) async {
-    final name = fileName.split(RegExp(r'[/\\]')).last.trim();
+    // A recognized work title can contain slashes (e.g. Fate/stay night).
+    // Only raw file paths need their directory components removed.
+    final name = isTitle
+        ? fileName.trim()
+        : fileName.split(RegExp(r'[/\\]')).last.trim();
     if (name.isEmpty || name.length > 1000) throw const AppFailure('视频识别参数无效。');
     final data = await _request(
       'match',

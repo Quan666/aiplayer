@@ -1,3 +1,4 @@
+import 'media_identity.dart';
 import 'store.dart';
 
 String _text(Object? value) => value?.toString().trim() ?? '';
@@ -63,9 +64,7 @@ String mediaSeriesKey(SyncRecord record) {
   if (record.data['bangumiId'] != null) {
     return 'bangumi:${record.data['bangumiId']}:$season';
   }
-  final series = _text(
-    record.data['series'],
-  ).toLowerCase().replaceAll(RegExp(r'[\s\p{P}\p{S}]', unicode: true), '');
+  final series = normalizedSeries(_text(record.data['series']));
   if (_text(record.data['episode']).isNotEmpty &&
       series.isNotEmpty &&
       series != '未分类') {

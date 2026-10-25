@@ -10,6 +10,7 @@ import 'data/app_model.dart';
 import 'data/store.dart';
 import 'ui/library_page.dart';
 import 'ui/glass.dart';
+import 'ui/desktop_window_frame.dart';
 import 'sources/apple_access.dart';
 import 'core/logger.dart';
 import 'playback/display.dart';
@@ -37,7 +38,7 @@ Future<void> main(List<String> arguments) async {
     final documents = await getApplicationSupportDirectory();
     await documents.create(recursive: true);
     await AppLog.instance.initialize(documents);
-    AppLog.instance.info('应用', '映库 0.5.18 启动');
+    AppLog.instance.info('应用', '映库 0.5.19 启动');
     final model = AppModel(
       await AppStore.open(p.join(documents.path, 'library.db')),
       documents,
@@ -57,6 +58,8 @@ Future<void> main(List<String> arguments) async {
       MaterialApp(
         theme: AppTheme.theme(),
         darkTheme: AppTheme.theme(brightness: Brightness.dark),
+        builder: (context, child) =>
+            DesktopWindowFrame(child: child ?? const SizedBox()),
         home: const Scaffold(
           body: Center(child: Text('启动失败：请检查播放器原生库和应用数据目录权限。')),
         ),
@@ -340,7 +343,7 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
                 enabled: appearance.animations,
                 child: AbsorbPointer(
                   absorbing: _closing,
-                  child: child ?? const SizedBox(),
+                  child: DesktopWindowFrame(child: child ?? const SizedBox()),
                 ),
               ),
             ),

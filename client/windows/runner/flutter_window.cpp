@@ -3,6 +3,9 @@
 #include <optional>
 #include <algorithm>
 #include <cmath>
+#include <commctrl.h>
+#include <dwmapi.h>
+#include <windowsx.h>
 #include <flutter/standard_method_codec.h>
 #include <flutter/method_result_functions.h>
 #include <flutter_windows.h>
@@ -32,19 +35,23 @@ double AspectArgument(const flutter::EncodableMap* args, double fallback) {
 }
 
 RECT WindowDecoration(HWND window) {
-  RECT decoration{};
-  const DWORD style = static_cast<DWORD>(GetWindowLongPtr(window, GWL_STYLE));
-  const DWORD extended = static_cast<DWORD>(GetWindowLongPtr(window, GWL_EXSTYLE));
-  using AdjustForDpi = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
-  const auto adjust = reinterpret_cast<AdjustForDpi>(
-      GetProcAddress(GetModuleHandle(L"user32.dll"), "AdjustWindowRectExForDpi"));
-  if (adjust) {
-    adjust(&decoration, style, FALSE, extended,
-        FlutterDesktopGetDpiForMonitor(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST)));
-  } else {
-    AdjustWindowRectEx(&decoration, style, FALSE, extended);
-  }
-  return decoration;
+  RECT outer{}, client{};
+  GetWindowRect(window, &outer);
+  GetClientRect(window, &client);
+  // WS_CAPTION remains set for native window behavior, but NCCALCSIZE makes
+  // the title area part of Flutter. Measure its actual client size.
+  return RECT{0, 0, (outer.right - outer.left) - client.right,
+              (outer.bottom - outer.top) - client.bottom};
+}
+
+int ResizeBorder(HWND window, int metric) {
+  const UINT dpi = FlutterDesktopGetDpiForMonitor(
+      MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST));
+  using MetricsForDpi = int(WINAPI*)(int, UINT);
+  const auto metrics = reinterpret_cast<MetricsForDpi>(
+      GetProcAddress(GetModuleHandle(L"user32.dll"), "GetSystemMetricsForDpi"));
+  if (metrics) return metrics(metric, dpi) + metrics(SM_CXPADDEDBORDER, dpi);
+  return GetSystemMetrics(metric) + GetSystemMetrics(SM_CXPADDEDBORDER);
 }
 
 std::string HardwareDescription(const wchar_t* name) {
@@ -81,6 +88,14 @@ bool FlutterWindow::OnCreate() {
   system_proxy_ = std::make_unique<SystemProxyHandler>(
       flutter_controller_->engine()->messenger(), GetHandle());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  // The Flutter child covers our custom frame. Let non-client hit tests pass
+  // through it so native edge resize and caption drag still reach the parent.
+  SetWindowSubclass(flutter_controller_->view()->GetNativeWindow(),
+                    ContentSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
+  const MARGINS margins{1, 1, 1, 1};
+  DwmExtendFrameIntoClientArea(GetHandle(), &margins);
+  SetWindowPos(GetHandle(), nullptr, 0, 0, 0, 0,
+      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
   window_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       flutter_controller_->engine()->messenger(), "app.aiplayer/window_mode",
       &flutter::StandardMethodCodec::GetInstance());
@@ -137,7 +152,29 @@ bool FlutterWindow::OnCreate() {
           {flutter::EncodableValue("model"), flutter::EncodableValue(model)}}));
     } else if (call.method_name() == "ready") {
       desktop_ready_ = true;
+      last_fullscreen_ = video_fullscreen_;
+      last_maximized_ = IsZoomed(GetHandle()) != FALSE;
+      window_state_sent_ = true;
+      result->Success(WindowState());
+    } else if (call.method_name() == "startDrag") {
       result->Success();
+      if (!video_fullscreen_) {
+        ReleaseCapture();
+        const DWORD position = GetMessagePos();
+        PostMessage(GetHandle(), WM_NCLBUTTONDOWN, HTCAPTION, position);
+      }
+    } else if (call.method_name() == "minimize") {
+      ShowWindow(GetHandle(), SW_MINIMIZE);
+      result->Success();
+    } else if (call.method_name() == "toggleMaximize") {
+      if (!video_fullscreen_) {
+        ShowWindow(GetHandle(), IsZoomed(GetHandle()) ? SW_RESTORE : SW_MAXIMIZE);
+      }
+      result->Success();
+    } else if (call.method_name() == "requestClose") {
+      result->Success();
+      // Follow the same saved-progress cleanup as the native close command.
+      PostMessage(GetHandle(), WM_CLOSE, 0, 0);
     } else if (call.method_name() == "closeWindow") {
       result->Success();
       // Destroy the engine after the method reply has been sent.
@@ -163,6 +200,10 @@ void FlutterWindow::OnDestroy() {
   window_channel_.reset();
   desktop_channel_.reset();
   if (flutter_controller_) {
+    if (flutter_controller_->view()) {
+      RemoveWindowSubclass(flutter_controller_->view()->GetNativeWindow(),
+                           ContentSubclassProc, 1);
+    }
     flutter_controller_ = nullptr;
   }
 
@@ -197,6 +238,10 @@ void FlutterWindow::SetVideoFullscreen(bool enabled) {
         fullscreen_bounds_.bottom - fullscreen_bounds_.top,
         SWP_SHOWWINDOW | SWP_FRAMECHANGED);
   }
+  const MARGINS margins = video_fullscreen_ ? MARGINS{0, 0, 0, 0}
+                                          : MARGINS{1, 1, 1, 1};
+  DwmExtendFrameIntoClientArea(window, &margins);
+  PublishWindowState();
 }
 
 void FlutterWindow::ExitFloating() {
@@ -208,10 +253,102 @@ void FlutterWindow::ExitFloating() {
       saved_bounds_.bottom - saved_bounds_.top, SWP_SHOWWINDOW);
 }
 
+flutter::EncodableValue FlutterWindow::WindowState() {
+  return flutter::EncodableValue(flutter::EncodableMap{
+      {flutter::EncodableValue("fullscreen"), flutter::EncodableValue(video_fullscreen_)},
+      {flutter::EncodableValue("maximized"), flutter::EncodableValue(IsZoomed(GetHandle()) != FALSE)}});
+}
+
+void FlutterWindow::PublishWindowState() {
+  if (!desktop_ready_ || !desktop_channel_) return;
+  const bool maximized = IsZoomed(GetHandle()) != FALSE;
+  if (window_state_sent_ && last_fullscreen_ == video_fullscreen_ &&
+      last_maximized_ == maximized) return;
+  window_state_sent_ = true;
+  last_fullscreen_ = video_fullscreen_;
+  last_maximized_ = maximized;
+  desktop_channel_->InvokeMethod("windowStateChanged",
+      std::make_unique<flutter::EncodableValue>(WindowState()));
+}
+
+LRESULT FlutterWindow::FrameHitTest(LPARAM position) {
+  if (video_fullscreen_) return HTCLIENT;
+  const HWND window = GetHandle();
+  const POINT cursor{GET_X_LPARAM(position), GET_Y_LPARAM(position)};
+  RECT bounds{};
+  GetWindowRect(window, &bounds);
+  if (!PtInRect(&bounds, cursor)) return HTNOWHERE;
+  if (!IsZoomed(window)) {
+    const int horizontal = ResizeBorder(window, SM_CXSIZEFRAME);
+    const int vertical = ResizeBorder(window, SM_CYSIZEFRAME);
+    const bool left = cursor.x < bounds.left + horizontal;
+    const bool right = cursor.x >= bounds.right - horizontal;
+    const bool top = cursor.y < bounds.top + vertical;
+    const bool bottom = cursor.y >= bounds.bottom - vertical;
+    if (top) return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
+    if (bottom) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+  }
+  POINT client = cursor;
+  ScreenToClient(window, &client);
+  RECT content{};
+  GetClientRect(window, &content);
+  const double scale = FlutterDesktopGetDpiForMonitor(
+      MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST)) / 96.0;
+  // Match DesktopWindowFrame: 36 logical pixels high, three 46px controls.
+  // Native caption hit testing keeps drag-to-snap, double-click and the system
+  // menu working without Dart callbacks on every pointer movement.
+  if (client.y >= 0 && client.y < std::lround(36 * scale)) {
+    if (client.x < content.right - std::lround(138 * scale)) return HTCAPTION;
+    // Keep the maximize button native for Windows 11's hover Snap layouts.
+    // Flutter still supplies its appearance and keyboard/semantic action.
+    if (client.x >= content.right - std::lround(92 * scale) &&
+        client.x < content.right - std::lround(46 * scale)) return HTMAXBUTTON;
+  }
+  return HTCLIENT;
+}
+
+LRESULT CALLBACK FlutterWindow::ContentSubclassProc(
+    HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+    UINT_PTR subclass_id, DWORD_PTR reference_data) {
+  auto* self = reinterpret_cast<FlutterWindow*>(reference_data);
+  if (message == WM_NCHITTEST) {
+    const LRESULT hit = self->FrameHitTest(lparam);
+    if (hit != HTCLIENT && hit != HTNOWHERE) return HTTRANSPARENT;
+  } else if (message == WM_NCDESTROY) {
+    RemoveWindowSubclass(window, ContentSubclassProc, subclass_id);
+  }
+  return DefSubclassProc(window, message, wparam, lparam);
+}
+
 LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_NCCALCSIZE) {
+    auto* rect = wparam ? &reinterpret_cast<NCCALCSIZE_PARAMS*>(lparam)->rgrc[0]
+                       : reinterpret_cast<RECT*>(lparam);
+    if (!video_fullscreen_ && IsZoomed(hwnd)) {
+      // A maximized WS_THICKFRAME window overhangs its work area. Keep Flutter
+      // inside it, including taskbars placed on secondary monitors or edges.
+      MONITORINFO monitor{sizeof(MONITORINFO)};
+      if (GetMonitorInfo(MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        rect->left = std::max(rect->left, monitor.rcWork.left);
+        rect->top = std::max(rect->top, monitor.rcWork.top);
+        rect->right = std::min(rect->right, monitor.rcWork.right);
+        rect->bottom = std::min(rect->bottom, monitor.rcWork.bottom);
+      }
+    }
+    return 0;
+  }
+  if (message == WM_NCHITTEST) return FrameHitTest(lparam);
+  if (message == WM_ACTIVATE || message == WM_DWMCOMPOSITIONCHANGED) {
+    const MARGINS margins = video_fullscreen_ ? MARGINS{0, 0, 0, 0}
+                                            : MARGINS{1, 1, 1, 1};
+    DwmExtendFrameIntoClientArea(hwnd, &margins);
+  }
+  if (message == WM_SIZE) PublishWindowState();
   if (message == SystemProxyHandler::kCompletedMessage) {
     if (system_proxy_) system_proxy_->Complete();
     return 0;

@@ -1,0 +1,294 @@
+/// Persisted directory identities must be rebuilt when parsing rules change.
+const mediaIdentityRevision = 2;
+
+class ReleaseName {
+  final String anime, season, episode;
+  const ReleaseName(this.anime, [this.season = '', this.episode = '']);
+  String get matchName {
+    if (!RegExp(
+      r'^(?:[CSO])?\d{1,5}$',
+      caseSensitive: false,
+    ).hasMatch(episode)) {
+      return anime;
+    }
+    if (int.tryParse(episode) != null) {
+      final s = RegExp(r'^[1-9]\d?$').hasMatch(season) ? season : '1';
+      return '$anime S${s.padLeft(2, '0')}E${episode.padLeft(2, '0')}';
+    }
+    return '$anime $episode';
+  }
+}
+
+final _mediaExtension = RegExp(
+  r'\.(mkv|mp4|webm|avi|mov|m4v|ts|m2ts|flv|wmv)$',
+  caseSensitive: false,
+);
+final _bracketGroups = RegExp(r'\[([^\[\]]*)\]|【([^【】]*)】|［([^［］]*)］');
+final _releaseGroup = RegExp(
+  r'(?:字幕(?:组|組|社)?|(?:组|組)$|(?:group|subs?(?:please)?|raws?|encodes?|loliHouse|kissaten)\b|^ANi$)',
+  caseSensitive: false,
+);
+final _technicalTag = RegExp(
+  r'^(?:\d{3,4}[pi]|[248]k|HEVC|AVC|H[ .]?26[45]|x26[45]|WEB[ .-]?(?:DL|Rip)|Blu[ .-]?Ray|BDRip|DVDRip|\d{1,2}bit|AAC|FLAC|AC3|EAC3|DTS|DDP|HDR|SDR|Dolby|ASS|SRT|CH[ST]|GB|BIG5|简体|簡體|繁体|繁體|简繁|簡繁|内封|內封|外挂|外掛)(?:\b|[\s._-]|$)',
+  caseSensitive: false,
+);
+
+String _fileStem(String filename) {
+  var title = filename.split(RegExp(r'[/\\]')).last;
+  try {
+    title = Uri.decodeComponent(title);
+  } catch (_) {
+    // A literal percent sign is valid in a filename.
+  }
+  return title.replaceFirst(_mediaExtension, '');
+}
+
+// Release tags are evidence, brackets themselves are not. In particular an
+// embedded 【name】 or [name] is part of the work's title unless it is a known
+// technical tag. Unknown groups stay intact rather than destroying a title.
+String _withoutReleaseTags(String title) {
+  var previousEnd = 0;
+  var hasTitle = false;
+  return title.replaceAllMapped(_bracketGroups, (match) {
+    if (title.substring(previousEnd, match.start).trim().isNotEmpty) {
+      hasTitle = true;
+    }
+    previousEnd = match.end;
+    final content = (match[1] ?? match[2] ?? match[3]!).trim();
+    if (_technicalTag.hasMatch(content) ||
+        (!hasTitle && _releaseGroup.hasMatch(content))) {
+      return ' ';
+    }
+    hasTitle = true;
+    return match[0]!;
+  });
+}
+
+/// Parse release filenames only. Verified catalogue/AI titles must retain their
+/// punctuation and are used directly by [mediaRecordIdentity].
+ReleaseName parseReleaseName(String filename, {bool allowBareEpisode = false}) {
+  final stem = _fileStem(filename);
+  final parsed = _parseIdentity(stem.replaceAll('_', ' '));
+  if (allowBareEpisode && parsed.episode.isEmpty) {
+    final bare = RegExp(
+      r'^(?:EP?)?(\d{1,4})(?:[ ._-].*)?$',
+      caseSensitive: false,
+    ).firstMatch(stem);
+    if (bare != null) {
+      return ReleaseName('', parsed.season, '${int.parse(bare[1]!)}');
+    }
+  }
+  return parsed;
+}
+
+ReleaseName _parseIdentity(String input, {bool release = true}) {
+  var title = release ? _withoutReleaseTags(input) : input;
+  final dottedRelease = !RegExp(r'\s').hasMatch(title.trim());
+  var season = '', episode = '';
+  final ordinal = RegExp(
+    r'\b(\d{1,2})(?:st|nd|rd|th)\s+Season\b',
+    caseSensitive: false,
+  ).firstMatch(title);
+  if (ordinal != null) {
+    season = '${int.parse(ordinal[1]!)}';
+    title = title.replaceRange(ordinal.start, ordinal.end, ' ');
+  }
+
+  final marker = RegExp(
+    r'(?:^|(?<=[\s.([【［_-]))(?:Season[ .-]*|S)(\d{1,2})(?=$|[\s.\])】］_-])|第\s*([一二三四五六七八九十两\d]{1,3})\s*[季部期]',
+    caseSensitive: false,
+  ).firstMatch(title);
+  if (marker != null) {
+    final value = marker[1] ?? marker[2]!;
+    const digits = {
+      '一': 1,
+      '二': 2,
+      '两': 2,
+      '三': 3,
+      '四': 4,
+      '五': 5,
+      '六': 6,
+      '七': 7,
+      '八': 8,
+      '九': 9,
+    };
+    final parts = value.split('十');
+    final n =
+        int.tryParse(value) ??
+        (parts.length == 2
+            ? (digits[parts[0]] ?? 1) * 10 + (digits[parts[1]] ?? 0)
+            : digits[value]);
+    if (n != null && n > 0 && n < 100) season = '$n';
+    title = title.replaceRange(marker.start, marker.end, ' ');
+  }
+  if (season.isNotEmpty) {
+    title = title.replaceAll(RegExp(r'\(\s*\)|\[\s*\]|【\s*】|［\s*］'), ' ');
+  }
+  if (!release) {
+    return ReleaseName(title.replaceAll(RegExp(r'\s+'), ' ').trim(), season);
+  }
+  final patterns = [
+    r'第\s*(\d{1,2})\s*[季部期]\s*第\s*(\d{1,4})\s*[话話集]',
+    r'(?:^|[\s.\[(【［-])S(\d{1,2})[ .-]*E(\d{1,4})(?:v\d+)?(?=$|[\s.\])】］_-])',
+    r'(?:^|[\s.\[(【［-])(?:EP?|Episode)[ .-]*(\d{1,4})(?:v\d+)?(?=$|[\s.\])】］_-])',
+    r'第\s*(\d{1,4})\s*[话話集]',
+    r'\s-\s*(\d{1,4})(?:v\d+)?(?=$|[\s.\]【［(_-])',
+    r'[\[(【［](\d{1,3})(?:v\d+)?[\])】］]',
+    r'(?:\s+|(?<!\d)\.)(\d{1,3})(?:v\d+)?(?=$|\s*\[[^\]]+\]$)',
+  ];
+  for (var i = 0; i < patterns.length; i++) {
+    final m = RegExp(patterns[i], caseSensitive: false).firstMatch(title);
+    if (m == null) continue;
+    if (i == 5 && title.substring(0, m.start).trim().isEmpty) continue;
+    // The trailing number in H.264 / H.265 describes the codec, not an episode.
+    if (i == patterns.length - 1 &&
+        (m[1] == '264' || m[1] == '265') &&
+        RegExp(
+          r'\bH$',
+          caseSensitive: false,
+        ).hasMatch(title.substring(0, m.start))) {
+      continue;
+    }
+    if (i < 2) season = '${int.parse(m[1]!)}';
+    episode = '${int.parse(m[i < 2 ? 2 : 1]!)}';
+    title = title.substring(0, m.start);
+    break;
+  }
+  // Explicit special episode tokens are kept instead of guessed as ordinary episodes.
+  if (episode.isEmpty) {
+    final special = RegExp(
+      r'(?:^|[\s.\[-])(SP|OVA|OAD|[CSO])(\d{1,5})(?=$|[\s.\]])',
+      caseSensitive: false,
+    ).firstMatch(title);
+    if (special != null) {
+      final kind = special[1]!.toUpperCase();
+      episode =
+          '${kind == 'SP'
+              ? 'S'
+              : kind == 'OVA' || kind == 'OAD'
+              ? 'O'
+              : kind}${int.parse(special[2]!)}';
+      title = title.substring(0, special.start);
+    }
+  }
+  title = title.replaceFirst(
+    RegExp(
+      r'\b(?:1080[pi]|720p|2160p|480p|4k|HEVC|AVC|H[ .]?26[45]|x26[45]|WEB[ .-]?DL|BluRay|BDRip|10bit|AAC|FLAC)\b.*$',
+      caseSensitive: false,
+    ),
+    '',
+  );
+  // Dots are release separators in Some.Show.S02E03, but remain punctuation in
+  // titles such as Dr. STONE. Never trim balanced closing brackets from titles.
+  if (dottedRelease && (episode.isNotEmpty || title != input)) {
+    title = title.replaceAll('.', ' ');
+  }
+  title = title.replaceAll(RegExp(r'\s+'), ' ').trim();
+  final roman = RegExp(
+    r'\s+(II|III|IV|V|VI)$',
+    caseSensitive: false,
+  ).firstMatch(title);
+  if (season.isEmpty && roman != null && episode.isNotEmpty) {
+    const numbers = {'II': '2', 'III': '3', 'IV': '4', 'V': '5', 'VI': '6'};
+    season = numbers[roman[1]!.toUpperCase()]!;
+    title = title.substring(0, roman.start).trim();
+  }
+  return ReleaseName(title, season, episode);
+}
+
+String normalizedSeries(String value) => value.toLowerCase().replaceAll(
+  RegExp(r'[\s\p{P}\p{S}]', unicode: true),
+  '',
+);
+
+/// A season belongs to its own Bangumi subject. Never reuse a first-season
+/// poster just because the series title matches a later season's filename.
+ReleaseName subjectIdentity(
+  String name, {
+  bool inferSeasonSuffix = true,
+  bool releaseTags = false,
+}) {
+  final value = (releaseTags ? _withoutReleaseTags(name) : name).trim();
+  if (!inferSeasonSuffix) return _parseIdentity(value, release: false);
+  final numeric = RegExp(
+    r'\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+Season)?$',
+    caseSensitive: false,
+  ).firstMatch(value);
+  if (numeric != null) {
+    return ReleaseName(
+      value.substring(0, numeric.start).trim(),
+      '${int.parse(numeric[1]!)}',
+    );
+  }
+  final roman = RegExp(
+    r'\s+(II|III|IV|V|VI)$',
+    caseSensitive: false,
+  ).firstMatch(value);
+  if (roman != null) {
+    const numbers = {'II': '2', 'III': '3', 'IV': '4', 'V': '5', 'VI': '6'};
+    return ReleaseName(
+      value.substring(0, roman.start).trim(),
+      numbers[roman[1]!.toUpperCase()]!,
+    );
+  }
+  return _parseIdentity(value, release: false);
+}
+
+/// Combine a filename with already resolved directory evidence. This is shared
+/// by foreground browsing and the directory worker.
+ReleaseName releaseIdentity(String fileName, {required ReleaseName folder}) {
+  final guess = parseReleaseName(
+    fileName,
+    allowBareEpisode: folder.anime.isNotEmpty,
+  );
+  final compatible =
+      guess.anime.isEmpty ||
+      normalizedSeries(guess.anime) == normalizedSeries(folder.anime);
+  return ReleaseName(
+    guess.anime.isEmpty ? folder.anime : guess.anime,
+    guess.season.isNotEmpty
+        ? guess.season
+        : compatible
+        ? folder.season
+        : '',
+    guess.episode,
+  );
+}
+
+/// Resolve saved recognition once for playback and search. Catalogue/AI names
+/// are already titles: parsing them as filenames would lose slashes, brackets,
+/// punctuation and numbers that belong to the work.
+ReleaseName mediaRecordIdentity(Map<String, dynamic> data) {
+  String text(String field) => data[field]?.toString().trim() ?? '';
+  final identified = text('metadataTitle');
+  final rawSeries = text('series');
+  final series = rawSeries == '未分类' ? '' : rawSeries;
+  final fileName = text('fileName');
+  final parsed = parseReleaseName(fileName.isEmpty ? text('title') : fileName);
+  var name = identified.isNotEmpty ? identified : series;
+  if (name.isEmpty) {
+    name = parsed.anime;
+  } else if (identified.isEmpty && fileName.isNotEmpty) {
+    // Repair only the historical blanket-bracket deletion. A different saved
+    // series may come from a folder, a manual choice, or AI and must be kept.
+    final legacy = parsed.anime.replaceAll(_bracketGroups, ' ');
+    if (legacy != parsed.anime &&
+        normalizedSeries(legacy) == normalizedSeries(series)) {
+      name = parsed.anime;
+    }
+  }
+  final movie = text('metadataType') == 'movie';
+  return ReleaseName(
+    name,
+    text('season').isNotEmpty
+        ? text('season')
+        : movie
+        ? ''
+        : parsed.season,
+    text('episode').isNotEmpty
+        ? text('episode')
+        : movie
+        ? ''
+        : parsed.episode,
+  );
+}

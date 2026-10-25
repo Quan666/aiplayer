@@ -1,8 +1,15 @@
+import 'dart:async';
+
+import 'package:aiplayer/data/app_model.dart';
+import 'package:aiplayer/data/preferences.dart';
+import 'package:aiplayer/playback/session.dart';
+import 'package:aiplayer/ui/player_controls_settings.dart';
 import 'package:aiplayer/ui/player_theme.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:media_kit/media_kit.dart';
 
 List<Color> _glassColors(WidgetTester tester, Finder glass) {
   final decoration = tester.widget<DecoratedBox>(
@@ -22,6 +29,84 @@ List<Color> _glassColors(WidgetTester tester, Finder glass) {
 }
 
 void main() {
+  testWidgets(
+    'advanced settings fit each active tab and scroll in a short window',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(1280, 900);
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final session = _SettingsSession();
+      addTearDown(session.dispose);
+      addTearDown(session.model.dispose);
+      await _openQuickSettings(tester, session);
+      final heights = <String, double>{};
+      for (final name in ['播放', '字幕', '弹幕', '诊断', '字幕']) {
+        await tester.tap(find.widgetWithText(Tab, name));
+        await tester.pumpAndSettle();
+        heights[name] = tester.getSize(find.byType(PlayerGlass)).height;
+        expect(heights[name], lessThan(PlayerTheme.advancedSettingsMaxHeight));
+        expect(tester.takeException(), isNull);
+      }
+      expect(heights['诊断'], lessThan(heights['字幕']!));
+      tester.view.physicalSize = const Size(844, 260);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      final scroll = tester
+          .state<ScrollableState>(
+            find
+                .descendant(
+                  of: find.byType(PlayerQuickSettings),
+                  matching: find.byType(Scrollable),
+                )
+                .first,
+          )
+          .position;
+      expect(scroll.maxScrollExtent, greaterThan(0));
+      scroll.jumpTo(scroll.maxScrollExtent);
+      await tester.pumpAndSettle();
+      expect(find.text('字幕偏移').hitTestable(), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('settings drafts survive tab changes and late saves', (
+    tester,
+  ) async {
+    final session = _SettingsSession();
+    addTearDown(session.dispose);
+    addTearDown(session.model.dispose);
+    await _openQuickSettings(tester, session);
+    await tester.tap(find.widgetWithText(Tab, '字幕'));
+    await tester.pumpAndSettle();
+    Slider scale() => tester.widget<Slider>(find.byType(Slider).first);
+    scale().onChanged!(1.5);
+    scale().onChangeEnd!(1.5);
+    await tester.pump();
+    await tester.tap(find.widgetWithText(Tab, '诊断'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(Tab, '字幕'));
+    await tester.pumpAndSettle();
+    expect(scale().value, 1.5);
+    scale().onChanged!(2.0);
+    await tester.pump();
+    session.saves.first.complete();
+    await tester.pump();
+    expect(scale().value, 2.0);
+    scale().onChangeEnd!(2.0);
+    session.saves.last.complete();
+    await tester.pumpAndSettle();
+    expect(session.model.preferences.subtitleScale, 2.0);
+    expect(scale().value, 2.0);
+    // Disposing a panel must not revive its draft listeners on completion.
+    scale().onChanged!(2.5);
+    scale().onChangeEnd!(2.5);
+    await tester.pumpWidget(const SizedBox());
+    session.saves.last.complete();
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+  });
+
   for (final selected in [0, 600, 999]) {
     testWidgets(
       'choice menu opens centered on option $selected without building preceding rows',
@@ -990,4 +1075,67 @@ void main() {
     );
     expect(tester.takeException(), isNull);
   });
+}
+
+Future<void> _openQuickSettings(
+  WidgetTester tester,
+  _SettingsSession session,
+) async {
+  await tester.pumpWidget(
+    MaterialApp(
+      home: Scaffold(
+        body: Builder(
+          builder: (context) => TextButton(
+            onPressed: () => showModalBottomSheet<void>(
+              context: context,
+              isScrollControlled: true,
+              builder: (_) => PlayerSheet(
+                child: PlayerQuickSettings(
+                  session: session,
+                  onDanmaku: () {},
+                  onDiagnostics: () {},
+                ),
+              ),
+            ),
+            child: const Text('打开高级设置'),
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.tap(find.text('打开高级设置'));
+  await tester.pumpAndSettle();
+}
+
+class _SettingsModel extends ChangeNotifier implements AppModel {
+  final values = <String, dynamic>{};
+  void applyChanges(Map<String, dynamic> changes) {
+    values.addAll(changes);
+    notifyListeners();
+  }
+
+  @override
+  AppPreferences get preferences => AppPreferences(values);
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _SettingsPlayer extends Fake implements Player {}
+
+class _SettingsSession extends ChangeNotifier implements PlaybackSession {
+  @override
+  final _SettingsModel model = _SettingsModel();
+  @override
+  final player = _SettingsPlayer();
+  final saves = <Completer<void>>[];
+  @override
+  Future<void> updateSettings(Map<String, dynamic> changes) async {
+    final saved = Completer<void>();
+    saves.add(saved);
+    await saved.future;
+    model.applyChanges(changes);
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

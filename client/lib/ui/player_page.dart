@@ -10,7 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../danmaku/overlay.dart';
-import '../danmaku/release_name.dart';
+import '../data/media_identity.dart';
 import '../data/app_model.dart';
 import '../data/store.dart';
 import '../playback/session.dart';
@@ -853,15 +853,10 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       );
       return;
     }
-    final title = TextEditingController(
-          text: '${session.media.data['series']}',
-        ),
-        season = TextEditingController(
-          text: '${session.media.data['season'] ?? ''}',
-        ),
-        episode = TextEditingController(
-          text: '${session.media.data['episode'] ?? ''}',
-        );
+    final identity = session.danmakuIdentity;
+    final title = TextEditingController(text: identity.anime),
+        season = TextEditingController(text: identity.season),
+        episode = TextEditingController(text: identity.episode);
     await showModalBottomSheet(
       context: PlayerTheme.routeContext(context),
       isScrollControlled: true,

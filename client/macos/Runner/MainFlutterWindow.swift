@@ -20,6 +20,15 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var fullscreenFrame: NSRect?
   private var fullscreenStyle: NSWindow.StyleMask = []
   private var fullscreenLevel: NSWindow.Level = .normal
+  private var lastWindowState: [String: Bool]?
+  private var dragMouseDown: NSEvent?
+  private var nativeFullscreenTransition = false
+  private var nativeFullscreenEntering = false
+  private enum PendingWindowAction {
+    case fullscreen(Bool)
+    case floating(Double)
+  }
+  private var pendingWindowAction: PendingWindowAction?
   private var terminationCompletion: (() -> Void)?
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
@@ -28,7 +37,9 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     flutterViewController.mouseTrackingMode = .inActiveApp
     acceptsMouseMovedEvents = true
     self.contentViewController = flutterViewController
-    // Keep the playback area at 16:9; the native title bar is extra.
+    configureImmersiveTitlebar()
+    // Flutter draws through the title bar and reserves space for the native
+    // traffic lights; there is no separate strip above the application.
     var contentSize = NSSize(width: 1280, height: 720)
     if let display = screen ?? NSScreen.main {
       let work = display.visibleFrame
@@ -67,6 +78,25 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
       switch call.method {
       case "ready":
         self.desktopReady = true
+        self.lastWindowState = self.desktopWindowState
+        result(self.desktopWindowState)
+      case "startDrag":
+        if self.desktopWindowState["fullscreen"] != true,
+           NSEvent.pressedMouseButtons & 1 != 0,
+           let event = self.dragMouseDown {
+          self.dragMouseDown = nil
+          self.releaseFlutterMouseBeforeDrag(event)
+          self.performDrag(with: event)
+        }
+        result(nil)
+      case "minimize":
+        self.miniaturize(nil)
+        result(nil)
+      case "toggleMaximize":
+        self.performTitlebarDoubleClick()
+        result(nil)
+      case "requestClose":
+        self.performClose(nil)
         result(nil)
       case "closeWindow":
         self.closeApproved = true
@@ -92,7 +122,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
         self.exitFloating()
         let enabled = (call.arguments as? [String: Any])?["enabled"] as? Bool ?? false
         self.setVideoFullscreen(enabled)
-        result(self.fullscreenFrame != nil)
+        result(enabled && (self.nativeFullscreenTransition ||
+          self.desktopWindowState["fullscreen"] == true))
       case "enter":
         let value = ((call.arguments as? [String: Any])?["aspectRatio"] as? NSNumber)?.doubleValue ?? 16.0 / 9
         self.enterFloating(aspectRatio: value)
@@ -133,11 +164,128 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   }
 
   func windowWillClose(_ notification: Notification) {
+    pendingWindowAction = nil
     systemProxy?.close()
     systemProxy = nil
   }
 
   deinit { systemProxy?.close() }
+
+  func configureImmersiveTitlebar() {
+    styleMask.insert(.fullSizeContentView)
+    titleVisibility = .hidden
+    titlebarAppearsTransparent = true
+    if #available(macOS 11.0, *) { titlebarSeparatorStyle = .none }
+    // Leave AppKit's traffic lights, resize edges and titlebar gestures intact.
+    // Background dragging outside the dedicated strip would steal player input.
+    isMovableByWindowBackground = false
+  }
+
+  var desktopWindowState: [String: Bool] {
+    ["fullscreen": fullscreenFrame != nil || nativeFullscreenEntering ||
+       styleMask.contains(.fullScreen),
+     "maximized": isZoomed]
+  }
+
+  private func publishWindowState() {
+    guard desktopReady else { return }
+    let state = desktopWindowState
+    guard state != lastWindowState else { return }
+    lastWindowState = state
+    desktopPlayerChannel?.invokeMethod("windowStateChanged", arguments: state)
+  }
+
+  override func sendEvent(_ event: NSEvent) {
+    if event.type == .leftMouseDown {
+      dragMouseDown = event
+    } else if event.type == .leftMouseUp {
+      dragMouseDown = nil
+    }
+    super.sendEvent(event)
+  }
+
+  private func releaseFlutterMouseBeforeDrag(_ down: NSEvent) {
+    // AppKit may consume the final mouse-up during performDrag. End Flutter's
+    // gesture before handing off, or the next click can remain part of the old
+    // drag. Deliver only to Flutter; the Window Server still gets the original
+    // down event and the real button state for its native drag operation.
+    guard let controller = contentViewController as? FlutterViewController,
+          let up = NSEvent.mouseEvent(
+            with: .leftMouseUp, location: mouseLocationOutsideOfEventStream,
+            modifierFlags: down.modifierFlags,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: windowNumber, context: nil,
+            eventNumber: down.eventNumber, clickCount: down.clickCount,
+            pressure: 0) else { return }
+    controller.mouseUp(with: up)
+  }
+
+  private func performTitlebarDoubleClick() {
+    guard desktopWindowState["fullscreen"] != true else { return }
+    // Match the system titlebar action in the additional Flutter drag area.
+    switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick")?.lowercased() {
+    case "minimize": miniaturize(nil)
+    case "none": break
+    default: zoom(nil)
+    }
+    publishWindowState()
+  }
+
+  func windowDidResize(_ notification: Notification) {
+    publishWindowState()
+  }
+
+  func windowWillEnterFullScreen(_ notification: Notification) {
+    nativeFullscreenTransition = true
+    nativeFullscreenEntering = true
+    publishWindowState()
+  }
+
+  func windowDidEnterFullScreen(_ notification: Notification) {
+    nativeFullscreenTransition = false
+    nativeFullscreenEntering = false
+    publishWindowState()
+    applyPendingWindowAction()
+  }
+
+  func windowWillExitFullScreen(_ notification: Notification) {
+    nativeFullscreenTransition = true
+  }
+
+  func windowDidExitFullScreen(_ notification: Notification) {
+    nativeFullscreenTransition = false
+    nativeFullscreenEntering = false
+    publishWindowState()
+    restoreFlutterInput()
+    applyPendingWindowAction()
+  }
+
+  func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+    nativeFullscreenTransition = false
+    nativeFullscreenEntering = false
+    publishWindowState()
+    applyPendingWindowAction()
+  }
+
+  func windowDidFailToExitFullScreen(_ window: NSWindow) {
+    nativeFullscreenTransition = false
+    if case .floating? = pendingWindowAction {
+      pendingWindowAction = nil
+      windowModeChannel?.invokeMethod("changed", arguments: false)
+    }
+    publishWindowState()
+    applyPendingWindowAction()
+  }
+
+  private func applyPendingWindowAction() {
+    guard !nativeFullscreenTransition, !closeRequested,
+          let action = pendingWindowAction else { return }
+    pendingWindowAction = nil
+    switch action {
+    case .fullscreen(let enabled): setVideoFullscreen(enabled)
+    case .floating(let ratio): enterFloating(aspectRatio: ratio)
+    }
+  }
 
   fileprivate func handleFileCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     var bookmarks = UserDefaults.standard.dictionary(forKey: "aiplayerBookmarks") as? [String: Data] ?? [:]
@@ -163,6 +311,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private func requestClose() {
     guard !closeRequested else { return }
     closeRequested = true
+    pendingWindowAction = nil
     desktopPlayerChannel?.invokeMethod("closeRequested", arguments: nil)
   }
 
@@ -180,6 +329,13 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   }
 
   func enterFloating(aspectRatio value: Double) {
+    // AppKit must finish leaving its fullscreen Space before changing window
+    // collection behavior or geometry. Continue from the delegate event.
+    if nativeFullscreenTransition || styleMask.contains(.fullScreen) {
+      pendingWindowAction = .floating(value)
+      if !nativeFullscreenTransition { toggleFullScreen(nil) }
+      return
+    }
     setVideoFullscreen(false)
     let ratio = value.isFinite ? min(2.39, max(0.42, value)) : 16.0 / 9
     if floatingFrame == nil {
@@ -204,6 +360,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   }
 
   func exitFloating() {
+    if case .floating? = pendingWindowAction { pendingWindowAction = nil }
     guard let saved = floatingFrame else { return }
     floatingFrame = nil
     collectionBehavior = originalCollectionBehavior
@@ -213,6 +370,17 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   }
 
   func setVideoFullscreen(_ enabled: Bool) {
+    // Do not replace AppKit's fullscreen style with a second borderless mode.
+    // AppKit transitions cannot be interrupted: keep only the latest intent
+    // and apply it from the completion event, never a timer or frame callback.
+    if nativeFullscreenTransition {
+      pendingWindowAction = .fullscreen(enabled)
+      return
+    }
+    if styleMask.contains(.fullScreen) {
+      if !enabled { toggleFullScreen(nil) }
+      return
+    }
     guard enabled != (fullscreenFrame != nil) else { return }
     let responder = firstResponder
     if enabled {
@@ -231,6 +399,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     }
     makeKeyAndOrderFront(nil)
     restoreFlutterInput(preferredResponder: responder)
+    publishWindowState()
   }
 
   func restoreFlutterInput(preferredResponder: NSResponder? = nil) {

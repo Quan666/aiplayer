@@ -5,45 +5,14 @@ import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import '../core/logger.dart';
 import '../core/network.dart';
-import '../danmaku/release_name.dart';
+import 'media_identity.dart';
 import '../sources/source.dart';
 import 'store.dart';
 import 'catalog_cache.dart';
 import 'media_presentation.dart';
 import 'tmdb_catalog.dart';
 
-String normalizedSeries(String value) => value.toLowerCase().replaceAll(
-  RegExp(r'[\s\p{P}\p{S}]', unicode: true),
-  '',
-);
-
-/// A season belongs to its own Bangumi subject. Never reuse a first-season
-/// poster just because the series title matches a later season's filename.
-ReleaseName subjectIdentity(String name) {
-  var value = name.trim();
-  final numeric = RegExp(
-    r'\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+Season)?$',
-    caseSensitive: false,
-  ).firstMatch(value);
-  if (numeric != null) {
-    return ReleaseName(
-      value.substring(0, numeric.start).trim(),
-      '${int.parse(numeric[1]!)}',
-    );
-  }
-  final roman = RegExp(
-    r'\s+(II|III|IV|V|VI)$',
-    caseSensitive: false,
-  ).firstMatch(value);
-  if (roman != null) {
-    const numbers = {'II': '2', 'III': '3', 'IV': '4', 'V': '5', 'VI': '6'};
-    return ReleaseName(
-      value.substring(0, roman.start).trim(),
-      numbers[roman[1]!.toUpperCase()]!,
-    );
-  }
-  return parseReleaseName(value);
-}
+export 'media_identity.dart' show normalizedSeries, subjectIdentity;
 
 /// A season directory carries the season, while its parent carries the title.
 /// This evidence is available before any file has been played or identified.
@@ -58,14 +27,27 @@ ReleaseName directoryIdentity(String path, {String rootPath = ''}) {
   if (name == '.' || name == '/' || name.isEmpty) return const ReleaseName('');
   final parsed = parseReleaseName(name);
   if (parsed.anime.isNotEmpty || parsed.season.isEmpty) {
-    return subjectIdentity(name);
+    return subjectIdentity(name, releaseTags: true);
   }
   final parent = p.posix.dirname(fullPath);
   if (parent == '.' || parent == '/' || parent == fullPath) return parsed;
   final parentName = p.posix.basename(parent);
   final parentIdentity = parseReleaseName(parentName);
   if (parentIdentity.anime.isEmpty) return parsed;
-  return ReleaseName(subjectIdentity(parentName).anime, parsed.season);
+  return ReleaseName(
+    subjectIdentity(parentName, releaseTags: true).anime,
+    parsed.season,
+  );
+}
+
+/// Files opened directly and files inspected by the directory worker use the
+/// same filename and parent-folder evidence before any provider recognition.
+ReleaseName sourceEntryIdentity(SourceEntry entry, {ReleaseName? fallback}) {
+  var folder = directoryIdentity(
+    p.posix.dirname(entry.path.replaceAll('\\', '/')),
+  );
+  if (folder.anime.isEmpty && fallback != null) folder = fallback;
+  return releaseIdentity(entry.name, folder: folder);
 }
 
 /// Called on the directory worker (or an in-memory test store). A WebDAV root
@@ -390,25 +372,15 @@ DirectoryCollection? identifyDirectory(
   final folder = folderIdentity ?? directoryIdentity(path);
   final identities = <String, ReleaseName>{};
   final parsedVideos = <(SourceEntry, ReleaseName)>[];
-  final bareEpisode = RegExp(
-    r'^(?:EP?)?(\d{1,4})(?:[ ._-].*)?$',
-    caseSensitive: false,
-  );
   String? explicitTitle, explicitSeason;
   String? title, season;
   String seasonKey(String value) => value.isEmpty ? '1' : value;
   for (final video in entries) {
     if (video.directory || !isVideo(video.name)) continue;
-    var parsed = parseReleaseName(video.name);
-    if (parsed.episode.isEmpty) {
-      final bare = bareEpisode.firstMatch(
-        p.basenameWithoutExtension(video.name),
-      );
-      // Extras without episode evidence do not prevent the actual series from
-      // opening its details. Distinct episodic titles still make it ambiguous.
-      if (bare == null) continue;
-      parsed = ReleaseName('', parsed.season, '${int.parse(bare[1]!)}');
-    }
+    final parsed = parseReleaseName(video.name, allowBareEpisode: true);
+    // Extras without episode evidence do not prevent the actual series from
+    // opening its details. Distinct episodic titles still make it ambiguous.
+    if (parsed.episode.isEmpty) continue;
     if (parsed.anime.isNotEmpty) {
       if (explicitTitle != null &&
           normalizedSeries(explicitTitle) != normalizedSeries(parsed.anime)) {
@@ -554,14 +526,24 @@ DirectoryInspection prepareDirectoryInspection(
 }
 
 String metadataQuery(String value, {bool preserveSeason = true}) {
-  // Never let a pasted source URL or full path become a catalogue query.
-  if (value.contains('://') ||
-      value.contains('/') ||
-      value.contains('\\') ||
-      RegExp(r'[\x00-\x1f]').hasMatch(value)) {
+  final title = value.trim();
+  // Work-title queries retain legal slashes and symbols. Legacy callers may
+  // still pass release filenames, distinguished by a supported video suffix.
+  // Reject pasted URLs and absolute/explicit relative paths without treating
+  // a title such as Fate/stay night as a file path.
+  if (title.contains('://') ||
+      title.contains('\\') ||
+      RegExp(r'^(?:/|[a-zA-Z]:/|~/|\.{1,2}/)').hasMatch(title) ||
+      RegExp(
+        r'^(?:https?|file|data|magnet|ftp|smb):',
+        caseSensitive: false,
+      ).hasMatch(title) ||
+      RegExp(r'[\x00-\x1f\x7f]').hasMatch(title)) {
     return '';
   }
-  final parsed = parseReleaseName(value);
+  final parsed = isVideo(title)
+      ? parseReleaseName(title)
+      : subjectIdentity(title, inferSeasonSuffix: false);
   final clean =
       '${parsed.anime.trim()}${preserveSeason && parsed.season.isNotEmpty ? ' 第${parsed.season}季' : ''}';
   return String.fromCharCodes(clean.runes.take(160));
@@ -723,7 +705,7 @@ class LibraryCatalog {
     tmdb = TmdbCatalog(this.transport, this.tmdbCredential, store: store);
   }
   static const headers = {
-    'User-Agent': 'AIPlayer/0.5.18 (personal anime library)',
+    'User-Agent': 'AIPlayer/0.5.19 (personal anime library)',
   };
 
   Future<Map<String, dynamic>> _bangumiRequest(
@@ -785,7 +767,13 @@ class LibraryCatalog {
     return sha256
         .convert(
           utf8.encode(
-            jsonEncode(['catalog-v5', source, strategy(), aiContext()]),
+            jsonEncode([
+              'catalog-v5',
+              mediaIdentityRevision,
+              source,
+              strategy(),
+              aiContext(),
+            ]),
           ),
         )
         .toString();
@@ -991,11 +979,16 @@ class LibraryCatalog {
       'catalog-v1:bangumi:search:${sha256.convert(utf8.encode(query))}',
       fetch: (token) async {
         final data = await _bangumiRequest(
-          Uri.https('api.bgm.tv', '/search/subject/$query', {
-            'type': '2',
-            'responseGroup': 'large',
-            'max_results': '20',
-          }),
+          Uri(
+            scheme: 'https',
+            host: 'api.bgm.tv',
+            pathSegments: ['search', 'subject', query],
+            queryParameters: {
+              'type': '2',
+              'responseGroup': 'large',
+              'max_results': '20',
+            },
+          ),
           operation: '搜索',
           cancel: token,
         );

@@ -311,6 +311,8 @@ class _FolderArtwork extends StatelessWidget {
   final String? frame;
   final bool folder, favorite;
   final VoidCallback? onRequestPreview;
+  final VoidCallback? onVisibleIdle;
+  final Object? visibleIdleRevision;
   const _FolderArtwork({
     required this.model,
     this.poster = '',
@@ -318,6 +320,8 @@ class _FolderArtwork extends StatelessWidget {
     this.folder = true,
     this.favorite = false,
     this.onRequestPreview,
+    this.onVisibleIdle,
+    this.visibleIdleRevision,
   });
   @override
   Widget build(BuildContext context) {
@@ -342,6 +346,8 @@ class _FolderArtwork extends StatelessWidget {
           loadWhileScrolling: true,
           placeholder: fallback(),
           onRequestPreview: onRequestPreview,
+          onVisibleIdle: onVisibleIdle,
+          visibleIdleRevision: visibleIdleRevision,
         ),
       ),
     );
@@ -2118,8 +2124,11 @@ class _SourceBrowserState extends State<SourceBrowser>
   MediaCollectionDetails? _headerDetails;
   SyncRecord? _headerLatest;
   final folderCollections = <String, DirectoryCollection?>{};
+  final _listedFolders = <String>{};
   final folderQueue = <({SourceEntry entry, String parent})>[];
   final inspectedFolders = <String>{};
+  int _folderInspectionRevision = 0, _folderRequestRevision = 0;
+  bool _folderQueueWasFull = false;
   bool inspectingFolder = false;
   bool _modelRefreshScheduled = false;
   bool _modelDirty = false;
@@ -2286,6 +2295,7 @@ class _SourceBrowserState extends State<SourceBrowser>
       _directoryCancel.cancel();
       cached.clear();
       folderCollections.clear();
+      _listedFolders.clear();
       folderQueue.clear();
       inspectedFolders.clear();
       _listingFingerprints.clear();
@@ -2331,6 +2341,12 @@ class _SourceBrowserState extends State<SourceBrowser>
               preview: collection,
             );
             for (final path in folderCollections.keys.toList()) {
+              // An empty/mixed listing is authoritative too. Old imported
+              // records must not resurrect its previous episode count.
+              if (_listedFolders.contains(path) &&
+                  folderCollections[path] == null) {
+                continue;
+              }
               folderCollections[path] = _knownCollection(
                 widget.model,
                 widget.source['id'],
@@ -2375,9 +2391,6 @@ class _SourceBrowserState extends State<SourceBrowser>
         (!oldWidget.active || oldWidget.model != widget.model)) {
       if (_modelDirty) _modelChanged();
       _queueRefresh();
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) unawaited(_inspectNextFolder());
-      });
     }
     if (!widget.active) _pauseRefresh();
     if (oldWidget.model != widget.model || sourceChanged) unawaited(_open());
@@ -2424,7 +2437,6 @@ class _SourceBrowserState extends State<SourceBrowser>
       _directoryCancel = CancelToken();
     }
     if (_canRefresh && _modelDirty) _modelChanged();
-    if (_canRefresh) unawaited(_inspectNextFolder());
     if (widget.source['kind'] == 'http' || widget.associateId != null) return;
     _refreshPending = true;
     if (!_canRefresh ||
@@ -2470,7 +2482,11 @@ class _SourceBrowserState extends State<SourceBrowser>
     }
     // Directory reads are driven by navigation, lifecycle/configuration
     // changes and explicit refresh gestures. An idle folder never polls.
-    if (_refreshPending) _queueRefresh();
+    if (_refreshPending) {
+      _queueRefresh();
+    } else {
+      unawaited(_inspectNextFolder());
+    }
   }
 
   Future<void> _refreshManually() {
@@ -2574,12 +2590,21 @@ class _SourceBrowserState extends State<SourceBrowser>
       final found = await _readDirectory(directory, token);
       final fingerprint = await _listingFingerprint(directory, found, token);
       if (!_canRefresh || ticket != generation || directory != current) return;
+      void revalidateFolders() {
+        _directoryCancel.cancel();
+        _directoryCancel = token;
+        _resetFolderInspections();
+      }
+
       if (_listingFingerprints[directory] == fingerprint) {
+        // Parent membership/mtime can stay unchanged when an episode is added
+        // inside a child. Re-arm only visible rows for this validation pass.
+        final hadFolderRequests = inspectedFolders.isNotEmpty;
+        revalidateFolders();
+        if (hadFolderRequests) setState(() {});
         if (_inspectionComplete(directory, fingerprint)) {
           return;
         }
-        _directoryCancel.cancel();
-        _directoryCancel = token;
         await _inspectCurrent(
           ticket,
           directory,
@@ -2591,6 +2616,7 @@ class _SourceBrowserState extends State<SourceBrowser>
       }
       final visible = await _visible(found);
       if (!_canRefresh || ticket != generation || directory != current) return;
+      revalidateFolders();
       if (cached.length >= 16 && !cached.containsKey(directory)) {
         _completedInspections.remove(cached.keys.first);
         _listingFingerprints.remove(cached.keys.first);
@@ -2603,8 +2629,6 @@ class _SourceBrowserState extends State<SourceBrowser>
         error = '';
         entries = visible;
       });
-      _directoryCancel.cancel();
-      _directoryCancel = token;
       await _inspectCurrent(ticket, directory, found, fingerprint: fingerprint);
     } on Cancelled {
       // Hidden/closed pages and newer directories own their next refresh.
@@ -2771,13 +2795,25 @@ class _SourceBrowserState extends State<SourceBrowser>
     }
   }
 
+  void _resetFolderInspections() {
+    _folderInspectionRevision++;
+    inspectedFolders.clear();
+    folderQueue.clear();
+    _folderQueueWasFull = false;
+  }
+
   void _queueFolder(SourceEntry entry) {
-    if (widget.associateId != null ||
+    if (!_canRefresh ||
+        widget.associateId != null ||
         !entry.directory ||
         inspectedFolders.contains(entry.path)) {
       return;
     }
     if (adapter is SmbServerSource && current.isEmpty) return;
+    if (folderQueue.length >= 32) {
+      _folderQueueWasFull = true;
+      return;
+    }
     inspectedFolders.add(entry.path);
     folderQueue.add((entry: entry, parent: current));
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2788,13 +2824,25 @@ class _SourceBrowserState extends State<SourceBrowser>
   }
 
   Future<void> _inspectNextFolder() async {
-    if (inspectingFolder || busy || adapter == null || !_canRefresh) {
+    if (inspectingFolder ||
+        busy ||
+        _loadCancel != null ||
+        _refreshWork != null ||
+        _refreshPending ||
+        adapter == null ||
+        !_canRefresh) {
       return;
     }
     inspectingFolder = true;
     try {
-      while (folderQueue.isNotEmpty && !busy && _canRefresh) {
+      while (folderQueue.isNotEmpty &&
+          !busy &&
+          _loadCancel == null &&
+          _refreshWork == null &&
+          !_refreshPending &&
+          _canRefresh) {
         final ticket = generation;
+        final revision = _folderInspectionRevision;
         final token = _directoryCancel;
         final connection = adapter;
         if (connection == null) break;
@@ -2813,26 +2861,37 @@ class _SourceBrowserState extends State<SourceBrowser>
                 modified: item.entry.modified,
                 cancel: token,
               ))?.collection;
-              if (preview?.subject != null) {
-                final resolved = await widget.model
-                    .synchronizeCollectionInBackground(
-                      widget.source['id'],
-                      preview!,
-                      importMissing: false,
-                      cancel: token,
-                    );
-                if (!mounted ||
-                    ticket != generation ||
-                    item.parent != current) {
-                  return null;
+              // A preview supplies artwork, never proof of current membership.
+              // Many WebDAV servers do not update a parent's directory mtime.
+              final List<SourceEntry> found;
+              try {
+                found = await _readDirectory(item.entry.path, token);
+              } on Cancelled {
+                rethrow;
+              } catch (_) {
+                token.check();
+                // Offline previews can still enrich already imported videos,
+                // but cannot import files or confirm current episode counts.
+                if (preview?.subject != null &&
+                    mounted &&
+                    ticket == generation &&
+                    revision == _folderInspectionRevision &&
+                    item.parent == current &&
+                    identical(adapter, connection) &&
+                    _canRefresh) {
+                  await widget.model.synchronizeCollectionInBackground(
+                    widget.source['id'],
+                    preview!,
+                    importMissing: false,
+                    cancel: token,
+                  );
                 }
-                return (path: item.entry.path, collection: resolved);
+                rethrow;
               }
-              final found =
-                  cached[item.entry.path] ??
-                  await _readDirectory(item.entry.path, token);
+              token.check();
               if (!mounted ||
                   ticket != generation ||
+                  revision != _folderInspectionRevision ||
                   !identical(adapter, connection)) {
                 return null;
               }
@@ -2843,7 +2902,7 @@ class _SourceBrowserState extends State<SourceBrowser>
               }
               cached[item.entry.path] = found;
               final visible = await _visible(found);
-              final value =
+              var value =
                   await widget.model.catalog.inspect(
                     widget.source['id'],
                     item.entry.path,
@@ -2858,8 +2917,23 @@ class _SourceBrowserState extends State<SourceBrowser>
                           visible,
                         )
                       : null);
+              token.check();
+              // Keep usable artwork through a temporary catalogue failure,
+              // while taking videos and episode counts from the fresh listing.
+              if (value != null &&
+                  value.subject == null &&
+                  preview?.subject != null &&
+                  value.title == preview!.title &&
+                  value.season == preview.season) {
+                value = value.withMetadata(
+                  preview.subject,
+                  preview.episodeTitles,
+                  metadataComplete: false,
+                );
+              }
               if (!mounted ||
                   ticket != generation ||
+                  revision != _folderInspectionRevision ||
                   item.parent != current ||
                   !identical(adapter, connection)) {
                 return null;
@@ -2881,10 +2955,9 @@ class _SourceBrowserState extends State<SourceBrowser>
           }),
         );
         if (!mounted) return;
-        if (ticket != generation || !identical(adapter, connection)) {
-          for (final item in batch) {
-            inspectedFolders.remove(item.entry.path);
-          }
+        if (ticket != generation ||
+            revision != _folderInspectionRevision ||
+            !identical(adapter, connection)) {
           continue;
         }
         if (token.cancelled) {
@@ -2901,17 +2974,29 @@ class _SourceBrowserState extends State<SourceBrowser>
           }
           continue;
         }
-        void update() {
-          for (final result in results.nonNulls) {
-            folderCollections[result.path] = result.collection;
-          }
+        Object? presentation(DirectoryCollection? value) => value == null
+            ? null
+            : (
+                value.displayName,
+                value.seasonLabel,
+                value.episodeCount,
+                value.videos.length,
+                value.poster,
+              );
+        var changed = false;
+        for (final result in results.nonNulls) {
+          _listedFolders.add(result.path);
+          changed |=
+              presentation(folderCollections[result.path]) !=
+              presentation(result.collection);
+          folderCollections[result.path] = result.collection;
         }
-
-        if (_canRefresh) {
-          setState(update);
-        } else {
-          update();
+        if (_folderQueueWasFull) {
+          _folderQueueWasFull = false;
+          _folderRequestRevision++;
+          changed = true;
         }
+        if (_canRefresh && changed) setState(() {});
       }
     } finally {
       inspectingFolder = false;
@@ -2924,7 +3009,13 @@ class _SourceBrowserState extends State<SourceBrowser>
       return _posterOrFrame(
         poster: folderCollections[entry.path]?.poster ?? '',
         folder: true,
-        onRequestPreview: () {
+        visibleIdleRevision: (
+          generation,
+          _folderInspectionRevision,
+          _folderRequestRevision,
+          entry.path,
+        ),
+        onVisibleIdle: () {
           if (mounted && ticket == generation) _queueFolder(entry);
         },
       );
@@ -2988,12 +3079,16 @@ class _SourceBrowserState extends State<SourceBrowser>
     String? frame,
     required bool folder,
     VoidCallback? onRequestPreview,
+    VoidCallback? onVisibleIdle,
+    Object? visibleIdleRevision,
   }) => _FolderArtwork(
     model: widget.model,
     poster: poster,
     frame: frame,
     folder: folder,
     onRequestPreview: onRequestPreview,
+    onVisibleIdle: onVisibleIdle,
+    visibleIdleRevision: visibleIdleRevision,
   );
 
   void _setCollection(DirectoryCollection? value) {
@@ -3165,9 +3260,9 @@ class _SourceBrowserState extends State<SourceBrowser>
     _catalogRevision = widget.model.catalog.directoryInspectionRevision(
       widget.source['id'],
     );
-    inspectedFolders.clear();
-    folderQueue.clear();
+    _resetFolderInspections();
     folderCollections.clear();
+    _listedFolders.clear();
     _setCollection(null);
     final ticket = ++generation;
     _directoryCancel.cancel();
@@ -3246,6 +3341,7 @@ class _SourceBrowserState extends State<SourceBrowser>
     _refreshCancel?.cancel();
     _refreshPending = false;
     _directoryCancel.cancel();
+    _resetFolderInspections();
     _inspectionWork = null;
     final token = _loadCancel = _directoryCancel = CancelToken();
     _sorter.cancelPending();

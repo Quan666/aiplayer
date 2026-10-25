@@ -76,12 +76,15 @@ void main() {
     expect(find.text('1 个视频'), findsOneWidget);
     expect(model.sortApplications, 0);
     model.mediaReads = 0;
+    model.snapshotReads = model.snapshotPreparations = 0;
     for (var index = 0; index < 5; index++) {
       store.save('progress', 'first:0', {'position': index});
       model.changed();
       await tester.pumpAndSettle();
     }
     expect(model.mediaReads, 0);
+    expect(model.snapshotReads, 0);
+    expect(model.snapshotPreparations, 0);
     model.addMedia(
       'local',
       const SourceEntry(name: 'second.mp4', path: 'second.mp4'),
@@ -89,7 +92,9 @@ void main() {
     model.changed();
     await tester.pumpAndSettle();
     expect(find.text('2 个视频'), findsOneWidget);
-    expect(model.mediaReads, greaterThan(0));
+    expect(model.mediaReads, 0);
+    expect(model.snapshotReads, 1);
+    expect(model.snapshotPreparations, 1);
     await tester.pumpWidget(const SizedBox());
   });
 

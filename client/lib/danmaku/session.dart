@@ -4,7 +4,7 @@ import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/store.dart';
 import 'api.dart';
-import 'release_name.dart';
+import '../data/media_identity.dart';
 
 class DanmakuSession extends ChangeNotifier {
   final AppStore store;
@@ -128,12 +128,16 @@ class DanmakuSession extends ChangeNotifier {
         if (!_current(generation)) return;
         if (found.length == 1 &&
             (guess.season.isEmpty ||
-                parseReleaseName(found.first.animeTitle).season ==
+                subjectIdentity(found.first.animeTitle).season ==
                     guess.season)) {
           if (await load(found.first) || !_current(generation)) return;
         }
       }
-      final result = await api.match(guess.matchName, cancel: cancel);
+      final result = await api.match(
+        guess.matchName,
+        isTitle: true,
+        cancel: cancel,
+      );
       if (!_current(generation)) return;
       candidates = {
         for (final v in [...found, ...result.matches])

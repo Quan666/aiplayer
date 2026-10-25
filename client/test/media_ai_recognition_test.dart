@@ -4,6 +4,7 @@ import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/media_ai_recognition.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/subtitles/ai.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _Transport implements SubtitleAiTransport {
@@ -148,7 +149,7 @@ void main() {
       expect(transport.input, {'fileName': '[Group] Frieren 12.5.mkv'});
       expect(jsonEncode(transport.bodies), isNot(contains('/private')));
       expect(jsonEncode(transport.bodies), isNot(contains('DO NOT USE')));
-      expect(transport.configs.single.prompt, 'media-recognition-v1');
+      expect(transport.configs.single.prompt, 'media-recognition-v2');
       expect(result.name, '葬送のフリーレン');
       expect(result.searchNames, [
         '葬送のフリーレン',
@@ -174,6 +175,8 @@ void main() {
         'smb://server/user/video.mkv',
         '/only/directory/',
         'video.mkv?token=secret',
+        'video.mkv?secret',
+        'video?token=secret',
         'name\nvideo.mkv',
       ]) {
         await expectLater(
@@ -183,6 +186,80 @@ void main() {
         );
       }
       expect(transport.bodies, isEmpty);
+    },
+  );
+
+  for (final mode in ['single', 'batch', 'folder']) {
+    test(
+      '$mode AI recognition preserves title punctuation and brackets',
+      () async {
+        const title = '用【循环利息】强制收回借出的魔力：谁？ Why? (再会) [Re:Start]';
+        const fileName = '$title - 02.mkv';
+        final identityJson = _identityJson({
+          'name': title,
+          'titles': {'zh': title, 'en': '', 'ja': ''},
+          'aliases': [],
+          'episode': 2,
+        });
+        transport.reply = () => jsonEncode(
+          mode == 'single'
+              ? identityJson
+              : {
+                  'items': [
+                    {'id': '0', 'identity': identityJson},
+                  ],
+                },
+        );
+        final result = switch (mode) {
+          'single' => await analyze(fileName),
+          'batch' => (await batch([fileName]))[fileName]!,
+          _ => (await service.analyzeFolderFilenames(
+            [fileName],
+            config: config,
+            cancel: CancelToken(),
+          ))[fileName]!,
+        };
+        expect(result.name, title);
+        expect(result.searchNames, [title]);
+        expect(result.fileName, fileName);
+        final messages = transport.bodies.single['messages'] as List;
+        expect(
+          messages.first['content'],
+          contains('including meaningful punctuation'),
+        );
+        expect(messages.last['content'], contains(fileName));
+      },
+    );
+  }
+
+  test('filename question marks following title dots are not URL suffixes', () {
+    expect(MediaAiRecognition.filenameOnly('Dr.Who?.mkv'), 'Dr.Who?.mkv');
+  });
+
+  test(
+    'old name rules cannot reuse a cached identity that lost brackets',
+    () async {
+      const filename = '用【循环利息】强制收回借出的魔力 - 01.mkv';
+      final oldConfig = SubtitleAiConfig(
+        origin: config.origin.toString(),
+        token: config.token,
+        model: config.model,
+        target: 'multilingual metadata',
+        prompt: 'media-recognition-v1',
+      );
+      final oldKey = sha256.convert(
+        utf8.encode(jsonEncode([1, filename, oldConfig.identity])),
+      );
+      store.setLocal(
+        'media-ai-filename:$oldKey',
+        _identityJson({'name': '用 强制收回借出的魔力'}),
+      );
+      transport.reply = () =>
+          jsonEncode(_identityJson({'name': '用【循环利息】强制收回借出的魔力'}));
+      expect((await analyze(filename)).name, '用【循环利息】强制收回借出的魔力');
+      expect(transport.bodies, hasLength(1));
+      await analyze(filename);
+      expect(transport.bodies, hasLength(1));
     },
   );
 

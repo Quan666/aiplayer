@@ -36,6 +36,12 @@ class MediaArtwork extends StatefulWidget {
   /// Runs after layout, when the surrounding scrollables allow expensive work.
   /// A later widget update retries a previously full preview queue.
   final VoidCallback? onRequestPreview;
+
+  /// Runs once per revision when this artwork is visible and scrolling is idle,
+  /// including when a poster is already available. The owner bounds and
+  /// cancels any asynchronous work started by this callback.
+  final VoidCallback? onVisibleIdle;
+  final Object? visibleIdleRevision;
   const MediaArtwork({
     super.key,
     this.poster = '',
@@ -46,6 +52,8 @@ class MediaArtwork extends StatefulWidget {
     this.maxDecodeEdge = 640,
     this.loadWhileScrolling = false,
     this.onRequestPreview,
+    this.onVisibleIdle,
+    this.visibleIdleRevision,
   }) : assert(maxDecodeEdge >= 64);
   @override
   State<MediaArtwork> createState() => _MediaArtworkState();
@@ -60,6 +68,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
   Listenable? _cacheCapacity;
   Future<File?>? _poster;
   bool _previewPending = false, _previewFrameScheduled = false;
+  bool _visibleIdlePending = false;
   bool _imageLoadingAllowed = false;
   bool _active = true;
   bool get _enabled => _active && ArtworkLifecycle.instance.value;
@@ -100,6 +109,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
       });
     }
     _previewPending = widget.onRequestPreview != null;
+    _visibleIdlePending = widget.onVisibleIdle != null;
     widget.cache?.changes.addListener(_cacheChanged);
   }
 
@@ -325,7 +335,8 @@ class _MediaArtworkState extends State<MediaArtwork> {
         (!needsPoster &&
             _imageLoadingAllowed &&
             _queuedImage == null &&
-            (!_needsPreview || _scrollActivity?.value == true)) ||
+            ((!_needsPreview && !_visibleIdlePending) ||
+                _scrollActivity?.value == true)) ||
         _previewFrameScheduled) {
       return;
     }
@@ -405,6 +416,10 @@ class _MediaArtworkState extends State<MediaArtwork> {
         _previewPending = false;
         widget.onRequestPreview?.call();
       }
+      if (_visibleIdlePending && priority == 0 && !_deferLoading) {
+        _visibleIdlePending = false;
+        widget.onVisibleIdle?.call();
+      }
     });
     WidgetsBinding.instance.ensureVisualUpdate();
   }
@@ -439,6 +454,12 @@ class _MediaArtworkState extends State<MediaArtwork> {
         (widget.thumbnail == null &&
             oldWidget.onRequestPreview != widget.onRequestPreview)) {
       _previewPending = widget.onRequestPreview != null;
+    }
+    if (oldWidget.visibleIdleRevision != widget.visibleIdleRevision ||
+        (oldWidget.onVisibleIdle == null) != (widget.onVisibleIdle == null)) {
+      // Parent rebuilds often replace a closure without changing its work.
+      // Only a new revision or enabling the callback admits another request.
+      _visibleIdlePending = widget.onVisibleIdle != null;
     }
     _loadArtwork();
   }

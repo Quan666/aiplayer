@@ -224,6 +224,12 @@ void main() {
   testWidgets(
     'continue watching decodes adjacent covers during dragging before entry',
     (tester) async {
+      // Keep wall previews separate from the carousel's recent episodes.
+      store.setLocal('settings', {
+        ...model.settings,
+        'librarySortField': 'name',
+        'librarySortDescending': false,
+      });
       await mount(tester);
       final carousel = find.byKey(
         const PageStorageKey('library-continue-scroll'),

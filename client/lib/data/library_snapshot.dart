@@ -6,7 +6,7 @@ import 'package:sqlite3/sqlite3.dart';
 import 'package:path/path.dart' as p;
 
 import '../core/network.dart';
-import '../danmaku/release_name.dart';
+import 'media_identity.dart';
 import '../sources/directory_sort.dart';
 import '../sources/source.dart';
 import 'library_sort.dart';

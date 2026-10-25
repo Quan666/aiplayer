@@ -11,7 +11,7 @@ import 'package:uuid/uuid.dart';
 import '../core/network.dart';
 import '../core/logger.dart';
 import '../danmaku/api.dart';
-import '../danmaku/release_name.dart';
+import 'media_identity.dart';
 import '../sources/source.dart';
 import '../sources/configuration.dart';
 import '../sources/apple_access.dart';
@@ -163,10 +163,22 @@ class AppModel extends ChangeNotifier {
     changed();
   }
 
-  LibrarySort get librarySorting => LibrarySort(
-    field: preferences.librarySortField,
-    descending: preferences.librarySortDescending,
-  );
+  int _librarySortingRevision = -1;
+  LibrarySort? _librarySorting;
+  LibrarySort get librarySorting {
+    // Scroll-idle revision checks reuse this immutable snapshot until settings
+    // change; the store revision also observes rollback and external commits.
+    final revision = store.localKeyRevision('settings');
+    if (_librarySorting == null || _librarySortingRevision != revision) {
+      final current = preferences;
+      _librarySorting = LibrarySort(
+        field: current.librarySortField,
+        descending: current.librarySortDescending,
+      );
+      _librarySortingRevision = revision;
+    }
+    return _librarySorting!;
+  }
 
   LibrarySort? _pendingLibrarySorting;
   Future<void>? _librarySortingWork;
@@ -1026,38 +1038,7 @@ class AppModel extends ChangeNotifier {
     return connectSource(source, password: password);
   }
 
-  ReleaseName mediaIdentity(SourceEntry entry) {
-    var guess = parseReleaseName(entry.name);
-    final folder = directoryIdentity(
-      p.posix.dirname(entry.path.replaceAll('\\', '/')),
-    );
-    if (guess.episode.isEmpty && folder.anime.isNotEmpty) {
-      final number = RegExp(
-        r'^(?:EP?)?(\d{1,4})(?:[ ._-].*)?$',
-        caseSensitive: false,
-      ).firstMatch(p.basenameWithoutExtension(entry.name));
-      if (number != null) {
-        guess = ReleaseName(
-          folder.anime,
-          folder.season,
-          '${int.parse(number[1]!)}',
-        );
-      }
-    }
-    final name = guess.anime.isEmpty ? folder.anime : guess.anime;
-    final compatible =
-        guess.anime.isEmpty ||
-        normalizedSeries(guess.anime) == normalizedSeries(folder.anime);
-    return ReleaseName(
-      name,
-      guess.season.isNotEmpty
-          ? guess.season
-          : compatible
-          ? folder.season
-          : '',
-      guess.episode,
-    );
-  }
+  ReleaseName mediaIdentity(SourceEntry entry) => sourceEntryIdentity(entry);
 
   bool applyCollectionMetadata(
     String id,
