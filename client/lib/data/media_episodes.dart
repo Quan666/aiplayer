@@ -1,21 +1,7 @@
 import 'media_presentation.dart';
 import 'store.dart';
 
-String _number(Object? value, {String fallback = ''}) {
-  final text = '${value ?? ''}'.trim();
-  if (text.isEmpty) return fallback;
-  final number = num.tryParse(text);
-  if (number == null || !number.isFinite) return text.toLowerCase();
-  return number == number.roundToDouble() ? '${number.toInt()}' : '$number';
-}
-
-/// A season/episode is one navigation destination. Alternate files remain in
-/// the group, with their own IDs, technical information and watch progress.
-String mediaEpisodeKey(SyncRecord media, {String? seriesKey}) {
-  final episode = _number(media.data['episode']);
-  if (episode.isEmpty) return 'file:${media.id}';
-  return '${seriesKey ?? mediaSeriesKey(media)}:${_number(media.data['season'], fallback: '1')}:$episode';
-}
+export 'media_presentation.dart' show mediaEpisodeKey;
 
 Map<String, List<SyncRecord>> groupMediaEpisodes(
   Iterable<SyncRecord> media, {

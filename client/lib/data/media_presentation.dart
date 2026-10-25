@@ -1,7 +1,25 @@
+import 'package:path/path.dart' as p;
+
 import 'media_identity.dart';
 import 'store.dart';
 
 String _text(Object? value) => value?.toString().trim() ?? '';
+
+String _episodeNumber(Object? value, {String fallback = ''}) {
+  final text = _text(value);
+  if (text.isEmpty) return fallback;
+  final number = num.tryParse(text);
+  if (number == null || !number.isFinite) return text.toLowerCase();
+  return number == number.roundToDouble() ? '${number.toInt()}' : '$number';
+}
+
+/// Counts and navigation share one season/episode identity. Alternate files
+/// retain their own record IDs and progress within this episode.
+String mediaEpisodeKey(SyncRecord media, {String? seriesKey}) {
+  final episode = _episodeNumber(media.data['episode']);
+  if (episode.isEmpty) return 'file:${media.id}';
+  return '${seriesKey ?? mediaSeriesKey(media)}:${_episodeNumber(media.data['season'], fallback: '1')}:$episode';
+}
 
 String mediaSeasonLabel(Object? value, {Object? totalSeasons}) {
   final season = _text(value);
@@ -115,7 +133,10 @@ class MediaCollectionDetails {
     this.genres = const [],
   });
 
-  factory MediaCollectionDetails.fromRecords(Iterable<SyncRecord> records) {
+  factory MediaCollectionDetails.fromRecords(
+    Iterable<SyncRecord> records, {
+    Map<String, Map<String, dynamic>> locations = const {},
+  }) {
     final values = records.toList()..sort(compareMediaEpisodes);
     if (values.isEmpty) return const MediaCollectionDetails(title: '影视资料');
     final info = <String, dynamic>{};
@@ -129,13 +150,23 @@ class MediaCollectionDetails {
     }
     final date = _text(info['airDate']);
     final episodes = <String>{};
+    final videos = <Object>{};
     for (final item in values) {
       final episode = _text(item.data['episode']);
       if (episode.isNotEmpty) {
-        episodes.add(
-          '${_text(item.data['season']).isEmpty ? '1' : item.data['season']}:$episode',
-        );
+        episodes.add(mediaEpisodeKey(item, seriesKey: ''));
       }
+      final location = locations[item.id];
+      final source = _text(location?['source']);
+      final path = '${location?['path'] ?? ''}';
+      // Importing or syncing can associate several record IDs with one file.
+      // Only a shared source/path proves that they are the same video; names,
+      // sizes and episode numbers can also match genuinely different copies.
+      videos.add(
+        source.isNotEmpty && path.isNotEmpty
+            ? (source, p.posix.normalize(path.replaceAll('\\', '/')))
+            : item.id,
+      );
     }
     return MediaCollectionDetails(
       title: _text(info['metadataTitle']).isNotEmpty
@@ -150,7 +181,7 @@ class MediaCollectionDetails {
       totalEpisodes: num.tryParse(_text(info['totalEpisodes']))?.toInt(),
       totalSeasons: num.tryParse(_text(info['totalSeasons']))?.toInt(),
       availableEpisodes: episodes.length,
-      videoCount: values.length,
+      videoCount: videos.length,
       genres: List<String>.unmodifiable(
         (info['genres'] as List?)?.whereType<String>() ?? const [],
       ),

@@ -629,7 +629,10 @@ class _SnapshotData {
     });
     details = Map.unmodifiable({
       for (final entry in series.entries)
-        entry.key: MediaCollectionDetails.fromRecords(entry.value),
+        entry.key: MediaCollectionDetails.fromRecords(
+          entry.value,
+          locations: locations,
+        ),
     });
     _ordering = {
       for (final entry in series.entries)

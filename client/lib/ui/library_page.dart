@@ -1187,7 +1187,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     final media = items.first;
     final isSeries = !key.startsWith('file:');
     final representative = _snapshot?.representativeFor(media) ?? media;
-    final poster = _snapshot?.detailsFor(media).poster ?? '';
+    final details = _snapshot?.detailsFor(media);
+    final videoCount = details?.videoCount ?? items.length;
     final title = isSeries
         ? model.seriesTitle(representative)
         : model.displayTitle(media);
@@ -1204,14 +1205,15 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     return Semantics(
       key: ValueKey(key),
       button: true,
-      label: '$title，${items.length} 个视频',
+      label: '$title，$videoCount 个视频',
       checked: _selecting ? selected : null,
       child: _PosterTile(
         cache: model.posterCache,
         title: title,
-        poster: poster,
+        poster: details?.poster ?? '',
         thumbnail: model.thumbnailPath(media.id),
-        count: items.length,
+        videoCount: videoCount,
+        episodeCount: isSeries ? details?.availableEpisodes ?? 0 : 0,
         duration: model.mediaDuration(media),
         mediaId: media.id,
         selecting: _selecting,
@@ -1882,7 +1884,7 @@ class _PosterTile extends StatefulWidget {
   final PosterCache cache;
   final String title, poster, mediaId;
   final String? thumbnail;
-  final int count;
+  final int videoCount, episodeCount;
   final double duration;
   final bool selecting, selected, enabled;
   final VoidCallback onTap, onDetails, onRequestPreview, onSelect;
@@ -1892,7 +1894,8 @@ class _PosterTile extends StatefulWidget {
     required this.title,
     required this.poster,
     required this.thumbnail,
-    required this.count,
+    required this.videoCount,
+    required this.episodeCount,
     required this.duration,
     required this.mediaId,
     required this.selecting,
@@ -2059,12 +2062,14 @@ class _PosterTileState extends State<_PosterTile> {
                                 itemBuilder: (_) => _posterActions,
                               ),
                             ),
-                          if (widget.count > 1)
+                          if (widget.episodeCount > 1 || widget.videoCount > 1)
                             Positioned(
                               bottom: 7,
                               right: 8,
                               child: Text(
-                                '${widget.count} 集',
+                                widget.episodeCount > 0
+                                    ? '${widget.episodeCount} 集'
+                                    : '${widget.videoCount} 个视频',
                                 style: LibraryStyles.of(context).posterCount,
                               ),
                             ),
@@ -2079,7 +2084,7 @@ class _PosterTileState extends State<_PosterTile> {
                     overflow: TextOverflow.ellipsis,
                     style: LibraryStyles.of(context).posterTitle,
                   ),
-                  if (widget.duration > 0 && widget.count == 1)
+                  if (widget.duration > 0 && widget.videoCount == 1)
                     Text(
                       mediaTime(widget.duration),
                       style: AppStyles.of(context).micro,

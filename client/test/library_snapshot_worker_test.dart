@@ -829,6 +829,141 @@ void main() {
   );
 
   test(
+    'availability counts files once without losing duplicate record history',
+    () async {
+      for (var episode = 1; episode <= 4; episode++) {
+        store.save('media', 'episode-$episode', {
+          'title': 'Show S01E0$episode.mp4',
+          'series': 'Show',
+          'season': episode == 1 ? '1.0' : '1',
+          'episode': '$episode',
+          'size': 10,
+        });
+        store.setLocal('location:episode-$episode', {
+          'source': 'nas',
+          'path': '/Show/episode-$episode.mp4',
+          'size': 10,
+        });
+      }
+      store.save('media', 'duplicate', {
+        ...store.get('media', 'episode-1')!.data,
+        'season': '01',
+        'episode': '1.0',
+      });
+      const duplicateLocation = {
+        'source': 'nas',
+        'path': r'\Show\.\episode-1.mp4',
+        'size': 10,
+      };
+      store.setLocal('location:duplicate', duplicateLocation);
+      for (final (id, position) in [('episode-1', 3), ('duplicate', 7)]) {
+        store.save('progress', '$id:10', {
+          'position': position,
+          'updatedAt': '2026-10-25',
+        });
+      }
+
+      final original = await model.loadLibrarySnapshot();
+      final first = original.byId['episode-1']!;
+      final details = original.detailsFor(first);
+      expect(original.preparationIsolate, isNot(Isolate.current.hashCode));
+      expect(original.media, hasLength(5));
+      expect(original.seriesFor(first), hasLength(5));
+      expect(original.versionsFor(first), hasLength(2));
+      expect(original.episodesFor(first), hasLength(4));
+      expect(details.availableEpisodes, 4);
+      expect(details.videoCount, 4);
+      expect(details.availability, '已收录 4 集');
+      expect(original.progress['episode-1:10']?['position'], 3);
+      expect(original.progress['duplicate:10']?['position'], 7);
+      expect(await model.loadLibrarySnapshot(), same(original));
+
+      // Equal filenames, sizes and episode identities cannot establish that
+      // different locations, or an unbound synced record, are the same file.
+      for (final location in <Map<String, dynamic>?>[
+        {...duplicateLocation, 'path': '/Alternate/episode-1.mp4'},
+        {...duplicateLocation, 'source': 'other-nas'},
+        null,
+      ]) {
+        if (location == null) {
+          store.removeLocal('location:duplicate');
+        } else {
+          store.setLocal('location:duplicate', location);
+        }
+        final updated = await model.loadLibrarySnapshot();
+        expect(updated.detailsFor(first).videoCount, 5);
+        expect(updated.detailsFor(first).availableEpisodes, 4);
+        expect(updated.detailsFor(first).availability, '已收录 4 集 · 5 个视频');
+        expect(updated.episodesFor(first), hasLength(4));
+        expect(updated.media, hasLength(5));
+      }
+      expect(original.detailsFor(first).videoCount, 4);
+      expect(store.fullReads, 0);
+    },
+  );
+
+  test(
+    'file counts follow external bindings, direct SQL, removal and rollback',
+    () async {
+      for (final id in ['first', 'duplicate']) {
+        store.save('media', id, {
+          'title': 'Show S01E01.mp4',
+          'series': 'Show',
+          'episode': '1',
+        });
+        store.setLocal('location:$id', {
+          'source': 'nas',
+          'path': '/Show/episode-1.mp4',
+        });
+      }
+      const sharedLocation = {'source': 'nas', 'path': '/Show/episode-1.mp4'};
+      final first = await model.loadLibrarySnapshot();
+      expect(first.details.values.single.videoCount, 1);
+
+      final external = AppStore.openExisting(store.path);
+      addTearDown(external.dispose);
+      external.setLocal('location:duplicate', {
+        ...sharedLocation,
+        'path': '/Other/episode-1.mp4',
+      });
+      expect(
+        (await model.loadLibrarySnapshot()).details.values.single.videoCount,
+        2,
+      );
+      store.db.execute('UPDATE local SET value=? WHERE key=?', [
+        jsonEncode(sharedLocation),
+        'location:duplicate',
+      ]);
+      expect(
+        (await model.loadLibrarySnapshot()).details.values.single.videoCount,
+        1,
+      );
+      external.removeLocal('location:duplicate');
+      expect(
+        (await model.loadLibrarySnapshot()).details.values.single.videoCount,
+        2,
+      );
+
+      late Future<LibrarySnapshot> duringTransaction;
+      expect(
+        () => store.transaction(() {
+          store.setLocal('location:duplicate', sharedLocation);
+          duringTransaction = model.loadLibrarySnapshot();
+          throw StateError('rollback');
+        }),
+        throwsStateError,
+      );
+      expect((await duringTransaction).details.values.single.videoCount, 2);
+      external.save('media', 'duplicate', {}, deleted: true);
+      final removed = await model.loadLibrarySnapshot();
+      expect(removed.details.values.single.videoCount, 1);
+      expect(removed.media.single.id, 'first');
+      expect(removed.preparationIsolate, isNot(Isolate.current.hashCode));
+      expect(store.fullReads, 0);
+    },
+  );
+
+  test(
     'filename aliases respect the recorded season and exclude movies',
     () async {
       for (final season in ['1', '2']) {

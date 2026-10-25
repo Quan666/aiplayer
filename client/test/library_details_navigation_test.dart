@@ -238,6 +238,82 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('posters without episode numbers label their count as videos', (
+    tester,
+  ) async {
+    for (var number = 1; number <= 30; number++) {
+      final id = 'episode-$number';
+      final record = store.get('media', id)!;
+      store.save('media', id, {
+        ...record.data,
+        'episode': '',
+      }, deleted: number > 2);
+    }
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: GlassPalette.theme(),
+        home: LibraryPage(model: model),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('2 个视频'), findsOneWidget);
+    expect(find.text('2 集'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  for (final episodeCount in [1, 4]) {
+    for (final duplicateLocation in [false, true]) {
+      testWidgets(
+        '$episodeCount episodes with a ${duplicateLocation ? 'duplicate record' : 'different encode'} have consistent poster and details counts',
+        (tester) async {
+          for (var number = episodeCount + 1; number <= 30; number++) {
+            store.save('media', 'episode-$number', {}, deleted: true);
+          }
+          final first = store.get('media', 'episode-1')!;
+          store.save('media', 'z-alternate', {
+            ...first.data,
+            'title': duplicateLocation ? first.data['title'] : '系列作品 S01E1.mp4',
+          });
+          store.setLocal('location:z-alternate', {
+            'source': 'local',
+            'path': duplicateLocation
+                ? '${directory.path}/episode-1.mkv'
+                : '${directory.path}/alternate.mp4',
+          });
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: GlassPalette.theme(),
+              home: LibraryPage(model: model),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(
+            find.text('$episodeCount 集'),
+            episodeCount > 1 || !duplicateLocation
+                ? findsOneWidget
+                : findsNothing,
+          );
+          expect(find.text('${episodeCount + 1} 集'), findsNothing);
+          await tester.tap(find.byKey(const ValueKey('play:episode-1')));
+          await tester.pumpAndSettle();
+          expect(
+            find.text(
+              '已收录 $episodeCount 集${duplicateLocation ? '' : ' · ${episodeCount + 1} 个视频'}',
+            ),
+            findsOneWidget,
+          );
+          expect(
+            find.byType(MediaDetailsEpisodeTile),
+            findsNWidgets(episodeCount),
+          );
+          expect(tester.takeException(), isNull);
+          await tester.pumpWidget(const SizedBox());
+        },
+      );
+    }
+  }
+
   testWidgets(
     'partly identified alternate encodes share one episode and a version chooser',
     (tester) async {
