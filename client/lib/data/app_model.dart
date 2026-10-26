@@ -30,6 +30,7 @@ import 'library_snapshot.dart';
 import 'library_sort.dart';
 import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
+import 'local_state_worker.dart';
 import 'media_presentation.dart';
 import 'media_title_translation.dart';
 import 'poster_cache.dart';
@@ -129,6 +130,7 @@ class AppModel extends ChangeNotifier {
     _clearCacheWork = done.future;
     _clearingCaches = true;
     cacheRevision++;
+    _discardBrowsePreviews();
     unawaited(_clearCaches().then(done.complete, onError: done.completeError));
     return done.future;
   }
@@ -392,6 +394,11 @@ class AppModel extends ChangeNotifier {
   final _metadataLookups = _MetadataLimiter(3);
   bool _metadataWorkerRunning = false;
   bool _metadataTasksRestored = false;
+  LocalStateWorker? _localStateWorker;
+  List<Map<String, dynamic>>? _pendingMetadataCheckpoint;
+  Future<void>? _metadataCheckpointWrite;
+  (Object, StackTrace)? _metadataCheckpointError;
+  Future<void>? _localStateShutdown;
   Timer? _syncTimer;
   Timer? _syncDebounce;
   Timer? _syncResumeTimer;
@@ -413,6 +420,13 @@ class AppModel extends ChangeNotifier {
   final _previewDiagnostics = <String>{};
   final _previewFileChecks = <String, Future<bool>>{};
   final _pendingPreviewChecks = <String>{};
+  final _pendingBrowsePreviews = <String, MediaPreviewRequest>{};
+  final _browsePreviewCapacity = ValueNotifier<int>(0);
+  ValueListenable<int> get sourcePreviewCapacity => _browsePreviewCapacity;
+  Future<void>? _browsePreviewWork;
+  CancelToken? _browsePreviewCancel;
+  MediaPreviewRequest? _activeBrowsePreview;
+  int _previewPauses = 0;
   final _playbackPreviewWork = <Future<void>>{};
   bool _disposed = false;
   String status = '';
@@ -972,6 +986,7 @@ class AppModel extends ChangeNotifier {
       list[index] = persisted;
     }
     store.setLocal('sources', list);
+    _discardBrowsePreviews(source: source['id'] as String);
     for (final location in store.locations.where(
       (v) => v['source'] == source['id'],
     )) {
@@ -1018,6 +1033,7 @@ class AppModel extends ChangeNotifier {
       'sources',
       sources..removeWhere((source) => source['id'] == id),
     );
+    _discardBrowsePreviews(source: id);
     for (final location in store.locations.where((v) => v['source'] == id)) {
       _previews?.forget(location['id']);
     }
@@ -2042,26 +2058,141 @@ class AppModel extends ChangeNotifier {
   String sourcePreviewId(String sourceId, String path) =>
       sourceMedia(sourceId, path)?.id ?? browsingMediaId(sourceId, path);
 
+  /// A visible artwork can wait for capacity instead of losing its one request.
+  bool tryEnsureSourceMediaPreview(String sourceId, SourceEntry entry) {
+    if (_canPrepareBrowsePreviews &&
+        _pendingBrowsePreviews.length >= 64 &&
+        !_pendingBrowsePreviews.containsKey(
+          browsingMediaId(sourceId, entry.path),
+        ) &&
+        sourceMedia(sourceId, entry.path) == null) {
+      return false;
+    }
+    ensureSourceMediaPreview(sourceId, entry);
+    return true;
+  }
+
   String ensureSourceMediaPreview(String sourceId, SourceEntry entry) {
     if (_disposed || _clearingCaches) {
       return browsingMediaId(sourceId, entry.path);
     }
     final id = sourcePreviewId(sourceId, entry.path);
-    if (sourceMedia(sourceId, entry.path) == null) {
-      store.setLocal('browse:$id', {
-        'source': sourceId,
-        'path': entry.path,
-        'size': entry.size,
-      });
-      final index = List<String>.from(
-        store.local('browse:index') ?? <String>[],
-      );
-      index.remove(id);
-      index.add(id);
-      store.setLocal('browse:index', index);
+    if (!_canPrepareBrowsePreviews) return id;
+    if (sourceMedia(sourceId, entry.path) != null) {
+      ensureMediaPreview(id);
+      return id;
     }
-    ensureMediaPreview(id);
+    final pending = _pendingBrowsePreviews[id];
+    if (pending == null && _pendingBrowsePreviews.length >= 64) return id;
+    if (pending == null || pending.size != entry.size) {
+      _pendingBrowsePreviews[id] = MediaPreviewRequest(
+        id,
+        sourceId,
+        entry.path,
+        entry.size,
+      );
+    }
+    _startBrowsePreviews();
     return id;
+  }
+
+  bool get _canPrepareBrowsePreviews =>
+      !_disposed &&
+      !_clearingCaches &&
+      _foreground &&
+      _previewPauses == 0 &&
+      _previews != null &&
+      activePlaybackMediaId == null;
+
+  void _startBrowsePreviews() {
+    if (!_canPrepareBrowsePreviews ||
+        _browsePreviewWork != null ||
+        _pendingBrowsePreviews.isEmpty) {
+      return;
+    }
+    _browsePreviewWork = _prepareBrowsePreviews().whenComplete(() {
+      _browsePreviewWork = null;
+      _startBrowsePreviews();
+    });
+  }
+
+  Future<void> _prepareBrowsePreviews() async {
+    while (_canPrepareBrowsePreviews && _pendingBrowsePreviews.isNotEmpty) {
+      final request = _pendingBrowsePreviews.values.first;
+      final token = _browsePreviewCancel = CancelToken();
+      _activeBrowsePreview = request;
+      try {
+        // Register only requested artwork. The database transaction, index
+        // decoding and lock retry share one worker instead of the UI isolate.
+        if (store.path == ':memory:') {
+          store.setLocal('browse:${request.id}', {
+            'source': request.source,
+            'path': request.path,
+            'size': request.size,
+          });
+          final index = List<String>.from(
+            store.local('browse:index') ?? <String>[],
+          );
+          if (!index.contains(request.id)) {
+            index.add(request.id);
+            store.setLocal('browse:index', index);
+          }
+        } else {
+          await (_localStateWorker ??= LocalStateWorker(
+            store.path,
+          )).registerBrowse(
+            request.id,
+            request.source,
+            request.path,
+            request.size,
+            cancel: token,
+          );
+        }
+        token.check();
+        if (!_canPrepareBrowsePreviews) return;
+        if (!identical(_pendingBrowsePreviews[request.id], request)) continue;
+        _removeBrowsePreview(request);
+        // Recognition may have imported this file while the write waited.
+        ensureMediaPreview(sourcePreviewId(request.source, request.path));
+      } on Cancelled {
+        // Keep this bounded request for resume, unless its source was removed.
+        // A stopped worker also reports Cancelled, but retrying it immediately
+        // would spin forever through failed futures without an event-loop turn.
+        if (!token.cancelled) _removeBrowsePreview(request);
+      } catch (error) {
+        _removeBrowsePreview(request);
+        if (!_disposed) {
+          AppLog.instance.warning('封面', safeFailure(error).message);
+        }
+      } finally {
+        if (identical(_browsePreviewCancel, token)) {
+          _browsePreviewCancel = null;
+          _activeBrowsePreview = null;
+        }
+      }
+    }
+  }
+
+  void _removeBrowsePreview(MediaPreviewRequest request) {
+    if (!identical(_pendingBrowsePreviews[request.id], request)) return;
+    final wasFull = _pendingBrowsePreviews.length == 64;
+    _pendingBrowsePreviews.remove(request.id);
+    if (!_disposed && wasFull) _browsePreviewCapacity.value++;
+  }
+
+  void _discardBrowsePreviews({String? source}) {
+    final wasFull = _pendingBrowsePreviews.length == 64;
+    if (source == null || _activeBrowsePreview?.source == source) {
+      _browsePreviewCancel?.cancel();
+    }
+    if (source == null) {
+      _pendingBrowsePreviews.clear();
+    } else {
+      _pendingBrowsePreviews.removeWhere((_, value) => value.source == source);
+    }
+    if (!_disposed && wasFull && _pendingBrowsePreviews.length < 64) {
+      _browsePreviewCapacity.value++;
+    }
   }
 
   String? thumbnailPath(String id) {
@@ -2281,8 +2412,17 @@ class AppModel extends ChangeNotifier {
     }
   }
 
-  Future<void> pausePreviews() async => _previews?.pause();
-  void resumePreviews() => _previews?.resume();
+  Future<void> pausePreviews() async {
+    _previewPauses++;
+    _browsePreviewCancel?.cancel();
+    await _previews?.pause();
+  }
+
+  void resumePreviews() {
+    if (_previewPauses > 0) _previewPauses--;
+    _previews?.resume();
+    _startBrowsePreviews();
+  }
 
   void recordMediaMetadata(
     String id, {
@@ -2914,8 +3054,13 @@ class AppModel extends ChangeNotifier {
 
   @override
   void dispose() {
-    if (backgroundWork && _metadataTasksRestored) _persistMetadataTasks();
+    if (backgroundWork && _metadataTasksRestored && _metadataTasks.isNotEmpty) {
+      _persistMetadataTasks();
+    }
     _disposed = true;
+    _localStateShutdown = _closeLocalState();
+    _discardBrowsePreviews();
+    _browsePreviewCapacity.dispose();
     _librarySourceRefreshCancel?.cancel();
     for (final task in _metadataTasks) {
       task._progressTimer?.cancel();
@@ -2943,6 +3088,11 @@ class AppModel extends ChangeNotifier {
       unawaited((secrets as LocalCredentialStorage).close());
     }
     super.dispose();
+  }
+
+  Future<void> _closeLocalState() async {
+    await _metadataCheckpointWrite;
+    await _localStateWorker?.close();
   }
 }
 

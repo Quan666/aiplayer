@@ -316,6 +316,7 @@ class _FolderArtwork extends StatelessWidget {
   final String? frame;
   final bool folder, favorite;
   final VoidCallback? onRequestPreview;
+  final FutureOr<bool> Function()? tryRequestPreview;
   final VoidCallback? onVisibleIdle;
   final Object? visibleIdleRevision;
   const _FolderArtwork({
@@ -325,6 +326,7 @@ class _FolderArtwork extends StatelessWidget {
     this.folder = true,
     this.favorite = false,
     this.onRequestPreview,
+    this.tryRequestPreview,
     this.onVisibleIdle,
     this.visibleIdleRevision,
   });
@@ -351,6 +353,8 @@ class _FolderArtwork extends StatelessWidget {
           loadWhileScrolling: true,
           placeholder: fallback(),
           onRequestPreview: onRequestPreview,
+          tryRequestPreview: tryRequestPreview,
+          previewCapacity: model.sourcePreviewCapacity,
           onVisibleIdle: onVisibleIdle,
           visibleIdleRevision: visibleIdleRevision,
         ),
@@ -3053,18 +3057,19 @@ class _SourceBrowserState extends State<SourceBrowser>
     return _posterOrFrame(
       frame: frame,
       folder: false,
-      onRequestPreview: () async {
+      tryRequestPreview: () async {
         final model = widget.model;
         final revision = model.cacheRevision;
-        if (!_canRefresh) return;
+        if (!_canRefresh) return false;
         final needed = await model.needsMediaPreview(id);
         if (needed &&
             _canRefresh &&
             identical(model, widget.model) &&
             revision == model.cacheRevision &&
             ticket == generation) {
-          model.ensureSourceMediaPreview(sourceId, entry);
+          return model.tryEnsureSourceMediaPreview(sourceId, entry);
         }
+        return !needed;
       },
     );
   }
@@ -3102,6 +3107,7 @@ class _SourceBrowserState extends State<SourceBrowser>
     String? frame,
     required bool folder,
     VoidCallback? onRequestPreview,
+    FutureOr<bool> Function()? tryRequestPreview,
     VoidCallback? onVisibleIdle,
     Object? visibleIdleRevision,
   }) => _FolderArtwork(
@@ -3110,6 +3116,7 @@ class _SourceBrowserState extends State<SourceBrowser>
     frame: frame,
     folder: folder,
     onRequestPreview: onRequestPreview,
+    tryRequestPreview: tryRequestPreview,
     onVisibleIdle: onVisibleIdle,
     visibleIdleRevision: visibleIdleRevision,
   );

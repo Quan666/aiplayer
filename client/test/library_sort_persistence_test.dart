@@ -71,7 +71,7 @@ void main() {
       opened = await AppStore.open(path);
       expect(released, isTrue);
       expect(opened.deviceId, deviceId);
-      expect(opened.db.select('PRAGMA user_version').single.values.single, 3);
+      expect(opened.db.select('PRAGMA user_version').single.values.single, 4);
     } finally {
       release.cancel();
       if (!released) other.db.execute('ROLLBACK');

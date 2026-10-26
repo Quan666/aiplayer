@@ -100,10 +100,15 @@ class _PlayerDanmakuPanelState extends State<PlayerDanmakuPanel>
         Flexible(
           child: _tab == 0
               ? PageStorage(bucket: _storage, child: _settings(context))
-              : PlayerDanmakuList(
-                  position: session.position,
-                  comments: d.comments,
-                  shift: d.shift + d.offset,
+              : ListenableBuilder(
+                  listenable: session,
+                  builder: (context, _) => PlayerDanmakuList(
+                    position: session.position,
+                    comments: d.comments,
+                    shift: d.shift + d.offset,
+                    timelineRevision: session.timelineRevision,
+                    sourceKey: (d, d.episodeId),
+                  ),
                 ),
         ),
       ],

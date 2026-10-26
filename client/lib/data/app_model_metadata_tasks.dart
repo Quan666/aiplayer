@@ -237,7 +237,8 @@ extension MetadataBackgroundTasks on AppModel {
     task.status = '已取消';
     task._cancel.cancel();
     task._attemptCancel?.cancel();
-    if (!task._done.isCompleted) task._done.complete();
+    if (!task._external) _persistMetadataTasks();
+    unawaited(_completeMetadataTask(task));
     _taskChanged(task);
   }
 
@@ -258,11 +259,13 @@ extension MetadataBackgroundTasks on AppModel {
         item._cancel.cancel();
         item._attemptCancel?.cancel();
       }
-      if (!item._done.isCompleted) item._done.complete();
       _metadataTasks.remove(item);
       item._changed();
     }
     if (removed.any((item) => !item._external)) _persistMetadataTasks();
+    for (final item in removed) {
+      unawaited(_completeMetadataTask(item));
+    }
     if (!_disposed) changed();
   }
 
@@ -304,7 +307,7 @@ extension MetadataBackgroundTasks on AppModel {
 
   void _persistMetadataTasks() {
     if (_disposed) return;
-    store.setLocal('metadata:pending-tasks', [
+    final snapshot = <Map<String, dynamic>>[
       for (final task in _metadataTasks.where(
         (t) => t.running && !t.cancelled && !t._external,
       ))
@@ -326,14 +329,68 @@ extension MetadataBackgroundTasks on AppModel {
           // indicates selected candidates should preserve per-file AI episodes.
           'analyzeSelection': task._identity != null,
         },
-    ]);
+    ];
+    if (store.path == ':memory:') {
+      store.setLocal('metadata:pending-tasks', snapshot);
+      return;
+    }
+    // Keep only the latest checkpoint while a worker owns the writer lock.
+    // Status/progress notifications do not rewrite the task list.
+    _pendingMetadataCheckpoint = snapshot;
+    _metadataCheckpointWrite ??= _writeMetadataCheckpoints();
+  }
+
+  Future<void> _writeMetadataCheckpoints() async {
+    try {
+      while (_pendingMetadataCheckpoint != null) {
+        final snapshot = _pendingMetadataCheckpoint!;
+        _pendingMetadataCheckpoint = null;
+        try {
+          await (_localStateWorker ??= LocalStateWorker(
+            store.path,
+          )).saveMetadataTasks(snapshot);
+          _metadataCheckpointError = null;
+        } catch (error, stack) {
+          _metadataCheckpointError = (error, stack);
+          AppLog.instance.warning('识别任务保存', safeFailure(error).message);
+        }
+      }
+    } finally {
+      _metadataCheckpointWrite = null;
+    }
+  }
+
+  /// Await durable task state before restarting the model or closing its store.
+  Future<void> flushMetadataTasks() async {
+    while (_metadataCheckpointWrite != null) {
+      final pending = _metadataCheckpointWrite!;
+      await pending;
+    }
+    await _localStateShutdown;
+    if (_metadataCheckpointError case final error?) {
+      Error.throwWithStackTrace(error.$1, error.$2);
+    }
+  }
+
+  Future<void> _completeMetadataTask(MetadataTask task) async {
+    try {
+      await flushMetadataTasks();
+    } catch (error) {
+      if (!_disposed && !task.removed) {
+        task.error = safeFailure(error).message;
+        task.status = '识别任务保存失败';
+        task._changed();
+      }
+    } finally {
+      if (!task._done.isCompleted) task._done.complete();
+    }
   }
 
   void _restoreMetadataTasks() {
     if (_metadataTasksRestored) return;
     _metadataTasksRestored = true;
     final saved = store.local('metadata:pending-tasks');
-    if (saved is! List || _metadataTasks.isNotEmpty) return;
+    if (saved is! List || saved.isEmpty || _metadataTasks.isNotEmpty) return;
     for (final row in saved.whereType<Map>()) {
       final records = <SyncRecord>[];
       final recordIds = <String>{};
@@ -407,7 +464,6 @@ extension MetadataBackgroundTasks on AppModel {
       return;
     }
     task._lastProgress = DateTime.now();
-    if (!task._external) _persistMetadataTasks();
     task._changed();
     if (task._parentTask case final parent?) {
       if (!parent.removed) parent._changed();
@@ -552,7 +608,8 @@ extension MetadataBackgroundTasks on AppModel {
             }
             _taskChanged(task);
           }
-          if (!paused && !task._done.isCompleted) task._done.complete();
+          if (!_disposed) _persistMetadataTasks();
+          if (!paused) await _completeMetadataTask(task);
           if (!paused && task._parentTask != null) {
             // The parent retains the latest selection result; hidden child
             // jobs need no separate, ever-growing history in the queue.
@@ -667,6 +724,7 @@ extension MetadataBackgroundTasks on AppModel {
                 for (final record in records) {
                   _taskCompleteRecord(task, record, allowed.contains(record));
                 }
+                _persistMetadataTasks();
               }
               try {
                 if (task.manual) {
@@ -753,6 +811,7 @@ extension MetadataBackgroundTasks on AppModel {
       }
       _taskCompleteRecord(task, record, applied);
     }
+    _persistMetadataTasks();
     await _fillTaskEpisodeNames(task);
   }
 
@@ -927,5 +986,6 @@ extension MetadataBackgroundTasks on AppModel {
         task._pendingEpisodeNames.remove(id);
       }
     }
+    if (grouped.isNotEmpty) _persistMetadataTasks();
   }
 }

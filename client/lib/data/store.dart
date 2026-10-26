@@ -157,15 +157,15 @@ class AppStore {
   }
 
   void _createChangeCounters() {
-    const version = 3;
+    const version = 4;
     int schemaVersion() =>
         db.select('PRAGMA user_version').first.values.first as int;
     if (schemaVersion() >= version) return;
     db.execute('BEGIN IMMEDIATE');
     try {
       // Another engine may have migrated while this connection waited. Replace
-      // old local triggers once; IF NOT EXISTS alone would retain the broad
-      // settings scope on existing installations.
+      // old local triggers once; IF NOT EXISTS alone would retain broad
+      // invalidation for settings and worker-owned local state.
       if (schemaVersion() < version) {
         for (final event in ['insert', 'update', 'delete']) {
           db.execute('DROP TRIGGER IF EXISTS store_change_local_$event');
@@ -200,6 +200,12 @@ class AppStore {
             "CASE WHEN $row.key='settings'"
                 '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
                 " THEN 'settings'"
+                " WHEN $row.key='metadata:pending-tasks'"
+                '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
+                " THEN 'metadataTasks'"
+                " WHEN substr($row.key,1,7)='browse:'"
+                '${event == 'UPDATE' ? " AND substr(OLD.key,1,7)='browse:'" : ''}'
+                " THEN 'browse'"
                 " WHEN ($row.key='lastSync' OR substr($row.key,1,4)='sync')"
                 '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
                 " THEN 'sync' ELSE 'other' END",
@@ -308,13 +314,27 @@ class AppStore {
                 _localPrefixRevisions[prefix] = revision;
               }
             }
-          } else if (scope == 'settings') {
+          } else if (scope == 'settings' || scope == 'metadataTasks') {
+            final localKey = scope == 'settings'
+                ? 'settings'
+                : 'metadata:pending-tasks';
             _localRevision = revision;
-            if (_localKeyRevisions.containsKey('settings')) {
-              _localKeyRevisions['settings'] = revision;
+            if (_localKeyRevisions.containsKey(localKey)) {
+              _localKeyRevisions[localKey] = revision;
             }
             for (final prefix in _localPrefixRevisions.keys) {
-              if ('settings'.startsWith(prefix)) {
+              if (localKey.startsWith(prefix)) {
+                _localPrefixRevisions[prefix] = revision;
+              }
+            }
+          } else if (scope == 'browse') {
+            _localRevision = revision;
+            for (final key in _localKeyRevisions.keys) {
+              if (key.startsWith('browse:')) _localKeyRevisions[key] = revision;
+            }
+            for (final prefix in _localPrefixRevisions.keys) {
+              if (prefix.startsWith('browse:') ||
+                  'browse:'.startsWith(prefix)) {
                 _localPrefixRevisions[prefix] = revision;
               }
             }
@@ -343,6 +363,10 @@ class AppStore {
         ? kind!
         : localKey == 'settings'
         ? 'settings'
+        : localKey == 'metadata:pending-tasks'
+        ? 'metadataTasks'
+        : localKey?.startsWith('browse:') == true
+        ? 'browse'
         : localKey != null &&
               (localKey.startsWith('sync') || localKey == 'lastSync')
         ? 'sync'

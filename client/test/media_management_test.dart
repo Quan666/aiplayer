@@ -19,6 +19,7 @@ void main() {
   });
   tearDown(() async {
     model.dispose();
+    await model.flushMetadataTasks();
     model.store.dispose();
     await root.delete(recursive: true);
   });

@@ -232,6 +232,7 @@ void main() {
   });
   tearDown(() async {
     model.dispose();
+    await model.flushMetadataTasks();
     await Future<void>.delayed(Duration.zero);
     store.dispose();
     directory.deleteSync(recursive: true);
@@ -249,6 +250,98 @@ void main() {
     });
     return store.get('media', id)!;
   }
+
+  test(
+    'locked checkpoint writes keep the event loop free and save the latest cancellation',
+    () async {
+      model.setForeground(false);
+      final records = List.generate(6, (i) => add('locked-$i'));
+      await model.flushMetadataTasks();
+      final blocker = AppStore.openExisting(store.path);
+      // A UI write must fail immediately instead of masking a regression with
+      // SQLite's busy wait. Only the independent worker may wait/retry.
+      store.db.execute('PRAGMA busy_timeout=0');
+      blocker.db.execute('BEGIN IMMEDIATE');
+      var locked = true;
+      try {
+        final tasks = [
+          for (final record in records)
+            model.startMetadataTask([record], manual: false),
+        ];
+        for (final task in tasks) {
+          model.cancelMetadataTask(task);
+        }
+        var saved = false;
+        final flush = model.flushMetadataTasks().then((_) => saved = true);
+        // No widget frames are pumped while backgrounded and the writer is held.
+        await Future<void>.delayed(const Duration(milliseconds: 75));
+        expect(saved, false);
+        expect(model.fakeCatalog.normalQueries, isEmpty);
+        expect(tasks.every((task) => task.cancelled), true);
+        blocker.db.execute('COMMIT');
+        locked = false;
+        await flush;
+        await Future.wait(tasks.map((task) => task.done));
+        expect(store.local('metadata:pending-tasks'), isEmpty);
+        model.setForeground(true);
+        await Future<void>.delayed(Duration.zero);
+        expect(model.fakeCatalog.normalQueries, isEmpty);
+        final writes =
+            store.db
+                    .select(
+                      "SELECT value FROM store_change_counters WHERE scope='metadataTasks'",
+                    )
+                    .single['value']
+                as int;
+        expect(
+          writes,
+          lessThanOrEqualTo(2),
+          reason: 'one in flight plus the latest snapshot',
+        );
+      } finally {
+        if (locked) blocker.db.execute('ROLLBACK');
+        blocker.dispose();
+      }
+    },
+  );
+
+  test(
+    'disposing behind a writer lock drains the suspended checkpoint',
+    () async {
+      model.setForeground(false);
+      final record = add('dispose-locked');
+      await model.flushMetadataTasks();
+      final blocker = AppStore.openExisting(store.path);
+      store.db.execute('PRAGMA busy_timeout=0');
+      blocker.db.execute('BEGIN IMMEDIATE');
+      var locked = true;
+      try {
+        final task = model.startMetadataTask([record], manual: false);
+        model.dispose();
+        await Future<void>.delayed(const Duration(milliseconds: 75));
+        blocker.db.execute('COMMIT');
+        locked = false;
+        await model.flushMetadataTasks();
+        final saved = store.local('metadata:pending-tasks') as List;
+        expect(saved.single['id'], task.id);
+        expect(saved.single['records'], [
+          {'id': record.id, 'revision': record.revision},
+        ]);
+        store.dispose();
+        store = AppStore('${directory.path}/test.db');
+        model = _Model(store, directory);
+        await model.startBackgroundWork();
+        final restored = model.metadataTasks.single;
+        expect(restored.id, task.id);
+        await restored.done;
+        expect(restored.matched, 1);
+        expect(store.local('metadata:pending-tasks'), isEmpty);
+      } finally {
+        if (locked) blocker.db.execute('ROLLBACK');
+        blocker.dispose();
+      }
+    },
+  );
 
   test(
     'manual selections preserve batch history and remove only task records',
@@ -629,6 +722,7 @@ void main() {
         await model.fakeCatalog.episodeStarted.future;
         model.setForeground(false);
         await Future<void>.delayed(Duration.zero);
+        await model.flushMetadataTasks();
         final saved = store.local('metadata:pending-tasks') as List;
         final groups = (saved.single as Map)['episodeNames'] as List;
         expect(groups, hasLength(1));
@@ -640,6 +734,7 @@ void main() {
         });
         final savedId = task.id;
         model.dispose();
+        await model.flushMetadataTasks();
         await Future<void>.delayed(Duration.zero);
         store.dispose();
         store = AppStore('${directory.path}/test.db');
@@ -914,6 +1009,7 @@ void main() {
         'series': 'New user edit',
       });
       model.dispose();
+      await model.flushMetadataTasks();
       await Future<void>.delayed(Duration.zero);
       store.dispose();
       store = AppStore('${directory.path}/test.db');

@@ -33,6 +33,7 @@ extension _CacheMaintenance on AppModel {
       await _syncWork;
       await worker?.close();
       await previewPause;
+      await _browsePreviewWork;
       await flushPlaybackPreviews();
       _metadataCancel.check();
       previews?.clearPending();

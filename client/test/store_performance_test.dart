@@ -116,6 +116,18 @@ void main() {
     expect(store.local('metadata:pending-tasks'), saved);
   });
 
+  test('idle shutdown does not create a metadata checkpoint', () async {
+    final store = AppStore(':memory:');
+    final model = AppModel(store, Directory.systemTemp, deferBackgroundWork: true);
+    await model.startBackgroundWork();
+    expect(model.metadataTasks, isEmpty);
+    model.dispose();
+    await model.flushMetadataTasks();
+    expect(store.local('metadata:pending-tasks'), isNull);
+    expect(store.localModified('metadata:pending-tasks'), isNull);
+    store.dispose();
+  });
+
   test('deferred startup does no library work until the host is ready', () async {
     final store = _CountingStore();
     store.setLocal('settings', {'metadataStrategy': 'off'});

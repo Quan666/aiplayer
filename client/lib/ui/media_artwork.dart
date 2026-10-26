@@ -37,6 +37,11 @@ class MediaArtwork extends StatefulWidget {
   /// A later widget update retries a previously full preview queue.
   final VoidCallback? onRequestPreview;
 
+  /// Returns false when the bounded preview queue is full. Only rejected
+  /// artwork listens for capacity, and retries when visible and idle again.
+  final FutureOr<bool> Function()? tryRequestPreview;
+  final ValueListenable<int>? previewCapacity;
+
   /// Runs once per revision when this artwork is visible and scrolling is idle,
   /// including when a poster is already available. The owner bounds and
   /// cancels any asynchronous work started by this callback.
@@ -52,6 +57,8 @@ class MediaArtwork extends StatefulWidget {
     this.maxDecodeEdge = 640,
     this.loadWhileScrolling = false,
     this.onRequestPreview,
+    this.tryRequestPreview,
+    this.previewCapacity,
     this.onVisibleIdle,
     this.visibleIdleRevision,
   }) : assert(maxDecodeEdge >= 64);
@@ -68,12 +75,17 @@ class _MediaArtworkState extends State<MediaArtwork> {
   Listenable? _cacheCapacity;
   Future<File?>? _poster;
   bool _previewPending = false, _previewFrameScheduled = false;
+  bool _previewRequestRunning = false, _previewBlocked = false;
+  int _previewRequestRevision = 0;
+  ValueListenable<int>? _previewCapacity;
   bool _visibleIdlePending = false;
   bool _imageLoadingAllowed = false;
   bool _active = true;
   bool get _enabled => _active && ArtworkLifecycle.instance.value;
   bool get _needsPreview =>
       _previewPending &&
+      !_previewRequestRunning &&
+      !_previewBlocked &&
       (widget.poster.isEmpty || widget.cache == null || _posterFailed);
   ValueListenable<bool>? _scrollActivity;
   final _scrollPositions = <ScrollPosition>{};
@@ -108,13 +120,15 @@ class _MediaArtworkState extends State<MediaArtwork> {
         _artworkLayoutGeneration++;
       });
     }
-    _previewPending = widget.onRequestPreview != null;
+    _previewPending =
+        widget.onRequestPreview != null || widget.tryRequestPreview != null;
     _visibleIdlePending = widget.onVisibleIdle != null;
     widget.cache?.changes.addListener(_cacheChanged);
   }
 
   void _lifecycleChanged() {
     if (!ArtworkLifecycle.instance.value) {
+      _stopWaitingForPreviewCapacity();
       _cancelDecode();
       // Even if no background frame rebuilds TickerMode, the first resumed
       // frame must retry the cold image whose queued request was cancelled.
@@ -164,6 +178,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
       _cancelDecode();
     }
     _route = ModalRoute.of(context);
+    if (!_enabled || _route?.isCurrent == false) {
+      _stopWaitingForPreviewCapacity();
+    }
     // Sheets can lay out their covers below the screen during entrance. Retry
     // after the transform settles even if the user has not started scrolling.
     final entrance = _route?.animation;
@@ -235,6 +252,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
   }
 
   void _routeSettled(AnimationStatus status) {
+    if (!_enabled || _route?.isCurrent == false) {
+      _stopWaitingForPreviewCapacity();
+    }
     if (status == AnimationStatus.dismissed ||
         status == AnimationStatus.completed) {
       _loadArtwork();
@@ -242,6 +262,48 @@ class _MediaArtworkState extends State<MediaArtwork> {
   }
 
   bool get _visible => _artworkPriority == 0;
+
+  void _stopWaitingForPreviewCapacity() {
+    _previewCapacity?.removeListener(_previewCapacityChanged);
+    _previewCapacity = null;
+    _previewBlocked = false;
+  }
+
+  void _previewCapacityChanged() {
+    _stopWaitingForPreviewCapacity();
+    if (mounted && _enabled && _visible && !_deferLoading) _loadArtwork();
+  }
+
+  Future<void> _tryPreview() async {
+    final request = widget.tryRequestPreview!;
+    final revision = ++_previewRequestRevision;
+    final capacity = widget.previewCapacity;
+    final before = capacity?.value;
+    _previewRequestRunning = true;
+    bool accepted;
+    try {
+      accepted = await Future<bool>.sync(request);
+    } catch (error) {
+      if (mounted && revision == _previewRequestRevision) {
+        _previewRequestRunning = false;
+        _reportFailure(error);
+      }
+      return;
+    }
+    if (!mounted || revision != _previewRequestRevision) return;
+    _previewRequestRunning = false;
+    if (accepted) return;
+    _previewPending = true;
+    if (!_enabled || _route?.isCurrent == false || capacity == null) return;
+    // Capacity may have become available while the asynchronous visibility
+    // check was answering. Observe its revision before waiting for an event.
+    if (capacity.value != before) {
+      if (_visible && !_deferLoading) _loadArtwork();
+      return;
+    }
+    _previewBlocked = true;
+    _previewCapacity = capacity..addListener(_previewCapacityChanged);
+  }
 
   // Only the immediately adjacent viewport is speculative. Distant sliver
   // children, covered routes and hidden tabs never start artwork work.
@@ -414,7 +476,11 @@ class _MediaArtworkState extends State<MediaArtwork> {
       }
       if (_needsPreview && priority == 0 && !_deferLoading) {
         _previewPending = false;
-        widget.onRequestPreview?.call();
+        if (widget.tryRequestPreview != null) {
+          unawaited(_tryPreview());
+        } else {
+          widget.onRequestPreview?.call();
+        }
       }
       if (_visibleIdlePending && priority == 0 && !_deferLoading) {
         _visibleIdlePending = false;
@@ -451,9 +517,15 @@ class _MediaArtworkState extends State<MediaArtwork> {
     }
     if (oldWidget.poster != widget.poster ||
         oldWidget.thumbnail != widget.thumbnail ||
+        oldWidget.previewCapacity != widget.previewCapacity ||
         (widget.thumbnail == null &&
-            oldWidget.onRequestPreview != widget.onRequestPreview)) {
-      _previewPending = widget.onRequestPreview != null;
+            (oldWidget.onRequestPreview != widget.onRequestPreview ||
+                oldWidget.tryRequestPreview != widget.tryRequestPreview))) {
+      _previewRequestRevision++;
+      _previewRequestRunning = false;
+      _stopWaitingForPreviewCapacity();
+      _previewPending =
+          widget.onRequestPreview != null || widget.tryRequestPreview != null;
     }
     if (oldWidget.visibleIdleRevision != widget.visibleIdleRevision ||
         (oldWidget.onVisibleIdle == null) != (widget.onVisibleIdle == null)) {
@@ -544,6 +616,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
 
   @override
   void dispose() {
+    _stopWaitingForPreviewCapacity();
     ArtworkLifecycle.instance.removeListener(_lifecycleChanged);
     _cancelDecode();
     widget.cache?.changes.removeListener(_cacheChanged);

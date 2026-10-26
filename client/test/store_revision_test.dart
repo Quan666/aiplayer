@@ -153,7 +153,7 @@ void main() {
       });
       expect(
         migrated.db.select('PRAGMA user_version').single['user_version'],
-        3,
+        4,
       );
       expect(migrated.local('settings'), {'volume': 70});
       final media = migrated.recordsRevision('media');

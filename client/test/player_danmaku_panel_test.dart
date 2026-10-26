@@ -9,6 +9,7 @@ import 'package:aiplayer/playback/session.dart';
 import 'package:aiplayer/ui/player_danmaku_panel.dart';
 import 'package:aiplayer/ui/player_danmaku_list.dart';
 import 'package:aiplayer/ui/player_theme.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -206,6 +207,206 @@ void main() {
   });
 
   testWidgets(
+    'manual browsing survives playback and refresh until returning to current',
+    (tester) async {
+      final position = _Position()..value = const Duration(seconds: 500);
+      final comments = [
+        for (var i = 0; i < 1000; i++)
+          DanmakuComment(i.toDouble(), '弹幕 $i', 0xffffff, 0),
+      ];
+      addTearDown(position.dispose);
+      await _showTimeList(tester, position, comments);
+      await tester.pumpAndSettle();
+      await tester.drag(find.byType(CustomScrollView), const Offset(0, -144));
+      await tester.pumpAndSettle();
+      final scroll = _timeScroll(tester);
+      final offset = scroll.pixels;
+      expect(offset, greaterThan(100));
+      expect(
+        find.byKey(const ValueKey('danmaku-follow-current')),
+        findsOneWidget,
+      );
+
+      for (final second in [501, 502, 508]) {
+        position.value = Duration(seconds: second);
+        await tester.pumpAndSettle();
+        expect(scroll.pixels, offset);
+      }
+      final current = find.byKey(const ValueKey('danmaku-comment-508'));
+      expect(current.hitTestable(), findsOneWidget);
+      expect(tester.widget<Semantics>(current).properties.selected, isTrue);
+
+      // The periodic refresh can replace the snapshot without taking control
+      // of a list the user is reading.
+      await _showTimeList(tester, position, [
+        ...comments,
+        const DanmakuComment(1001, '刷新增加的弹幕', 0xffffff, 0),
+      ]);
+      await tester.pumpAndSettle();
+      expect(scroll.pixels, offset);
+      expect(
+        find.byKey(const ValueKey('danmaku-follow-current')),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.byKey(const ValueKey('danmaku-follow-current')));
+      await tester.pumpAndSettle();
+      expect(scroll.pixels, 0);
+      expect(
+        find.byKey(const ValueKey('danmaku-follow-current')),
+        findsNothing,
+      );
+      expect(current.hitTestable(), findsOneWidget);
+      position.value = const Duration(seconds: 510);
+      await tester.pumpAndSettle();
+      final next = find.byKey(const ValueKey('danmaku-comment-510'));
+      expect(next.hitTestable(), findsOneWidget);
+      expect(tester.widget<Semantics>(next).properties.selected, isTrue);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('mouse wheel leaves the list in manual browsing mode', (
+    tester,
+  ) async {
+    final position = _Position()..value = const Duration(seconds: 500);
+    addTearDown(position.dispose);
+    await _showTimeList(tester, position, [
+      for (var i = 0; i < 1000; i++)
+        DanmakuComment(i.toDouble(), '弹幕 $i', 0xffffff, 0),
+    ]);
+    await tester.pumpAndSettle();
+    await tester.sendEventToBinding(
+      PointerScrollEvent(
+        position: tester.getCenter(find.byType(CustomScrollView)),
+        scrollDelta: const Offset(0, 144),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scroll = _timeScroll(tester);
+    final offset = scroll.pixels;
+    expect(offset, greaterThan(100));
+    expect(
+      find.byKey(const ValueKey('danmaku-follow-current')),
+      findsOneWidget,
+    );
+    position.value = const Duration(seconds: 550);
+    await tester.pumpAndSettle();
+    expect(scroll.pixels, offset);
+    expect(find.byKey(const ValueKey('danmaku-comment-550')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('keyboard scroll intents preserve manual browsing', (
+    tester,
+  ) async {
+    final position = _Position()..value = const Duration(seconds: 500);
+    addTearDown(position.dispose);
+    await _showTimeList(tester, position, [
+      for (var i = 0; i < 1000; i++)
+        DanmakuComment(i.toDouble(), '弹幕 $i', 0xffffff, 0),
+    ]);
+    await tester.pumpAndSettle();
+    Actions.invoke(
+      tester.element(find.byType(SliverList).last),
+      const ScrollIntent(
+        direction: AxisDirection.down,
+        type: ScrollIncrementType.page,
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scroll = _timeScroll(tester);
+    final offset = scroll.pixels;
+    expect(offset, greaterThan(100));
+    expect(
+      find.byKey(const ValueKey('danmaku-follow-current')),
+      findsOneWidget,
+    );
+    position.value = const Duration(seconds: 550);
+    await tester.pumpAndSettle();
+    expect(scroll.pixels, offset);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('truncated browsing snapshots do not measure a long prefix', (
+    tester,
+  ) async {
+    final position = _Position()..value = const Duration(seconds: 100);
+    final comments = [
+      for (var i = 0; i < 10000; i++)
+        DanmakuComment(i.toDouble(), '弹幕 $i', 0xffffff, 0),
+    ];
+    addTearDown(position.dispose);
+    await _showTimeList(tester, position, comments);
+    await tester.pumpAndSettle();
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -144));
+    await tester.pumpAndSettle();
+    final scroll = _timeScroll(tester);
+    scroll.jumpTo(60000);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('danmaku-follow-current')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('danmaku-comment-2600')).hitTestable(),
+      findsOneWidget,
+    );
+
+    // The old anchor (100) still exists, but the entire visible window has
+    // been removed. Retaining its large offset would measure ~1900 rows.
+    final shortened = _Comments(comments.take(2000).toList());
+    await _showTimeList(tester, position, shortened);
+    await tester.pumpAndSettle();
+    expect(shortened.reads, lessThan(150));
+    expect(
+      find.byKey(const ValueKey('danmaku-follow-current')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('danmaku-comment-1999')).hitTestable(),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('danmaku-comment-100')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'explicit player seeks resume following including the same time',
+    (tester) async {
+      _desktopSize(tester);
+      final (session, danmaku) = _sessions();
+      session.position.value = const Duration(seconds: 500);
+      danmaku.showComments([
+        for (var i = 0; i < 1000; i++)
+          DanmakuComment(i.toDouble(), '弹幕 $i', 0xffffff, 0),
+      ]);
+      await _open(tester, session, danmaku);
+      await tester.tap(find.text('列表'));
+      await tester.pumpAndSettle();
+
+      for (final target in [500, 900]) {
+        await tester.drag(find.byType(CustomScrollView), const Offset(0, -144));
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('danmaku-follow-current')),
+          findsOneWidget,
+        );
+        session.seekTo(Duration(seconds: target));
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('danmaku-follow-current')),
+          findsNothing,
+        );
+        final current = find.byKey(ValueKey('danmaku-comment-$target'));
+        expect(current.hitTestable(), findsOneWidget);
+        expect(tester.widget<Semantics>(current).properties.selected, isTrue);
+      }
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
     'equal-time comments highlight together and background stops now',
     (tester) async {
       final position = _Position()..value = const Duration(seconds: 500);
@@ -262,6 +463,14 @@ void main() {
 
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       expect(position.listened, isTrue);
+      await tester.pumpAndSettle();
+      expect(scroll.pixels, offset);
+      expect(
+        find.byKey(const ValueKey('danmaku-follow-current')),
+        findsOneWidget,
+      );
+      expect(find.byKey(const ValueKey('danmaku-comment-7500')), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('danmaku-follow-current')));
       await tester.pumpAndSettle();
       expect(
         find.byKey(const ValueKey('danmaku-comment-7500')).hitTestable(),
@@ -357,6 +566,7 @@ void _desktopSize(WidgetTester tester) {
   final danmaku = _Danmaku(store);
   addTearDown(store.dispose);
   addTearDown(danmaku.dispose);
+  addTearDown(session.dispose);
   addTearDown(session.position.dispose);
   return (session, danmaku);
 }
@@ -399,7 +609,38 @@ ScrollPosition _scroll(WidgetTester tester) => tester
     )
     .position;
 
-class _Session extends Fake implements PlaybackSession {
+Future<void> _showTimeList(
+  WidgetTester tester,
+  _Position position,
+  List<DanmakuComment> comments,
+) => tester.pumpWidget(
+  MaterialApp(
+    home: Center(
+      child: SizedBox(
+        width: 480,
+        height: 240,
+        child: PlayerDanmakuList(
+          position: position,
+          comments: comments,
+          shift: 0,
+        ),
+      ),
+    ),
+  ),
+);
+
+ScrollPosition _timeScroll(WidgetTester tester) => tester
+    .state<ScrollableState>(
+      find.descendant(
+        of: find.byType(PlayerDanmakuList),
+        matching: find.byType(Scrollable),
+      ),
+    )
+    .position;
+
+class _Session extends Fake with ChangeNotifier implements PlaybackSession {
+  @override
+  int timelineRevision = 0;
   @override
   final _Position position = _Position();
   @override
@@ -410,6 +651,12 @@ class _Session extends Fake implements PlaybackSession {
   @override
   Future<void> updateSettings(Map<String, dynamic> changes) async {
     model.settings.addAll(changes);
+  }
+
+  void seekTo(Duration value) {
+    timelineRevision++;
+    position.value = value;
+    notifyListeners();
   }
 }
 
