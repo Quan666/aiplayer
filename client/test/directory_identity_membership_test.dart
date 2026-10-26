@@ -290,6 +290,69 @@ void main() {
     },
   );
 
+  for (final manual in [false, true]) {
+    test(
+      'conflicting subjects import only missing filenames without a shared collection (manual=$manual)',
+      () async {
+        final entries = _entries(opaque: false).take(3).toList();
+        _save(store, entries[0], 'first', '1');
+        _save(store, entries[1], 'second', '2');
+        final second = store.get('media', 'second')!;
+        store.save('media', second.id, {...second.data, 'bangumiId': '99'});
+        if (manual) store.setLocal('manualMetadata:first', true);
+        final before = {
+          for (final record in store.records('media')) record.id: record,
+        };
+
+        expect(
+          await worker.synchronizeListing(
+            'nas',
+            'Example',
+            entries,
+            hideHidden: true,
+          ),
+          isNull,
+        );
+        expect(store.records('media'), hasLength(3));
+        for (final entry in before.entries) {
+          final current = store.get('media', entry.key)!;
+          expect(current.data, entry.value.data);
+          expect(current.revision, entry.value.revision);
+        }
+        final imported = store
+            .records('media')
+            .singleWhere((record) => !before.containsKey(record.id));
+        expect(imported.data['series'], 'Example');
+        expect(imported.data['season'], '1');
+        expect(imported.data['episode'], '3');
+        expect(imported.data['bangumiId'], isNull);
+        expect(imported.data['tmdbId'], isNull);
+        expect(store.local('location:${imported.id}')['path'], entries[2].path);
+        expect(
+          (await worker.prepareInspection(
+            'nas',
+            'Example',
+            'test',
+            entries,
+          )).collection,
+          isNull,
+        );
+        final revision = store.recordsRevision('media');
+        expect(
+          await worker.synchronizeListing(
+            'nas',
+            'Example',
+            entries,
+            hideHidden: true,
+          ),
+          isNull,
+        );
+        expect(store.recordsRevision('media'), revision);
+        expect(store.records('progress'), isEmpty);
+      },
+    );
+  }
+
   test(
     'manual episode overrides survive complete AI synchronization and batching',
     () async {

@@ -123,16 +123,27 @@ Future<String> encodeComments(List<DanmakuComment> comments) async =>
 class EpisodeMatch {
   final String episodeId, animeTitle, episodeTitle;
   final double shift;
+  final int? commentCount;
   const EpisodeMatch(
     this.episodeId,
     this.animeTitle,
     this.episodeTitle, [
     this.shift = 0,
+    this.commentCount,
   ]);
   String get label => '$animeTitle · $episodeTitle';
 }
 
 bool validEpisodeId(String id) => RegExp(r'^[1-9]\d{0,18}$').hasMatch(id);
+
+int? _commentCount(Object? value) {
+  final count = value is int
+      ? value
+      : value is String
+      ? int.tryParse(value, radix: 10)
+      : null;
+  return count != null && count >= 0 ? count : null;
+}
 
 class DanmuApiClient {
   static const defaultOrigin = 'https://danmu-api.cutejk.com';
@@ -241,6 +252,8 @@ class DanmuApiClient {
             id,
             '${a['animeTitle'] ?? ''}',
             '${e['episodeTitle'] ?? ''}',
+            0,
+            _commentCount(e['commentCount']),
           ),
         );
       }
@@ -277,6 +290,7 @@ class DanmuApiClient {
           '${m['animeTitle'] ?? ''}',
           '${m['episodeTitle'] ?? ''}',
           shift.isFinite && shift.abs() <= 86400 ? shift : 0,
+          _commentCount(m['commentCount']),
         ),
       );
     }

@@ -682,9 +682,17 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
   // A named anchor can complete numeric siblings even when the folder was
   // renamed or the source is rooted at S02. identifyDirectory can return just
   // the named files in that case, so anchored details must inspect every file.
-  var collection = anchorId == null
-      ? identifyStoredDirectory(store, sourceId, path, visible)
+  final parsed = anchorId == null
+      ? identifyDirectory(path, visible, folderIdentity: folderIdentity)
       : null;
+  var collection = anchorId == null
+      ? _mergeStoredDirectory(store, sourceId, visible, parsed)
+      : null;
+  // Conflicting saved subjects prevent a shared collection, but filenames
+  // can still identify missing episodes. Import only those files without
+  // borrowing a subject or changing any existing per-file identity.
+  final importOnly = anchorId == null && collection == null && parsed != null;
+  if (importOnly) collection = parsed;
   if (collection == null && anchorId != null) {
     if (anchor == null || anchor.deleted || location is! Map) return null;
     final originalEvidence = sourceEntryIdentity(
@@ -815,7 +823,11 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
         ),
         importMissing: true,
         anchorId: anchorId,
-        donorCache: donors,
+        donorVideos: importOnly ? const [] : null,
+        donorCache: importOnly ? null : donors,
+        expectedRecords: importOnly
+            ? {for (final entry in batch) entry.path: null}
+            : null,
         guard: guard,
       );
     });
@@ -826,6 +838,7 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
     names.addAll(resolved.episodeTitles);
   }
   cancel?.check();
+  if (importOnly) return null;
   return DirectoryMetadataResult(
     DirectoryCollection(
       title: resolved.title,

@@ -46,7 +46,7 @@ def release_assets(directory: Path, version: str, target: str) -> list[Path]:
     return assets
 
 
-def publish(tag: str, assets: list[Path]) -> None:
+def publish(tag: str, assets: list[Path], *, notes: Path | None = None) -> None:
     existing = subprocess.run(
         ["gh", "release", "view", tag, "--json", "isDraft"],
         check=False, capture_output=True, text=True,
@@ -55,7 +55,8 @@ def publish(tag: str, assets: list[Path]) -> None:
         draft = json.loads(existing.stdout)["isDraft"]
     else:
         # A failed upload must leave a new release unpublished and retryable.
-        command = ["gh", "release", "create", tag, "--draft", "--verify-tag", "--generate-notes", "--title", tag]
+        command = ["gh", "release", "create", tag, "--draft", "--verify-tag", "--title", tag]
+        command.extend(["--notes-file", str(notes)] if notes is not None else ["--generate-notes"])
         if "-" in tag:
             command.append("--prerelease")
         subprocess.run(command, check=True)
@@ -83,7 +84,9 @@ def main() -> None:
     if args.artifacts is None:
         parser.error("--artifacts is required when publishing")
     assets = release_assets(args.artifacts, version, args.target)
-    publish(args.tag, assets)
+    # Only a tag matching the validated pubspec version can form this filename.
+    notes = ROOT / "docs" / "releases" / f"{args.tag}.md"
+    publish(args.tag, assets, notes=notes if notes.is_file() else None)
 
 
 if __name__ == "__main__":

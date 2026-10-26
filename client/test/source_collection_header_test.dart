@@ -275,6 +275,12 @@ void main() {
         expect(find.byType(MediaDetailsOverview), findsNothing);
         expect(fixture.store.get('media', 'current-1')!.data['bangumiId'], '7');
         expect(fixture.store.get('media', 'current-2')!.data['bangumiId'], '8');
+        final imported = fixture.store
+            .records('media')
+            .singleWhere((record) => record.data['episode'] == '3');
+        expect(imported.data['series'], 'Current');
+        expect(imported.data['bangumiId'], isNull);
+        expect(imported.data['tmdbId'], isNull);
         expect(fixture.plays, 0);
         expect(tester.takeException(), isNull);
       } finally {

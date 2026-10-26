@@ -145,6 +145,70 @@ void main() {
       expect(calls, 3);
     },
   );
+  test('search and match accept only valid optional comment counts', () async {
+    final countFields = <Map<String, dynamic>>[
+      {},
+      {'commentCount': null},
+      {'commentCount': 0},
+      {'commentCount': 1245},
+      {'commentCount': '27'},
+      {'commentCount': '0'},
+      {'commentCount': -1},
+      {'commentCount': '-2'},
+      {'commentCount': 1.5},
+      {'commentCount': '1.5'},
+      {'commentCount': ''},
+      {'commentCount': 'NaN'},
+      {'commentCount': true},
+      {'commentCount': 3.0},
+      {'count': 42, 'episodeCount': 12},
+    ];
+    final expected = <int?>[
+      null,
+      null,
+      0,
+      1245,
+      27,
+      0,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+    ];
+    final entries = [
+      for (var i = 0; i < countFields.length; i++)
+        {'episodeId': i + 1, 'episodeTitle': '第${i + 1}集', ...countFields[i]},
+    ];
+    var calls = 0;
+    final api = DanmuApiClient(
+      DanmuApiClient.defaultOrigin,
+      'fixture',
+      transport: FakeTransport((uri, method, body, cancel) async {
+        calls++;
+        if (uri.path.endsWith('search/episodes')) {
+          return {
+            'animes': [
+              {'animeTitle': '作品', 'episodes': entries},
+            ],
+          };
+        }
+        expect(uri.path, endsWith('/match'));
+        return {'isMatched': false, 'matches': entries};
+      }),
+    );
+
+    expect((await api.search('作品')).map((e) => e.commentCount), expected);
+    expect(
+      (await api.match('作品')).matches.map((e) => e.commentCount),
+      expected,
+    );
+    expect(calls, 2);
+  });
   test(
     'normalization preserves text, duplicates, colors, modes and user IDs',
     () {
@@ -256,13 +320,17 @@ void main() {
         }),
       );
       final session = DanmakuSession(store, api, 'v');
-      session.select(const EpisodeMatch('1', '作品', '1'));
+      const match = EpisodeMatch('1', '作品', '1', 0, 99);
+      expect(session.candidateCommentCount(match), 99);
+      session.select(match);
       time.flushMicrotasks();
+      expect(session.candidateCommentCount(match), 2);
       session.configure(isPlaying: true);
       time.elapse(const Duration(seconds: 30));
       time.flushMicrotasks();
       expect(calls, 2);
       expect(session.comments.single.text, 'edited');
+      expect(session.candidateCommentCount(match), 1);
       session.configure(isPlaying: false);
       time.elapse(const Duration(minutes: 2));
       expect(calls, 2);
@@ -383,6 +451,12 @@ void main() {
       pending.complete({'comments': []});
       time.flushMicrotasks();
       expect(session.comments, isEmpty);
+      expect(
+        session.candidateCommentCount(
+          const EpisodeMatch('1', '作品', '1', 0, 99),
+        ),
+        0,
+      );
       expect(notifications, 1);
       session.dispose();
       store.dispose();

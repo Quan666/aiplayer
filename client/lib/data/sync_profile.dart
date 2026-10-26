@@ -6,9 +6,9 @@ import '../core/logger.dart';
 import '../core/network.dart';
 import '../sources/favorites.dart';
 import 'credential_storage.dart';
+import 'directory_preview_context.dart';
 import 'store.dart';
 import 'preferences.dart';
-import 'media_identity.dart';
 import 'media_previews.dart';
 import 'sync_artwork.dart';
 
@@ -1348,19 +1348,11 @@ class SyncProfile {
       settings['aiSubtitleModel'],
       store.local('metadataCredentialsRevision'),
     ]);
-    return hash.sha256
-        .convert(
-          utf8.encode(
-            jsonEncode([
-              'catalog-v5',
-              mediaIdentityRevision,
-              source,
-              settings['metadataStrategy'] ?? 'conservative',
-              aiContext,
-            ]),
-          ),
-        )
-        .toString();
+    return directoryPreviewContext(
+      source: source,
+      strategy: settings['metadataStrategy'] ?? 'conservative',
+      aiContext: aiContext,
+    );
   }
 
   void _applySourceOrder() {

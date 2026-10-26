@@ -9,6 +9,7 @@ import 'media_identity.dart';
 import '../sources/source.dart';
 import 'store.dart';
 import 'catalog_cache.dart';
+import 'directory_preview_context.dart';
 import 'media_presentation.dart';
 import 'tmdb_catalog.dart';
 
@@ -761,7 +762,7 @@ class LibraryCatalog {
     tmdb = TmdbCatalog(this.transport, this.tmdbCredential, store: store);
   }
   static const headers = {
-    'User-Agent': 'AIPlayer/0.5.21 (personal anime library)',
+    'User-Agent': 'AIPlayer/0.5.22 (personal anime library)',
   };
 
   Future<Map<String, dynamic>> _bangumiRequest(
@@ -820,19 +821,11 @@ class LibraryCatalog {
     final source = sources
         .where((value) => value['id'] == sourceId)
         .firstOrNull;
-    return sha256
-        .convert(
-          utf8.encode(
-            jsonEncode([
-              'catalog-v6',
-              mediaIdentityRevision,
-              source,
-              strategy(),
-              aiContext(),
-            ]),
-          ),
-        )
-        .toString();
+    return directoryPreviewContext(
+      source: source,
+      strategy: strategy(),
+      aiContext: aiContext(),
+    );
   }
 
   DirectoryPreview? directoryPreview(

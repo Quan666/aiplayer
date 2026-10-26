@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../danmaku/session.dart';
 import '../data/media_identity.dart';
 import '../playback/session.dart';
+import 'player_danmaku_list.dart';
 import 'player_theme.dart';
 
 class PlayerDanmakuPanel extends StatefulWidget {
@@ -17,10 +18,18 @@ class PlayerDanmakuPanel extends StatefulWidget {
   State<PlayerDanmakuPanel> createState() => _PlayerDanmakuPanelState();
 }
 
-class _PlayerDanmakuPanelState extends State<PlayerDanmakuPanel> {
+class _PlayerDanmakuPanelState extends State<PlayerDanmakuPanel>
+    with SingleTickerProviderStateMixin {
   final _title = TextEditingController();
   final _season = TextEditingController();
   final _episode = TextEditingController();
+  final _storage = PageStorageBucket();
+  late final _tabs = TabController(
+    length: 2,
+    vsync: this,
+    animationDuration: Duration.zero,
+  );
+  int _tab = 0;
   PlaybackSession get session => widget.session;
   DanmakuSession get d => widget.danmaku;
 
@@ -45,6 +54,7 @@ class _PlayerDanmakuPanelState extends State<PlayerDanmakuPanel> {
 
   @override
   void dispose() {
+    _tabs.dispose();
     _title.dispose();
     _season.dispose();
     _episode.dispose();
@@ -54,7 +64,55 @@ class _PlayerDanmakuPanelState extends State<PlayerDanmakuPanel> {
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: d,
-    builder: (context, _) => PlayerMenuList(
+    builder: (context, _) => Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  d.episodeId == null ? '弹幕' : '弹幕 · ${d.comments.length} 条',
+                  style: PlayerTheme.of(context).panelTitleStyle,
+                ),
+              ),
+              Switch(
+                value: d.visible,
+                onChanged: (value) =>
+                    session.updateSettings({'danmuVisible': value}),
+              ),
+            ],
+          ),
+        ),
+        TabBar(
+          controller: _tabs,
+          tabs: const [
+            Tab(text: '设置'),
+            Tab(text: '列表'),
+          ],
+          onTap: (value) {
+            if (_tab == value) return;
+            FocusManager.instance.primaryFocus?.unfocus();
+            setState(() => _tab = value);
+          },
+        ),
+        Flexible(
+          child: _tab == 0
+              ? PageStorage(bucket: _storage, child: _settings(context))
+              : PlayerDanmakuList(
+                  position: session.position,
+                  comments: d.comments,
+                  shift: d.shift + d.offset,
+                ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _settings(BuildContext context) => KeyedSubtree(
+    key: const PageStorageKey('danmaku-settings'),
+    child: PlayerMenuList(
       key: const ValueKey('player-danmaku-panel'),
       padding: const EdgeInsets.all(16),
       // The form and adjustments are two bounded groups. A short panel fits
@@ -64,9 +122,14 @@ class _PlayerDanmakuPanelState extends State<PlayerDanmakuPanel> {
         if (index == 0) return _form(context);
         if (index == d.candidates.length + 1) return _adjustments(context);
         final match = d.candidates[index - 1];
+        final count = d.candidateCommentCount(match);
         return ListTile(
           key: ValueKey('danmaku-candidate-${match.episodeId}'),
           title: Text(match.label),
+          trailing: Text(
+            count == null ? '数量未知' : '$count 条',
+            style: PlayerTheme.of(context).mutedStyle,
+          ),
           onTap: () => d.select(match),
         );
       },
@@ -77,18 +140,6 @@ class _PlayerDanmakuPanelState extends State<PlayerDanmakuPanel> {
     mainAxisSize: MainAxisSize.min,
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
-      Row(
-        children: [
-          Expanded(
-            child: Text('弹幕', style: PlayerTheme.of(context).panelTitleStyle),
-          ),
-          Switch(
-            value: d.visible,
-            onChanged: (value) =>
-                session.updateSettings({'danmuVisible': value}),
-          ),
-        ],
-      ),
       if (d.label.isNotEmpty)
         Text(d.label, style: PlayerTheme.of(context).mutedStyle),
       const SizedBox(height: 16),

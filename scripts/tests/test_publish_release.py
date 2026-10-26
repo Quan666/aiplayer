@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -161,9 +162,33 @@ class ReleasePublishingTest(unittest.TestCase):
         ])
         self.assertIn("--draft", commands[1])
         self.assertIn("--verify-tag", commands[1])
+        self.assertIn("--generate-notes", commands[1])
+        self.assertNotIn("--notes-file", commands[1])
         self.assertNotIn("--prerelease", commands[1])
         self.assert_uploaded_assets(commands[2])
         self.assertIn("--draft=false", commands[3])
+
+    def test_new_release_uses_explicit_notes_without_generated_notes(self):
+        notes = Path("docs/releases") / f"{TAG}.md"
+        with patch.object(
+            release.subprocess, "run", side_effect=self.github_response()
+        ) as run:
+            release.publish(TAG, self.assets, notes=notes)
+        create = self.commands(run)[1]
+        self.assertEqual(create[create.index("--notes-file") + 1], str(notes))
+        self.assertNotIn("--generate-notes", create)
+
+    def test_existing_release_preserves_notes_during_upload_retry(self):
+        notes = Path("docs/releases") / f"{TAG}.md"
+        for existing in (True, False):
+            with self.subTest(draft=existing), patch.object(
+                release.subprocess, "run", side_effect=self.github_response(existing=existing)
+            ) as run:
+                release.publish(TAG, self.assets, notes=notes)
+                for command in self.commands(run):
+                    self.assertNotIn("--notes-file", command)
+                    self.assertNotIn("--generate-notes", command)
+                    self.assertNotEqual(command[2], "create")
 
     def test_published_release_can_replace_assets_without_recreating_it(self):
         with patch.object(
@@ -207,6 +232,35 @@ class ReleasePublishingTest(unittest.TestCase):
         create = next(command for command in self.commands(run) if command[2] == "create")
         self.assertIn("--prerelease", create)
         self.assertIn("--draft", create)
+
+
+class ReleaseNotesSelectionTest(unittest.TestCase):
+    def test_main_selects_only_existing_notes_for_the_validated_tag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "client").mkdir()
+            (root / "client/pubspec.yaml").write_text(f"version: {VERSION}\n")
+            notes = root / "docs/releases" / f"{TAG}.md"
+            notes.parent.mkdir(parents=True)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            for name in ANDROID_ASSETS:
+                (artifacts / name).write_bytes(b"package fixture")
+            argv = [
+                "publish_release.py", "--tag", TAG, "--target", "android",
+                "--artifacts", str(artifacts),
+            ]
+            with patch.object(release, "ROOT", root), patch.object(sys, "argv", argv):
+                for present in (False, True):
+                    if present:
+                        notes.write_text("弹幕列表与目录识别修复\n", encoding="utf-8")
+                    with self.subTest(notes_present=present), patch.object(release, "publish") as publish:
+                        release.main()
+                        self.assertEqual(publish.call_args.kwargs["notes"], notes if present else None)
+                argv[2] = "../outside"
+                with patch.object(release, "publish") as publish, self.assertRaises(ValueError):
+                    release.main()
+                publish.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -32,6 +32,9 @@ class DanmakuSession extends ChangeNotifier {
       episodeId != null &&
       interval > 0;
 
+  int? candidateCommentCount(EpisodeMatch match) =>
+      match.episodeId == episodeId ? comments.length : match.commentCount;
+
   /// Presentation lifetime is separate from the video clock: audio and PiP can
   /// keep playing while their invisible inline comments need no network work.
   void setPresentationActive(bool value) {
@@ -139,10 +142,22 @@ class DanmakuSession extends ChangeNotifier {
         cancel: cancel,
       );
       if (!_current(generation)) return;
-      candidates = {
-        for (final v in [...found, ...result.matches])
-          if (!missingIds.contains(v.episodeId)) v.episodeId: v,
-      }.values.toList();
+      final merged = <String, EpisodeMatch>{};
+      for (final match in [...found, ...result.matches]) {
+        if (missingIds.contains(match.episodeId)) continue;
+        final count =
+            match.commentCount ?? merged[match.episodeId]?.commentCount;
+        merged[match.episodeId] = count == match.commentCount
+            ? match
+            : EpisodeMatch(
+                match.episodeId,
+                match.animeTitle,
+                match.episodeTitle,
+                match.shift,
+                count,
+              );
+      }
+      candidates = merged.values.toList();
       if (result.matched && await load(result.matches.single)) return;
       if (!_current(generation)) return;
       candidates.removeWhere((match) => missingIds.contains(match.episodeId));

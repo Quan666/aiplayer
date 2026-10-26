@@ -203,6 +203,23 @@ void main() {
             reason:
                 'Opening a single named video must not fabricate episode 1.',
           );
+        } else if (names.length > expected) {
+          // An unrecognized extra keeps membership partial, so the header
+          // reports every listed video without counting the trailer as an
+          // episode or importing it into the library.
+          expect(
+            find.descendant(
+              of: find.byType(MediaDetailsOverview),
+              matching: find.text('${names.length} 个视频'),
+            ),
+            findsOneWidget,
+          );
+          expect(find.textContaining('已收录'), findsNothing);
+          expect(model.sourceMedia('nas', '${target}trailer.mkv'), isNull);
+          expect(
+            store.all('media').map((record) => record.data['episode']).toSet(),
+            {'1', '2'},
+          );
         } else {
           expect(find.textContaining('已收录 $expected 集'), findsOneWidget);
         }

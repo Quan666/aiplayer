@@ -53,6 +53,125 @@ Map<String, dynamic> matchedResult(String id) => {
 };
 
 void main() {
+  test(
+    'candidate counts preserve search metadata when matches omit it',
+    () async {
+      final store = AppStore(':memory:');
+      final transport = LoadingTransport((uri) async {
+        if (uri.path.endsWith('search/episodes')) {
+          return {
+            'animes': [
+              {
+                'animeTitle': '搜索作品',
+                'episodes': [
+                  {'episodeId': 1, 'commentCount': 21},
+                  {'episodeId': 2, 'commentCount': 0},
+                  {'episodeId': 3, 'commentCount': 9},
+                  {'episodeId': 4},
+                  {'episodeId': 5, 'commentCount': 3},
+                ],
+              },
+            ],
+          };
+        }
+        expect(uri.path, endsWith('/match'));
+        return {
+          'isMatched': false,
+          'matches': [
+            {'episodeId': 1, 'animeTitle': '匹配作品', 'shift': 2.5},
+            {'episodeId': 2, 'commentCount': 7},
+            {'episodeId': 3, 'commentCount': 0},
+            {'episodeId': 4},
+            {'episodeId': 5, 'commentCount': -1},
+          ],
+        };
+      });
+      final session = DanmakuSession(
+        store,
+        DanmuApiClient(
+          DanmuApiClient.defaultOrigin,
+          'fixture',
+          transport: transport,
+        ),
+        'video',
+      );
+      addTearDown(store.dispose);
+      addTearDown(session.dispose);
+
+      await session.identify(const ReleaseName('作品', '', '1'));
+
+      expect(session.candidates.map((e) => e.episodeId), [
+        '1',
+        '2',
+        '3',
+        '4',
+        '5',
+      ]);
+      expect(session.candidates.map((e) => e.commentCount), [
+        21,
+        7,
+        0,
+        null,
+        3,
+      ]);
+      expect(session.candidates.first.animeTitle, '匹配作品');
+      expect(session.candidates.first.shift, 2.5);
+      for (var i = 0; i < 100; i++) {
+        expect(session.candidates.map(session.candidateCommentCount), [
+          21,
+          7,
+          0,
+          null,
+          3,
+        ]);
+      }
+      expect(transport.paths.map((path) => path.split('/api/v2/').last), [
+        'search/episodes',
+        'match',
+      ]);
+    },
+  );
+
+  test('search candidate counts do not download unknown episodes', () async {
+    final store = AppStore(':memory:');
+    final transport = LoadingTransport((uri) async {
+      expect(uri.path, endsWith('/search/episodes'));
+      return {
+        'animes': [
+          {
+            'animeTitle': '作品',
+            'episodes': [
+              {'episodeId': 1, 'commentCount': 0},
+              {'episodeId': 2},
+              {'episodeId': 3, 'commentCount': '18'},
+            ],
+          },
+        ],
+      };
+    });
+    final session = DanmakuSession(
+      store,
+      DanmuApiClient(
+        DanmuApiClient.defaultOrigin,
+        'fixture',
+        transport: transport,
+      ),
+      'video',
+    );
+    addTearDown(store.dispose);
+    addTearDown(session.dispose);
+
+    await session.search('作品', '1');
+
+    expect(session.candidates.map(session.candidateCommentCount), [
+      0,
+      null,
+      18,
+    ]);
+    expect(session.episodeId, isNull);
+    expect(transport.paths, hasLength(1));
+  });
+
   for (final operation in ['search', 'match', 'comment']) {
     test('$operation 404 preserves status and provides safe context', () async {
       final api = DanmuApiClient(
