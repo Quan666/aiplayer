@@ -206,6 +206,55 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('early timestamps leave no empty history above the first row', (
+    tester,
+  ) async {
+    final position = _Position();
+    final comments = [
+      const DanmakuComment(2, '第一条', 0xffffff, 0),
+      const DanmakuComment(2.5, '第二条', 0xffffff, 0),
+      for (var i = 2; i < 90; i++) DanmakuComment(i * 10, '弹幕 $i', 0xffffff, 0),
+    ];
+    addTearDown(position.dispose);
+    for (final height in [480.0, 240.0]) {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: 480,
+              height: height,
+              child: PlayerDanmakuList(
+                position: position,
+                comments: comments,
+                shift: 0,
+              ),
+            ),
+          ),
+        ),
+      );
+      for (final milliseconds in [0, 2000, 2500, 20000]) {
+        position.value = Duration(milliseconds: milliseconds);
+        await tester.pumpAndSettle();
+        expect(
+          tester.getTopLeft(find.byKey(const ValueKey('danmaku-comment-0'))).dy,
+          tester.getTopLeft(find.byType(CustomScrollView)).dy,
+        );
+      }
+      // A seek back from the middle must also remove the reserved history.
+      position.value = const Duration(seconds: 500);
+      await tester.pumpAndSettle();
+      position.value = const Duration(milliseconds: 2500);
+      await tester.pumpAndSettle();
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('danmaku-comment-0'))).dy,
+        tester.getTopLeft(find.byType(CustomScrollView)).dy,
+      );
+      final current = find.byKey(const ValueKey('danmaku-comment-1'));
+      expect(tester.widget<Semantics>(current).properties.selected, isTrue);
+    }
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'manual browsing survives playback and refresh until returning to current',
     (tester) async {

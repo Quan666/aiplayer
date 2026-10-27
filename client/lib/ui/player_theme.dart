@@ -1,8 +1,64 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'glass.dart';
 import 'theme/player_style.dart';
 export 'theme/player_style.dart';
+
+/// Route-scoped Escape handling also works after a tab clears keyboard focus.
+/// The default dismiss action depends on focus staying inside the modal and can
+/// be consumed by text fields or a tooltip before it reaches that action.
+class _PlayerPopupDismiss extends StatefulWidget {
+  final Widget child;
+  const _PlayerPopupDismiss({required this.child});
+
+  @override
+  State<_PlayerPopupDismiss> createState() => _PlayerPopupDismissState();
+}
+
+class _PlayerPopupDismissState extends State<_PlayerPopupDismiss> {
+  ModalRoute<dynamic>? _route;
+
+  @override
+  void initState() {
+    super.initState();
+    FocusManager.instance.addEarlyKeyEventHandler(_keyEvent);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _route = ModalRoute.of(context);
+  }
+
+  KeyEventResult _keyEvent(KeyEvent event) {
+    final route = _route;
+    if (!mounted ||
+        route is! PopupRoute<dynamic> ||
+        !route.isCurrent ||
+        event.logicalKey != LogicalKeyboardKey.escape ||
+        (event is! KeyDownEvent && event is! KeyRepeatEvent)) {
+      return KeyEventResult.ignored;
+    }
+    // Holding Escape must not also dismiss a parent panel or exit playback.
+    // maybePop preserves any route-level back/cancellation guards.
+    if (event is KeyDownEvent) {
+      Tooltip.dismissAllToolTips();
+      unawaited(route.navigator?.maybePop());
+    }
+    return KeyEventResult.handled;
+  }
+
+  @override
+  void dispose() {
+    FocusManager.instance.removeEarlyKeyEventHandler(_keyEvent);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
 
 class PlayerGlass extends StatelessWidget {
   // The filter is immutable and shared: timeline/volume changes must not
@@ -189,41 +245,43 @@ class PlayerDialog extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) => Dialog(
-    backgroundColor: Colors.transparent,
-    surfaceTintColor: Colors.transparent,
-    elevation: 0,
-    shape: RoundedRectangleBorder(
-      borderRadius: BorderRadius.all(
-        Radius.circular(PlayerTheme.of(context).panelRadius),
+  Widget build(BuildContext context) => _PlayerPopupDismiss(
+    child: Dialog(
+      backgroundColor: Colors.transparent,
+      surfaceTintColor: Colors.transparent,
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.all(
+          Radius.circular(PlayerTheme.of(context).panelRadius),
+        ),
       ),
-    ),
-    constraints: const BoxConstraints(maxWidth: 520),
-    child: PlayerGlass(
-      radius: PlayerTheme.of(context).panelRadius,
-      blur: false,
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            DefaultTextStyle.merge(
-              style: PlayerTheme.of(context).dialogTitleStyle,
-              child: title,
-            ),
-            const SizedBox(height: 18),
-            content,
-            if (actions.isNotEmpty) ...[
-              const SizedBox(height: 20),
-              OverflowBar(
-                alignment: MainAxisAlignment.end,
-                spacing: 8,
-                overflowSpacing: 8,
-                children: actions,
+      constraints: const BoxConstraints(maxWidth: 520),
+      child: PlayerGlass(
+        radius: PlayerTheme.of(context).panelRadius,
+        blur: false,
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              DefaultTextStyle.merge(
+                style: PlayerTheme.of(context).dialogTitleStyle,
+                child: title,
               ),
+              const SizedBox(height: 18),
+              content,
+              if (actions.isNotEmpty) ...[
+                const SizedBox(height: 20),
+                OverflowBar(
+                  alignment: MainAxisAlignment.end,
+                  spacing: 8,
+                  overflowSpacing: 8,
+                  children: actions,
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     ),
@@ -455,40 +513,42 @@ class PlayerSheet extends StatelessWidget {
                 media.padding.vertical -
                 40)
             .clamp(0.0, media.size.height * .84);
-    return PlayerTheme.surface(
-      SafeArea(
-        top: false,
-        child: Padding(
-          padding: EdgeInsets.fromLTRB(
-            PlayerTheme.viewportInset,
-            0,
-            PlayerTheme.viewportInset,
-            PlayerTheme.viewportInset + media.viewInsets.bottom,
-          ),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: 640, maxHeight: available),
-            child: PlayerGlass(
-              radius: PlayerTheme.of(context).panelRadius,
-              // A large scrolling panel should not blur every video frame.
-              blur: false,
-              child: Material(
-                color: Colors.transparent,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (available >= 24)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 8),
-                        child: Container(
-                          width: 34,
-                          height: 4,
-                          decoration: PlayerTheme.of(
-                            context,
-                          ).sheetHandleDecoration,
+    return _PlayerPopupDismiss(
+      child: PlayerTheme.surface(
+        SafeArea(
+          top: false,
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(
+              PlayerTheme.viewportInset,
+              0,
+              PlayerTheme.viewportInset,
+              PlayerTheme.viewportInset + media.viewInsets.bottom,
+            ),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: 640, maxHeight: available),
+              child: PlayerGlass(
+                radius: PlayerTheme.of(context).panelRadius,
+                // A large scrolling panel should not blur every video frame.
+                blur: false,
+                child: Material(
+                  color: Colors.transparent,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (available >= 24)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Container(
+                            width: 34,
+                            height: 4,
+                            decoration: PlayerTheme.of(
+                              context,
+                            ).sheetHandleDecoration,
+                          ),
                         ),
-                      ),
-                    Flexible(child: child),
-                  ],
+                      Flexible(child: child),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -507,54 +567,56 @@ Future<T?> showPlayerSettingsMenu<T>({
   context: PlayerTheme.routeContext(context),
   useSafeArea: false,
   barrierColor: PlayerTheme.of(context).barrierColor,
-  builder: (context) => PlayerTheme.surface(
-    SafeArea(
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          const original = PlayerTheme.settingsMenuInsets;
-          // Preserve the familiar position at normal sizes while allowing
-          // the menu to remain within a short landscape or resized window.
-          final insets = EdgeInsets.fromLTRB(
-            original.left.clamp(0.0, constraints.maxWidth / 4),
-            original.top.clamp(0.0, constraints.maxHeight / 10),
-            original.right.clamp(0.0, constraints.maxWidth / 4),
-            original.bottom.clamp(0.0, constraints.maxHeight / 3),
-          );
-          final height =
-              (constraints.maxHeight -
-                      insets.vertical -
-                      PlayerTheme.settingsMenuHeightReserve)
-                  .clamp(0.0, double.infinity);
-          return Align(
-            alignment: Alignment.bottomRight,
-            child: Padding(
-              padding: insets,
-              child: ConstrainedBox(
-                constraints: BoxConstraints(
-                  maxWidth: PlayerTheme.settingsMenuMaxWidth,
-                  maxHeight: height,
-                ),
-                child: MediaQuery.removePadding(
-                  context: context,
-                  removeLeft: true,
-                  removeTop: true,
-                  removeRight: true,
-                  removeBottom: true,
-                  child: Builder(
-                    builder: (context) => PlayerGlass(
-                      radius: PlayerTheme.of(context).panelRadius,
-                      blur: false,
-                      child: Material(
-                        color: Colors.transparent,
-                        child: builder(context),
+  builder: (context) => _PlayerPopupDismiss(
+    child: PlayerTheme.surface(
+      SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            const original = PlayerTheme.settingsMenuInsets;
+            // Preserve the familiar position at normal sizes while allowing
+            // the menu to remain within a short landscape or resized window.
+            final insets = EdgeInsets.fromLTRB(
+              original.left.clamp(0.0, constraints.maxWidth / 4),
+              original.top.clamp(0.0, constraints.maxHeight / 10),
+              original.right.clamp(0.0, constraints.maxWidth / 4),
+              original.bottom.clamp(0.0, constraints.maxHeight / 3),
+            );
+            final height =
+                (constraints.maxHeight -
+                        insets.vertical -
+                        PlayerTheme.settingsMenuHeightReserve)
+                    .clamp(0.0, double.infinity);
+            return Align(
+              alignment: Alignment.bottomRight,
+              child: Padding(
+                padding: insets,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: PlayerTheme.settingsMenuMaxWidth,
+                    maxHeight: height,
+                  ),
+                  child: MediaQuery.removePadding(
+                    context: context,
+                    removeLeft: true,
+                    removeTop: true,
+                    removeRight: true,
+                    removeBottom: true,
+                    child: Builder(
+                      builder: (context) => PlayerGlass(
+                        radius: PlayerTheme.of(context).panelRadius,
+                        blur: false,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: builder(context),
+                        ),
                       ),
                     ),
                   ),
                 ),
               ),
-            ),
-          );
-        },
+            );
+          },
+        ),
       ),
     ),
   ),
@@ -583,31 +645,33 @@ Future<T?> showPlayerPopover<T>({
     context: PlayerTheme.routeContext(context),
     useSafeArea: false,
     barrierColor: PlayerTheme.of(context).barrierColor,
-    builder: (context) => PlayerTheme.surface(
-      CustomSingleChildLayout(
-        delegate: _PlayerPopoverLayout(
-          anchor: bounds,
-          padding:
-              MediaQuery.paddingOf(context) +
-              const EdgeInsets.all(PlayerTheme.viewportInset),
-          width: width,
-        ),
-        // The layout delegate already keeps the whole popup inside the safe
-        // area. ListTile has its own SafeArea, so consume these screen insets
-        // before building the contents instead of applying the notch twice.
-        child: MediaQuery.removePadding(
-          context: context,
-          removeLeft: true,
-          removeTop: true,
-          removeRight: true,
-          removeBottom: true,
-          child: Builder(
-            builder: (context) => PlayerGlass(
-              radius: PlayerTheme.of(context).panelRadius,
-              blur: false,
-              child: Material(
-                color: Colors.transparent,
-                child: builder(context),
+    builder: (context) => _PlayerPopupDismiss(
+      child: PlayerTheme.surface(
+        CustomSingleChildLayout(
+          delegate: _PlayerPopoverLayout(
+            anchor: bounds,
+            padding:
+                MediaQuery.paddingOf(context) +
+                const EdgeInsets.all(PlayerTheme.viewportInset),
+            width: width,
+          ),
+          // The layout delegate already keeps the whole popup inside the safe
+          // area. ListTile has its own SafeArea, so consume these screen insets
+          // before building the contents instead of applying the notch twice.
+          child: MediaQuery.removePadding(
+            context: context,
+            removeLeft: true,
+            removeTop: true,
+            removeRight: true,
+            removeBottom: true,
+            child: Builder(
+              builder: (context) => PlayerGlass(
+                radius: PlayerTheme.of(context).panelRadius,
+                blur: false,
+                child: Material(
+                  color: Colors.transparent,
+                  child: builder(context),
+                ),
               ),
             ),
           ),

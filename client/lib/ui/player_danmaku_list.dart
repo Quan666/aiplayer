@@ -292,6 +292,12 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
         final height = constraints.hasBoundedHeight
             ? constraints.maxHeight
             : 480.0;
+        // Reserve only space that preceding rows can fill. Their minimum
+        // height avoids measuring history while keeping early comments at
+        // the top instead of leaving a gap above a fixed 30% anchor.
+        final viewportAnchor = height > 0
+            ? math.min(.3, anchor * minimumHeight / height)
+            : 0.0;
         _scroll ??= ScrollController(keepScrollOffset: false);
         return SizedBox(
           height: height,
@@ -310,7 +316,7 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
                     controller: _scroll,
                     primary: false,
                     center: _centerKey,
-                    anchor: anchor == 0 ? 0 : .3,
+                    anchor: viewportAnchor,
                     // Split at the current timestamp: variable-height rows seek
                     // without measuring the preceding history or keeping it alive.
                     slivers: [

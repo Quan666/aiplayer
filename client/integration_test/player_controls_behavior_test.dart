@@ -10,7 +10,10 @@ import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/playback/desktop_window.dart';
 import 'package:aiplayer/playback/session.dart';
 import 'package:aiplayer/playback/subtitle_fonts.dart';
+import 'package:aiplayer/ui/player_controls_settings.dart';
+import 'package:aiplayer/ui/player_danmaku_panel.dart';
 import 'package:aiplayer/ui/player_page.dart';
+import 'package:aiplayer/ui/player_theme.dart';
 import 'package:aiplayer/ui/desktop_window_frame.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -226,7 +229,7 @@ void main() {
       await _until(() => settings.evaluate().isNotEmpty, 'settings shortcut');
       await tester.pump(const Duration(milliseconds: 250));
       _expectChrome(tester, visible: false);
-      Navigator.of(tester.element(settings)).pop();
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pump(const Duration(milliseconds: 300));
       expect(settings, findsNothing);
       _expectChrome(tester, visible: false);
@@ -235,6 +238,81 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
       await tester.pump(const Duration(milliseconds: 500));
       _expectChrome(tester, visible: false);
+      final fullscreenBeforePanels = DesktopWindow.state.value.fullscreen;
+      final playerRoute = ModalRoute.of(
+        tester.element(find.byType(PlayerPage)),
+      )!;
+
+      Future<void> dismissPanel(Finder panel, String name) async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.escape);
+        try {
+          await tester.pump(const Duration(milliseconds: 350));
+          expect(panel, findsNothing, reason: '$name closes with Escape');
+          // Holding Escape after closing a popup must not leave fullscreen or
+          // playback, even after its route and keyboard listener are disposed.
+          await tester.sendKeyRepeatEvent(LogicalKeyboardKey.escape);
+          await tester.pump(const Duration(milliseconds: 100));
+          expect(find.byType(PlayerPage), findsOneWidget);
+          expect(DesktopWindow.state.value.fullscreen, fullscreenBeforePanels);
+          expect(session.closed, isFalse);
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.escape);
+        }
+        actions.add('Escape dismisses $name without leaving playback');
+      }
+
+      for (final (open, panel, name)
+          in <(Future<void> Function(), Finder, String)>[
+            (() => page.quickSettings(), settings, 'settings'),
+            (
+              () => page.playbackSpeed(),
+              find.byKey(const ValueKey('player-speed-popup')),
+              'playback speed',
+            ),
+            (
+              () => page.audioTracks(),
+              find.byKey(const ValueKey('player-audio-popup')),
+              'audio tracks',
+            ),
+            (() => page.tracks(false), find.text('选择本地外挂字幕'), 'subtitles'),
+            (() => page.diagnostics(), find.text('播放诊断'), 'diagnostics'),
+          ]) {
+        final closed = open();
+        await _until(() => panel.evaluate().isNotEmpty, 'open $name');
+        await tester.pump(const Duration(milliseconds: 350));
+        await dismissPanel(panel, name);
+        await closed;
+        expect(playerRoute.isCurrent, isTrue);
+      }
+
+      final danmakuClosed = page.danmakuPanel() as Future<void>;
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.tap(find.byType(TextField).first);
+      await tester.enterText(find.byType(TextField).first, '保留弹幕搜索草稿');
+      await tester.tap(find.widgetWithText(Tab, '列表'));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.byKey(const ValueKey('danmaku-time-list')), findsOneWidget);
+      await dismissPanel(
+        find.byType(PlayerDanmakuPanel),
+        'danmaku list after unfocus',
+      );
+      await danmakuClosed;
+      expect(playerRoute.isCurrent, isTrue);
+
+      final advancedClosed = page.advancedSettings() as Future<void>;
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.tap(find.byType(PlayerSelect<String>).first);
+      await tester.pump(const Duration(milliseconds: 350));
+      final choices = find.widgetWithText(PlayerChoiceTile, '裁剪填满');
+      expect(choices, findsOneWidget);
+      await dismissPanel(choices, 'nested video fit choice');
+      expect(find.byType(PlayerQuickSettings), findsOneWidget);
+      expect(playerRoute.isCurrent, isFalse);
+      await dismissPanel(find.byType(PlayerQuickSettings), 'advanced settings');
+      await advancedClosed;
+      expect(playerRoute.isCurrent, isTrue);
+
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pump(const Duration(milliseconds: 500));
       expect(find.byType(PlayerPage), findsOneWidget);
