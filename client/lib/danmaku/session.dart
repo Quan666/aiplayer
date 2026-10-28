@@ -295,6 +295,10 @@ class DanmakuSession extends ChangeNotifier {
       _generation++;
       busy = false;
     }
+    if (previous.$3 != interval) {
+      _timer?.cancel();
+      _timer = null;
+    }
     if (!active) {
       _stopRefresh();
     } else {

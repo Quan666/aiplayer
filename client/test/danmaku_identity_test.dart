@@ -44,6 +44,39 @@ void main() {
 
     expect(transport.matches, ['作品 S01E03.mkv', '作品 S01E04.mkv']);
   });
+
+  test(
+    'mixed encoded release repairs its saved title before matching episode four',
+    () async {
+      final store = AppStore(':memory:');
+      final transport = _Transport();
+      final session = DanmakuSession(
+        store,
+        DanmuApiClient(
+          DanmuApiClient.defaultOrigin,
+          'fixture',
+          transport: transport,
+        ),
+        'video',
+      );
+      addTearDown(store.dispose);
+      addTearDown(session.dispose);
+
+      await session.identify(
+        mediaRecordIdentity({
+          'fileName':
+              '2026-10/世界最强的魔女，就此开始/世界最强的魔女，就此开始%20-%20E04%20[ANi]%20[繁体].mp4',
+          'series': '世界最强的魔女，就此开始%20-%20E04%20[ANi]%20',
+        }),
+      );
+
+      expect(transport.searches.single.queryParameters, {
+        'anime': '世界最强的魔女，就此开始',
+        'episode': '4',
+      });
+      expect(transport.matches, ['世界最强的魔女，就此开始 S01E04']);
+    },
+  );
 }
 
 class _Transport implements JsonTransport {

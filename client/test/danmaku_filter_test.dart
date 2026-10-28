@@ -32,6 +32,50 @@ void main() {
     },
   );
 
+  test('preset keeps dialogue containing ordinary numbers', () {
+    for (final text in [
+      '原來這要繳貸款喔 35年的嗎',
+      '原来这要缴贷款哦 35年的吗',
+      '这次借了35点魔力',
+      '借了20点魔力',
+    ]) {
+      expect(matchesDanmakuPreset(text), isFalse, reason: text);
+    }
+  });
+
+  test('preset still filters standalone numbers within its original range', () {
+    for (final text in ['10', '35', '800', '05', ' 35 ', '\t90\n']) {
+      expect(matchesDanmakuPreset(text), isTrue, reason: text);
+    }
+    for (final text in ['60', '70']) {
+      expect(matchesDanmakuPreset(text), isFalse, reason: text);
+    }
+  });
+
+  test(
+    'narrowing numeric spam preserves date and other preset expressions',
+    () {
+      for (final text in [
+        '2026年10月28',
+        '2026-10-28',
+        '20261028',
+        'AV1234567',
+        'S.B',
+        '前面穿蓝衣服的',
+      ]) {
+        expect(matchesDanmakuPreset(text), isTrue, reason: text);
+      }
+    },
+  );
+
+  test('loan dialogue reaches layout with the preset enabled', () {
+    const dialogue = DanmakuComment(1121, '原來這要繳貸款喔 35年的嗎', 0xffffff, 0);
+    const comments = [DanmakuComment(1121, '35', 0xffffff, 0), dialogue];
+    final layout = DanmakuLayout()..update(comments, 1, now: 1121);
+
+    expect(layout.visibleAt(1121).single.comment, same(dialogue));
+  });
+
   test('keyword fallback and overlaps agree with literal substring matching', () {
     final random = Random(54);
     final keywords = danmakuPresetKeywords

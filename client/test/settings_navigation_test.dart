@@ -197,8 +197,8 @@ void main() {
       await tester.pumpAndSettle();
       await group('弹幕');
       expect(find.text('局域网'), findsNothing);
-      await revealDanmaku(field('更新间隔 / 秒'));
-      await tester.enterText(field('更新间隔 / 秒'), '5');
+      await revealDanmaku(field('播放时更新间隔 / 秒'));
+      await tester.enterText(field('播放时更新间隔 / 秒'), '5');
       await tester.enterText(field('Token'), 'draft-danmaku-token');
       await group('同步');
       await tester.enterText(field('同步服务地址'), 'https://new-sync.example');
@@ -212,9 +212,12 @@ void main() {
         'saved-danmaku-token',
       );
       await group('弹幕');
-      await revealDanmaku(field('更新间隔 / 秒'));
-      expect(tester.widget<TextField>(field('更新间隔 / 秒')).controller!.text, '5');
-      await tester.enterText(field('更新间隔 / 秒'), '120');
+      await revealDanmaku(field('播放时更新间隔 / 秒'));
+      expect(
+        tester.widget<TextField>(field('播放时更新间隔 / 秒')).controller!.text,
+        '5',
+      );
+      await tester.enterText(field('播放时更新间隔 / 秒'), '120');
       await revealDanmaku(find.text('保存弹幕服务'));
       await tester.tap(find.text('保存弹幕服务'));
       await tester.pumpAndSettle();

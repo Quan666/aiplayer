@@ -55,6 +55,107 @@ void main() {
     }
   });
 
+  test('mixed and fully encoded release filenames retain their episode', () {
+    const title = '世界最强的魔女，就此开始';
+    const fileName = '$title - E04 [ANi] [繁体].mp4';
+    for (final name in [
+      fileName,
+      '$title%20-%20E04%20[ANi]%20[繁体].mp4',
+      Uri.encodeComponent(fileName),
+    ]) {
+      final parsed = parseReleaseName('2026-10/$title/$name');
+      expect([parsed.anime, parsed.season, parsed.episode], [title, '', '4']);
+      expect(parsed.matchName, '$title S01E04');
+    }
+  });
+
+  test('percent decoding is single pass and preserves invalid sequences', () {
+    const cases = {
+      '命运100%?%20-%20E04.mp4': '命运100%?',
+      '命运%25%20-%20E04.mp4': '命运%',
+      '命运%2520%20-%20E04.mp4': '命运%20',
+      '命运%ZZ%20-%20E04.mp4': '命运%ZZ',
+      '命运%E4%20-%20E04.mp4': '命运%E4',
+      '命运%FF%20-%20E04.mp4': '命运%FF',
+      '命运%ED%A0%80%20-%20E04.mp4': '命运%ED%A0%80',
+      '命运%E4%B8%96%E7%95%8C%20-%20E04.mp4': '命运世界',
+    };
+    for (final entry in cases.entries) {
+      final parsed = parseReleaseName(entry.key);
+      expect(parsed.anime, entry.value, reason: entry.key);
+      expect(parsed.episode, '4', reason: entry.key);
+    }
+  });
+
+  test('episode separators are removed without trimming authored hyphens', () {
+    const cases = {
+      '某作品 - E04.mp4': '某作品',
+      '某作品 - S02E04.mp4': '某作品',
+      '某作品 - OVA1.mp4': '某作品',
+      '前-后 - E04.mp4': '前-后',
+      '前 - 后 - E04.mp4': '前 - 后',
+      '作品- E04.mp4': '作品-',
+      '作品- - E04.mp4': '作品-',
+      '作品 -- E04.mp4': '作品 --',
+      '作品 - 结局.mp4': '作品 - 结局',
+    };
+    for (final entry in cases.entries) {
+      expect(parseReleaseName(entry.key).anime, entry.value, reason: entry.key);
+    }
+  });
+
+  test('exact names left by the previous release parser are repaired', () {
+    const title = '世界最强的魔女，就此开始';
+    const encodedFile = '$title%20-%20E04%20[ANi]%20[繁体].mp4';
+    const plainFile = '$title - E04 [ANi] [繁体].mp4';
+    for (final (fileName, oldSeries) in [
+      (encodedFile, '$title%20-%20E04%20[ANi]%20'),
+      (plainFile, '$title -'),
+      (Uri.encodeComponent(plainFile), '$title -'),
+    ]) {
+      final repaired = mediaRecordIdentity({
+        'fileName': fileName,
+        'series': oldSeries,
+      });
+      expect([repaired.anime, repaired.episode], [title, '4']);
+      final savedEpisode = mediaRecordIdentity({
+        'fileName': fileName,
+        'series': oldSeries,
+        'season': '2',
+        'episode': '7',
+      });
+      expect(
+        [savedEpisode.anime, savedEpisode.season, savedEpisode.episode],
+        [title, '2', '7'],
+      );
+      for (final manualTitle in ['人工作品名', '$title 手动修正 -']) {
+        expect(
+          mediaRecordIdentity({
+            'fileName': fileName,
+            'series': manualTitle,
+          }).anime,
+          manualTitle,
+        );
+      }
+      expect(
+        mediaRecordIdentity({
+          'fileName': fileName,
+          'series': oldSeries,
+          'metadataTitle': '识别或人工指定的标题 -',
+        }).anime,
+        '识别或人工指定的标题 -',
+      );
+    }
+    // A similar-looking saved title is not repaired without file evidence.
+    expect(
+      mediaRecordIdentity({
+        'fileName': '$title E04.mp4',
+        'series': '$title -',
+      }).anime,
+      '$title -',
+    );
+  });
+
   test('catalogue titles do not pass through filename cleanup', () {
     for (final name in [
       'Fate/stay night [Unlimited Blade Works]',
@@ -177,30 +278,33 @@ void main() {
   test('persisted previews from the old title parser are not reused', () {
     final store = AppStore(':memory:');
     try {
-      final legacyContext = sha256
-          .convert(
-            utf8.encode(jsonEncode(['catalog-v5', null, 'conservative', ''])),
-          )
-          .toString();
-      persistDirectoryPreview(
-        store,
-        'nas',
-        '/Show',
-        DirectoryPreview(
-          collection: const DirectoryCollection(
-            title: '用 强制收回借出的魔力',
-            season: '',
-            videos: [],
-            identities: {},
+      for (final legacyInput in [
+        ['catalog-v5', null, 'conservative', ''],
+        ['catalog-v6', 2, null, 'conservative', ''],
+      ]) {
+        final legacyContext = sha256
+            .convert(utf8.encode(jsonEncode(legacyInput)))
+            .toString();
+        persistDirectoryPreview(
+          store,
+          'nas',
+          '/Show',
+          DirectoryPreview(
+            collection: const DirectoryCollection(
+              title: '用 强制收回借出的魔力',
+              season: '',
+              videos: [],
+              identities: {},
+            ),
+            context: legacyContext,
+            fingerprint: 'unchanged-files',
+            updatedAt: DateTime.now().millisecondsSinceEpoch,
+            modified: 0,
           ),
-          context: legacyContext,
-          fingerprint: 'unchanged-files',
-          updatedAt: DateTime.now().millisecondsSinceEpoch,
-          modified: 0,
-        ),
-      );
-      expect(readDirectoryPreview(store, 'nas', '/Show'), isNotNull);
-      expect(LibraryCatalog(store).directoryPreview('nas', '/Show'), isNull);
+        );
+        expect(readDirectoryPreview(store, 'nas', '/Show'), isNotNull);
+        expect(LibraryCatalog(store).directoryPreview('nas', '/Show'), isNull);
+      }
     } finally {
       store.dispose();
     }

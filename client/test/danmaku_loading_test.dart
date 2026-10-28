@@ -492,6 +492,128 @@ void main() {
     });
   });
 
+  for (final (previous, next) in [(30, 120), (120, 30)]) {
+    test(
+      'changing refresh interval from $previous to $next restarts its wait',
+      () {
+        fakeAsync((time) {
+          final store = AppStore(':memory:');
+          var calls = 0;
+          final session = DanmakuSession(
+            store,
+            DanmuApiClient(
+              DanmuApiClient.defaultOrigin,
+              'fixture',
+              transport: LoadingTransport((_) async {
+                calls++;
+                return snapshot;
+              }),
+            ),
+            'video',
+          );
+          session.select(const EpisodeMatch('1', '作品', ''));
+          time.flushMicrotasks();
+          session.configure(isPlaying: true, seconds: previous);
+          time.elapse(const Duration(seconds: 10));
+
+          session.configure(seconds: next);
+          time.elapse(Duration(seconds: next - 1));
+          expect(calls, 1);
+          time.elapse(const Duration(seconds: 1));
+          expect(calls, 2);
+          session.dispose();
+          expect(time.pendingTimers, isEmpty);
+          store.dispose();
+        });
+      },
+    );
+  }
+
+  test('interval changes preserve one in-flight refresh and its next wait', () {
+    fakeAsync((time) {
+      final store = AppStore(':memory:');
+      final pending = Completer<Map<String, dynamic>>();
+      var calls = 0;
+      final transport = LoadingTransport((_) async {
+        calls++;
+        return calls == 2 ? pending.future : snapshot;
+      });
+      final session = DanmakuSession(
+        store,
+        DanmuApiClient(
+          DanmuApiClient.defaultOrigin,
+          'fixture',
+          transport: transport,
+        ),
+        'video',
+      );
+      session.select(const EpisodeMatch('1', '作品', ''));
+      time.flushMicrotasks();
+      session.configure(isPlaying: true);
+      time.elapse(const Duration(seconds: 30));
+      expect(calls, 2);
+
+      session.configure(seconds: 120);
+      time.elapse(const Duration(minutes: 5));
+      expect(calls, 2);
+      expect(transport.cancellations.last!.cancelled, isFalse);
+      pending.complete(snapshot);
+      time.flushMicrotasks();
+      time.elapse(const Duration(seconds: 119));
+      expect(calls, 2);
+      time.elapse(const Duration(seconds: 1));
+      expect(calls, 3);
+      session.dispose();
+      expect(time.pendingTimers, isEmpty);
+      store.dispose();
+    });
+  });
+
+  test(
+    'disabling refresh cancels work and a late response cannot restart it',
+    () {
+      fakeAsync((time) {
+        final store = AppStore(':memory:');
+        final pending = Completer<Map<String, dynamic>>();
+        var calls = 0;
+        final transport = LoadingTransport((_) async {
+          calls++;
+          return calls == 2 ? pending.future : snapshot;
+        });
+        final session = DanmakuSession(
+          store,
+          DanmuApiClient(
+            DanmuApiClient.defaultOrigin,
+            'fixture',
+            transport: transport,
+          ),
+          'video',
+        );
+        session.select(const EpisodeMatch('1', '作品', ''));
+        time.flushMicrotasks();
+        final original = session.comments;
+        session.configure(isPlaying: true);
+        time.elapse(const Duration(seconds: 30));
+        expect(calls, 2);
+
+        session.configure(seconds: 0);
+        expect(transport.cancellations.last!.cancelled, isTrue);
+        pending.complete({
+          'comments': [
+            {'time': 1, 'text': 'disabled refresh'},
+          ],
+        });
+        time.flushMicrotasks();
+        time.elapse(const Duration(hours: 2));
+        expect(session.comments, same(original));
+        expect(calls, 2);
+        expect(time.pendingTimers, isEmpty);
+        session.dispose();
+        store.dispose();
+      });
+    },
+  );
+
   test(
     'play state changes cannot refresh the old episode during rematching',
     () {

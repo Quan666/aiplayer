@@ -11,6 +11,7 @@ import 'package:aiplayer/ui/player_danmaku_list.dart';
 import 'package:aiplayer/ui/player_theme.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -126,6 +127,116 @@ void main() {
       tester.widget<TextField>(find.byType(TextField).first).controller!.text,
       '保留搜索',
     );
+  });
+
+  testWidgets('tapping a comment time or text copies the complete row', (
+    tester,
+  ) async {
+    _desktopSize(tester);
+    final copied = _recordClipboard(tester);
+    final (session, danmaku) = _sessions();
+    session.position.value = const Duration(seconds: 1121);
+    const text = '原來這要繳貸款喔 35年的嗎\n這是一條換行後仍需完整複製的長彈幕，內容與標點都要保留。';
+    danmaku.showComments(const [DanmakuComment(1121, text, 0xffffff, 0)]);
+    await _open(tester, session, danmaku);
+    await tester.tap(find.text('列表'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('18:41'));
+    await tester.pumpAndSettle();
+    expect(copied, ['18:41 $text']);
+    expect(find.text('已复制弹幕'), findsOneWidget);
+    await tester.tap(find.text(text), kind: PointerDeviceKind.mouse);
+    await tester.pumpAndSettle();
+    expect(copied, ['18:41 $text', '18:41 $text']);
+    expect(session.position.value, const Duration(seconds: 1121));
+    expect(find.byKey(const ValueKey('danmaku-follow-current')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('copied time follows the displayed offset and hour format', (
+    tester,
+  ) async {
+    final copied = _recordClipboard(tester);
+    final position = _Position();
+    addTearDown(position.dispose);
+    for (final (time, shift, displayed) in [
+      (3600.9, 61.8, '1:01:02'),
+      (1.2, -3.5, '00:00'),
+    ]) {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              height: 240,
+              child: PlayerDanmakuList(
+                position: position,
+                comments: [DanmakuComment(time, '完整内容', 0xffffff, 0)],
+                shift: shift,
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(displayed));
+      await tester.pumpAndSettle();
+      expect(copied.last, '$displayed 完整内容');
+      expect(tester.takeException(), isNull);
+    }
+    expect(copied.length, 2);
+  });
+
+  testWidgets('dragging never copies and copying preserves manual browsing', (
+    tester,
+  ) async {
+    final copied = _recordClipboard(tester);
+    final position = _Position()..value = const Duration(seconds: 500);
+    addTearDown(position.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: SizedBox(
+              width: 480,
+              height: 240,
+              child: PlayerDanmakuList(
+                position: position,
+                comments: [
+                  for (var i = 0; i < 1000; i++)
+                    DanmakuComment(i.toDouble(), '弹幕 $i', 0xffffff, 0),
+                ],
+                shift: 0,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -144));
+    await tester.pumpAndSettle();
+    final scroll = _timeScroll(tester);
+    final offset = scroll.pixels;
+    expect(copied, isEmpty);
+    expect(offset, greaterThan(100));
+    expect(
+      find.byKey(const ValueKey('danmaku-follow-current')),
+      findsOneWidget,
+    );
+
+    final row = find.byKey(const ValueKey('danmaku-comment-508'));
+    expect(row.hitTestable(), findsOneWidget);
+    await tester.tap(row);
+    await tester.pumpAndSettle();
+    expect(copied, ['08:28 弹幕 508']);
+    expect(scroll.pixels, offset);
+    expect(position.value, const Duration(seconds: 500));
+    expect(
+      find.byKey(const ValueKey('danmaku-follow-current')),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('time list stays compact and lazy while seeking and shifting', (
@@ -607,6 +718,26 @@ void _desktopSize(WidgetTester tester) {
   tester.view.physicalSize = const Size(1280, 1200);
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);
+}
+
+List<String> _recordClipboard(WidgetTester tester) {
+  final copied = <String>[];
+  tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+    SystemChannels.platform,
+    (call) async {
+      if (call.method == 'Clipboard.setData') {
+        copied.add((call.arguments as Map)['text'] as String);
+      }
+      return null;
+    },
+  );
+  addTearDown(() {
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      null,
+    );
+  });
+  return copied;
 }
 
 (_Session, _Danmaku) _sessions() {

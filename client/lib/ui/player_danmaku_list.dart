@@ -4,9 +4,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart'
     show RenderSliverList, ScrollDirection, SliverMultiBoxAdaptorParentData;
+import 'package:flutter/services.dart';
 
 import '../danmaku/api.dart';
 import '../playback/fullscreen_transition.dart';
+import 'glass.dart';
 import 'player_theme.dart';
 
 /// Uses the already ordered snapshot and the player's existing position events.
@@ -229,6 +231,27 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
     });
   }
 
+  Future<void> _copy(String text) async {
+    if (!_active) return;
+    try {
+      await Clipboard.setData(ClipboardData(text: text));
+    } on PlatformException {
+      if (!mounted || !_active) return;
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..removeCurrentSnackBar()
+        ..showSnackBar(
+          const SnackBar(
+            content: Text('复制失败，请重试'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      return;
+    }
+    if (!mounted || !_active) return;
+    showGlassSuccess(context, '已复制弹幕');
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -261,25 +284,37 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
       return Semantics(
         key: ValueKey('danmaku-comment-$index'),
         selected: selected,
-        child: ColoredBox(
-          color: selected ? style.selectedColor : Colors.transparent,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(minHeight: minimumHeight),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    time,
-                    style: textStyle.copyWith(
-                      color: style.secondaryForeground,
-                      fontFeatures: const [FontFeature.tabularFigures()],
-                    ),
+        button: true,
+        onTapHint: '复制时间和内容',
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => _copy('$time ${comment.text}'),
+            child: ColoredBox(
+              color: selected ? style.selectedColor : Colors.transparent,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: minimumHeight),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
                   ),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(comment.text, style: textStyle)),
-                ],
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        time,
+                        style: textStyle.copyWith(
+                          color: style.secondaryForeground,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(comment.text, style: textStyle)),
+                    ],
+                  ),
+                ),
               ),
             ),
           ),

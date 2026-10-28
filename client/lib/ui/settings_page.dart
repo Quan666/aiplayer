@@ -177,7 +177,7 @@ class _SettingsPageState extends State<SettingsPage>
       final seconds = int.tryParse(interval.text);
       if (seconds == null ||
           !(seconds == 0 || seconds >= 30 && seconds <= 3600)) {
-        throw const AppFailure('刷新间隔须为 0 或 30–3600 秒。');
+        throw const AppFailure('播放时更新间隔须为 0 或 30–3600 秒。');
       }
       await model.setSettings({
         'danmuOrigin': origin.text.trim().replaceFirst(RegExp(r'/$'), ''),
@@ -746,7 +746,7 @@ class _SettingsPageState extends State<SettingsPage>
       controller: interval,
       keyboardType: TextInputType.number,
       decoration: const InputDecoration(
-        labelText: '更新间隔 / 秒',
+        labelText: '播放时更新间隔 / 秒',
         helperText: '0 为关闭；30–3600 秒',
         helperMaxLines: 2,
       ),
@@ -1017,7 +1017,7 @@ class _SettingsPageState extends State<SettingsPage>
         'danmaku',
         '弹幕',
         Icons.chat_bubble_outline_rounded,
-        '字号 不透明度 区域 密度 速度 屏蔽词 预设 过滤 正则 顶部 底部 滚动 服务 API Token 更新间隔',
+        '字号 不透明度 区域 密度 速度 屏蔽词 预设 过滤 正则 顶部 底部 滚动 服务 API Token 播放时更新间隔',
       ),
       (
         'ai',
