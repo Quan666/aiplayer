@@ -31,7 +31,9 @@ void main() {
   late _Session session;
   late PlayerWindowMode mode;
   Map<String, dynamic>? request;
+  Completer<void>? mediaStateReady;
   setUp(() {
+    mediaStateReady = null;
     directory = Directory.systemTemp.createTempSync('aiplayer-ios-pip-');
     store = AppStore(':memory:');
     model = AppModel(store, directory);
@@ -55,7 +57,12 @@ void main() {
       }
       return null;
     });
-    mode = PlayerWindowMode(isIOS: true)..bindSession(session);
+    mode = PlayerWindowMode(
+      isIOS: true,
+      beforeNativePictureInPicture: () async {
+        await mediaStateReady?.future;
+      },
+    )..bindSession(session);
   });
   tearDown(() async {
     await mode.close();
@@ -101,6 +108,34 @@ void main() {
     await entering;
     expect(request?['playing'], true);
   });
+
+  test('iOS handoff publishes media ownership before native entry', () async {
+    mediaStateReady = Completer<void>();
+    final entering = mode.enter(aspectRatio: 16 / 9);
+    await Future<void>.delayed(Duration.zero);
+    expect(mode.active, true);
+    expect(request, isNull);
+    mediaStateReady!.complete();
+    await entering;
+    expect(request, isNotNull);
+  });
+
+  test(
+    'backgrounding while publishing ownership cancels native entry',
+    () async {
+      mediaStateReady = Completer<void>();
+      final entering = mode.enter(aspectRatio: 16 / 9);
+      final result = expectLater(entering, throwsA(isA<Cancelled>()));
+      await Future<void>.delayed(Duration.zero);
+      session.backgroundPauseRevision++;
+      session.backgroundPlaybackBlocked = true;
+      mediaStateReady!.complete();
+      await result;
+      expect(request, isNull);
+      expect(session.remotePlayback, false);
+      expect(session.player.state.playing, false);
+    },
+  );
 
   test(
     'backgrounding during foreground restore cancels native handoff',

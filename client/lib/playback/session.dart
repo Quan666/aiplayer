@@ -343,11 +343,16 @@ class PlaybackSession extends ChangeNotifier {
     _pendingPlayingIntent = playing;
     _openingWantsPlay = playing;
     final intent = ++_playbackIntentRevision;
+    final pauseRevision = _backgroundPauseRevision;
+    final initiallyAllowedToPlay = !_backgroundPlaybackBlocked;
     try {
       await _backgroundRestoreWork;
       await _backgroundPauseWork;
       if (closed || intent != _playbackIntentRevision) return;
-      if (playing && !_backgroundPlaybackBlocked) {
+      if (playing &&
+          initiallyAllowedToPlay &&
+          pauseRevision == _backgroundPauseRevision &&
+          !_backgroundPlaybackBlocked) {
         await player.play();
         if (intent == _playbackIntentRevision && !_backgroundPlaybackBlocked) {
           _resumeAfterBackground = false;

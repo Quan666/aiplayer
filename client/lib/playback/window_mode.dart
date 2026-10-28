@@ -15,6 +15,7 @@ class PlayerWindowMode extends ChangeNotifier {
   static const _channel = MethodChannel('app.aiplayer/window_mode');
   final bool _isIOS;
   final bool _isAndroid;
+  final Future<void> Function()? beforeNativePictureInPicture;
   bool _active = false, _supported = false, _closed = false;
   PlaybackSession? _session;
   int _sessionRevision = 0;
@@ -53,6 +54,7 @@ class PlayerWindowMode extends ChangeNotifier {
   bool get systemPip => _isAndroid || _isIOS;
   late final Future<void> _ready = _initialize();
   PlayerWindowMode({
+    this.beforeNativePictureInPicture,
     @visibleForTesting bool? isIOS,
     @visibleForTesting bool? isAndroid,
   }) : _isIOS = isIOS ?? Platform.isIOS,
@@ -278,6 +280,7 @@ class PlayerWindowMode extends ChangeNotifier {
     notifyListeners();
     try {
       await session.player.pause();
+      await beforeNativePictureInPicture?.call();
       if (_closed ||
           session.closed ||
           revision != _sessionRevision ||

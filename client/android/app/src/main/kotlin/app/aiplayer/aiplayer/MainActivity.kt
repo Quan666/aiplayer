@@ -21,6 +21,7 @@ import android.provider.Settings
 import android.os.Build
 import android.os.PowerManager
 import android.view.OrientationEventListener
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -33,6 +34,7 @@ class MainActivity : FlutterActivity() {
     private var windowModeChannel: MethodChannel? = null
     private var externalVideos: ExternalVideoHandler? = null
     private var systemProxy: SystemProxyHandler? = null
+    private var mediaControls: MediaControlsHandler? = null
     private var deviceInfoChannel: MethodChannel? = null
     private var displayChannel: MethodChannel? = null
     private var discoveryChannel: MethodChannel? = null
@@ -70,6 +72,8 @@ class MainActivity : FlutterActivity() {
         externalVideos?.accept(intent)
         systemProxy?.close()
         systemProxy = SystemProxyHandler(flutterEngine.dartExecutor.binaryMessenger)
+        mediaControls?.close()
+        mediaControls = MediaControlsHandler(this, flutterEngine.dartExecutor.binaryMessenger)
         displayChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "app.aiplayer/display"
@@ -274,6 +278,12 @@ class MainActivity : FlutterActivity() {
         externalVideos?.accept(intent)
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Consume native media keys before Flutter sees them; a press has one owner.
+        if (mediaControls?.dispatchKeyEvent(event) == true) return true
+        return super.dispatchKeyEvent(event)
+    }
+
     private fun localInterfaces(): List<Map<String, Any>> {
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         return manager.allNetworks.flatMap { network ->
@@ -428,6 +438,8 @@ class MainActivity : FlutterActivity() {
         externalVideos = null
         systemProxy?.close()
         systemProxy = null
+        mediaControls?.close()
+        mediaControls = null
         watchOrientation(false)
         applyImmersiveBars(false)
         restoreBrightness()

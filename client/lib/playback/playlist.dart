@@ -1,3 +1,5 @@
+import 'dart:isolate';
+
 import 'package:path/path.dart' as paths;
 import '../data/app_model.dart';
 import '../data/media_presentation.dart';
@@ -10,6 +12,27 @@ final _playlists = Expando<_PlaylistIndex>();
 /// controls must not decode every media/location row or sort the series again.
 List<SyncRecord> playbackPlaylist(AppModel model, SyncRecord media) =>
     (_playlists[model.store] ??= _PlaylistIndex()).playlist(model.store, media);
+
+/// Prepare only the two remote-control destinations off the rendering isolate.
+/// The private connection sees one consistent library/location snapshot.
+Future<(SyncRecord?, SyncRecord?)> playbackNeighbors(
+  String databasePath,
+  SyncRecord media,
+) => Isolate.run(() {
+  final store = AppStore.openExisting(databasePath);
+  try {
+    store.db.execute('BEGIN');
+    final items = _PlaylistIndex().playlist(store, media);
+    final index = items.indexWhere((item) => item.id == media.id);
+    return (
+      index > 0 ? items[index - 1] : null,
+      index >= 0 && index + 1 < items.length ? items[index + 1] : null,
+    );
+  } finally {
+    store.db.execute('ROLLBACK');
+    store.dispose();
+  }
+});
 
 class _PlaylistIndex {
   int? _mediaRevision, _locationRevision;

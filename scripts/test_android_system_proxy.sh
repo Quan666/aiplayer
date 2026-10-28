@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compile the Android bridge against cached SDKs, then run its pure-JVM checks.
-# This does not build an APK or emulate Android's PAC service.
+# Compile the Android bridges against cached SDKs, then run pure-JVM checks.
+# This does not build an APK or emulate Android's PAC/media session services.
 set -euo pipefail
 proxy_project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 proxy_build_root="${AIPLAYER_BUILD_ROOT:-$proxy_project_root/.local-build}"
@@ -28,5 +28,9 @@ java -cp "$proxy_kotlin_lib/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
   "$proxy_sources/SystemProxyHandler.kt" \
   "$proxy_sources/MainActivity.kt" \
   "$proxy_sources/ExternalVideoHandler.kt" \
+  "$proxy_sources/MediaButtonDispatcher.kt" \
+  "$proxy_sources/MediaControlsHandler.kt" \
+  "$proxy_project_root/client/android/host_test/MediaButtonDispatcherCheck.kt" \
   "$proxy_project_root/client/android/host_test/SystemProxyResolverCheck.kt"
 java -cp "$proxy_output:${proxy_stdlib[0]}" app.aiplayer.aiplayer.SystemProxyResolverCheckKt
+java -cp "$proxy_output:${proxy_stdlib[0]}" app.aiplayer.aiplayer.MediaButtonDispatcherCheckKt

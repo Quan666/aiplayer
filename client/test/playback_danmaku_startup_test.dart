@@ -276,6 +276,32 @@ void main() {
     expect(session.player.state.playing, isFalse);
   });
 
+  for (final requestedInBackground in [false, true]) {
+    test(
+      'queued play cannot cross a background cycle (hidden=$requestedInBackground)',
+      () async {
+        final model = _Model();
+        final session = _Session(model);
+        _cleanup(model, session);
+        model.credentials.complete(null);
+        model.source.complete(_Source());
+        await session.open();
+        await session.setPlaying(false);
+        final pause = session.player.pauseGate = Completer<void>();
+        session.setBackgroundPlaybackBlocked(true);
+        if (!requestedInBackground) session.setBackgroundPlaybackBlocked(false);
+        final playing = session.setPlaying(true);
+        await Future<void>.delayed(Duration.zero);
+        if (!requestedInBackground) session.setBackgroundPlaybackBlocked(true);
+        session.setBackgroundPlaybackBlocked(false);
+        pause.complete();
+        await playing;
+        expect(session.player.plays, 0);
+        expect(session.player.state.playing, false);
+      },
+    );
+  }
+
   test(
     'explicit pause pending on native player survives background restore',
     () async {

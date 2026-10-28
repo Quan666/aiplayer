@@ -11,6 +11,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var fileChannel: FlutterMethodChannel?
   private var discoveryChannel: FlutterMethodChannel?
   private var systemProxy: SystemProxyHandler?
+  private var mediaControls: MediaControlsHandler?
   private let discovery = LocalServiceDiscovery()
   private var accessed: [URL] = []
   private var desktopPlayerChannel: FlutterMethodChannel?
@@ -62,6 +63,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     RegisterGeneratedPlugins(registry: flutterViewController)
     systemProxy?.close()
     systemProxy = SystemProxyHandler(messenger: flutterViewController.engine.binaryMessenger)
+    mediaControls?.close()
+    mediaControls = MediaControlsHandler(messenger: flutterViewController.engine.binaryMessenger)
     ExternalVideoInbox.shared.bind(flutterViewController.engine.binaryMessenger)
     delegate = self
     desktopPlayerChannel = FlutterMethodChannel(name: "app.aiplayer/desktop_player",
@@ -176,9 +179,14 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     pendingWindowAction = nil
     systemProxy?.close()
     systemProxy = nil
+    mediaControls?.close()
+    mediaControls = nil
   }
 
-  deinit { systemProxy?.close() }
+  deinit {
+    systemProxy?.close()
+    mediaControls?.close()
+  }
 
   func configureImmersiveTitlebar() {
     styleMask.insert(.fullSizeContentView)

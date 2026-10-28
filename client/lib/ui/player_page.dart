@@ -15,6 +15,7 @@ import '../data/store.dart';
 import '../playback/session.dart';
 import '../playback/display.dart';
 import '../playback/input.dart';
+import '../playback/media_controls.dart';
 import '../playback/playlist.dart';
 import '../playback/seek_preview.dart';
 import '../playback/seek_timeline.dart';
@@ -25,6 +26,7 @@ import 'cast_sheet.dart';
 import '../core/logger.dart';
 import '../subtitles/tools_panel.dart';
 import 'player_controls_settings.dart';
+import 'player_controls_shade.dart';
 import 'player_danmaku_panel.dart';
 import 'player_loading.dart';
 import 'player_model_changes.dart';
@@ -117,7 +119,13 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   Timer? _orientationDeadline;
   bool _waitingForOrientation = false;
   final display = PlayerDisplay();
-  final windowMode = PlayerWindowMode();
+  late final windowMode = PlayerWindowMode(
+    beforeNativePictureInPicture: mediaControls.settleNativeState,
+  );
+  final mediaControls = PlayerMediaControls();
+  (SyncRecord?, SyncRecord?) _mediaNeighbors = (null, null);
+  Object? _mediaNeighborsRevision;
+  Future<void>? _mediaNeighborsWork;
   final _settingsAnchor = GlobalKey();
   final _speedAnchor = GlobalKey();
   final _modelChanges = PlayerModelChanges();
@@ -137,6 +145,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     session.addListener(_changed);
     windowMode.bindSession(session);
     windowMode.addListener(_windowChanged);
+    mediaControls.bindSession(session);
+    _refreshMediaControls();
     _modelChanges.update(widget.model, session.media);
     widget.model.addListener(_modelChanged);
     unawaited(
@@ -267,7 +277,75 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   void _modelChanged() {
     _syncBackgroundPlayback();
     _scheduleNextEpisode();
+    _refreshMediaControls();
     if (_modelChanges.update(widget.model, session.media)) _refreshControls();
+  }
+
+  Object get _navigationRevision => (
+    session,
+    widget.model.store.recordsRevision('media'),
+    widget.model.store.locationRevision,
+  );
+
+  void _configureMediaControls() {
+    final current = session;
+    final revision = _mediaNeighborsRevision;
+    Future<void> select(SyncRecord media) async {
+      if (_disposed ||
+          _leaving ||
+          current != session ||
+          revision != _navigationRevision) {
+        return;
+      }
+      await selectMedia(media, externalControl: true);
+    }
+
+    mediaControls.configure(
+      title: widget.model.displayTitle(session.media),
+      seekStepSeconds: widget.model.preferences.seekStepSeconds,
+      onPrevious: _mediaNeighbors.$1 == null
+          ? null
+          : () => select(_mediaNeighbors.$1!),
+      onNext: _mediaNeighbors.$2 == null
+          ? null
+          : () => select(_mediaNeighbors.$2!),
+    );
+  }
+
+  void _refreshMediaControls() {
+    if (_disposed || _leaving) return;
+    _configureMediaControls();
+    if (_backgrounded || session.closed || _mediaNeighborsWork != null) return;
+    final revision = _navigationRevision;
+    if (revision == _mediaNeighborsRevision) return;
+    _mediaNeighborsRevision = revision;
+    _mediaNeighbors = (null, null);
+    _configureMediaControls();
+    final current = session;
+    final path = widget.model.store.path;
+    // In-memory stores exist only in widget fixtures and cannot be shared with
+    // a separate SQLite connection. Real libraries always have a database path.
+    if (path == ':memory:') return;
+    _mediaNeighborsWork = playbackNeighbors(path, current.media)
+        .then((neighbors) {
+          if (_disposed ||
+              _leaving ||
+              current != session ||
+              revision != _navigationRevision) {
+            return;
+          }
+          _mediaNeighbors = neighbors;
+          _configureMediaControls();
+        })
+        .catchError((Object error) {
+          AppLog.instance.warning('媒体控制', safeFailure(error).message);
+        })
+        .whenComplete(() {
+          _mediaNeighborsWork = null;
+          if (!_disposed && !_leaving && revision != _navigationRevision) {
+            _refreshMediaControls();
+          }
+        });
   }
 
   void _scheduleNextEpisode() {
@@ -358,6 +436,9 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   void _windowChanged() {
     final state = WidgetsBinding.instance.lifecycleState;
     if (playbackIsBackgrounded(state)) _backgrounded = true;
+    mediaControls.setNativePictureInPicture(
+      Platform.isIOS && windowMode.active,
+    );
     _syncBackgroundPlayback();
     _refreshControls();
   }
@@ -444,6 +525,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       },
       display.dispose,
       windowMode.close,
+      mediaControls.close,
       session.close,
       () async {
         await _retiringSession?.close();
@@ -465,20 +547,25 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _backgrounded = false;
       _syncBackgroundPlayback();
+      _refreshMediaControls();
     } else if (playbackIsBackgrounded(state)) {
       _saveBackgroundState();
     }
   }
 
-  void _syncBackgroundPlayback() => session.setBackgroundPlaybackBlocked(
-    playbackShouldPauseInBackground(
-      mobile: widget.mobilePlaybackLifecycle ?? PlayerDisplay.supported,
-      backgrounded: _backgrounded,
-      pauseOnBackground: widget.model.preferences.pauseOnBackground,
-      pictureInPicture: windowMode.active,
-    ),
-    restoreOnForeground: true,
-  );
+  void _syncBackgroundPlayback() {
+    session.setBackgroundPlaybackBlocked(
+      playbackShouldPauseInBackground(
+        mobile: widget.mobilePlaybackLifecycle ?? PlayerDisplay.supported,
+        backgrounded: _backgrounded,
+        pauseOnBackground: widget.model.preferences.pauseOnBackground,
+        pictureInPicture: windowMode.active,
+      ),
+      restoreOnForeground: true,
+    );
+    // Invalidate queued accessory commands directly from lifecycle delivery.
+    mediaControls.refresh();
+  }
 
   void _saveBackgroundState() {
     _backgrounded = true;
@@ -491,6 +578,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _disposed = true;
+    unawaited(mediaControls.close());
     widget.controller?._select = null;
     _orientationDeadline?.cancel();
     WidgetsBinding.instance.removeObserver(this);
@@ -504,6 +592,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   Future<void> leave() async {
     if (_leaving) return;
     setState(() => _leaving = true);
+    unawaited(mediaControls.close());
     // Decoder disposal and progress thumbnails continue behind the disposal
     // barrier; they must not block the user's navigation gesture.
     if (!session.closed) {
@@ -516,16 +605,25 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> selectMedia(SyncRecord media, {bool autoAdvance = false}) {
+  Future<void> selectMedia(
+    SyncRecord media, {
+    bool autoAdvance = false,
+    bool externalControl = false,
+  }) {
     // Capture before queuing: another selection or a background/resume cycle
     // can finish while this request waits for an earlier native transition.
     final expectedSession = session;
     final expectedPauseRevision = session.backgroundPauseRevision;
+    final expectedNavigationRevision = externalControl
+        ? _navigationRevision
+        : null;
     bool requestIsCurrent() =>
-        !autoAdvance ||
+        (!autoAdvance && !externalControl) ||
         (identical(session, expectedSession) &&
             session.backgroundPauseRevision == expectedPauseRevision &&
-            !session.backgroundPlaybackBlocked);
+            !session.backgroundPlaybackBlocked &&
+            (!externalControl ||
+                expectedNavigationRevision == _navigationRevision));
     return _mediaTransitions.run(() async {
       if (!requestIsCurrent()) return;
       await _selectMedia(
@@ -572,6 +670,9 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         _surfaceState = null;
       });
       _syncBackgroundPlayback();
+      mediaControls.bindSession(next);
+      _mediaNeighbors = (null, null);
+      _refreshMediaControls();
       if (_nativeFullscreen) {
         unawaited(_fullscreenTransitions.run(_syncVideoOrientation));
       }
@@ -2456,12 +2557,7 @@ class _PlayerControlsState extends State<_PlayerControls>
               ),
               Positioned.fill(
                 key: const ValueKey('player-shade'),
-                child: IgnorePointer(
-                  child: _ChromeEntrance(
-                    visible: show,
-                    child: const _PlayerShade(),
-                  ),
-                ),
+                child: PlayerControlsShade(visible: show),
               ),
               Positioned(
                 key: const ValueKey('player-lock'),
@@ -2872,13 +2968,6 @@ class _PlayerButton extends StatelessWidget {
             shadows: PlayerTheme.of(context).iconShadows,
           ),
   );
-}
-
-class _PlayerShade extends StatelessWidget {
-  const _PlayerShade();
-  @override
-  Widget build(BuildContext context) =>
-      DecoratedBox(decoration: PlayerTheme.of(context).shadeDecoration);
 }
 
 class _OptionRow extends StatelessWidget {

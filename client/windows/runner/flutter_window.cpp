@@ -87,6 +87,8 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   system_proxy_ = std::make_unique<SystemProxyHandler>(
       flutter_controller_->engine()->messenger(), GetHandle());
+  media_controls_ = std::make_unique<MediaControlsHandler>(
+      flutter_controller_->engine()->messenger(), GetHandle());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
   // The Flutter child covers our custom frame. Let non-client hit tests pass
   // through it so native edge resize and caption drag still reach the parent.
@@ -207,6 +209,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  media_controls_.reset();
   system_proxy_.reset();
   window_channel_.reset();
   desktop_channel_.reset();
@@ -367,6 +370,12 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     if (system_proxy_) system_proxy_->Complete();
     return 0;
   }
+  if (message == MediaControlsHandler::kCommandMessage) {
+    if (media_controls_) media_controls_->DispatchCommands();
+    return 0;
+  }
+  // Let Windows route WM_APPCOMMAND to SMTC. Dispatching it here as well would
+  // apply a headset/media-key command twice.
   // Keep the main engine alive until Dart saves progress and closes playback.
   if (message == WM_CLOSE && desktop_ready_) {
     if (!close_requested_) {

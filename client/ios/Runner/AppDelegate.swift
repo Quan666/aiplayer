@@ -10,6 +10,7 @@ import AVKit
   private var displayChannel: FlutterMethodChannel?
   private var discoveryChannel: FlutterMethodChannel?
   private var systemProxy: SystemProxyHandler?
+  private var mediaControls: MediaControlsHandler?
   private let discovery = LocalServiceDiscovery()
   private let pictureInPicture = PlayerPictureInPicture()
   private var originalBrightness: CGFloat?
@@ -45,6 +46,10 @@ import AVKit
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     systemProxy?.close()
     systemProxy = SystemProxyHandler(messenger: engineBridge.applicationRegistrar.messenger())
+    mediaControls?.close()
+    let mediaControls = MediaControlsHandler(messenger: engineBridge.applicationRegistrar.messenger())
+    self.mediaControls = mediaControls
+    pictureInPicture.mediaControls = mediaControls
     ExternalVideoInbox.shared.bind(engineBridge.applicationRegistrar.messenger())
     pictureInPicture.bind(engineBridge.applicationRegistrar.messenger())
     let deviceInfo = FlutterMethodChannel(
@@ -141,6 +146,7 @@ import AVKit
   }
 
   deinit {
+    mediaControls?.close()
     systemProxy?.close()
     for observer in displayObservers {
       NotificationCenter.default.removeObserver(observer)
@@ -153,6 +159,7 @@ import AVKit
 /// temporary AVPlayer receives the current URI/time and returns its final
 /// state to Dart. No remux, upload, or remote playback service is involved.
 private final class PlayerPictureInPicture: NSObject, AVPictureInPictureControllerDelegate {
+  weak var mediaControls: MediaControlsHandler?
   private var channel: FlutterMethodChannel?
   private var player: AVPlayer?
   private var controller: AVPictureInPictureController?
@@ -225,6 +232,10 @@ private final class PlayerPictureInPicture: NSObject, AVPictureInPictureControll
     let volume = (values["volume"] as? NSNumber)?.floatValue ?? 1
     player.volume = volume.isFinite ? min(1, max(0, volume)) : 1
     self.player = player
+    mediaControls?.attachNativePlayer(player) { [weak self, weak player] action, position in
+      guard let self = self, let player = player, self.player === player else { return false }
+      return self.control(action, position: position)
+    }
     let host = PictureInPictureHost(frame: root.view.bounds)
     host.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     host.playerLayer.player = player
@@ -282,6 +293,36 @@ private final class PlayerPictureInPicture: NSObject, AVPictureInPictureControll
       let controller = controller, controller.isPictureInPicturePossible else { return }
     starting = true
     controller.startPictureInPicture()
+  }
+
+  private func control(_ action: String, position: Double?) -> Bool {
+    guard let player = player else { return false }
+    switch action {
+    case "play", "pause", "toggle", "stop":
+      let playing = prepared && seekCompleted
+        ? player.timeControlStatus != .paused : requestedPlaying
+      requestedPlaying = action == "play" || (action == "toggle" && !playing)
+      if requestedPlaying {
+        if prepared && seekCompleted { player.playImmediately(atRate: requestedRate) }
+      } else {
+        player.pause()
+        channel?.invokeMethod("progress", arguments: snapshot())
+      }
+      return true
+    case "seek", "seekForward", "seekBackward":
+      guard prepared, seekCompleted else { return false }
+      let current = player.currentTime().seconds
+      let step = mediaControls?.seekStepSeconds ?? 10
+      let target = action == "seek" ? (position ?? .nan)
+        : current + (action == "seekForward" ? step : -step)
+      guard target.isFinite else { return false }
+      let duration = player.currentItem?.duration.seconds ?? 0
+      let seconds = duration.isFinite && duration > 0
+        ? min(duration, max(0, target)) : max(0, target)
+      player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600))
+      return true
+    default: return false
+    }
   }
 
   private func snapshot() -> [String: Any] {
@@ -344,6 +385,7 @@ private final class PlayerPictureInPicture: NSObject, AVPictureInPictureControll
     controller?.delegate = nil
     if starting || started || controller?.isPictureInPictureActive == true { controller?.stopPictureInPicture() }
     controller = nil
+    mediaControls?.detachNativePlayer()
     player?.pause(); host?.playerLayer.player = nil; player = nil
     host?.removeFromSuperview(); host = nil
     prepared = false; seekCompleted = false; starting = false; started = false
