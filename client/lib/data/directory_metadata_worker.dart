@@ -190,6 +190,7 @@ DirectoryCollection? _mergeStoredDirectory(
   Map<String, SyncRecord>? recordsByPath,
   Map<String, SyncRecord>? verifiedEvidence,
 }) {
+  if (!directoryAllowsCollection(entries)) return null;
   final videos = entries
       .where((entry) => !entry.directory && isVideo(entry.name))
       .toList();
@@ -206,6 +207,10 @@ DirectoryCollection? _mergeStoredDirectory(
   }
   verifiedEvidence?.addAll(verified);
   if (verified.isEmpty) return parsed;
+  // Every identified file in the current listing participates, including
+  // opaque filenames excluded by the release parser. A subset cannot assign
+  // one work's identity to a parent containing another work or season.
+  if (verified.values.map(mediaSeriesKey).toSet().length != 1) return null;
   final donors = parsed == null
       ? verified.values.toList()
       : [for (final entry in parsed.videos) ?verified[entry.path]];
@@ -224,7 +229,9 @@ DirectoryCollection? _mergeStoredDirectory(
       }),
     );
   }
-  if (donors.isEmpty) return parsed;
+  // Current identified files outside the parsed series are real conflicting
+  // membership evidence, unlike stale library records or unrecognized extras.
+  if (donors.isEmpty) return null;
   final keys = donors.map(mediaSeriesKey).toSet();
   if (keys.length != 1) return null;
   if (parsed == null && verified.length != videos.length) return null;
@@ -343,6 +350,8 @@ DirectoryInspection prepareStoredDirectoryInspection(
     fingerprint,
     collection,
     prepared.preparationIsolate,
+    allowCollection:
+        prepared.allowCollection && (collection != null || verified.isEmpty),
   );
 }
 

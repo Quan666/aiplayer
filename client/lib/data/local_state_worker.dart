@@ -4,11 +4,12 @@ import 'dart:isolate';
 
 import '../core/network.dart';
 import 'store.dart';
+import 'local_video_removal.dart';
 
 /// Serializes local state on one connection outside the UI isolate.
 class LocalStateWorker {
   final _messages = ReceivePort();
-  final _pending = <int, Completer<void>>{};
+  final _pending = <int, Completer<dynamic>>{};
   final _outbox = <List<Object?>>[];
   final _closed = Completer<void>();
   SendPort? _commands;
@@ -42,7 +43,7 @@ class LocalStateWorker {
       }
       final result = _pending.remove(row[1] as int);
       if (row[0] == 'result') {
-        result?.complete();
+        result?.complete(row.length > 2 ? row[2] : null);
       } else {
         result?.completeError(
           row[2] == 'cancelled'
@@ -88,7 +89,7 @@ class LocalStateWorker {
     }
   }
 
-  Future<void> _call(
+  Future<dynamic> _call(
     String operation,
     List<Object?> values,
     CancelToken? cancel,
@@ -100,7 +101,7 @@ class LocalStateWorker {
       return Future.error(const AppFailure('后台状态任务繁忙，请稍后重试。'));
     }
     final id = ++_serial;
-    final result = Completer<void>();
+    final result = Completer<dynamic>();
     _pending[id] = result;
     _send([operation, id, ...values]);
     final cancellation = cancel?.whenCancelled.asStream().listen((_) {
@@ -109,8 +110,9 @@ class LocalStateWorker {
     return result.future.whenComplete(() => cancellation?.cancel());
   }
 
-  Future<void> saveMetadataTasks(List<Map<String, dynamic>> snapshot) =>
-      _call('metadata', [snapshot], null);
+  Future<void> saveMetadataTasks(List<Map<String, dynamic>> snapshot) async {
+    await _call('metadata', [snapshot], null);
+  }
 
   Future<void> registerBrowse(
     String id,
@@ -118,7 +120,18 @@ class LocalStateWorker {
     String path,
     int size, {
     CancelToken? cancel,
-  }) => _call('browse', [id, source, path, size], cancel);
+  }) async {
+    await _call('browse', [id, source, path, size], cancel);
+  }
+
+  Future<bool> deleteLocalVideo(
+    String documentsPath,
+    String id,
+    Map<String, dynamic> expected, {
+    CancelToken? cancel,
+  }) async =>
+      await _call('deleteLocalVideo', [documentsPath, id, expected], cancel) ==
+      true;
 
   /// Drain accepted checkpoints; optional browse work is cancelled on close.
   Future<void> close() {
@@ -158,8 +171,18 @@ void _localStateWorkerMain(List<Object?> startup) async {
       final id = row[1] as int;
       final cancel = cancellable[id];
       try {
+        dynamic result;
         await retryStoreBusy(() {
           cancel?.check();
+          if (row[0] == 'deleteLocalVideo') {
+            result = removeLocalVideo(
+              store,
+              row[2] as String,
+              row[3] as String,
+              row[4] as Map<String, dynamic>,
+            );
+            return;
+          }
           store.transaction(() {
             cancel?.check();
             if (row[0] == 'metadata') {
@@ -189,7 +212,7 @@ void _localStateWorkerMain(List<Object?> startup) async {
             }
           });
         });
-        reply.send(['result', id]);
+        reply.send(['result', id, result]);
       } catch (error) {
         reply.send([
           'failure',
@@ -216,7 +239,9 @@ void _localStateWorkerMain(List<Object?> startup) async {
     } else if (row[0] == 'cancel') {
       cancellable[row[1]]?.cancel();
     } else {
-      if (row[0] == 'browse') cancellable[row[1] as int] = CancelToken();
+      if (row[0] == 'browse' || row[0] == 'deleteLocalVideo') {
+        cancellable[row[1] as int] = CancelToken();
+      }
       queue.add(row);
       unawaited(drain());
     }

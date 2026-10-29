@@ -37,6 +37,7 @@ class _Downloads extends OfflineDownloads {
     String bindingRevision = '',
     bool userPaused = false,
   }) {
+    final wasComplete = values[id]?.isComplete ?? false;
     values[id] = OfflineDownload(
       mediaId: id,
       sourceId: 'nas',
@@ -49,11 +50,12 @@ class _Downloads extends OfflineDownloads {
       bindingRevision: bindingRevision,
       userPaused: userPaused,
     );
+    if (wasComplete != values[id]!.isComplete) completedRevision++;
     notifyListeners();
   }
 
   void remove(String id) {
-    values.remove(id);
+    if (values.remove(id)?.isComplete == true) completedRevision++;
     notifyListeners();
   }
 
@@ -286,6 +288,13 @@ void main() {
         .toList();
     expect(choices.first.onChanged, isNotNull);
     expect(choices.skip(1).every((item) => item.onChanged == null), isTrue);
+    expect(choices.map((item) => item.value), [
+      false,
+      true,
+      false,
+      false,
+      false,
+    ]);
     expect(find.byIcon(Icons.download_done_rounded), findsOneWidget);
     expect(find.byTooltip('旧位置的下载'), findsOneWidget);
     await tester.tap(find.text('全选'));
@@ -297,6 +306,188 @@ void main() {
     ]);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'completed selections stay checked through manual and bulk selection changes',
+    (tester) async {
+      final records = ['completed', 'one', 'two'].map(_record).toList();
+      for (final record in records) {
+        bind(record);
+      }
+      downloads.update(
+        'completed',
+        OfflineDownloadStatus.completed,
+        received: 100,
+      );
+      await tester.pumpWidget(
+        shell(
+          Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showDownloadSelection(context, model, records),
+              child: const Text('打开'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('打开'));
+      await tester.pumpAndSettle();
+      final completed = find.byKey(const ValueKey('download-select:0'));
+      expect(tester.widget<CheckboxListTile>(completed).value, isTrue);
+      expect(tester.widget<CheckboxListTile>(completed).onChanged, isNull);
+      expect(find.text('下载 (0)'), findsOneWidget);
+      await tester.tap(completed);
+      await tester.pump();
+      expect(tester.widget<CheckboxListTile>(completed).value, isTrue);
+      expect(find.text('下载 (0)'), findsOneWidget);
+
+      await tester.tap(find.text('全选'));
+      await tester.pump();
+      expect(find.text('下载 (2)'), findsOneWidget);
+      await tester.tap(find.text('取消全选'));
+      await tester.pump();
+      expect(find.text('下载 (0)'), findsOneWidget);
+      expect(tester.widget<CheckboxListTile>(completed).value, isTrue);
+      expect(tester.widget<CheckboxListTile>(completed).onChanged, isNull);
+
+      await tester.tap(find.byKey(const ValueKey('download-select:2')));
+      await tester.pump();
+      await tester.tap(find.text('下载 (1)'));
+      await tester.pumpAndSettle();
+      expect(model.requested, [
+        ['two'],
+      ]);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'completion while selecting removes that file from count and submission',
+    (tester) async {
+      final records = ['one', 'two'].map(_record).toList();
+      for (final record in records) {
+        bind(record);
+      }
+      await tester.pumpWidget(
+        shell(
+          Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showDownloadSelection(context, model, records),
+              child: const Text('打开'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('打开'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('全选'));
+      await tester.pump();
+      expect(find.text('下载 (2)'), findsOneWidget);
+
+      downloads.update('one', OfflineDownloadStatus.completed, received: 100);
+      await tester.pump();
+      final completed = tester.widget<CheckboxListTile>(
+        find.byKey(const ValueKey('download-select:0')),
+      );
+      expect(completed.value, isTrue);
+      expect(completed.onChanged, isNull);
+      expect(find.text('下载 (1)'), findsOneWidget);
+      await tester.tap(find.text('下载 (1)'));
+      await tester.pumpAndSettle();
+      expect(model.requested, [
+        ['two'],
+      ]);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  for (final background in [true, false]) {
+    testWidgets(
+      'selection coalesces completed files while ${background ? 'paused without frames' : 'covered by another route'}',
+      (tester) async {
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        addTearDown(() {
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.resumed,
+          );
+        });
+        final records = ['one', 'two', 'three'].map(_record).toList();
+        for (final record in records) {
+          bind(record);
+        }
+        await tester.pumpWidget(
+          shell(
+            Builder(
+              builder: (context) => TextButton(
+                onPressed: () => showDownloadSelection(context, model, records),
+                child: const Text('打开'),
+              ),
+            ),
+          ),
+        );
+        await tester.tap(find.text('打开'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('全选'));
+        await tester.pump();
+        expect(find.text('下载 (3)'), findsOneWidget);
+
+        if (background) {
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.paused,
+          );
+        } else {
+          showDialog<void>(
+            context: tester.element(
+              find.byKey(const ValueKey('download-selection-list')),
+            ),
+            builder: (context) => AlertDialog(
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('返回选择'),
+                ),
+              ],
+            ),
+          );
+          await tester.pumpAndSettle();
+        }
+        downloads.reads = 0;
+        downloads.update('one', OfflineDownloadStatus.completed, received: 100);
+        downloads.update('two', OfflineDownloadStatus.completed, received: 100);
+        // In particular, Android may deliver no frame after paused.
+        expect(downloads.reads, 0);
+
+        if (background) {
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.resumed,
+          );
+          expect(
+            downloads.reads,
+            3,
+            reason: 'prune the retained selection once',
+          );
+        } else {
+          await tester.tap(find.text('返回选择'));
+        }
+        await tester.pumpAndSettle();
+        for (final index in [0, 1]) {
+          final completed = tester.widget<CheckboxListTile>(
+            find.byKey(ValueKey('download-select:$index')),
+          );
+          expect(completed.value, isTrue);
+          expect(completed.onChanged, isNull);
+        }
+        expect(find.text('下载 (1)'), findsOneWidget);
+        await tester.tap(find.text('下载 (1)'));
+        await tester.pumpAndSettle();
+        expect(model.requested, [
+          ['three'],
+        ]);
+        await tester.pumpWidget(const SizedBox());
+      },
+    );
+  }
 
   testWidgets(
     'source selection resolves saved IDs and accepts unimported paths',
@@ -329,7 +520,9 @@ void main() {
           .widgetList<CheckboxListTile>(find.byType(CheckboxListTile))
           .toList();
       expect(choices.first.onChanged, isNull);
+      expect(choices.first.value, isTrue);
       expect(choices.last.onChanged, isNotNull);
+      expect(choices.last.value, isFalse);
       await tester.tap(find.text('全选'));
       await tester.pump();
       await tester.tap(find.text('下载 (1)'));

@@ -24,7 +24,7 @@ class SettingsStyles {
   static const folderRowShape = RoundedRectangleBorder(
     borderRadius: BorderRadius.all(Radius.circular(GlassMetrics.control)),
   );
-  static const folderRowDensity = VisualDensity(vertical: -2);
+  static const folderRowDensity = VisualDensity(vertical: -1);
   static const logFilterDensity = VisualDensity(horizontal: -2, vertical: -2);
   static const shortcutPadding = EdgeInsets.symmetric(
     horizontal: 10,

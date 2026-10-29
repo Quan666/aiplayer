@@ -347,6 +347,7 @@ Future<void> showDownloadSelection(
     }
     await _showDownloadSelection(
       context,
+      downloads: model.downloads,
       count: records.length,
       nameAt: (index) =>
           '${records[index].data['fileName'] ?? records[index].data['title'] ?? model.displayTitle(records[index])}',
@@ -384,6 +385,7 @@ Future<void> showSourceDownloadSelection(
     final known = snapshot.recordsBySource[sourceId] ?? const {};
     await _showDownloadSelection(
       context,
+      downloads: model.downloads,
       count: entries.length,
       nameAt: (index) => entries[index].name,
       directoryAt: (index) => entries[index].directory,
@@ -436,6 +438,7 @@ _DownloadAvailability _downloadAvailability(
 
 Future<void> _showDownloadSelection(
   BuildContext context, {
+  required OfflineDownloads downloads,
   required int count,
   required String Function(int) nameAt,
   bool Function(int)? directoryAt,
@@ -447,6 +450,7 @@ Future<void> _showDownloadSelection(
     context: context,
     isScrollControlled: true,
     builder: (_) => _DownloadSelection(
+      downloads: downloads,
       count: count,
       nameAt: nameAt,
       directoryAt: directoryAt,
@@ -458,6 +462,7 @@ Future<void> _showDownloadSelection(
 }
 
 class _DownloadSelection extends StatefulWidget {
+  final OfflineDownloads downloads;
   final int count;
   final String Function(int) nameAt;
   final bool Function(int)? directoryAt;
@@ -465,6 +470,7 @@ class _DownloadSelection extends StatefulWidget {
   final _DownloadAvailability Function(int) availabilityAt;
   final Future<void> Function(Set<int>) submit;
   const _DownloadSelection({
+    required this.downloads,
     required this.count,
     required this.nameAt,
     this.directoryAt,
@@ -479,8 +485,68 @@ class _DownloadSelection extends StatefulWidget {
 
 class _DownloadSelectionState extends State<_DownloadSelection> {
   final _selected = <int>{};
+  late int _completedRevision;
   bool _busy = false, _allSelected = false;
+  bool _visible = true, _dirty = false;
   String _error = '';
+  bool get _active => _visible && ArtworkLifecycle.instance.value;
+
+  @override
+  void initState() {
+    super.initState();
+    _completedRevision = widget.downloads.completedRevision;
+    widget.downloads.addListener(_downloadsChanged);
+    ArtworkLifecycle.instance.addListener(_lifecycleChanged);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _visible =
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.isCurrentOf(context) ?? true);
+    if (_active && _dirty) _refreshCompletedSelection();
+  }
+
+  @override
+  void didUpdateWidget(_DownloadSelection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.downloads == widget.downloads) return;
+    oldWidget.downloads.removeListener(_downloadsChanged);
+    widget.downloads.addListener(_downloadsChanged);
+    _dirty = true;
+    if (_active) _refreshCompletedSelection();
+  }
+
+  void _lifecycleChanged() {
+    if (_active && _dirty) _downloadsChanged();
+  }
+
+  void _refreshCompletedSelection() {
+    _completedRevision = widget.downloads.completedRevision;
+    _selected.removeWhere((index) => !_available(index));
+    _allSelected = false;
+    _dirty = false;
+  }
+
+  void _downloadsChanged() {
+    final revision = widget.downloads.completedRevision;
+    // Transfer progress cannot change selection availability. Refresh only
+    // when completed-file membership changes, including while this sheet is open.
+    if (_completedRevision == revision && !_dirty) return;
+    if (!_active) {
+      _dirty = true;
+      return;
+    }
+    setState(_refreshCompletedSelection);
+  }
+
+  @override
+  void dispose() {
+    widget.downloads.removeListener(_downloadsChanged);
+    ArtworkLifecycle.instance.removeListener(_lifecycleChanged);
+    super.dispose();
+  }
 
   Future<void> _submit() async {
     if (_busy || _selected.isEmpty) return;
@@ -566,7 +632,9 @@ class _DownloadSelectionState extends State<_DownloadSelection> {
                   key: ValueKey('download-select:$index'),
                   dense: true,
                   controlAffinity: ListTileControlAffinity.leading,
-                  value: available && _selected.contains(index),
+                  value:
+                      availability == _DownloadAvailability.completed ||
+                      (available && _selected.contains(index)),
                   secondary: switch (availability) {
                     _DownloadAvailability.available =>
                       widget.directoryAt?.call(index) == true

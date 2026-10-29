@@ -585,6 +585,7 @@ class SyncProfile {
         value['collection'] is! Map ||
         value.keys.any(
           (key) => ![
+            'membershipRevision',
             'sourceId',
             'fingerprint',
             'at',

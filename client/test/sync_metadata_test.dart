@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/library_catalog.dart';
+import 'package:aiplayer/data/directory_preview_context.dart';
 import 'package:aiplayer/data/media_previews.dart';
 import 'package:aiplayer/data/media_technical_info.dart';
 import 'package:aiplayer/data/store.dart';
@@ -248,6 +249,7 @@ Map<String, dynamic> _location() => {
 };
 
 Map<String, dynamic> _directory() => {
+  'membershipRevision': directoryPreviewMembershipRevision,
   'sourceId': 'nas',
   'context': 'device-context',
   'fingerprint': 'folder-files',

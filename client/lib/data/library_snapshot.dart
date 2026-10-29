@@ -38,6 +38,7 @@ class LibrarySnapshot {
   final Map<String, LibraryFolderSnapshot> folders;
   final List<SourceEntry> localEntries;
   final Map<String, SyncRecord> localRecords;
+  final Map<String, LocalDirectorySnapshot> localDirectories;
   final int localHiddenEntries,
       localSubtitleEntries,
       localHiddenSubtitleEntries;
@@ -64,6 +65,7 @@ class LibrarySnapshot {
     required this.folders,
     this.localEntries = const [],
     this.localRecords = const {},
+    this.localDirectories = const {},
     this.localHiddenEntries = 0,
     this.localSubtitleEntries = 0,
     this.localHiddenSubtitleEntries = 0,
@@ -103,6 +105,114 @@ class LibrarySnapshot {
       details[seriesKeyFor(record)] ??
       const MediaCollectionDetails(title: '影视资料');
 }
+
+/// Immediate children of a local browser directory, prepared on the snapshot
+/// worker. Paths are opaque keys; navigation follows [parentPath] instead of
+/// interpreting the key. Only source-root directories expose [sourceId].
+class LocalDirectorySnapshot {
+  final String path, name;
+  final String? parentPath, sourceId;
+  final List<SourceEntry> entries;
+  final Map<String, SyncRecord> records;
+
+  LocalDirectorySnapshot({
+    required this.path,
+    required this.name,
+    this.parentPath,
+    this.sourceId,
+    List<SourceEntry> entries = const [],
+    Map<String, SyncRecord> records = const {},
+  }) : entries = List.unmodifiable(entries),
+       records = Map.unmodifiable(records);
+}
+
+class _LocalDirectoryBuilder {
+  final String path, name;
+  final String? parentPath, sourceId;
+  final entries = <SourceEntry>[];
+  final records = <String, SyncRecord>{};
+
+  _LocalDirectoryBuilder(this.path, this.name, this.parentPath, this.sourceId);
+
+  LocalDirectorySnapshot freeze() => LocalDirectorySnapshot(
+    path: path,
+    name: name,
+    parentPath: parentPath,
+    sourceId: sourceId,
+    entries: entries,
+    records: records,
+  );
+}
+
+class _LocalDirectoryIndex {
+  final Map<String, String> sourceNames;
+  final directories = <String, _LocalDirectoryBuilder>{
+    '': _LocalDirectoryBuilder('', '本地视频', null, null),
+  };
+
+  _LocalDirectoryIndex(this.sourceNames);
+
+  void add(
+    SourceEntry entry,
+    SyncRecord record,
+    Map<String, dynamic>? offline,
+    List<String> parents,
+  ) {
+    var directory = directories['']!;
+    final source = offline?['remoteSource'], remote = offline?['remotePath'];
+    if (source is String && source.isNotEmpty && remote is String) {
+      _LocalDirectoryBuilder child(String relative, String name) {
+        // JSON preserves source/path boundaries even for names containing
+        // separators. The private key remains stable across catalogue rebuilds.
+        final key = 'download-directory:${jsonEncode([source, relative])}';
+        return directories.putIfAbsent(key, () {
+          directory.entries.add(
+            SourceEntry(name: name, path: key, directory: true),
+          );
+          return _LocalDirectoryBuilder(
+            key,
+            name,
+            directory.path,
+            relative.isEmpty ? source : null,
+          );
+        });
+      }
+
+      directory = child('', sourceNames[source] ?? source);
+      var relative = '';
+      for (final name in parents) {
+        relative = relative.isEmpty ? name : '$relative/$name';
+        directory = child(relative, name);
+      }
+    }
+    directory.entries.add(entry);
+    directory.records[record.id] = record;
+  }
+
+  Map<String, LocalDirectorySnapshot> freeze() => Map.unmodifiable({
+    for (final entry in directories.entries) entry.key: entry.value.freeze(),
+  });
+}
+
+List<String> _downloadParentSegments(String remote) {
+  final normalized = p.posix.normalize(remote.replaceAll('\\', '/'));
+  final parents = p.posix
+      .split(p.posix.dirname(normalized))
+      .where((part) => part.isNotEmpty && part != '/' && part != '.')
+      .toList();
+  // Current downloads reject traversal. Keep malformed legacy paths at their
+  // source root rather than making parent aliases into directories.
+  return parents.contains('..') ? const [] : parents;
+}
+
+Map<String, String> _configuredSourceNames(dynamic value) => {
+  if (value is List)
+    for (final source in value.whereType<Map>())
+      if (source['id'] case final String id)
+        id: source['label'] is String && (source['label'] as String).isNotEmpty
+            ? source['label'] as String
+            : id,
+};
 
 class LibraryFolderSnapshot {
   final List<SourceEntry> entries;
@@ -183,6 +293,7 @@ class LibrarySnapshotReader {
                 store.records('progress'),
                 store.localEntries('location:'),
                 offlineLocations: offlineLocations,
+                sourceNames: _configuredSourceNames(store.local('sources')),
               );
         _memoryRevision = revision;
         _memoryOfflineRevision = offlineRevision;
@@ -376,6 +487,12 @@ void _snapshotWorker((String, SendPort) arguments) {
                         ),
                     },
                     offlineLocations: offlineLocations,
+                    sourceNames: _configuredSourceNames(
+                      database
+                          .select("SELECT value FROM local WHERE key='sources'")
+                          .map((row) => jsonDecode(row['value'] as String))
+                          .firstOrNull,
+                    ),
                   );
           }
           if (refreshSearch) {
@@ -582,6 +699,7 @@ class _SnapshotData {
   late final Map<String, LibraryFolderSnapshot> folders;
   late final List<SourceEntry> localEntries;
   late final Map<String, SyncRecord> localRecords;
+  late final Map<String, LocalDirectorySnapshot> localDirectories;
   late final int localHiddenEntries,
       localSubtitleEntries,
       localHiddenSubtitleEntries;
@@ -596,6 +714,7 @@ class _SnapshotData {
     this.locations,
     this.progress,
     Map<String, Map<String, dynamic>> offlineLocations,
+    Map<String, String> sourceNames,
   ) : byId = Map.unmodifiable({for (final record in media) record.id: record}) {
     final index = _LibrarySeriesIndex(media);
     series = index.groups;
@@ -625,6 +744,7 @@ class _SnapshotData {
     folders = _groupFolders(media, locations, seriesKeys, history);
     final imports = <SourceEntry>[];
     final imported = <String, SyncRecord>{};
+    final localIndex = _LocalDirectoryIndex(sourceNames);
     var hiddenEntries = 0, subtitleEntries = 0, hiddenSubtitleEntries = 0;
     for (final record in media) {
       final binding = locations[record.id];
@@ -639,13 +759,19 @@ class _SnapshotData {
       final location = matches ? offline : binding;
       if (location?['source'] != 'local') continue;
       imported[record.id] = record;
+      final remote = offline?['remotePath'];
+      final parents = matches && remote is String
+          ? _downloadParentSegments(remote)
+          : const <String>[];
       final entry = SourceEntry(
         name: '${record.data['fileName'] ?? record.data['title'] ?? ''}',
         path: record.id,
         size: (location?['size'] as num?)?.toInt() ?? 0,
         modified: (location?['modified'] as num?)?.toInt() ?? 0,
+        hidden: parents.any((name) => name.startsWith('.')),
       );
       imports.add(entry);
+      localIndex.add(entry, record, matches ? offline : null, parents);
       final hidden = isHiddenEntry(entry), subtitle = isSubtitle(entry.name);
       if (hidden) hiddenEntries++;
       if (subtitle) subtitleEntries++;
@@ -653,6 +779,7 @@ class _SnapshotData {
     }
     localEntries = List.unmodifiable(imports);
     localRecords = Map.unmodifiable(imported);
+    localDirectories = localIndex.freeze();
     localHiddenEntries = hiddenEntries;
     localSubtitleEntries = subtitleEntries;
     localHiddenSubtitleEntries = hiddenSubtitleEntries;
@@ -719,6 +846,7 @@ class _SnapshotData {
     recordsBySource = previous.recordsBySource;
     localEntries = previous.localEntries;
     localRecords = previous.localRecords;
+    localDirectories = previous.localDirectories;
     localHiddenEntries = previous.localHiddenEntries;
     localSubtitleEntries = previous.localSubtitleEntries;
     localHiddenSubtitleEntries = previous.localHiddenSubtitleEntries;
@@ -874,6 +1002,7 @@ class _SnapshotData {
     Iterable<SyncRecord> history,
     Map<String, dynamic> savedLocations, {
     Map<String, Map<String, dynamic>> offlineLocations = const {},
+    Map<String, String> sourceNames = const {},
   }) {
     final media = List<SyncRecord>.unmodifiable(
       records
@@ -895,6 +1024,7 @@ class _SnapshotData {
       locations,
       progress,
       offlineLocations,
+      sourceNames,
     );
   }
 
@@ -996,6 +1126,7 @@ class _SnapshotData {
       folders: folders,
       localEntries: localEntries,
       localRecords: localRecords,
+      localDirectories: localDirectories,
       localHiddenEntries: localHiddenEntries,
       localSubtitleEntries: localSubtitleEntries,
       localHiddenSubtitleEntries: localHiddenSubtitleEntries,

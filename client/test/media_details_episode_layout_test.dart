@@ -184,6 +184,8 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.byType(MediaDetailsOverview), findsOneWidget);
+      expect(find.byTooltip('选择下载'), findsOneWidget);
+      expect(find.byTooltip('下载视频'), findsNothing);
       final rows = find.byType(MediaDetailsEpisodeTile);
       expect(rows, findsNWidgets(2));
       expect(model.media, hasLength(1));

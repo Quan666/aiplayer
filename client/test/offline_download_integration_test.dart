@@ -127,11 +127,20 @@ void main() {
         store.local('location:episode')['path'],
         '2026-10/Show S01E01.mp4',
       );
-      await model.deleteDownload(media.id);
+      store.save('progress', model.progressKey(media), {
+        'position': 15,
+        'duration': 30,
+      });
+      await model.deleteLocalVideo(media);
       expect(await File(path).exists(), isFalse);
       expect((await model.loadLibrarySnapshot()).localEntries, isEmpty);
       expect((await model.playbackLocation(media))?['source'], 'dav');
       expect(store.get('media', media.id)?.deleted, isFalse);
+      expect(store.get('progress', model.progressKey(media))?.deleted, isFalse);
+      expect(
+        store.get('progress', model.progressKey(media))?.data['position'],
+        15,
+      );
     },
   );
 

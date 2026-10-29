@@ -3,6 +3,7 @@ import 'dart:collection';
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'dart:io';
+import 'dart:math' show max;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -31,6 +32,7 @@ import 'library_sort.dart';
 import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
 import 'local_state_worker.dart';
+import 'local_video_removal.dart';
 import 'offline_downloads.dart';
 import 'media_presentation.dart';
 import 'media_title_translation.dart';
@@ -119,6 +121,51 @@ class AppModel extends ChangeNotifier {
     Iterable<SourceEntry> entries,
   ) => _downloadSourceEntries(sourceId, entries);
   Future<void> deleteDownload(String id) => downloads.delete(id);
+
+  /// Delete the local copy without removing a downloaded video's remote identity.
+  Future<void> deleteLocalVideo(SyncRecord record) async {
+    if (_disposed) throw const Cancelled();
+    final location = store.local('location:${record.id}');
+    final expected = location is Map
+        ? Map<String, dynamic>.from(location)
+        : null;
+    if (store.get('media', record.id)?.deleted != false) return;
+    if (store.path != ':memory:' && !downloads.initialized) {
+      await downloads.initialize();
+    }
+    if (_disposed) throw const Cancelled();
+    final latest = store.local('location:${record.id}');
+    if (!sameLocalVideoBinding(expected, latest)) throw const Cancelled();
+    final offline = downloads.entryFor(record.id);
+    if (offline?.isComplete == true &&
+        (expected == null ||
+            (offline!.sourceId == expected['source'] &&
+                offline.remotePath == expected['path'] &&
+                offline.bindingRevision ==
+                    (expected['previewRevision'] ?? '')))) {
+      await deleteDownload(record.id);
+      return;
+    }
+    if (expected?['source'] != 'local' || expected?['path'] is! String) {
+      throw const AppFailure('本地视频已删除或位置已改变，请刷新后重试。');
+    }
+    _previews?.forget(record.id);
+    final changed = store.path == ':memory:'
+        // In-memory stores exist only in tests; production shares the bounded
+        // local-state worker and its independent SQLite connection.
+        ? removeLocalVideo(store, documents.path, record.id, expected!)
+        : await (_localStateWorker ??= LocalStateWorker(
+            store.path,
+          )).deleteLocalVideo(
+            documents.path,
+            record.id,
+            expected!,
+            cancel: _metadataCancel,
+          );
+    if (_disposed) throw const Cancelled();
+    if (changed) notifyListeners();
+  }
+
   Future<Map<String, dynamic>?> playbackLocation(SyncRecord media) =>
       _playbackLocation(media);
   void _notifyDownloadsChanged() {
@@ -691,7 +738,7 @@ class AppModel extends ChangeNotifier {
   (int, int, int, int) get _libraryReadRevision => (
     store.recordsRevision('media'),
     store.recordsRevision('progress'),
-    store.locationRevision,
+    max(store.locationRevision, store.localKeyRevision('sources')),
     _downloads?.completedRevision ?? 0,
   );
 

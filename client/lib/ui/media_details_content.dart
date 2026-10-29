@@ -8,7 +8,6 @@ import '../sources/source.dart';
 import 'glass.dart';
 import 'media_artwork.dart';
 import 'media_details_header.dart';
-import 'offline_download_controls.dart';
 import 'theme/library_styles.dart';
 
 /// The complete details introduction used by library sheets and source folders.
@@ -288,12 +287,12 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
         visualDensity: const VisualDensity(vertical: -1),
         contentPadding: EdgeInsets.zero,
         horizontalTitleGap: 10,
-        minLeadingWidth: 64,
+        minLeadingWidth: LibraryStyles.listArtworkSize.width,
         minVerticalPadding: 8,
         leading: SizedBox(
           key: const ValueKey('episode-thumbnail'),
-          width: 64,
-          height: 44,
+          width: LibraryStyles.listArtworkSize.width,
+          height: LibraryStyles.listArtworkSize.height,
           child: ClipRRect(
             borderRadius: BorderRadius.circular(6),
             child: Stack(
@@ -346,24 +345,10 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
         onLongPress: widget.onLongPress,
         trailing: SizedBox(
           key: const ValueKey('episode-action'),
-          width: 80,
+          width: 40,
           height: 48,
-          child: Row(
-            children: [
-              OfflineDownloadButton(
-                model: model,
-                item: item,
-                sourceId: widget.sourceId,
-                sourceEntry: widget.sourceEntry,
-              ),
-              SizedBox(
-                width: 40,
-                child:
-                    widget.trailing ??
-                    const Icon(Icons.play_arrow_rounded, size: 20),
-              ),
-            ],
-          ),
+          child:
+              widget.trailing ?? const Icon(Icons.play_arrow_rounded, size: 20),
         ),
       ),
     );

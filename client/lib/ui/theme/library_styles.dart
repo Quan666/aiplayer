@@ -22,6 +22,7 @@ class LibraryStyles {
   static const historyRadius = BorderRadius.all(Radius.circular(14));
   static const progressRadius = BorderRadius.all(Radius.circular(2));
   static const progressHeight = 2.0;
+  static const listArtworkSize = Size(64, 44);
   static const iconSmall = 14.0;
   static const iconAction = 16.0;
   static const iconButton = 18.0;

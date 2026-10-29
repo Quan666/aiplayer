@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' show max;
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
@@ -142,6 +143,90 @@ void main() {
   );
 
   testWidgets(
+    'desktop folder menu opens from its trailing button and keeps row navigation',
+    (tester) async {
+      FlutterSecureStorage.setMockInitialValues({});
+      final directory = Directory.systemTemp.createTempSync(
+        'source-desktop-folder-menu-',
+      );
+      final store = AppStore(':memory:')
+        ..setLocal('settings', {
+          'metadataStrategy': 'off',
+          'autoDiscover': false,
+        });
+      final model = _SourceModel(store, directory, withFolder: true);
+      final folder = find.byKey(const ValueKey('/share/Season/'));
+      final menu = find.byKey(const ValueKey('folder-options:/share/Season/'));
+      try {
+        // A narrow desktop window still needs a mouse-accessible folder menu.
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: GlassPalette.theme().copyWith(
+              platform: TargetPlatform.linux,
+            ),
+            home: SourceBrowser(
+              model: model,
+              source: const {'id': 'dav', 'kind': 'webdav', 'label': 'DAV'},
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(menu, findsOneWidget);
+        expect(
+          tester.getCenter(menu).dx,
+          greaterThan(tester.getCenter(folder).dx),
+        );
+        expect(
+          tester
+              .widget<ListTile>(
+                find.descendant(of: folder, matching: find.byType(ListTile)),
+              )
+              .onLongPress,
+          isNull,
+        );
+
+        await tester.tap(menu);
+        await tester.pumpAndSettle();
+        expect(find.byType(BottomSheet), findsNothing);
+        expect(find.text('重新识别影视资料'), findsOneWidget);
+        expect(find.text('手动搜索影视资料'), findsOneWidget);
+        await tester.tap(find.text('收藏文件夹'));
+        await tester.pumpAndSettle();
+        expect(menu, findsOneWidget);
+        expect(
+          find.descendant(
+            of: folder,
+            matching: find.byIcon(Icons.star_rounded),
+          ),
+          findsOneWidget,
+        );
+
+        await tester.tap(menu);
+        await tester.pumpAndSettle();
+        expect(find.text('取消收藏'), findsOneWidget);
+        await tester.tap(find.text('下载文件夹'));
+        await tester.pumpAndSettle();
+        expect(model.requests.single, ['dav', '/share/Season/']);
+        expect(model.batches.single.single.directory, isTrue);
+        expect(folder, findsOneWidget);
+
+        await tester.tap(
+          find.descendant(of: folder, matching: find.text('Season')),
+        );
+        await tester.pumpAndSettle();
+        expect(menu, findsNothing);
+        expect(find.text('Season'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        model.dispose();
+        store.dispose();
+        directory.deleteSync(recursive: true);
+      }
+    },
+  );
+
+  testWidgets(
     'downloaded local video retains shared details and can be deleted',
     (tester) async {
       FlutterSecureStorage.setMockInitialValues({});
@@ -153,6 +238,9 @@ void main() {
           'metadataStrategy': 'off',
           'autoDiscover': false,
         })
+        ..setLocal('sources', [
+          {'id': 'dav', 'kind': 'webdav', 'label': '我的下载来源'},
+        ])
         ..save('media', 'episode', {
           'title': 'Series S01E01.mkv',
           'fileName': 'Series S01E01.mkv',
@@ -186,8 +274,23 @@ void main() {
         await tester.pumpAndSettle();
         await tester.tap(find.text('本地视频'));
         await tester.pumpAndSettle();
-        expect(find.byTooltip('已下载'), findsOneWidget);
-        await tester.tap(find.byTooltip('影视详情'));
+        expect(find.byKey(const ValueKey('local-video:episode')), findsNothing);
+        await tester.tap(find.text('我的下载来源'));
+        await tester.pumpAndSettle();
+        expect(find.text('share'), findsOneWidget);
+        await tester.tap(find.text('share'));
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('local-video:episode')),
+          findsOneWidget,
+        );
+        expect(find.byTooltip('已下载'), findsNothing);
+        expect(find.byIcon(Icons.download_done_rounded), findsNothing);
+        await tester.tap(
+          find.byKey(const ValueKey('local-video-options:episode')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('影视详情'));
         await tester.pumpAndSettle();
         expect(find.byType(MediaDetailsOverview), findsOneWidget);
         expect(find.byType(MediaDetailsEpisodeTile), findsOneWidget);
@@ -196,22 +299,220 @@ void main() {
           of: find.byType(MediaDetailsEpisodeTile),
           matching: find.byTooltip('已下载'),
         );
-        expect(downloaded, findsOneWidget);
-        await tester.tap(downloaded);
+        expect(downloaded, findsNothing);
+        expect(find.byTooltip('选择下载'), findsOneWidget);
+        Navigator.of(tester.element(find.byType(MediaDetailsOverview))).pop();
         await tester.pumpAndSettle();
-        await tester.tap(find.text('删除离线视频'));
+        await tester.tap(
+          find.byKey(const ValueKey('local-video-options:episode')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('删除本地视频'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('取消'));
+        await tester.pumpAndSettle();
+        expect(model.downloads.entryFor('episode'), isNotNull);
+        await tester.tap(
+          find.byKey(const ValueKey('local-video-options:episode')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('删除本地视频'));
         await tester.pumpAndSettle();
         await tester.tap(find.text('删除'));
         await tester.pumpAndSettle();
         expect(model.downloads.entryFor('episode'), isNull);
         expect(store.get('media', 'episode')?.deleted, isFalse);
         expect(store.local('location:episode')['source'], 'dav');
-        Navigator.of(tester.element(find.byType(MediaDetailsOverview))).pop();
-        await tester.pumpAndSettle();
         expect(find.text('还没有本地视频'), findsOneWidget);
+        expect(find.text('share'), findsNothing);
         expect(played, isEmpty);
         expect(tester.takeException(), isNull);
       } finally {
+        await tester.pumpWidget(const SizedBox());
+        model.dispose();
+        store.dispose();
+        directory.deleteSync(recursive: true);
+      }
+    },
+  );
+
+  testWidgets(
+    'large local directories restore scroll and search and reject a changed deletion binding',
+    (tester) async {
+      FlutterSecureStorage.setMockInitialValues({});
+      final directory = Directory.systemTemp.createTempSync('local-tree-ui-');
+      final store = AppStore(':memory:')
+        ..setLocal('settings', {
+          'metadataStrategy': 'off',
+          'autoDiscover': false,
+        })
+        ..setLocal('sources', [
+          {'id': 'dav', 'kind': 'webdav', 'label': '下载来源'},
+        ]);
+      final model = _CompletedModel(store, directory);
+      model.downloads.entries.clear();
+      model.downloads.completedLocations.clear();
+      void add(String id, String path) {
+        final name = path.split('/').last;
+        store.save('media', id, {'title': name, 'fileName': name, 'size': 100});
+        store.setLocal('location:$id', {
+          'id': id,
+          'source': 'dav',
+          'path': path,
+          'size': 100,
+        });
+        model.downloads.entries[id] = OfflineDownload(
+          mediaId: id,
+          sourceId: 'dav',
+          remotePath: path,
+          localPath: '/offline/$path',
+          name: name,
+          status: OfflineDownloadStatus.completed,
+          received: 100,
+          total: 100,
+        );
+        model.downloads.completedLocations[id] = {
+          'id': id,
+          'source': 'local',
+          'path': '/offline/$path',
+          'size': 100,
+          'offline': true,
+          'remoteSource': 'dav',
+          'remotePath': path,
+        };
+      }
+
+      for (var i = 0; i < 300; i++) {
+        add('file-$i', 'share/Video ${i.toString().padLeft(3, '0')}.mp4');
+      }
+      add('nested', 'share/Season 2/Nested.mp4');
+      Future<void> waitFor(Finder finder) async {
+        for (var i = 0; i < 200 && finder.evaluate().isEmpty; i++) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(finder, findsOneWidget);
+        await tester.pumpAndSettle();
+      }
+
+      try {
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: GlassPalette.theme(),
+            home: Scaffold(
+              body: SourcesPage(
+                model: model,
+                onImport: () async {},
+                onPlay: (_) async {},
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('本地视频'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('下载来源'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('share'));
+        await tester.pump();
+        // The source's old child row must not appear under the new title while
+        // the 301 entries are sorted on the directory worker.
+        expect(find.text('share'), findsOneWidget);
+        await waitFor(find.byKey(const ValueKey('local-video:file-0')));
+        final list = find.byType(ListView);
+        await tester.drag(list, const Offset(0, -700));
+        await tester.pumpAndSettle();
+        ScrollPosition position() => tester
+            .state<ScrollableState>(
+              find.descendant(of: list, matching: find.byType(Scrollable)),
+            )
+            .position;
+        final offset = position().pixels;
+        expect(offset, greaterThan(500));
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('share'));
+        await tester.pumpAndSettle();
+        for (var i = 0; i < 200 && position().pixels < offset - 1; i++) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(position().pixels, closeTo(offset, 1));
+
+        await tester.fling(list, const Offset(0, -300), 1200);
+        expect(position().isScrollingNotifier.value, isTrue);
+        // Lifecycle suspension ends scrolling immediately without a frame.
+        await tester.runAsync(() async {
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.inactive,
+          );
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.hidden,
+          );
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.paused,
+          );
+          final pausedOffset = position().pixels;
+          expect(position().isScrollingNotifier.value, isFalse);
+          await Future<void>.delayed(const Duration(milliseconds: 30));
+          expect(position().pixels, pausedOffset);
+        });
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.inactive,
+        );
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pumpAndSettle();
+
+        position().jumpTo(0);
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip('搜索'));
+        await tester.pumpAndSettle();
+        final search = find.byKey(const ValueKey('folder-search-field'));
+        await tester.enterText(search, 'Season');
+        await tester.pump(const Duration(milliseconds: 200));
+        await waitFor(find.text('Season 2'));
+        await tester.tap(find.text('Season 2'));
+        await tester.pumpAndSettle();
+        expect(search, findsNothing);
+        expect(
+          find.byKey(const ValueKey('local-video:nested')),
+          findsOneWidget,
+        );
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+        expect(tester.widget<TextField>(search).controller!.text, 'Season');
+        await waitFor(find.text('Season 2'));
+        await tester.tap(find.text('Season 2'));
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey('local-video-options:nested')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('删除本地视频'));
+        await tester.pumpAndSettle();
+        store.setLocal('location:nested', {
+          'id': 'nested',
+          'source': 'dav',
+          'path': 'replacement.mp4',
+          'size': 100,
+        });
+        await tester.tap(find.text('删除'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('视频位置已改变'), findsOneWidget);
+        expect(model.downloads.entryFor('nested'), isNotNull);
+        expect(store.get('media', 'nested')?.deleted, isFalse);
+        expect(tester.takeException(), isNull);
+      } finally {
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
         await tester.pumpWidget(const SizedBox());
         model.dispose();
         store.dispose();
@@ -280,7 +581,7 @@ class _CompletedModel extends AppModel {
     revision: (
       store.recordsRevision('media'),
       store.recordsRevision('progress'),
-      store.locationRevision,
+      max(store.locationRevision, store.localKeyRevision('sources')),
     ),
     offlineRevision: downloads.completedRevision,
     offlineLocations: downloads.completedLocations,
@@ -297,6 +598,9 @@ class _CompletedModel extends AppModel {
     downloads.completedRevision++;
     downloads.changed();
   }
+
+  @override
+  Future<void> deleteLocalVideo(SyncRecord record) => deleteDownload(record.id);
 
   @override
   void dispose() {

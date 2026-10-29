@@ -7,6 +7,7 @@ import '../core/logger.dart';
 import '../core/network.dart';
 import 'media_identity.dart';
 import '../sources/source.dart';
+import '../sources/directory_sort.dart';
 import 'store.dart';
 import 'catalog_cache.dart';
 import 'directory_preview_context.dart';
@@ -302,6 +303,7 @@ void persistDirectoryPreview(
     final collection = preview.collection;
     final key = _directoryPreviewKey(sourceId, path);
     final data = <String, dynamic>{
+      'membershipRevision': directoryPreviewMembershipRevision,
       'sourceId': sourceId,
       'context': preview.context,
       'fingerprint': preview.fingerprint,
@@ -357,7 +359,10 @@ void persistDirectoryPreview(
 }
 
 DirectoryPreview? _decodeDirectoryPreview(dynamic json) {
-  if (json is! Map) return null;
+  if (json is! Map ||
+      json['membershipRevision'] != directoryPreviewMembershipRevision) {
+    return null;
+  }
   try {
     final raw = json['collection'];
     DirectoryCollection? collection;
@@ -417,11 +422,49 @@ DirectoryPreview? readDirectoryPreview(
   String path,
 ) => _decodeDirectoryPreview(store.local(_directoryPreviewKey(sourceId, path)));
 
+/// Child works are independent directories, not evidence for the identity of
+/// their parent. Only explicit companion folders can accompany its videos.
+/// Production callers evaluate this together with parsing on the worker.
+bool directoryAllowsCollection(List<SourceEntry> entries) {
+  const companions = {
+    'extra',
+    'extras',
+    'bonus',
+    'bonusfeatures',
+    'featurettes',
+    'specials',
+    'subtitle',
+    'subtitles',
+    'subs',
+    'font',
+    'fonts',
+    'artwork',
+    'covers',
+    'posters',
+    'scans',
+    '字幕',
+    '特典',
+    '花絮',
+    '字体',
+    '字體',
+    '封面',
+    '海报',
+    '海報',
+  };
+  for (final entry in entries) {
+    if (!entry.directory || isHiddenEntry(entry)) continue;
+    final name = entry.name.toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
+    if (!companions.contains(name)) return false;
+  }
+  return true;
+}
+
 DirectoryCollection? identifyDirectory(
   String path,
   List<SourceEntry> entries, {
   ReleaseName? folderIdentity,
 }) {
+  if (!directoryAllowsCollection(entries)) return null;
   final videos = <SourceEntry>[];
   final folder = folderIdentity ?? directoryIdentity(path);
   final identities = <String, ReleaseName>{};
@@ -539,11 +582,13 @@ class DirectoryInspection {
   final String fingerprint;
   final DirectoryCollection? collection;
   final int preparationIsolate;
+  final bool allowCollection;
   const DirectoryInspection(
     this.fingerprint,
     this.collection,
-    this.preparationIsolate,
-  );
+    this.preparationIsolate, {
+    this.allowCollection = true,
+  });
 }
 
 DirectoryInspection prepareDirectoryInspection(
@@ -579,6 +624,7 @@ DirectoryInspection prepareDirectoryInspection(
         .toString(),
     identifyDirectory(path, entries, folderIdentity: folder),
     Isolate.current.hashCode,
+    allowCollection: directoryAllowsCollection(entries),
   );
 }
 
@@ -1736,7 +1782,8 @@ class LibraryCatalog {
         currentCollection?.membershipComplete == false &&
         cachedCollection!.listedVideoCount ==
             currentCollection!.listedVideoCount;
-    final currentWithCachedMetadata = cachedCollection?.subject == null
+    final currentWithCachedMetadata =
+        !prepared.allowCollection || cachedCollection?.subject == null
         ? null
         : completeCachedMembership
         ? cachedCollection
@@ -1759,7 +1806,7 @@ class LibraryCatalog {
       return currentWithCachedMetadata;
     }
     Future<DirectoryCollection?> inspectFresh() async {
-      final collection = prepared.collection;
+      final collection = prepared.allowCollection ? prepared.collection : null;
       var result = collection;
       if (collection != null && strategy() != 'off') {
         try {
@@ -1812,6 +1859,7 @@ class LibraryCatalog {
         return collection;
       }
       if (result?.subject == null &&
+          prepared.allowCollection &&
           strategy() != 'off' &&
           aiFallback != null) {
         try {
@@ -1861,7 +1909,8 @@ class LibraryCatalog {
           sourceEpoch != _directorySourceEpoch(store, sourceId)) {
         return collection;
       }
-      if (result?.subject != null) {
+      if (result?.subject != null ||
+          (result == null && cachedCollection != null)) {
         await _rememberDirectory(
           sourceId,
           path,

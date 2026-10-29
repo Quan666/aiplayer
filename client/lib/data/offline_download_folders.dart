@@ -297,7 +297,7 @@ extension _OfflineFolderWork on _OfflineWorker {
     // paused scan cannot restore a subsequently deleted or rebound media item.
     // Metadata edits keep the current record and are not overwritten.
     final library = store ??= AppStore(':memory:');
-    final added = <Map<String, dynamic>>[];
+    final admitted = <Map<String, dynamic>>[];
     db!.execute('BEGIN IMMEDIATE');
     try {
       library.transaction(() {
@@ -363,6 +363,18 @@ extension _OfflineFolderWork on _OfflineWorker {
                     (location['previewRevision'] ?? '')) {
               throw const AppFailure('已有下载来自旧视频位置，请删除旧下载后重试。');
             }
+            if (old['status'] == 'failed' && old['userPaused'] != true) {
+              // Reselecting a folder retries failed children just like selecting
+              // those files individually. Publish copies only after commit so a
+              // later binding conflict cannot leave rolled-back retries running.
+              final retry = <String, dynamic>{
+                ...old,
+                'status': _readyStatus(old),
+                'error': '',
+              };
+              _save(retry, notify: false);
+              admitted.add(retry);
+            }
             continue;
           }
           final row = <String, dynamic>{
@@ -382,7 +394,7 @@ extension _OfflineFolderWork on _OfflineWorker {
             'status': active ? 'queued' : 'paused',
           };
           _save(row, notify: false);
-          added.add(row);
+          admitted.add(row);
         }
         _deleteFolderState(id);
         db!.execute('DELETE FROM downloads WHERE id=?', [id]);
@@ -394,10 +406,10 @@ extension _OfflineFolderWork on _OfflineWorker {
       db!.execute('ROLLBACK');
       rethrow;
     }
-    for (final row in added) {
+    for (final row in admitted) {
       rows[row['mediaId'] as String] = row;
     }
     rows.remove(id);
-    if (!closing) reply.send(['admitted', id, added]);
+    if (!closing) reply.send(['admitted', id, admitted]);
   }
 }

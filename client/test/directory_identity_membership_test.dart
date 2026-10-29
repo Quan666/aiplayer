@@ -110,6 +110,179 @@ void main() {
   });
 
   test(
+    'a recognized movie cannot identify a parent containing other works',
+    () async {
+      const movie = SourceEntry(name: 'Movie.mkv', path: 'Mixed/Movie.mkv');
+      _save(store, movie, 'movie', '');
+      final original = store.get('media', 'movie')!;
+      store.save('media', 'movie', {
+        ...original.data,
+        'metadataType': 'movie',
+        'series': 'Movie',
+      });
+      final before = store.get('media', 'movie')!;
+      final pure = await worker.prepareInspection('nas', 'Mixed', 'test', [
+        movie,
+      ]);
+      expect(pure.collection?.videos.single.path, movie.path);
+      final entries = [
+        movie,
+        for (var i = 0; i < 12; i++)
+          SourceEntry(
+            name: 'Other $i',
+            path: 'Mixed/Other $i',
+            directory: true,
+          ),
+      ];
+      final mixed = await worker.prepareInspection(
+        'nas',
+        'Mixed',
+        'test',
+        entries,
+      );
+      expect(mixed.allowCollection, isFalse);
+      expect(mixed.collection, isNull);
+      expect(mixed.fingerprint, isNot(pure.fingerprint));
+      expect(
+        await worker.synchronizeListing(
+          'nas',
+          'Mixed',
+          entries,
+          hideHidden: true,
+        ),
+        isNull,
+      );
+      expect(store.get('media', 'movie')!.data, before.data);
+      expect(store.records('media'), hasLength(1));
+
+      final looseVideos = await worker
+          .prepareInspection('nas', 'Mixed', 'test', [
+            movie,
+            const SourceEntry(name: 'Vacation.mp4', path: 'Mixed/Vacation.mp4'),
+            const SourceEntry(name: 'Birthday.mp4', path: 'Mixed/Birthday.mp4'),
+          ]);
+      expect(looseVideos.collection, isNull);
+
+      final episodicMixed = await worker
+          .prepareInspection('nas', 'Mixed', 'test', [
+            movie,
+            const SourceEntry(name: 'Vacation.mp4', path: 'Mixed/Vacation.mp4'),
+            const SourceEntry(
+              name: 'Other S01E01.mkv',
+              path: 'Mixed/Other S01E01.mkv',
+            ),
+          ]);
+      expect(episodicMixed.collection, isNull);
+      expect(episodicMixed.allowCollection, isFalse);
+    },
+  );
+
+  test(
+    'companion folders preserve a series while child works reject its parent',
+    () async {
+      final videos = _entries(opaque: false);
+      for (var index = 0; index < videos.length; index++) {
+        _save(store, videos[index], '$index', '${index + 1}');
+      }
+      final entries = [
+        ...videos,
+        for (final name in ['Extras', '字幕', 'Fonts', '.actors'])
+          SourceEntry(name: name, path: 'Example/$name', directory: true),
+      ];
+      final companions = await worker.prepareInspection(
+        'nas',
+        'Example',
+        'test',
+        entries,
+      );
+      expect(companions.allowCollection, isTrue);
+      expect(companions.collection?.episodeCount, 4);
+      final mixed = await worker.prepareInspection('nas', 'Example', 'test', [
+        ...entries,
+        const SourceEntry(
+          name: 'Other Movie',
+          path: 'Example/Other Movie',
+          directory: true,
+        ),
+      ]);
+      expect(mixed.allowCollection, isFalse);
+      expect(mixed.collection, isNull);
+      expect(
+        identifyDirectory('Example', [
+          ...entries,
+          const SourceEntry(
+            name: 'Other Movie',
+            path: 'Example/Other Movie',
+            directory: true,
+          ),
+        ]),
+        isNull,
+      );
+    },
+  );
+
+  test('mixed directory clears its old preview without invoking AI', () async {
+    final transport = _Transport();
+    var aiCalls = 0;
+    final catalog = LibraryCatalog(
+      store,
+      transport: transport,
+      prepareDirectory: (source, path, context, entries, cancel) => worker
+          .prepareInspection(source, path, context, entries, cancel: cancel),
+      persistDirectory: (source, path, preview, cancel) =>
+          worker.persistPreview(source, path, preview, cancel: cancel),
+      aiFallback: (_, _, _, _) async {
+        aiCalls++;
+        return null;
+      },
+    );
+    final entries = _entries(opaque: false);
+    expect(
+      (await catalog.inspect('nas', 'Example', entries))?.subject,
+      isNotNull,
+    );
+    expect(catalog.directoryPreview('nas', 'Example')?.collection, isNotNull);
+    final requests = transport.requests;
+    final mixed = [
+      ...entries,
+      const SourceEntry(
+        name: 'Other Movie',
+        path: 'Example/Other Movie',
+        directory: true,
+      ),
+    ];
+    expect(await catalog.inspect('nas', 'Example', mixed), isNull);
+    expect(catalog.directoryPreview('nas', 'Example')?.collection, isNull);
+    expect(readDirectoryPreview(store, 'nas', 'Example')?.collection, isNull);
+    expect(aiCalls, 0);
+    expect(transport.requests, requests);
+  });
+
+  test(
+    'legacy preview membership is rejected even with a current context',
+    () async {
+      final catalog = LibraryCatalog(store, transport: _Transport());
+      await catalog.inspect('nas', 'Example', _entries(opaque: false));
+      for (final prefix in [
+        'directory-preview:',
+        'directory-preview-envelope:',
+      ]) {
+        final row = store.localEntries(prefix).entries.single;
+        final legacy = Map<String, dynamic>.from(row.value as Map)
+          ..remove('membershipRevision');
+        store.setLocal(row.key, legacy);
+      }
+      expect(readDirectoryPreview(store, 'nas', 'Example'), isNull);
+      expect(catalog.directoryPreview('nas', 'Example'), isNull);
+      final restored = LibraryCatalog(
+        store,
+        readDirectory: (_, _, _) async => null,
+      );
+      expect(restored.directoryPreview('nas', 'Example'), isNull);
+    },
+  );
+
+  test(
     'prepared folder snapshots merge identities without any UI store reads',
     () {
       final entries = _entries();
@@ -239,7 +412,7 @@ void main() {
   );
 
   test(
-    'unknown extras and conflicting identities never become a fourth episode',
+    'unknown extras stay outside episodes and verified conflicts reject the parent',
     () async {
       final entries = _entries();
       for (var index = 0; index < 3; index++) {
@@ -263,9 +436,8 @@ void main() {
         'test',
         entries,
       );
-      expect(conflict.collection!.episodeCount, 3);
-      expect(conflict.collection!.listedVideoCount, 4);
-      expect(conflict.collection!.membershipComplete, isFalse);
+      expect(conflict.collection, isNull);
+      expect(conflict.allowCollection, isFalse);
       expect(conflict.fingerprint, isNot(unknown.fingerprint));
       store.save('media', 'extra', {...extra.data, 'season': '2'});
       final otherSeason = await worker.prepareInspection(
@@ -274,8 +446,8 @@ void main() {
         'test',
         entries,
       );
-      expect(otherSeason.collection!.episodeCount, 3);
-      expect(otherSeason.collection!.membershipComplete, isFalse);
+      expect(otherSeason.collection, isNull);
+      expect(otherSeason.allowCollection, isFalse);
       expect(otherSeason.fingerprint, isNot(conflict.fingerprint));
       store.save('media', 'extra', {...extra.data, 'episode': '3'});
       final alternate = await worker.prepareInspection(
@@ -542,12 +714,17 @@ void main() {
         'test',
         entries,
       );
-      expect(changed.collection!.episodeCount, 3);
+      expect(changed.collection, isNull);
+      expect(changed.allowCollection, isFalse);
       expect(changed.fingerprint, isNot(previous.fingerprint));
       final fresh = await catalog.inspect('nas', 'Example', entries);
-      expect(fresh!.episodeCount, 3);
-      expect(fresh.identities.containsKey(entries.last.path), isFalse);
-      expect(fresh.membershipComplete, isFalse);
+      expect(fresh, isNull);
+      expect(catalog.directoryPreview('nas', 'Example')?.collection, isNull);
+      expect(aiCalls, 1);
+      expect(store.get('media', 'other')!.data['bangumiId'], '99');
+      for (var index = 0; index < 3; index++) {
+        expect(store.get('media', '$index')!.data['bangumiId'], '42');
+      }
     },
   );
 

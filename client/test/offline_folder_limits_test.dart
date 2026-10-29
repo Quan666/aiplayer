@@ -283,6 +283,172 @@ void main() {
       }
     },
   );
+
+  test(
+    'reselecting a folder retries its failed files and keeps completed files',
+    () async {
+      final paths = [for (var i = 1; i <= 4; i++) 'Show/Show S01E0$i.mp4'];
+      final fixture = await _Folders.create({
+        'Show': [for (final path in paths) (path, false)],
+      });
+      fixture.failures.addAll(paths.skip(1));
+      final manager = fixture.manager();
+      try {
+        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+        await _until(
+          () => manager.completedCount == 1 && manager.failedCount == 3,
+        );
+        final originalIds = manager.taskIds.toSet();
+        final completed = manager.entries.values.singleWhere(
+          (entry) => entry.isComplete,
+        );
+        final completedRevision = manager.completedRevision;
+        expect(completed.remotePath, paths.first);
+        expect(fixture.gets, unorderedEquals(paths));
+
+        fixture.failures.clear();
+        final libraryRevision = manager.libraryRevision;
+        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+        await _until(
+          () =>
+              manager.libraryRevision > libraryRevision &&
+              manager.activeCount == 0,
+        );
+        expect(manager.completedCount, 4);
+        expect(manager.failedCount, 0);
+        expect(manager.taskIds.toSet(), originalIds);
+        expect(
+          manager.entryFor(completed.mediaId)?.localPath,
+          completed.localPath,
+        );
+        expect(manager.completedRevision, completedRevision + 3);
+        expect(fixture.store.records('media'), hasLength(4));
+        expect(fixture.gets, unorderedEquals([...paths, ...paths.skip(1)]));
+        for (final entry in manager.entries.values) {
+          expect(
+            await File(entry.localPath).readAsBytes(),
+            List.generate(32, (i) => i),
+          );
+        }
+      } finally {
+        await manager.close();
+        manager.dispose();
+        await fixture.close();
+      }
+    },
+  );
+
+  test(
+    'folder retries preserve manual pauses and roll back after a binding conflict',
+    () async {
+      final paths = [for (var i = 1; i <= 4; i++) 'Show/Show S01E0$i.mp4'];
+      final fixture = await _Folders.create({
+        'Show': [for (final path in paths) (path, false)],
+      });
+      fixture.failures.addAll(paths.skip(1));
+      fixture.store.save('media', 'paused', {
+        'title': p.posix.basename(paths.first),
+        'fileName': p.posix.basename(paths.first),
+      });
+      final pausedLocation = {
+        'id': 'paused',
+        'source': 'dav',
+        'path': paths.first,
+        'size': 32,
+      };
+      fixture.store.setLocal('location:paused', pausedLocation);
+      final manager = fixture.manager(active: false);
+      try {
+        await manager.enqueue(
+          media: fixture.store.get('media', 'paused')!,
+          location: pausedLocation,
+        );
+        await manager.pause('paused');
+        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+        manager.setActive(true);
+        await _until(
+          () => manager.failedCount == 3 && manager.activeCount == 0,
+        );
+        final originalIds = manager.taskIds.toSet();
+        final failed = {
+          for (final entry in manager.entries.values)
+            if (entry.status == OfflineDownloadStatus.failed)
+              entry.mediaId: entry,
+        };
+        expect(manager.entryFor('paused')?.userPaused, true);
+        expect(manager.pausedCount, 1);
+        expect(fixture.gets, unorderedEquals(paths.skip(1)));
+
+        final stale = failed.values.singleWhere(
+          (entry) => entry.remotePath == paths.last,
+        );
+        final location = Map<String, dynamic>.from(
+          fixture.store.local('location:${stale.mediaId}'),
+        );
+        fixture.store.setLocal('location:${stale.mediaId}', {
+          ...location,
+          'previewRevision': 'rebound',
+        });
+        fixture.failures.clear();
+        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+        await _until(
+          () => manager.failedCount == 4 && manager.activeCount == 0,
+        );
+        final scan = manager.entries.values.singleWhere(
+          (entry) => entry.isDirectory,
+        );
+        expect(scan.error, contains('旧视频位置'));
+        expect(manager.entryFor('paused')?.userPaused, true);
+        expect(manager.pausedCount, 1);
+        expect(fixture.gets, unorderedEquals(paths.skip(1)));
+        final database = sqlite3.open(
+          p.join(fixture.directory.path, 'downloads.sqlite'),
+          mode: OpenMode.readOnly,
+        );
+        try {
+          for (final entry in failed.values) {
+            expect(manager.entryFor(entry.mediaId)?.status, entry.status);
+            expect(manager.entryFor(entry.mediaId)?.error, entry.error);
+            final saved =
+                jsonDecode(
+                      database.select(
+                            'SELECT value FROM downloads WHERE id=?',
+                            [entry.mediaId],
+                          ).single['value']
+                          as String,
+                    )
+                    as Map;
+            expect(saved['status'], 'failed');
+            expect(saved['error'], entry.error);
+          }
+        } finally {
+          database.dispose();
+        }
+
+        await manager.cancel(scan.mediaId);
+        fixture.store.setLocal('location:${stale.mediaId}', location);
+        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+        await _until(
+          () => manager.completedCount == 3 && manager.activeCount == 0,
+        );
+        expect(manager.failedCount, 0);
+        expect(manager.pausedCount, 1);
+        expect(manager.entryFor('paused')?.userPaused, true);
+        expect(manager.taskIds.toSet(), originalIds);
+        expect(
+          fixture.gets,
+          unorderedEquals([...paths.skip(1), ...paths.skip(1)]),
+        );
+        await manager.resume('paused');
+        await _until(() => manager.completedCount == 4);
+        expect(fixture.gets.where((path) => path == paths.first), hasLength(1));
+      } finally {
+        await manager.close();
+        manager.dispose();
+        await fixture.close();
+      }
+    },
+  );
 }
 
 SourceEntry _folder(String path) => SourceEntry(
@@ -305,6 +471,7 @@ class _Folders {
   final AppStore store;
   final Map<String, List<(String, bool)>> listings;
   final listed = <String>[], gets = <String>[];
+  final failures = <String>{};
   Directory get directory => Directory(p.join(root.path, 'offline'));
   Map<String, dynamic> get source => {
     'id': 'dav',
@@ -342,6 +509,9 @@ class _Folders {
             );
           }
           response.write('</d:multistatus>');
+        } else if (request.method != 'HEAD' && failures.contains(path)) {
+          gets.add(path);
+          response.statusCode = HttpStatus.serviceUnavailable;
         } else {
           response.headers.set('accept-ranges', 'bytes');
           response.contentLength = 32;
