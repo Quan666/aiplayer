@@ -369,32 +369,6 @@ void main() {
     expect(automaticPlays, 0);
     expect(tester.takeException(), isNull);
   });
-
-  testWidgets('source badge ignores progress and defers hidden updates', (
-    tester,
-  ) async {
-    final f = await fixture(tester);
-    final media = f.add('episode', 'dav');
-    await tester.pumpWidget(
-      _shell(MediaSourceBadge(model: f.model, item: media)),
-    );
-    expect(find.text('WebDAV · 云盘'), findsOneWidget);
-    final reads = f.downloads.reads;
-    for (var index = 0; index < 20; index++) {
-      f.downloads.progressChanged();
-    }
-    expect(f.downloads.reads, reads);
-    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
-    f.downloads.put(media.id);
-    f.model.changed();
-    // No pump: paused lifecycle events must stop work synchronously.
-    expect(f.downloads.reads, reads);
-    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-    expect(f.downloads.reads, reads + 1);
-    await tester.pump();
-    expect(find.text('本地 · 已下载'), findsOneWidget);
-    expect(tester.takeException(), isNull);
-  });
 }
 
 Widget _shell(Widget child) => MaterialApp(
@@ -492,7 +466,7 @@ class _Model extends AppModel {
 
 class _Downloads extends ChangeNotifier implements OfflineDownloads {
   final values = <String, OfflineDownload>{};
-  int reads = 0, validations = 0;
+  int validations = 0;
   @override
   int completedRevision = 0;
 
@@ -514,7 +488,6 @@ class _Downloads extends ChangeNotifier implements OfflineDownloads {
 
   @override
   OfflineDownload? entryFor(String mediaId) {
-    reads++;
     return values[mediaId];
   }
 
@@ -538,8 +511,6 @@ class _Downloads extends ChangeNotifier implements OfflineDownloads {
     completedRevision++;
     notifyListeners();
   }
-
-  void progressChanged() => notifyListeners();
 
   @override
   Future<String?> localPath(String mediaId) async {

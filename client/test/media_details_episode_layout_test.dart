@@ -21,6 +21,7 @@ import 'package:image/image.dart' as images;
 class _EpisodeModel extends AppModel {
   final frames = <String, String>{};
   final frameReads = <String, int>{};
+  final labelReads = <String, int>{};
   final requests = <String>{};
   final entries = const [
     SourceEntry(
@@ -35,6 +36,12 @@ class _EpisodeModel extends AppModel {
     ),
   ];
   _EpisodeModel(super.store, super.documents);
+
+  @override
+  String episodeLabel(SyncRecord record) {
+    labelReads.update(record.id, (value) => value + 1, ifAbsent: () => 1);
+    return super.episodeLabel(record);
+  }
 
   @override
   String? thumbnailPath(String id) {
@@ -123,6 +130,9 @@ void main() {
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
+      store.setLocal('sources', [
+        {'id': 'nas', 'kind': 'webdav', 'label': 'NAS'},
+      ]);
       final first = model.addMedia('nas', model.entries.first);
       final second = model.sourcePreviewId('nas', model.entries.last.path);
       final frameSource = Platform.environment['DETAILS_EPISODE_FRAME'];
@@ -188,6 +198,10 @@ void main() {
       expect(find.byTooltip('下载视频'), findsNothing);
       final rows = find.byType(MediaDetailsEpisodeTile);
       expect(rows, findsNWidgets(2));
+      expect(
+        find.descendant(of: rows, matching: find.text('WebDAV · NAS')),
+        findsNothing,
+      );
       expect(model.media, hasLength(1));
       final titles = find.byKey(const ValueKey('episode-title'));
       final thumbs = find.byKey(const ValueKey('episode-thumbnail'));
@@ -378,4 +392,128 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets('paused episode notifications coalesce without another frame', (
+    tester,
+  ) async {
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    final id = model.addMedia('nas', model.entries.first);
+    final record = store.get('media', id)!;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MediaDetailsEpisodeTile(
+            model: model,
+            item: record,
+            onPlay: () {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    try {
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      model.frameReads.clear();
+      model.labelReads.clear();
+      // No pump after paused: lifecycle events must gate reads immediately.
+      for (var revision = 1; revision <= 3; revision++) {
+        store.setLocal('preview:$id', {'revision': revision});
+        store.setLocal('episodeTitle:$id', '后台标题 $revision');
+        store.save('progress', model.progressKey(record), {
+          'position': revision * 10,
+          'duration': 100,
+        });
+        model.changed();
+      }
+      expect(model.frameReads, isEmpty);
+      expect(model.labelReads, isEmpty);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      expect(model.frameReads, {id: 1});
+      expect(model.labelReads, {id: 1});
+      await tester.pumpAndSettle();
+      expect(find.textContaining('后台标题 3'), findsOneWidget);
+      expect(find.textContaining('00:30'), findsOneWidget);
+      expect(model.frameReads, {id: 1});
+      expect(model.labelReads, {id: 1});
+      expect(tester.takeException(), isNull);
+    } finally {
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpWidget(const SizedBox());
+    }
+  });
+
+  testWidgets(
+    'initially paused episodes defer reads across model replacement',
+    (tester) async {
+      final id = model.addMedia('nas', model.entries.first);
+      final replacementStore = AppStore(':memory:')
+        ..setLocal('settings', {'metadataStrategy': 'off'});
+      final replacement = _EpisodeModel(replacementStore, root);
+      final replacementId = replacement.addMedia(
+        'nas',
+        replacement.entries.last,
+      );
+      final replacementRecord = replacementStore.get('media', replacementId)!;
+      Future<void> mount(AppModel owner, SyncRecord item) => tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MediaDetailsEpisodeTile(
+              key: const ValueKey('retained-episode'),
+              model: owner,
+              item: item,
+              onPlay: () {},
+            ),
+          ),
+        ),
+      );
+      try {
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+        await mount(model, store.get('media', id)!);
+        expect(model.frameReads, isEmpty);
+        expect(model.labelReads, isEmpty);
+        await mount(replacement, replacementRecord);
+        expect(replacement.frameReads, isEmpty);
+        expect(replacement.labelReads, isEmpty);
+        store.setLocal('episodeTitle:$id', '旧模型');
+        model.changed();
+        for (var revision = 1; revision <= 3; revision++) {
+          replacementStore.setLocal(
+            'episodeTitle:$replacementId',
+            '新模型 $revision',
+          );
+          replacementStore.save(
+            'progress',
+            replacement.progressKey(replacementRecord),
+            {'position': revision * 20, 'duration': 100},
+          );
+          replacement.changed();
+        }
+        expect(model.frameReads, isEmpty);
+        expect(model.labelReads, isEmpty);
+        expect(replacement.frameReads, isEmpty);
+        expect(replacement.labelReads, isEmpty);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        // The initial route was mounted while paused, so it becomes visible on
+        // this resumed frame. Its pending replacement refreshes only once.
+        await tester.pumpAndSettle();
+        expect(find.textContaining('新模型 3'), findsOneWidget);
+        expect(find.textContaining('01:00'), findsOneWidget);
+        expect(find.textContaining('旧模型'), findsNothing);
+        expect(model.frameReads, isEmpty);
+        expect(model.labelReads, isEmpty);
+        expect(replacement.frameReads, {replacementId: 1});
+        expect(replacement.labelReads, {replacementId: 1});
+        expect(tester.takeException(), isNull);
+      } finally {
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pumpWidget(const SizedBox());
+        replacement.dispose();
+        replacementStore.dispose();
+      }
+    },
+  );
 }

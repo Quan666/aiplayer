@@ -276,6 +276,10 @@ class DirectoryPreview {
 String _directoryPreviewKey(String sourceId, String path) =>
     'directory-preview:${sha256.convert(utf8.encode(jsonEncode([sourceId, p.posix.normalize(path.replaceAll('\\', '/'))])))}';
 
+/// Shared by background readers that need exact cached-directory membership.
+String directoryPreviewStorageKey(String sourceId, String path) =>
+    _directoryPreviewKey(sourceId, path);
+
 String _directoryEnvelopeKey(String key) =>
     key.replaceFirst('directory-preview:', 'directory-preview-envelope:');
 
@@ -421,6 +425,11 @@ DirectoryPreview? readDirectoryPreview(
   String sourceId,
   String path,
 ) => _decodeDirectoryPreview(store.local(_directoryPreviewKey(sourceId, path)));
+
+/// Decode the existing persisted format on a background worker. Callers must
+/// also validate source identity, context and epochs before using its facts.
+DirectoryPreview? decodeDirectoryPreview(Object? value) =>
+    _decodeDirectoryPreview(value);
 
 /// Child works are independent directories, not evidence for the identity of
 /// their parent. Only explicit companion folders can accompany its videos.

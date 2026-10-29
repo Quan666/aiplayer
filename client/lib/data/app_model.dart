@@ -819,6 +819,7 @@ class AppModel extends ChangeNotifier {
   LibrarySnapshot? _librarySnapshot;
   (int, int, int, int)? _librarySnapshotRevision;
   LibrarySearchRevision? _librarySnapshotSearchRevision;
+  LibraryLocalMetadataRevision? _librarySnapshotLocalMetadataRevision;
   Future<void>? _librarySnapshotWork;
   ContinueWatchingPresentationReader? _continueWatchingReader;
   Object? _continueWatchingRevision;
@@ -878,6 +879,27 @@ class AppModel extends ChangeNotifier {
     _downloads?.completedRevision ?? 0,
   );
 
+  /// Only recognition inputs affect cached directory donors. Playback/UI
+  /// preference writes must not rebuild the library's structural snapshot.
+  LibraryLocalMetadataRevision get libraryLocalMetadataRevision {
+    _refreshSettingsSnapshot();
+    return (
+      [
+        store.localPrefixRevision('directory-preview:'),
+        store.localPrefixRevision('manualMetadata:'),
+        store.localPrefixRevision('directoryPreviewSourceEpoch:'),
+        store.localKeyRevision('directoryPreviewEpoch'),
+        store.localKeyRevision('metadataCredentialsRevision'),
+      ].reduce(max),
+      jsonEncode([
+        AppPreferences(_settingsSnapshot).aiMetadataEnabled,
+        _settingsSnapshot['aiSubtitleOrigin'],
+        _settingsSnapshot['aiSubtitleModel'],
+        _settingsSnapshot['metadataStrategy'] ?? 'conservative',
+      ]),
+    );
+  }
+
   /// Local display overrides affect active searches, never the structural
   /// media snapshot or an unfiltered library refresh.
   LibrarySearchRevision get librarySearchRevision {
@@ -906,10 +928,12 @@ class AppModel extends ChangeNotifier {
       cancel?.check();
       if (_disposed) throw const Cancelled();
       final revision = _libraryReadRevision;
+      final localMetadataRevision = libraryLocalMetadataRevision;
       final searchRevision = search.isEmpty ? null : librarySearchRevision;
       final sort = librarySorting;
       final cached = _librarySnapshot;
       if (_librarySnapshotRevision == revision &&
+          _librarySnapshotLocalMetadataRevision == localMetadataRevision &&
           _librarySnapshotSearchRevision == searchRevision &&
           cached?.query == search &&
           cached?.sort == sort) {
@@ -920,6 +944,7 @@ class AppModel extends ChangeNotifier {
         revision,
         sort,
         searchRevision,
+        localMetadataRevision,
       ).whenComplete(() => _librarySnapshotWork = null);
       await Future.any<void>([
         work,
@@ -934,11 +959,13 @@ class AppModel extends ChangeNotifier {
     (int, int, int, int) revision,
     LibrarySort sort,
     LibrarySearchRevision? searchRevision,
+    LibraryLocalMetadataRevision localMetadataRevision,
   ) async {
     final reader = _librarySnapshotReader ??= LibrarySnapshotReader(store);
     final snapshot = await reader.read(
       query: query,
       revision: (revision.$1, revision.$2, revision.$3),
+      localMetadataRevision: localMetadataRevision,
       offlineRevision: revision.$4,
       offlineLocations: _downloads?.completedLocations ?? const {},
       sort: sort,
@@ -946,12 +973,14 @@ class AppModel extends ChangeNotifier {
     );
     if (_disposed ||
         revision != _libraryReadRevision ||
+        localMetadataRevision != libraryLocalMetadataRevision ||
         (query.isNotEmpty && searchRevision != librarySearchRevision) ||
         sort != librarySorting) {
       return;
     }
     _librarySnapshot = snapshot;
     _librarySnapshotRevision = revision;
+    _librarySnapshotLocalMetadataRevision = localMetadataRevision;
     _librarySnapshotSearchRevision = searchRevision;
     // Business readers can reuse the worker's immutable media snapshot too.
     _mediaSnapshot = snapshot.media;

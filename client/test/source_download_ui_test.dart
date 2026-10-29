@@ -292,8 +292,19 @@ void main() {
         await tester.pumpAndSettle();
         await tester.tap(find.text('影视详情'));
         await tester.pumpAndSettle();
-        expect(find.byType(MediaDetailsOverview), findsOneWidget);
-        expect(find.byType(MediaDetailsEpisodeTile), findsOneWidget);
+        final detailsSheet = find.byType(BottomSheet);
+        final overview = find.descendant(
+          of: detailsSheet,
+          matching: find.byType(MediaDetailsOverview),
+        );
+        expect(overview, findsOneWidget);
+        expect(
+          find.descendant(
+            of: detailsSheet,
+            matching: find.byType(MediaDetailsEpisodeTile),
+          ),
+          findsOneWidget,
+        );
         expect(find.text('离线系列'), findsWidgets);
         final downloaded = find.descendant(
           of: find.byType(MediaDetailsEpisodeTile),
@@ -301,7 +312,7 @@ void main() {
         );
         expect(downloaded, findsNothing);
         expect(find.byTooltip('选择下载'), findsOneWidget);
-        Navigator.of(tester.element(find.byType(MediaDetailsOverview))).pop();
+        Navigator.of(tester.element(overview)).pop();
         await tester.pumpAndSettle();
         await tester.tap(
           find.byKey(const ValueKey('local-video-options:episode')),
@@ -585,6 +596,7 @@ class _CompletedModel extends AppModel {
     ),
     offlineRevision: downloads.completedRevision,
     offlineLocations: downloads.completedLocations,
+    localMetadataRevision: libraryLocalMetadataRevision,
   );
   @override
   Future<List<SyncRecord>> loadSeriesEpisodes(

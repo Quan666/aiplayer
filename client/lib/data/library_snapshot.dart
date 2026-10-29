@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:isolate';
 
@@ -10,12 +11,18 @@ import 'media_identity.dart';
 import '../sources/directory_sort.dart';
 import '../sources/source.dart';
 import 'library_sort.dart';
+import 'library_catalog.dart' show directoryPreviewStorageKey;
+import 'local_directory_metadata.dart';
+import 'directory_preview_context.dart';
+import 'preferences.dart';
 import 'media_episodes.dart';
 import 'media_presentation.dart';
 import 'playback_source.dart';
 import 'playback_options.dart';
 import 'media_title_translation.dart';
 import 'store.dart';
+
+typedef LibraryLocalMetadataRevision = (int, String);
 
 typedef LibrarySearchRevision = (int, int, (String, String, String));
 
@@ -34,6 +41,7 @@ class LibrarySnapshot {
   final Map<String, String> episodeKeys;
   final Map<String, List<SyncRecord>> episodeVersions, episodes;
   final Map<String, List<MediaPlaybackOption>> playbackOptions;
+  final Map<String, List<MediaPlaybackOption>> localPlaybackOptionsById;
   final Map<String, SyncRecord> representatives;
   final Map<String, SyncRecord> latestBySeries;
   final Map<String, MediaCollectionDetails> details;
@@ -42,6 +50,10 @@ class LibrarySnapshot {
   final List<SourceEntry> localEntries;
   final Map<String, SyncRecord> localRecords;
   final Map<String, LocalDirectorySnapshot> localDirectories;
+
+  /// Resume records restricted to each recognized directory's local subtree.
+  /// Progress refreshes this map without rebuilding the directory hierarchy.
+  final Map<String, SyncRecord> localDirectoryLatest;
   final int localHiddenEntries,
       localSubtitleEntries,
       localHiddenSubtitleEntries;
@@ -61,6 +73,7 @@ class LibrarySnapshot {
     required this.episodeKeys,
     required this.episodeVersions,
     this.playbackOptions = const {},
+    this.localPlaybackOptionsById = const {},
     required this.episodes,
     required this.representatives,
     required this.latestBySeries,
@@ -70,6 +83,7 @@ class LibrarySnapshot {
     this.localEntries = const [],
     this.localRecords = const {},
     this.localDirectories = const {},
+    this.localDirectoryLatest = const {},
     this.localHiddenEntries = 0,
     this.localSubtitleEntries = 0,
     this.localHiddenSubtitleEntries = 0,
@@ -97,7 +111,9 @@ class LibrarySnapshot {
       episodeVersions[episodeKeyFor(record)] ?? const [];
 
   List<MediaPlaybackOption> playbackOptionsFor(SyncRecord record) =>
-      playbackOptions[episodeKeyFor(record)] ?? const [];
+      localPlaybackOptionsById[record.id] ??
+      playbackOptions[episodeKeyFor(record)] ??
+      const [];
 
   List<SyncRecord> episodesFor(SyncRecord record) =>
       episodes[seriesKeyFor(record)] ?? const [];
@@ -122,6 +138,15 @@ class LocalDirectorySnapshot {
   final List<SourceEntry> entries;
   final Map<String, SyncRecord> records;
 
+  /// Present only for a single recognized work/season. The collection includes
+  /// local descendants; [entries] and [records] always remain direct children.
+  final String? seriesKey;
+  final SyncRecord? anchor;
+  final MediaCollectionDetails? details;
+  final List<SyncRecord> episodes, collectionRecords;
+  final List<SourceEntry> collectionEntries;
+  final Map<String, SyncRecord> collectionRecordsByPath;
+
   LocalDirectorySnapshot({
     required this.path,
     required this.name,
@@ -129,6 +154,13 @@ class LocalDirectorySnapshot {
     this.sourceId,
     List<SourceEntry> entries = const [],
     Map<String, SyncRecord> records = const {},
+    this.seriesKey,
+    this.anchor,
+    this.details,
+    this.episodes = const [],
+    this.collectionRecords = const [],
+    this.collectionEntries = const [],
+    this.collectionRecordsByPath = const {},
   }) : entries = List.unmodifiable(entries),
        records = Map.unmodifiable(records);
 }
@@ -141,14 +173,65 @@ class _LocalDirectoryBuilder {
 
   _LocalDirectoryBuilder(this.path, this.name, this.parentPath, this.sourceId);
 
-  LocalDirectorySnapshot freeze() => LocalDirectorySnapshot(
-    path: path,
-    name: name,
-    parentPath: parentPath,
-    sourceId: sourceId,
-    entries: entries,
-    records: records,
-  );
+  LocalDirectorySnapshot freeze([_LocalCollectionData? collection]) =>
+      LocalDirectorySnapshot(
+        path: path,
+        name: name,
+        parentPath: parentPath,
+        sourceId: sourceId,
+        entries: entries,
+        records: records,
+        seriesKey: collection?.key,
+        anchor: collection?.anchor,
+        details: collection?.details,
+        episodes: collection?.episodes ?? const [],
+        collectionRecords: collection?.records ?? const [],
+        collectionEntries: collection == null
+            ? const []
+            : _LocalCollectionEntries(entries, collection.entries),
+        collectionRecordsByPath: collection == null
+            ? const {}
+            : records.values.any(
+                (record) => isSubtitle(
+                  '${record.data['fileName'] ?? record.data['title'] ?? ''}',
+                ),
+              )
+            ? Map.unmodifiable({
+                for (final entry in entries)
+                  if (!entry.directory &&
+                      isSubtitle(entry.name) &&
+                      records[entry.path] != null)
+                    entry.path: records[entry.path]!,
+                ...collection.recordsByPath,
+              })
+            : collection.recordsByPath,
+      );
+}
+
+/// Keep navigation items beside a shared episode list without copying every
+/// episode reference once per ancestor in a deeply nested download directory.
+class _LocalCollectionEntries extends ListBase<SourceEntry> {
+  final List<SourceEntry> _navigation, _episodes;
+  _LocalCollectionEntries(List<SourceEntry> direct, this._episodes)
+    : _navigation = List.unmodifiable(
+        direct.where((entry) => entry.directory || isSubtitle(entry.name)),
+      );
+  @override
+  int get length => _navigation.length + _episodes.length;
+  @override
+  set length(int value) =>
+      throw UnsupportedError('Immutable collection entries');
+  @override
+  SourceEntry operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    return index < _navigation.length
+        ? _navigation[index]
+        : _episodes[index - _navigation.length];
+  }
+
+  @override
+  void operator []=(int index, SourceEntry value) =>
+      throw UnsupportedError('Immutable collection entries');
 }
 
 class _LocalDirectoryIndex {
@@ -201,9 +284,183 @@ class _LocalDirectoryIndex {
     directory.records[record.id] = record;
   }
 
-  Map<String, LocalDirectorySnapshot> freeze() => Map.unmodifiable({
-    for (final entry in directories.entries) entry.key: entry.value.freeze(),
-  });
+  Map<String, LocalDirectorySnapshot> freeze(
+    _SnapshotData snapshot,
+    Map<String, Map<String, dynamic>> localLocations, {
+    _LibrarySeriesIndex? displayIndex,
+  }) {
+    final hasDonors = displayIndex != null;
+    final displaySeries = displayIndex?.groups ?? snapshot.series;
+    final displayKeys = displayIndex?.keys ?? snapshot.seriesKeys;
+    final displayDetails = <String, MediaCollectionDetails>{};
+    final entriesById = {
+      for (final entry in snapshot.localEntries) entry.path: entry,
+    };
+    final recognized = <String>{
+      for (final group in displaySeries.entries)
+        if (group.value.any(
+          (record) =>
+              _LibrarySeriesIndex._verified(record) ||
+              [
+                'metadataTitle',
+                'poster',
+                'summary',
+                'metadataProvider',
+              ].any((key) => '${record.data[key] ?? ''}'.trim().isNotEmpty),
+        ))
+          group.key,
+    };
+    final membership =
+        <String, ({String? key, bool mixed, List<SyncRecord> records})>{};
+    final collections = <List<SyncRecord>, _LocalCollectionData>{};
+    final result = <String, LocalDirectorySnapshot>{};
+    // Parents are inserted before children. Walking backwards resolves each
+    // subtree once and keeps direct membership separate from collection views.
+    for (final directory in directories.values.toList().reversed) {
+      String? key;
+      var mixed = false;
+      final parts = <List<SyncRecord>>[];
+      final direct = <SyncRecord>[
+        for (final record in directory.records.values)
+          if (!isSubtitle(entriesById[record.id]?.name ?? '')) record,
+      ];
+      void include(String? candidate, bool conflict, List<SyncRecord> records) {
+        if (conflict) mixed = true;
+        if (records.isEmpty) return;
+        if (candidate == null ||
+            candidate.startsWith('file:') ||
+            (key != null && key != candidate)) {
+          mixed = true;
+        }
+        key ??= candidate;
+        parts.add(records);
+      }
+
+      for (final record in direct) {
+        final candidate = displayKeys[record.id];
+        if (candidate == null ||
+            candidate.startsWith('file:') ||
+            (key != null && key != candidate)) {
+          mixed = true;
+        }
+        key ??= candidate;
+      }
+      if (direct.isNotEmpty) parts.add(direct);
+      for (final entry in directory.entries) {
+        if (!entry.directory) continue;
+        final child = membership[entry.path]!;
+        include(child.key, child.mixed, child.records);
+      }
+      final records = mixed
+          ? const <SyncRecord>[]
+          : parts.length == 1
+          ? parts.single
+          : List<SyncRecord>.unmodifiable(parts.expand((part) => part));
+      membership[directory.path] = (key: key, mixed: mixed, records: records);
+      final collection =
+          !mixed &&
+              records.isNotEmpty &&
+              key != null &&
+              recognized.contains(key) &&
+              directory.path.isNotEmpty &&
+              directory.sourceId == null
+          ? collections.putIfAbsent(
+              records,
+              () => _LocalCollectionData(
+                key!,
+                records,
+                snapshot,
+                entriesById,
+                localLocations,
+                displayDetails.putIfAbsent(
+                  key!,
+                  () => hasDonors
+                      ? MediaCollectionDetails.fromRecords(
+                          displaySeries[key]!,
+                          locations: snapshot.locations,
+                        )
+                      : snapshot.details[key]!,
+                ),
+              ),
+            )
+          : null;
+      result[directory.path] = directory.freeze(collection);
+    }
+    return Map.unmodifiable({
+      for (final key in directories.keys) key: result[key]!,
+    });
+  }
+}
+
+/// Shared by a chain of folders containing the same local episode set. Records
+/// are the snapshot's immutable objects, never copied media metadata subtrees.
+class _LocalCollectionData {
+  final String key;
+  late final List<SyncRecord> records, episodes;
+  late final List<SourceEntry> entries;
+  late final Map<String, SyncRecord> recordsByPath;
+  late final SyncRecord anchor;
+  late final MediaCollectionDetails details;
+
+  _LocalCollectionData(
+    this.key,
+    List<SyncRecord> members,
+    _SnapshotData snapshot,
+    Map<String, SourceEntry> entriesById,
+    Map<String, Map<String, dynamic>> localLocations,
+    MediaCollectionDetails catalogue,
+  ) {
+    records = List.unmodifiable(
+      List<SyncRecord>.of(members)..sort(compareMediaEpisodes),
+    );
+    final displayRecords = {for (final record in records) record.id: record};
+    final selected = <SyncRecord>[];
+    for (final versions in groupMediaEpisodes(records, seriesKey: key).values) {
+      final ids = {for (final record in versions) record.id};
+      final first = versions.first;
+      final options =
+          snapshot.localPlaybackOptionsById[first.id] ??
+          snapshot.playbackOptions[snapshot.episodeKeys[first.id]] ??
+          const [];
+      final best = options
+          .where((option) => option.isLocal && ids.contains(option.media.id))
+          .firstOrNull;
+      selected.add(
+        best == null
+            ? uniqueMediaEpisodes(versions, seriesKey: key).first
+            : displayRecords[best.media.id]!,
+      );
+    }
+    episodes = List.unmodifiable(selected..sort(compareMediaEpisodes));
+    entries = List.unmodifiable([
+      for (final record in episodes) entriesById[record.id]!,
+    ]);
+    recordsByPath = Map.unmodifiable({
+      for (final record in episodes) record.id: record,
+    });
+    anchor = records.firstWhere(
+      _LibrarySeriesIndex._verified,
+      orElse: () => episodes.first,
+    );
+    final local = MediaCollectionDetails.fromRecords(
+      records,
+      locations: localLocations,
+    );
+    details = MediaCollectionDetails(
+      title: catalogue.title,
+      poster: catalogue.poster,
+      summary: catalogue.summary,
+      season: catalogue.season,
+      year: catalogue.year,
+      provider: catalogue.provider,
+      rating: catalogue.rating,
+      totalEpisodes: catalogue.totalEpisodes,
+      totalSeasons: catalogue.totalSeasons,
+      genres: catalogue.genres,
+      availableEpisodes: local.availableEpisodes,
+      videoCount: local.videoCount,
+    );
+  }
 }
 
 List<String> _downloadParentSegments(String remote) {
@@ -267,6 +524,7 @@ class LibrarySnapshotReader {
   _SnapshotData? _memoryData;
   (int, int, int)? _memoryRevision;
   int _memoryOfflineRevision = -1;
+  LibraryLocalMetadataRevision? _memoryLocalMetadataRevision;
   _LibrarySearchLabels? _memorySearchLabels;
   (int, LibrarySearchRevision)? _memorySearchRevision;
 
@@ -276,6 +534,7 @@ class LibrarySnapshotReader {
     LibrarySort sort = const LibrarySort(),
     LibrarySearchRevision? searchRevision,
     int offlineRevision = 0,
+    LibraryLocalMetadataRevision localMetadataRevision = (0, ''),
     Map<String, Map<String, dynamic>> offlineLocations = const {},
   }) async {
     if (_disposed) throw const Cancelled();
@@ -292,18 +551,22 @@ class LibrarySnapshotReader {
       // This equivalent path is for tests; production uses the disk worker.
       if (_memoryData == null ||
           _memoryRevision != revision ||
-          _memoryOfflineRevision != offlineRevision) {
+          _memoryOfflineRevision != offlineRevision ||
+          _memoryLocalMetadataRevision != localMetadataRevision) {
         final previous = _memoryRevision;
         _memoryData =
             _memoryData != null &&
                 previous?.$1 == revision.$1 &&
                 previous?.$3 == revision.$3 &&
-                _memoryOfflineRevision == offlineRevision
+                _memoryOfflineRevision == offlineRevision &&
+                _memoryLocalMetadataRevision == localMetadataRevision
             ? _memoryData!.withProgress(store.records('progress'))
             : _SnapshotData.fromRecords(
                 store.all('media'),
                 store.records('progress'),
                 store.localEntries('location:'),
+                readLocal: store.local,
+                manualMetadata: store.localEntries('manualMetadata:'),
                 technicalFacts: store.localEntries('technical:'),
                 offlineLocations: offlineLocations,
                 sourceNames: _configuredSourceNames(store.local('sources')),
@@ -316,6 +579,7 @@ class LibrarySnapshotReader {
               );
         _memoryRevision = revision;
         _memoryOfflineRevision = offlineRevision;
+        _memoryLocalMetadataRevision = localMetadataRevision;
       }
       if (query.isNotEmpty &&
           _memorySearchRevision != (revision.$1, searchRevision!)) {
@@ -345,6 +609,7 @@ class LibrarySnapshotReader {
       searchRevision,
       offlineRevision,
       offlineLocations,
+      localMetadataRevision,
     ));
     return result.future;
   }
@@ -438,6 +703,7 @@ void _snapshotWorker((String, SendPort) arguments) {
   _SnapshotData? data;
   (int, int, int)? currentRevision;
   int currentOfflineRevision = -1;
+  LibraryLocalMetadataRevision? currentLocalMetadataRevision;
   _LibrarySearchLabels? searchLabels;
   (int, LibrarySearchRevision)? currentSearchRevision;
   replies.send(requests.sendPort);
@@ -455,6 +721,7 @@ void _snapshotWorker((String, SendPort) arguments) {
       searchRevision,
       offlineRevision,
       offlineLocations,
+      localMetadataRevision,
     ) = message
         as (
           int,
@@ -464,12 +731,14 @@ void _snapshotWorker((String, SendPort) arguments) {
           LibrarySearchRevision?,
           int,
           Map<String, Map<String, dynamic>>,
+          LibraryLocalMetadataRevision,
         );
     try {
       final refreshData =
           data == null ||
           revision != currentRevision ||
-          offlineRevision != currentOfflineRevision;
+          offlineRevision != currentOfflineRevision ||
+          localMetadataRevision != currentLocalMetadataRevision;
       final refreshSearch =
           query.isNotEmpty &&
           currentSearchRevision != (revision.$1, searchRevision!);
@@ -488,7 +757,8 @@ void _snapshotWorker((String, SendPort) arguments) {
                 data != null &&
                     previous?.$1 == revision.$1 &&
                     previous?.$3 == revision.$3 &&
-                    currentOfflineRevision == offlineRevision
+                    currentOfflineRevision == offlineRevision &&
+                    currentLocalMetadataRevision == localMetadataRevision
                 ? data!.withProgress(history)
                 : _SnapshotData.fromRecords(
                     database
@@ -500,6 +770,18 @@ void _snapshotWorker((String, SendPort) arguments) {
                     {
                       for (final row in database.select(
                         "SELECT key,value FROM local WHERE key>='location:' AND key<'location;'",
+                      ))
+                        row['key'] as String: jsonDecode(
+                          row['value'] as String,
+                        ),
+                    },
+                    readLocal: (key) => database
+                        .select('SELECT value FROM local WHERE key=?', [key])
+                        .map((row) => jsonDecode(row['value'] as String))
+                        .firstOrNull,
+                    manualMetadata: {
+                      for (final row in database.select(
+                        "SELECT key,value FROM local WHERE key>='manualMetadata:' AND key<'manualMetadata;'",
                       ))
                         row['key'] as String: jsonDecode(
                           row['value'] as String,
@@ -548,6 +830,7 @@ void _snapshotWorker((String, SendPort) arguments) {
         }
         currentRevision = revision;
         currentOfflineRevision = offlineRevision;
+        currentLocalMetadataRevision = localMetadataRevision;
         if (refreshSearch) {
           currentSearchRevision = (revision.$1, searchRevision);
         }
@@ -596,6 +879,122 @@ SyncRecord _freezeRecord(SyncRecord record) => SyncRecord(
   deleted: record.deleted,
   dirty: record.dirty,
 );
+
+SyncRecord _presentLocalRecord(
+  SyncRecord record,
+  Map<String, dynamic> fields,
+) => SyncRecord(
+  id: record.id,
+  kind: record.kind,
+  data: _freeze({...record.data, ...fields}) as Map<String, dynamic>,
+  modifiedAt: record.modifiedAt,
+  deviceId: record.deviceId,
+  deviceName: record.deviceName,
+  version: record.version,
+  revision: record.revision,
+  deleted: record.deleted,
+  dirty: record.dirty,
+);
+
+Map<String, Map<String, dynamic>> _readLocalMetadataDonors(
+  List<SyncRecord> media,
+  Map<String, Map<String, dynamic>> locations,
+  Map<String, Map<String, dynamic>> offlineLocations,
+  Map<String, dynamic> manualMetadata,
+  _LibrarySeriesIndex canonical,
+  Object? Function(String) readLocal,
+) {
+  final saved = <String, Object?>{};
+  Object? read(String key) => saved.putIfAbsent(key, () => readLocal(key));
+  final settingsRaw = read('settings');
+  final settings = settingsRaw is Map
+      ? Map<String, dynamic>.from(settingsRaw)
+      : <String, dynamic>{};
+  final sourcesRaw = read('sources');
+  final sources = {
+    if (sourcesRaw is List)
+      for (final source in sourcesRaw.whereType<Map>())
+        if (source['id'] is String) source['id'] as String: source,
+  };
+  final contextBySource = <String, String>{};
+  final directories = <(String, String), CachedLocalDirectoryMetadata?>{};
+  final established = {
+    for (final group in canonical.groups.entries)
+      if (group.value.any(
+        (record) =>
+            _LibrarySeriesIndex._verified(record) ||
+            [
+              'metadataTitle',
+              'poster',
+              'summary',
+              'metadataProvider',
+            ].any((key) => '${record.data[key] ?? ''}'.trim().isNotEmpty),
+      ))
+        group.key,
+  };
+  final result = <String, Map<String, dynamic>>{};
+  for (final record in media) {
+    if (established.contains(canonical.keys[record.id]) ||
+        manualMetadata['manualMetadata:${record.id}'] == true ||
+        _LibrarySeriesIndex._verified(record) ||
+        [
+          'metadataTitle',
+          'poster',
+          'summary',
+          'metadataProvider',
+        ].any((key) => '${record.data[key] ?? ''}'.trim().isNotEmpty)) {
+      continue;
+    }
+    final binding = locations[record.id], offline = offlineLocations[record.id];
+    final matches =
+        offline != null &&
+        (binding == null ||
+            (offline['remoteSource'] == binding['source'] &&
+                offline['remotePath'] == binding['path'] &&
+                (offline['remoteRevision'] ?? '') ==
+                    (binding['previewRevision'] ?? '')));
+    if ((matches ? offline : binding)?['source'] != 'local') continue;
+    final source = matches ? offline['remoteSource'] : binding?['source'];
+    final path = matches ? offline['remotePath'] : binding?['path'];
+    if (source is! String || path is! String || path.isEmpty) continue;
+    final parent = p.posix.dirname(path.replaceAll('\\', '/'));
+    final donor = directories.putIfAbsent(
+      (source, parent),
+      () => CachedLocalDirectoryMetadata.decode(
+        read(directoryPreviewStorageKey(source, parent)),
+        sourceId: source,
+        parentPath: parent,
+        cacheEpoch: (read('directoryPreviewEpoch') as num?)?.toInt() ?? 0,
+        sourceEpoch:
+            (read('directoryPreviewSourceEpoch:$source') as num?)?.toInt() ?? 0,
+        context: contextBySource.putIfAbsent(
+          source,
+          () => directoryPreviewContext(
+            source: sources[source],
+            strategy: settings['metadataStrategy'] ?? 'conservative',
+            aiContext: jsonEncode([
+              AppPreferences(settings).aiMetadataEnabled,
+              settings['aiSubtitleOrigin'],
+              settings['aiSubtitleModel'],
+              read('metadataCredentialsRevision'),
+            ]),
+          ),
+        ),
+      ),
+    );
+    final fields = donor?.fieldsFor(
+      path: path,
+      size:
+          ((binding?['size'] ?? offline?['size'] ?? record.data['size'])
+                  as num?)
+              ?.toInt() ??
+          0,
+      modified: (binding?['modified'] as num?)?.toInt() ?? 0,
+    );
+    if (fields != null) result[record.id] = fields;
+  }
+  return result;
+}
 
 /// One index owns membership for cards, details, search and recent playback.
 /// A verified series can adopt parsed siblings using unambiguous filename
@@ -729,6 +1128,7 @@ class _SnapshotData {
   late final Map<String, String> episodeKeys;
   late final Map<String, List<SyncRecord>> episodeVersions, episodes;
   late final Map<String, List<MediaPlaybackOption>> playbackOptions;
+  late final Map<String, List<MediaPlaybackOption>> localPlaybackOptionsById;
   late final Map<String, SyncRecord> representatives;
   late final Map<String, SyncRecord> latestBySeries;
   late final Map<String, MediaCollectionDetails> details;
@@ -737,6 +1137,8 @@ class _SnapshotData {
   late final List<SourceEntry> localEntries;
   late final Map<String, SyncRecord> localRecords;
   late final Map<String, LocalDirectorySnapshot> localDirectories;
+  late final Map<String, SyncRecord> localDirectoryLatest;
+  late final Map<String, String> _localParentByMedia;
   late final int localHiddenEntries,
       localSubtitleEntries,
       localHiddenSubtitleEntries;
@@ -754,8 +1156,9 @@ class _SnapshotData {
     Map<String, String> sourceNames,
     Map<String, dynamic> technicalFacts,
     Set<String> externalSources,
+    Map<String, Map<String, dynamic>> localDonors,
+    _LibrarySeriesIndex index,
   ) : byId = Map.unmodifiable({for (final record in media) record.id: record}) {
-    final index = _LibrarySeriesIndex(media);
     series = index.groups;
     seriesKeys = index.keys;
     episodeKeys = Map.unmodifiable({
@@ -803,6 +1206,7 @@ class _SnapshotData {
     folders = _groupFolders(media, locations, seriesKeys, history);
     final imports = <SourceEntry>[];
     final imported = <String, SyncRecord>{};
+    final localLocations = <String, Map<String, dynamic>>{};
     final localIndex = _LocalDirectoryIndex(sourceNames);
     var hiddenEntries = 0, subtitleEntries = 0, hiddenSubtitleEntries = 0;
     for (final record in media) {
@@ -817,7 +1221,11 @@ class _SnapshotData {
                       (binding['previewRevision'] ?? '')));
       final location = matches ? offline : binding;
       if (location?['source'] != 'local') continue;
-      imported[record.id] = record;
+      final display = localDonors[record.id] == null
+          ? record
+          : _presentLocalRecord(record, localDonors[record.id]!);
+      imported[record.id] = display;
+      localLocations[record.id] = location!;
       final remote = offline?['remotePath'];
       final relative = offline != null && offline['downloadRoot'] is String
           ? offline['downloadRelativePath']
@@ -828,12 +1236,12 @@ class _SnapshotData {
       final entry = SourceEntry(
         name: '${record.data['fileName'] ?? record.data['title'] ?? ''}',
         path: record.id,
-        size: (location?['size'] as num?)?.toInt() ?? 0,
-        modified: (location?['modified'] as num?)?.toInt() ?? 0,
+        size: (location['size'] as num?)?.toInt() ?? 0,
+        modified: (location['modified'] as num?)?.toInt() ?? 0,
         hidden: parents.any((name) => name.startsWith('.')),
       );
       imports.add(entry);
-      localIndex.add(entry, record, matches ? offline : null, parents);
+      localIndex.add(entry, display, matches ? offline : null, parents);
       final hidden = isHiddenEntry(entry), subtitle = isSubtitle(entry.name);
       if (hidden) hiddenEntries++;
       if (subtitle) subtitleEntries++;
@@ -841,7 +1249,7 @@ class _SnapshotData {
     }
     localEntries = List.unmodifiable(imports);
     localRecords = Map.unmodifiable(imported);
-    localDirectories = localIndex.freeze();
+
     localHiddenEntries = hiddenEntries;
     localSubtitleEntries = subtitleEntries;
     localHiddenSubtitleEntries = hiddenSubtitleEntries;
@@ -866,6 +1274,46 @@ class _SnapshotData {
           locations: locations,
         ),
     });
+    final displayIndex = localDonors.isEmpty
+        ? null
+        : _LibrarySeriesIndex([
+            for (final record in media) imported[record.id] ?? record,
+          ]);
+    final displayOptions = <String, List<MediaPlaybackOption>>{
+      if (displayIndex != null)
+        for (final group in displayIndex.groups.entries)
+          for (final episode in groupMediaEpisodes(
+            group.value,
+            seriesKey: group.key,
+          ).entries)
+            episode.key: preparePlaybackOptions(
+              episode.value,
+              locations,
+              offlineLocations,
+              technicalFacts,
+              availableSources,
+            ),
+    };
+    localPlaybackOptionsById = Map.unmodifiable({
+      if (displayIndex != null)
+        for (final record in imported.values)
+          record.id:
+              displayOptions[mediaEpisodeKey(
+                record,
+                seriesKey: displayIndex.keys[record.id],
+              )] ??
+              const <MediaPlaybackOption>[],
+    });
+    localDirectories = localIndex.freeze(
+      this,
+      localLocations,
+      displayIndex: displayIndex,
+    );
+    _localParentByMedia = Map.unmodifiable({
+      for (final directory in localDirectories.values)
+        for (final id in directory.records.keys) id: directory.path,
+    });
+    localDirectoryLatest = _localLatest(history);
     _ordering = {
       for (final entry in series.entries)
         entry.key: _LibraryGroupOrder(
@@ -903,6 +1351,7 @@ class _SnapshotData {
     episodeKeys = previous.episodeKeys;
     episodeVersions = previous.episodeVersions;
     playbackOptions = previous.playbackOptions;
+    localPlaybackOptionsById = previous.localPlaybackOptionsById;
     episodes = previous.episodes;
     representatives = previous.representatives;
     details = previous.details;
@@ -910,10 +1359,12 @@ class _SnapshotData {
     localEntries = previous.localEntries;
     localRecords = previous.localRecords;
     localDirectories = previous.localDirectories;
+    _localParentByMedia = previous._localParentByMedia;
     localHiddenEntries = previous.localHiddenEntries;
     localSubtitleEntries = previous.localSubtitleEntries;
     localHiddenSubtitleEntries = previous.localHiddenSubtitleEntries;
     final history = _history(media, locations, progress);
+    localDirectoryLatest = _localLatest(history);
     final seen = <String>{};
     recent = List.unmodifiable(
       history.where((record) => seen.add(seriesKeys[record.id]!)),
@@ -949,6 +1400,21 @@ class _SnapshotData {
       for (final entry in previous._ordering.entries)
         entry.key: entry.value.withRecent(playedAt[entry.key]),
     };
+  }
+
+  Map<String, SyncRecord> _localLatest(List<SyncRecord> history) {
+    final latest = <String, SyncRecord>{};
+    for (final record in history) {
+      var path = _localParentByMedia[record.id];
+      while (path != null) {
+        final directory = localDirectories[path]!;
+        if (directory.seriesKey != null) {
+          latest.putIfAbsent(path, () => localRecords[record.id] ?? record);
+        }
+        path = directory.parentPath;
+      }
+    }
+    return Map.unmodifiable(latest);
   }
 
   _SnapshotData withProgress(Iterable<SyncRecord> records) =>
@@ -1068,6 +1534,8 @@ class _SnapshotData {
     Map<String, String> sourceNames = const {},
     Map<String, dynamic> technicalFacts = const {},
     Set<String> externalSources = const {},
+    Object? Function(String)? readLocal,
+    Map<String, dynamic> manualMetadata = const {},
   }) {
     final media = List<SyncRecord>.unmodifiable(
       records
@@ -1083,6 +1551,7 @@ class _SnapshotData {
           entry.key.substring('location:'.length):
               _freeze(entry.value) as Map<String, dynamic>,
     });
+    final canonical = _LibrarySeriesIndex(media);
     return _SnapshotData._(
       media,
       _history(media, locations, progress),
@@ -1092,6 +1561,17 @@ class _SnapshotData {
       sourceNames,
       technicalFacts,
       externalSources,
+      readLocal == null
+          ? const {}
+          : _readLocalMetadataDonors(
+              media,
+              locations,
+              offlineLocations,
+              manualMetadata,
+              canonical,
+              readLocal,
+            ),
+      canonical,
     );
   }
 
@@ -1186,6 +1666,7 @@ class _SnapshotData {
       episodeKeys: episodeKeys,
       episodeVersions: episodeVersions,
       playbackOptions: playbackOptions,
+      localPlaybackOptionsById: localPlaybackOptionsById,
       episodes: episodes,
       representatives: representatives,
       latestBySeries: latestBySeries,
@@ -1195,6 +1676,7 @@ class _SnapshotData {
       localEntries: localEntries,
       localRecords: localRecords,
       localDirectories: localDirectories,
+      localDirectoryLatest: localDirectoryLatest,
       localHiddenEntries: localHiddenEntries,
       localSubtitleEntries: localSubtitleEntries,
       localHiddenSubtitleEntries: localHiddenSubtitleEntries,

@@ -8,7 +8,6 @@ import '../sources/source.dart';
 import 'glass.dart';
 import 'media_artwork.dart';
 import 'media_details_header.dart';
-import 'media_source_selection.dart';
 import 'theme/library_styles.dart';
 
 /// The complete details introduction used by library sheets and source folders.
@@ -18,6 +17,7 @@ class MediaDetailsOverview extends StatelessWidget {
   final MediaCollectionDetails details;
   final List<SyncRecord> records;
   final SyncRecord? latest;
+  final String? latestLabel;
   final ValueChanged<SyncRecord> onPlay;
   final VoidCallback? onMatch;
   final VoidCallback onSort;
@@ -30,6 +30,7 @@ class MediaDetailsOverview extends StatelessWidget {
     required this.details,
     required this.records,
     required this.latest,
+    this.latestLabel,
     required this.onPlay,
     required this.onSort,
     this.onMatch,
@@ -48,7 +49,12 @@ class MediaDetailsOverview extends StatelessWidget {
         onMatch: onMatch,
         availabilityLabel: availabilityLabel,
       ),
-      MediaDetailsContinue(model: model, latest: latest, onPlay: onPlay),
+      MediaDetailsContinue(
+        model: model,
+        latest: latest,
+        label: latestLabel,
+        onPlay: onPlay,
+      ),
       MediaDetailsPlaylistHeader(onSort: onSort, onDownload: onDownload),
     ],
   );
@@ -57,12 +63,14 @@ class MediaDetailsOverview extends StatelessWidget {
 class MediaDetailsContinue extends StatelessWidget {
   final AppModel model;
   final SyncRecord? latest;
+  final String? label;
   final ValueChanged<SyncRecord> onPlay;
 
   const MediaDetailsContinue({
     super.key,
     required this.model,
     required this.latest,
+    this.label,
     required this.onPlay,
   });
 
@@ -70,7 +78,7 @@ class MediaDetailsContinue extends StatelessWidget {
   Widget build(BuildContext context) {
     final item = latest;
     if (item == null) return const SizedBox.shrink();
-    final label = model.episodeLabel(item);
+    final label = this.label ?? model.episodeLabel(item);
     return FilledButton.icon(
       key: const ValueKey('series-continue'),
       onPressed: () => onPlay(item),
@@ -151,10 +159,19 @@ typedef _EpisodeView = ({
   double fraction,
 });
 
-class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
-  late _EpisodeView _view;
+class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile>
+    with WidgetsBindingObserver {
+  _EpisodeView _view = (
+    title: '',
+    technical: '',
+    progress: '',
+    thumbnail: null,
+    watched: false,
+    fraction: 0,
+  );
   Object? _revision;
-  bool _active = true, _dirty = false;
+  bool _routeActive = true, _foreground = true, _dirty = false;
+  bool get _active => _routeActive && _foreground;
   AppModel get model => widget.model;
   SyncRecord get item => widget.item;
 
@@ -172,14 +189,21 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
   @override
   void initState() {
     super.initState();
-    _refresh();
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    if (_foreground) {
+      _refresh();
+    } else {
+      _dirty = true;
+    }
     model.addListener(_modelChanged);
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _active =
+    _routeActive =
         TickerMode.valuesOf(context).enabled &&
         (ModalRoute.isCurrentOf(context) ?? true);
     if (_active && _dirty) _refresh();
@@ -191,6 +215,10 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
     if (oldWidget.model != model) {
       oldWidget.model.removeListener(_modelChanged);
       model.addListener(_modelChanged);
+    }
+    if (!_active) {
+      _dirty = true;
+      return;
     }
     if (oldWidget.model != model ||
         oldWidget.item != item ||
@@ -208,11 +236,22 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
   }
 
   void _modelChanged() {
-    if (_revision == _currentRevision) return;
     if (!_active) {
       _dirty = true;
       return;
     }
+    if (_revision == _currentRevision) return;
+    final previous = _view;
+    _refresh();
+    if (previous != _view) setState(() {});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final foreground = state == AppLifecycleState.resumed;
+    if (_foreground == foreground) return;
+    _foreground = foreground;
+    if (!_active || !_dirty) return;
     final previous = _view;
     _refresh();
     if (previous != _view) setState(() {});
@@ -255,6 +294,7 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
   }
 
   Future<void> _requestPreview() async {
+    if (!mounted || !_active) return;
     final source = widget.sourceId, entry = widget.sourceEntry;
     if (source != null && entry != null) {
       final currentModel = model;
@@ -275,6 +315,7 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     model.removeListener(_modelChanged);
     super.dispose();
   }
@@ -355,18 +396,14 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
     );
   }
 
-  Widget _episodeProgress(BuildContext context) {
+  Widget? _episodeProgress(BuildContext context) {
     final label = _view.progress, technical = _view.technical;
+    if (label.isEmpty && technical.isEmpty) return null;
     return Padding(
       padding: const EdgeInsets.only(top: 3),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          MediaSourceBadge(
-            model: model,
-            item: widget.item,
-            sourceId: widget.sourceId,
-          ),
           if (technical.isNotEmpty)
             Text(
               technical,

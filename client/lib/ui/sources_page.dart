@@ -416,6 +416,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       _localSubtitleEntries = 0,
       _localHiddenSubtitleEntries = 0;
   CancelToken? _localSnapshotCancel;
+  CancelToken? _localSourceSelectionCancel;
   Completer<void>? _localSnapshotDone;
   bool _foreground = true, _visible = true;
   Object? _renderedRevision;
@@ -435,6 +436,9 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
             model.store.recordsRevision('progress'),
             model.store.localPrefixRevision('preview:'),
             model.store.localPrefixRevision('mediaMetadata:'),
+            model.store.localPrefixRevision('technical:'),
+            model.store.localPrefixRevision('externalSource:'),
+            model.libraryLocalMetadataRevision,
             model.store.localPrefixRevision('episodeTitle:'),
             model.store.localPrefixRevision('media-title-display:'),
             model.store.localPrefixRevision('directorySort:'),
@@ -464,6 +468,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       widget.controller?.addListener(_showRoot);
     }
     if (oldWidget.model != widget.model) {
+      _localSourceSelectionCancel?.cancel();
       _localFolderDeleteCancel?.cancel();
       _localFolderDeleteCancel = null;
       _localFolderDeleting = null;
@@ -489,6 +494,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       oldWidget.model.removeListener(_refreshRoot);
       widget.model.addListener(_refreshRoot);
     }
+    if (!widget.active) _localSourceSelectionCancel?.cancel();
     _syncLocalSearch();
     if (localOpen && _localSearch.active) _prepareLocal();
   }
@@ -516,6 +522,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _foreground = state == AppLifecycleState.resumed;
+    if (!_foreground) _localSourceSelectionCancel?.cancel();
     _syncLocalSearch();
     if (_foreground) _refreshRoot();
   }
@@ -535,6 +542,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   }
 
   void _openSource(Map<String, dynamic> source, {SourceFavorite? favorite}) {
+    _localSourceSelectionCancel?.cancel();
     _localSearch.dismiss();
     NavigationRevealNotification.reveal(context);
     setState(() {
@@ -568,6 +576,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   String get _localPath => _localPaths.last;
 
   void _rememberLocalQuery() {
+    _localSourceSelectionCancel?.cancel();
     if (_localScroll.hasClients && !_localPendingScroll) {
       _localOffsets[_localPath] = _localScroll.offset;
     }
@@ -651,8 +660,12 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     model.store,
     model.downloads.completedRevision,
     model.store.recordsRevision('media'),
+    model.store.recordsRevision('progress'),
     model.store.locationRevision,
     model.store.localKeyRevision('sources'),
+    model.store.localPrefixRevision('technical:'),
+    model.store.localPrefixRevision('externalSource:'),
+    model.libraryLocalMetadataRevision,
   );
 
   Future<void> _loadLocalSnapshot() async {
@@ -725,12 +738,17 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     // Root searches retain their existing all-local-video scope. Browsing reads
     // the worker's immediate children, including for a single downloaded file.
     final searchingAll = _localPath.isEmpty && _localSearch.query.isNotEmpty;
+    final collection = directory?.details != null;
     _localSearch.update(
       searchingAll || directory == null
           ? _localEntriesSnapshot
+          : collection
+          ? directory.collectionEntries
           : directory.entries,
       records: searchingAll || directory == null
           ? _localRecords
+          : collection
+          ? directory.collectionRecordsByPath
           : directory.records,
       order: model.directorySorting('directorySort:local:imports'),
       hideHiddenFiles: model.preferences.hideHiddenFiles,
@@ -781,6 +799,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     widget.controller?.removeListener(_showRoot);
     widget.model.removeListener(_refreshRoot);
     _localSnapshotCancel?.cancel();
+    _localSourceSelectionCancel?.cancel();
     _localFolderDeleteCancel?.cancel();
     _localSearch.dispose();
     _localSorter.close();
@@ -1123,6 +1142,12 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (_hasLocalPlaybackAlternatives(item))
+              ListTile(
+                leading: const Icon(Icons.video_library_outlined),
+                title: const Text('切换版本与来源'),
+                onTap: () => Navigator.pop(context, 'source'),
+              ),
             ListTile(
               leading: const Icon(Icons.movie_outlined),
               title: const Text('影视详情'),
@@ -1159,6 +1184,10 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   Future<void> _runLocalAction(SyncRecord item, String action) async {
     if (!mounted) return;
     _localSearch.dismiss();
+    if (action == 'source') {
+      await _chooseLocalPlaybackSource(item);
+      return;
+    }
     if (action == 'delete') {
       await _deleteLocalVideo(item);
       return;
@@ -1188,32 +1217,39 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       onSelected: (action) {
         if (identical(model, owner)) unawaited(_runLocalAction(item, action));
       },
-      itemBuilder: (_) => const [
-        PopupMenuItem(
+      itemBuilder: (_) => [
+        if (_hasLocalPlaybackAlternatives(item))
+          const PopupMenuItem(
+            height: GlassMetrics.menuItemHeight,
+            padding: GlassMetrics.menuItemPadding,
+            value: 'source',
+            child: Text('切换版本与来源'),
+          ),
+        const PopupMenuItem(
           height: GlassMetrics.menuItemHeight,
           padding: GlassMetrics.menuItemPadding,
           value: 'details',
           child: Text('影视详情'),
         ),
-        PopupMenuItem(
+        const PopupMenuItem(
           height: GlassMetrics.menuItemHeight,
           padding: GlassMetrics.menuItemPadding,
           value: 'file-details',
           child: Text('查看文件详情'),
         ),
-        PopupMenuItem(
+        const PopupMenuItem(
           height: GlassMetrics.menuItemHeight,
           padding: GlassMetrics.menuItemPadding,
           value: 'auto',
           child: Text('重新识别影视资料'),
         ),
-        PopupMenuItem(
+        const PopupMenuItem(
           height: GlassMetrics.menuItemHeight,
           padding: GlassMetrics.menuItemPadding,
           value: 'search',
           child: Text('手动搜索影视资料'),
         ),
-        PopupMenuItem(
+        const PopupMenuItem(
           height: GlassMetrics.menuItemHeight,
           padding: GlassMetrics.menuItemPadding,
           value: 'delete',
@@ -1221,6 +1257,92 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
         ),
       ],
     );
+  }
+
+  bool _hasLocalPlaybackAlternatives(SyncRecord item) =>
+      (_knownFolderIndex.snapshot?.playbackOptionsFor(item).length ?? 0) > 1;
+
+  String _localEpisodeLabel(SyncRecord item) {
+    // Cached directory facts may not be written onto the media record. Keep
+    // those episode facts while honoring per-file overrides and translations.
+    final current = model.store.get('media', item.id) ?? item;
+    return mediaEpisodeLabel(
+      item,
+      episodeTitle: model.titleTranslations.display(
+        mediaSeriesKey(current),
+        model.originalEpisodeTitle(item),
+      ),
+    );
+  }
+
+  String _localEpisodeTitle(SyncRecord item) {
+    final label = _localEpisodeLabel(item);
+    return label.isNotEmpty
+        ? label
+        : model.titleTranslations.display(
+            mediaSeriesKey(item),
+            mediaSeriesName(item),
+          );
+  }
+
+  Future<void> _chooseLocalPlaybackSource(SyncRecord item) async {
+    if (!mounted ||
+        !widget.active ||
+        !_foreground ||
+        !localOpen ||
+        opened != null) {
+      return;
+    }
+    _localSourceSelectionCancel?.cancel();
+    final token = _localSourceSelectionCancel = CancelToken();
+    final owner = model, path = _localPath;
+    bool current() =>
+        mounted &&
+        identical(owner, model) &&
+        widget.active &&
+        _foreground &&
+        localOpen &&
+        opened == null &&
+        path == _localPath &&
+        !token.cancelled &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
+    try {
+      final choice = await showMediaSourceSelection(
+        context,
+        model: owner,
+        item: item,
+        cancel: token,
+      );
+      if (choice == null || !current()) return;
+      if (widget.onPlaySource case final play?) {
+        await play(choice);
+      } else {
+        await PlayerPage.waitForDisposals();
+        if (!mounted || !current()) return;
+        await Navigator.push(
+          context,
+          PageRouteBuilder(
+            transitionDuration: Duration.zero,
+            reverseTransitionDuration: Duration.zero,
+            pageBuilder: (_, _, _) => PlayerPage(
+              model: owner,
+              media: choice.media,
+              sourcePreference: choice.preference,
+              expectedBinding: choice.expectedBinding,
+            ),
+          ),
+        );
+      }
+    } catch (failure) {
+      if (mounted && current()) {
+        await _sourceFailure(context, failure, '打开视频失败');
+      }
+    } finally {
+      token.cancel();
+      if (identical(_localSourceSelectionCancel, token)) {
+        _localSourceSelectionCancel = null;
+      }
+    }
   }
 
   Future<void> _deleteLocalVideo(SyncRecord item) async {
@@ -1413,6 +1535,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   Widget _local() {
     final media = _localSearch.results;
     final directory = _localDirectories[_localPath];
+    final details = directory?.details;
+    final latest = _knownFolderIndex.snapshot?.localDirectoryLatest[_localPath];
     return RefreshIndicator(
       onRefresh: _refreshSources,
       child: _ContentList(
@@ -1429,6 +1553,13 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
               key: ValueKey('local-folder:${entry.path}'),
               title: _localDirectoryName(folder),
               subtitle: '',
+              leading: folder.anchor == null
+                  ? null
+                  : _localArtwork(
+                      folder.anchor!,
+                      poster: folder.details?.poster,
+                      directory: true,
+                    ),
               onTap: () => _openLocalDirectory(entry.path),
               trailing: _localDirectoryMenu(folder),
               onLongPress: () => _deleteLocalDirectory(folder),
@@ -1436,6 +1567,21 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
           }
           final item = _localSearch.resultRecords[entry.path];
           if (item == null) return const SizedBox.shrink();
+          if (details != null && isVideo(entry.name)) {
+            return MediaDetailsEpisodeTile(
+              key: ValueKey('local-video:${item.id}'),
+              model: model,
+              item: item,
+              title: _localEpisodeTitle(item),
+              showTechnical: directory!.episodes.length != 1,
+              onPlay: () {
+                _localSearch.dismiss();
+                widget.onPlay(item);
+              },
+              onLongPress: () => _localMetadataOptions(item),
+              trailing: _localVideoMenu(item),
+            );
+          }
           final progress = playbackProgressLabel(model.progressFor(item));
           final technical = MediaTechnicalInfo.forRecord(
             model.store,
@@ -1475,11 +1621,12 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
                 onPressed: _localSearch.toggle,
                 icon: const Icon(Icons.search_rounded, size: 21),
               ),
-              IconButton(
-                tooltip: '排序与显示',
-                onPressed: _sortLocal,
-                icon: const Icon(Icons.sort_rounded, size: 21),
-              ),
+              if (details == null)
+                IconButton(
+                  tooltip: '排序与显示',
+                  onPressed: _sortLocal,
+                  icon: const Icon(Icons.sort_rounded, size: 21),
+                ),
               IconButton(
                 tooltip: '导入视频',
                 onPressed: widget.onImport,
@@ -1538,6 +1685,26 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
             ),
           ],
           const SizedBox(height: 8),
+          if (details != null)
+            MediaDetailsOverview(
+              key: ValueKey('local-collection:$_localPath'),
+              model: model,
+              details: details,
+              records: directory!.collectionRecords,
+              latest: latest,
+              latestLabel: latest == null ? null : _localEpisodeLabel(latest),
+              onPlay: (item) {
+                _localSearch.dismiss();
+                widget.onPlay(item);
+              },
+              onSort: _sortLocal,
+              onMatch: () => _matchSourceRecords(
+                context,
+                model,
+                directory.collectionRecords,
+                automatic: false,
+              ),
+            ),
           if (media.isEmpty)
             _EmptyFolder(
               text: _localSearch.query.isEmpty ? '还没有本地视频' : '没有匹配的视频',
@@ -1554,17 +1721,21 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _localArtwork(SyncRecord media) {
-    final poster = media.data['poster'] as String? ?? '';
+  Widget _localArtwork(
+    SyncRecord media, {
+    String? poster,
+    bool directory = false,
+  }) {
+    poster ??= media.data['poster'] as String? ?? '';
     final path = model.thumbnailPath(media.id);
-    Widget fallback() => const Center(child: _FolderIcon(video: true));
+    Widget fallback() => Center(child: _FolderIcon(video: !directory));
     final artwork = MediaArtwork(
       poster: poster,
       cache: model.posterCache,
       thumbnail: path,
       loadWhileScrolling: true,
       placeholder: fallback(),
-      onRequestPreview: poster.isEmpty
+      onRequestPreview: poster.isEmpty && !directory
           ? () => model.ensureMediaPreview(media.id)
           : null,
     );

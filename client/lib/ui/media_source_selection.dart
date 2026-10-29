@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
-import '../data/offline_downloads.dart';
 import '../data/playback_source.dart';
 import '../data/store.dart';
 import 'glass.dart';
@@ -61,13 +60,6 @@ class _SourceLabels {
 
 _SourceLabel _label(AppModel model, String source) =>
     (_sourceLabels[model] ??= _SourceLabels()).read(model, source);
-
-bool _matches(OfflineDownload? download, Map? location) =>
-    download?.isComplete == true &&
-    (location == null ||
-        (download!.sourceId == location['source'] &&
-            download.remotePath == location['path'] &&
-            download.bindingRevision == (location['previewRevision'] ?? '')));
 
 /// Snapshot preparation and completed membership suffice for this picker.
 /// File validation happens on the download worker when playback is requested.
@@ -203,161 +195,4 @@ Future<MediaPlaybackChoice?> showMediaSourceSelection(
     }
     return null;
   }
-}
-
-/// A compact, event-driven indication of the default playback source.
-class MediaSourceBadge extends StatefulWidget {
-  final AppModel model;
-  final SyncRecord item;
-  final String? sourceId;
-  const MediaSourceBadge({
-    super.key,
-    required this.model,
-    required this.item,
-    this.sourceId,
-  });
-
-  @override
-  State<MediaSourceBadge> createState() => _MediaSourceBadgeState();
-}
-
-class _MediaSourceBadgeState extends State<MediaSourceBadge>
-    with WidgetsBindingObserver {
-  Object? _revision;
-  late _SourceLabel _value;
-  int _completed = -1;
-  bool _visible = true, _foreground = true, _dirty = false;
-  bool get _active => _visible && _foreground;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    final state = WidgetsBinding.instance.lifecycleState;
-    _foreground = state == null || state == AppLifecycleState.resumed;
-    _listen();
-    _refresh();
-  }
-
-  void _listen() {
-    widget.model.addListener(_changed);
-    widget.model.downloads.addListener(_downloadsChanged);
-  }
-
-  void _downloadsChanged() {
-    if (_completed == widget.model.downloads.completedRevision) return;
-    _changed();
-  }
-
-  void _refresh() {
-    final model = widget.model;
-    _completed = model.downloads.completedRevision;
-    _revision = (
-      _completed,
-      model.store.localKeyRevision('location:${widget.item.id}'),
-      model.store.localKeyRevision('sources'),
-      model.store.localPrefixRevision('externalSource:'),
-    );
-    final location = model.store.local('location:${widget.item.id}');
-    _value =
-        _matches(
-          model.downloads.entryFor(widget.item.id),
-          location is Map ? location : null,
-        )
-        ? (text: '本地 · 已下载', icon: Icons.download_done_rounded)
-        : _label(
-            model,
-            '${(location is Map ? location['source'] : widget.sourceId) ?? ''}',
-          );
-    _dirty = false;
-  }
-
-  void _changed() {
-    if (!_active) {
-      _dirty = true;
-      return;
-    }
-    final model = widget.model;
-    final next = (
-      model.downloads.completedRevision,
-      model.store.localKeyRevision('location:${widget.item.id}'),
-      model.store.localKeyRevision('sources'),
-      model.store.localPrefixRevision('externalSource:'),
-    );
-    if (_revision == next && !_dirty) return;
-    final previous = _value;
-    _refresh();
-    if (previous != _value) setState(() {});
-  }
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    _visible =
-        TickerMode.valuesOf(context).enabled &&
-        (ModalRoute.isCurrentOf(context) ?? true);
-    if (_active && _dirty) _refresh();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    _foreground = state == AppLifecycleState.resumed;
-    if (_active && _dirty) _changed();
-  }
-
-  @override
-  void didUpdateWidget(MediaSourceBadge oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.model != widget.model) {
-      oldWidget.model.removeListener(_changed);
-      oldWidget.model.downloads.removeListener(_downloadsChanged);
-      _listen();
-    }
-    if (oldWidget.model != widget.model ||
-        oldWidget.item.id != widget.item.id ||
-        oldWidget.sourceId != widget.sourceId) {
-      if (_active) {
-        _refresh();
-      } else {
-        _dirty = true;
-      }
-    }
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    widget.model.removeListener(_changed);
-    widget.model.downloads.removeListener(_downloadsChanged);
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) => Tooltip(
-    message: _value.text,
-    child: Container(
-      key: ValueKey('media-source-badge:${widget.item.id}'),
-      constraints: const BoxConstraints(maxWidth: 150),
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: GlassPalette.of(context).field,
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(_value.icon, size: 12),
-          const SizedBox(width: 4),
-          Flexible(
-            child: Text(
-              _value.text,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: AppStyles.of(context).micro,
-            ),
-          ),
-        ],
-      ),
-    ),
-  );
 }
