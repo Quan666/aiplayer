@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../data/poster_cache.dart';
+import '../data/poster_url.dart';
 import 'media_artwork.dart';
 
 Future<void> showMediaPosterViewer(
@@ -33,7 +34,19 @@ class _PosterViewer extends StatefulWidget {
 
 class _PosterViewerState extends State<_PosterViewer> {
   final _transform = TransformationController();
+  late final _originalPoster = originalPosterUrl(widget.poster);
   Offset _doubleTapPosition = Offset.zero;
+  double _decodeScale = 1;
+
+  void _updateDecodeScale() {
+    // Keep the sharpest requested texture when zooming back out. Integer
+    // magnification buckets bound variants and avoid work during the gesture.
+    final scale = _transform.value
+        .getMaxScaleOnAxis()
+        .clamp(1.0, 5.0)
+        .ceilToDouble();
+    if (scale > _decodeScale) setState(() => _decodeScale = scale);
+  }
 
   void _toggleZoom() {
     if (_transform.value.getMaxScaleOnAxis() > 1.01) {
@@ -47,6 +60,7 @@ class _PosterViewerState extends State<_PosterViewer> {
         _doubleTapPosition.dy * (1 - scale),
         0,
       );
+    _updateDecodeScale();
   }
 
   @override
@@ -81,19 +95,24 @@ class _PosterViewerState extends State<_PosterViewer> {
                     transformationController: _transform,
                     minScale: 1,
                     maxScale: 5,
+                    onInteractionEnd: (_) => _updateDecodeScale(),
                     child: SizedBox.expand(
                       child: MediaArtwork(
                         cache: widget.cache,
-                        poster: widget.poster,
+                        poster: _originalPoster,
                         fit: BoxFit.contain,
-                        maxDecodeEdge: 2048,
-                        placeholder: const Center(
-                          child: Icon(
-                            Icons.image_outlined,
-                            color: Colors.white54,
-                            size: 48,
-                          ),
-                        ),
+                        maxDecodeEdge: 4096,
+                        decodeScale: _decodeScale,
+                        loadWhileScrolling: true,
+                        placeholder: _originalPoster == widget.poster
+                            ? _placeholder
+                            : MediaArtwork(
+                                cache: widget.cache,
+                                poster: widget.poster,
+                                fit: BoxFit.contain,
+                                loadWhileScrolling: true,
+                                placeholder: _placeholder,
+                              ),
                       ),
                     ),
                   ),
@@ -116,3 +135,7 @@ class _PosterViewerState extends State<_PosterViewer> {
     ),
   );
 }
+
+const _placeholder = Center(
+  child: Icon(Icons.image_outlined, color: Colors.white54, size: 48),
+);

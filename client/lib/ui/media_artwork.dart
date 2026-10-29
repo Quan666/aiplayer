@@ -17,7 +17,7 @@ import 'theme/library_styles.dart';
 int _artworkLayoutGeneration = 0;
 bool _tracksArtworkLayout = false;
 
-/// Decode only a cover-sized image; scrolling never loads a full-resolution poster.
+/// Decode artwork to its displayed size, with a bounded physical pixel budget.
 class MediaArtwork extends StatefulWidget {
   final String poster;
   final String? thumbnail;
@@ -28,6 +28,10 @@ class MediaArtwork extends StatefulWidget {
   /// Bounds decoding in physical pixels. Fullscreen viewers can opt into a
   /// larger image while their first frame reuses the already visible cover.
   final int maxDecodeEdge;
+
+  /// Additional display magnification for a zoomable viewer. Update after a
+  /// gesture settles, so panning/pinching does not repeatedly start decodes.
+  final double decodeScale;
 
   /// Keep visible wall posters progressing during scrolling, with bounded
   /// native decoding. Video capture previews still wait for the region to idle.
@@ -55,13 +59,15 @@ class MediaArtwork extends StatefulWidget {
     this.placeholder,
     this.fit = BoxFit.cover,
     this.maxDecodeEdge = 640,
+    this.decodeScale = 1,
     this.loadWhileScrolling = false,
     this.onRequestPreview,
     this.tryRequestPreview,
     this.previewCapacity,
     this.onVisibleIdle,
     this.visibleIdleRevision,
-  }) : assert(maxDecodeEdge >= 64);
+  }) : assert(maxDecodeEdge >= 64),
+       assert(decodeScale >= 1 && decodeScale < double.infinity);
   @override
   State<MediaArtwork> createState() => _MediaArtworkState();
 }
@@ -329,7 +335,13 @@ class _MediaArtworkState extends State<MediaArtwork> {
       }
       ancestor = ancestor.parent;
     }
-    final bounds = box.localToGlobal(Offset.zero) & box.size;
+    // A zoomed poster can move its local origin outside the viewport while
+    // its scaled image remains visible. Transform the full rectangle before
+    // deciding whether its higher-resolution decode may start.
+    final bounds = MatrixUtils.transformRect(
+      box.getTransformTo(null),
+      Offset.zero & box.size,
+    );
     // Retained sliver children have no paint transform while offscreen.
     // NaN rectangles can pass overlaps(), so reject them before prioritizing.
     if (!bounds.isFinite) return -1;
@@ -740,10 +752,11 @@ class _MediaArtworkState extends State<MediaArtwork> {
                     ? constraints.biggest.longestSide
                     : constraints.maxWidth
               : widget.maxDecodeEdge / pixelRatio;
-          final decodeWidth = ((edge * pixelRatio / 64).ceil() * 64).clamp(
-            64,
-            widget.maxDecodeEdge,
-          );
+          final decodeWidth =
+              ((edge * pixelRatio * widget.decodeScale / 64).ceil() * 64).clamp(
+                64,
+                widget.maxDecodeEdge,
+              );
           return poster.isNotEmpty
               ? FutureBuilder<File?>(
                   // The repaired file keeps its path. Replace the failed
