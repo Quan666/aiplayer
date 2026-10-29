@@ -49,6 +49,8 @@ class _OfflineWorker {
   final running = <String, _DownloadAttempt>{};
   final configurations = <int, Completer<Map<String, dynamic>?>>{};
   final deleting = <String>{};
+  final removalPlans = <String, _LocalRemovalPlan>{};
+  final operations = <int, CancelToken>{};
   Database? db;
   AppStore? store;
   bool active, closing = false;
@@ -131,11 +133,21 @@ class _OfflineWorker {
             );
       } else if (message[0] == 'active') {
         _setActive(message[2] as bool);
+      } else if (message[0] == 'cancelOperation') {
+        operations[message[1]]?.cancel();
       } else if (message[0] == 'close') {
         closing = true;
+        for (final token in operations.values) {
+          token.cancel();
+        }
+        removalPlans.clear();
         _setActive(false);
         unawaited(_close());
       } else {
+        if (message[0] == 'prepareLocalDirectoryRemoval' ||
+            message[0] == 'deleteLocalDirectory') {
+          operations[message[1] as int] = CancelToken();
+        }
         // User mutations are serialized; lifecycle signals bypass this queue.
         writes = writes.then((_) => _command(message));
       }
@@ -171,6 +183,7 @@ class _OfflineWorker {
         'CREATE TABLE IF NOT EXISTS download_folder_files('
         'task TEXT NOT NULL,path TEXT NOT NULL,name TEXT NOT NULL,size INTEGER NOT NULL,'
         'modified INTEGER NOT NULL,expected_id TEXT,expected_revision TEXT,'
+        'expected_deleted INTEGER,expected_record_revision INTEGER,'
         'PRIMARY KEY(task,path))',
       );
       final folderColumns = database
@@ -178,10 +191,15 @@ class _OfflineWorker {
           .map((row) => row['name'])
           .toSet();
       var migratedFolderGuards = false;
-      for (final column in ['expected_id', 'expected_revision']) {
-        if (!folderColumns.contains(column)) {
+      for (final column in const {
+        'expected_id': 'TEXT',
+        'expected_revision': 'TEXT',
+        'expected_deleted': 'INTEGER',
+        'expected_record_revision': 'INTEGER',
+      }.entries) {
+        if (!folderColumns.contains(column.key)) {
           database.execute(
-            'ALTER TABLE download_folder_files ADD COLUMN $column TEXT',
+            'ALTER TABLE download_folder_files ADD COLUMN ${column.key} ${column.value}',
           );
           migratedFolderGuards = true;
         }
@@ -241,6 +259,19 @@ class _OfflineWorker {
       dynamic result;
       final payload = message[2];
       switch (message[0]) {
+        case 'prepareLocalDirectoryRemoval':
+          result = await _prepareLocalDirectoryRemoval(
+            payload[0] as String,
+            payload[1] as String,
+            operations[request]!,
+          );
+        case 'deleteLocalDirectory':
+          result = await _deleteLocalDirectory(
+            payload as String,
+            operations[request]!,
+          );
+        case 'discardLocalDirectoryRemoval':
+          removalPlans.remove(payload as String);
         case 'enqueueFolder':
           await _enqueueFolder(Map<String, dynamic>.from(payload as Map));
         case 'enqueue':
@@ -343,7 +374,13 @@ class _OfflineWorker {
       }
       reply.send(['result', request, result]);
     } catch (error) {
-      reply.send(['error', request, _downloadError(error)]);
+      reply.send(
+        error is Cancelled
+            ? ['cancelled', request]
+            : ['error', request, _downloadError(error)],
+      );
+    } finally {
+      operations.remove(request);
     }
   }
 
@@ -500,6 +537,8 @@ class _OfflineWorker {
           remote,
           row['name'] as String,
           configuration,
+          downloadRoot: row['downloadRoot'] as String?,
+          downloadRelativePath: row['downloadRelativePath'] as String?,
         );
         if (rows.values.any(
           (other) =>
@@ -962,8 +1001,21 @@ String _downloadPath(
   String sourceId,
   String remotePath,
   String name,
-  Map<String, dynamic> configuration,
-) {
+  Map<String, dynamic> configuration, {
+  String? downloadRoot,
+  String? downloadRelativePath,
+}) {
+  if (downloadRoot != null && downloadRelativePath != null) {
+    final namespace = sha256
+        .convert(utf8.encode(jsonEncode([sourceId, downloadRoot])))
+        .toString()
+        .substring(0, 20);
+    return p.joinAll([
+      root,
+      namespace,
+      ..._checkedSegments(downloadRelativePath).map(_safeSegment),
+    ]);
+  }
   var parts = _checkedSegments(remotePath);
   if (configuration['kind'] == 'webdav') {
     final base = Uri.parse(configuration['url'] as String);

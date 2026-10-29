@@ -15,26 +15,28 @@ bool sameLocalVideoBinding(Map? expected, dynamic current) => expected == null
           (current['previewRevision'] ?? '') ==
               (expected['previewRevision'] ?? '');
 
-/// Called only by the local-state worker in production. Binding validation,
+/// Called only by background workers in production. Binding validation,
 /// deletion and tombstones share a write transaction so a queued deletion cannot
 /// remove a replacement file or overwrite a later rebind.
 bool removeLocalVideo(
   AppStore store,
   String documentsPath,
   String id,
-  Map<String, dynamic> expected,
-) {
+  Map<String, dynamic> expected, {
+  bool Function()? guard,
+}) {
   var changed = false;
   store.transaction(() {
     final record = store.get('media', id);
     if (record == null || record.deleted) return;
     final location = store.local('location:$id');
     if (expected['source'] != 'local' ||
-        !sameLocalVideoBinding(expected, location)) {
+        !sameLocalVideoBinding(expected, location) ||
+        guard?.call() == false) {
       throw const Cancelled();
     }
     final path = location['path'] as String;
-    final owned = _managedFile(documentsPath, path);
+    final owned = managedLocalVideoFile(documentsPath, path);
     final size = location['size'] ?? record.data['size'] ?? 0;
     final excluded = sha256.convert(utf8.encode(jsonEncode(['local', path])));
     store.setLocal('automatic-import-excluded:$excluded', true);
@@ -87,7 +89,7 @@ bool removeLocalVideo(
   return changed;
 }
 
-File? _managedFile(String documentsPath, String path) {
+File? managedLocalVideoFile(String documentsPath, String path) {
   try {
     final root = Directory(p.join(documentsPath, 'media'));
     final file = File(path);

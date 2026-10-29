@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' show max;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
@@ -11,7 +12,7 @@ import '../data/app_model.dart';
 import '../data/continue_watching_presentation.dart';
 import '../data/store.dart';
 import '../data/media_presentation.dart';
-import '../data/media_technical_info.dart';
+import '../data/playback_source.dart';
 import '../data/poster_cache.dart';
 import '../data/library_snapshot.dart';
 import '../data/library_sort.dart';
@@ -28,11 +29,19 @@ import 'download_tasks_sheet.dart';
 import 'media_details_content.dart';
 import 'offline_download_controls.dart';
 import 'media_file_details.dart';
+import 'media_source_selection.dart';
 import 'search_header.dart';
 import 'navigation_reveal.dart';
 import 'device_icon.dart';
 import 'continue_watching_content.dart';
 import 'artwork_scroll_scope.dart';
+
+Object _mediaChoicesRevision(AppModel model) => (
+  model.store.localKeyRevision('sources'),
+  model.store.localPrefixRevision('externalSource:'),
+  model.store.localPrefixRevision('technical:'),
+  model.downloads.completedRevision,
+);
 
 void showFailure(BuildContext context, Object error) {
   final failure = safeFailure(error);
@@ -156,6 +165,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     model.store.recordsRevision('media'),
     model.store.recordsRevision('progress'),
     model.store.locationRevision,
+    _mediaChoicesRevision(model),
     query.toLowerCase(),
     query.trim().isEmpty ? null : model.librarySearchRevision,
     model.librarySorting,
@@ -215,6 +225,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     model.store.recordsRevision('media'),
     model.store.recordsRevision('progress'),
     model.store.locationRevision,
+    _mediaChoicesRevision(model),
     model.store.localPrefixRevision('preview:'),
     model.store.localPrefixRevision('mediaMetadata:'),
     model.store.localPrefixRevision('episodeTitle:'),
@@ -420,7 +431,12 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _play(SyncRecord record) async {
+  Future<void> _play(
+    SyncRecord record, {
+    PlaybackSourcePreference sourcePreference =
+        PlaybackSourcePreference.automatic,
+    Map<String, dynamic>? expectedBinding,
+  }) async {
     if (_openingPlayer) return;
     // Dismiss before any async preparation or association sheet can take focus.
     // The search controller also cancels a pending expansion focus request.
@@ -428,9 +444,21 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     FocusManager.instance.primaryFocus?.unfocus();
     _openingPlayer = true;
     try {
-      if (model.store.local('location:${record.id}') == null) {
-        await _associate(record);
-        return;
+      if (expectedBinding == null &&
+          sourcePreference != PlaybackSourcePreference.offline &&
+          model.store.local('location:${record.id}') == null &&
+          (sourcePreference == PlaybackSourcePreference.original ||
+              model.downloads.entryFor(record.id)?.isComplete != true)) {
+        final hasAlternative =
+            sourcePreference == PlaybackSourcePreference.automatic &&
+            (await model.loadLibrarySnapshot())
+                .playbackOptionsFor(record)
+                .isNotEmpty;
+        if (!mounted) return;
+        if (!hasAlternative) {
+          await _associate(record);
+          return;
+        }
       }
       await PlayerPage.waitForDisposals();
       if (!mounted) return;
@@ -438,7 +466,12 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         PageRouteBuilder(
           transitionDuration: Duration.zero,
           reverseTransitionDuration: Duration.zero,
-          pageBuilder: (_, _, _) => PlayerPage(model: model, media: record),
+          pageBuilder: (_, _, _) => PlayerPage(
+            model: model,
+            media: record,
+            sourcePreference: sourcePreference,
+            expectedBinding: expectedBinding,
+          ),
         ),
       );
       if (mounted) model.changed();
@@ -448,6 +481,12 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       _openingPlayer = false;
     }
   }
+
+  Future<void> _playSource(MediaPlaybackChoice choice) => _play(
+    choice.media,
+    sourcePreference: choice.preference,
+    expectedBinding: choice.expectedBinding,
+  );
 
   Future<void> _associate(SyncRecord record) async {
     _search.dismissFocus();
@@ -528,6 +567,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
             snapshot: snapshot,
             anchor: episodes.first,
             onPlay: _play,
+            onPlaySource: _playSource,
             onMatch: (items) {
               Navigator.pop(sheet);
               showMetadataMatchDialog(
@@ -1510,6 +1550,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         active: page == 1,
         onImport: _files,
         onPlay: _play,
+        onPlaySource: _playSource,
       );
     }
     final settingsKey = (model, page == 2);
@@ -2131,6 +2172,7 @@ Future<void> showLibraryMediaDetails(
   required LibrarySnapshot snapshot,
   required SyncRecord anchor,
   required ValueChanged<SyncRecord> onPlay,
+  ValueChanged<MediaPlaybackChoice>? onPlaySource,
   void Function(String, SyncRecord)? onAction,
 }) async {
   await showGlassBottomSheet<void>(
@@ -2141,6 +2183,7 @@ Future<void> showLibraryMediaDetails(
       snapshot: snapshot,
       anchor: anchor,
       onPlay: onPlay,
+      onPlaySource: onPlaySource,
       onMatch: (items) {
         Navigator.pop(sheet);
         showMetadataMatchDialog(
@@ -2161,6 +2204,7 @@ class _SeriesDetailsSheet extends StatefulWidget {
   final LibrarySnapshot snapshot;
   final SyncRecord anchor;
   final ValueChanged<SyncRecord> onPlay;
+  final ValueChanged<MediaPlaybackChoice>? onPlaySource;
   final ValueChanged<List<SyncRecord>> onMatch;
   final void Function(String, SyncRecord)? onAction;
   const _SeriesDetailsSheet({
@@ -2168,6 +2212,7 @@ class _SeriesDetailsSheet extends StatefulWidget {
     required this.snapshot,
     required this.anchor,
     required this.onPlay,
+    this.onPlaySource,
     required this.onMatch,
     required this.onAction,
   });
@@ -2195,7 +2240,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   CancelToken? _sourceRefreshCancel;
   bool get _canRefreshSource =>
       mounted && _routeCurrent && _foreground && !model.clearingCaches;
-  late (int, int) _recordsVersion;
+  late (int, int, int, int) _recordsVersion;
   late int _progressRevision;
   late int _episodeTitleRevision;
   late int _titleRevision;
@@ -2204,8 +2249,18 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   String get _currentSort =>
       model.directorySorting(_sortKey).toJson().toString();
   AppModel get model => widget.model;
-  (int, int) get _currentRecordsVersion =>
-      (model.store.recordsRevision('media'), model.store.locationRevision);
+  (int, int, int, int) get _currentRecordsVersion => (
+    model.store.recordsRevision('media'),
+    model.store.locationRevision,
+    max(
+      model.store.localPrefixRevision('technical:'),
+      max(
+        model.store.localKeyRevision('sources'),
+        model.store.localPrefixRevision('externalSource:'),
+      ),
+    ),
+    model.downloads.completedRevision,
+  );
   bool get _needsMetadataRefresh =>
       _snapshotNeedsRefresh ||
       _recordsVersion != _currentRecordsVersion ||
@@ -2243,34 +2298,32 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   }
 
   Future<void> _chooseVersion(SyncRecord item) async {
-    final versions = _snapshot.versionsFor(item);
-    final selected = await showGlassBottomSheet<SyncRecord>(
-      context: context,
-      builder: (context) => SafeArea(
-        child: ListView.builder(
-          shrinkWrap: true,
-          itemCount: versions.length,
-          itemBuilder: (context, index) {
-            final version = versions[index];
-            final location = model.store.local('location:${version.id}');
-            return ListTile(
-              title: Text(
-                '${version.data['fileName'] ?? version.data['title'] ?? model.displayTitle(version)}',
-              ),
-              subtitle: Text(
-                [
-                  MediaTechnicalInfo.forRecord(model.store, version).label,
-                  if (location is Map) '${location['path']}',
-                  playbackProgressLabel(model.progressFor(version)),
-                ].where((text) => text.isNotEmpty).join('\n'),
-              ),
-              onTap: () => Navigator.pop(context, version),
-            );
-          },
+    final selected = await showMediaSourceSelection(
+      context,
+      model: model,
+      item: item,
+      cancel: _cancel,
+    );
+    if (selected == null || !mounted) return;
+    if (widget.onPlaySource case final play?) {
+      play(selected);
+      return;
+    }
+    await PlayerPage.waitForDisposals();
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      PageRouteBuilder(
+        transitionDuration: Duration.zero,
+        reverseTransitionDuration: Duration.zero,
+        pageBuilder: (_, _, _) => PlayerPage(
+          model: model,
+          media: selected.media,
+          sourcePreference: selected.preference,
+          expectedBinding: selected.expectedBinding,
         ),
       ),
     );
-    if (selected != null && mounted) widget.onPlay(selected);
   }
 
   int? _cacheRevision;
@@ -2344,7 +2397,10 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
       final recordsChanged =
           recordsInvalidated &&
           records.isNotEmpty &&
-          (!_sameEpisodes(records) || version.$2 != _recordsVersion.$2);
+          (!_sameEpisodes(records) ||
+              version.$2 != _recordsVersion.$2 ||
+              version.$3 != _recordsVersion.$3 ||
+              version.$4 != _recordsVersion.$4);
       final sortingChanged = _sortFingerprint != _currentSort;
       final namesRevision = model.store.localPrefixRevision('episodeTitle:');
       final titlesChanged =
@@ -2548,7 +2604,9 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
       itemCount: _episodes.length + 1,
       itemBuilder: (_, index) {
         if (index == 0) return _header;
-        final item = _episodes[index - 1];
+        final episode = _episodes[index - 1];
+        final options = _snapshot.playbackOptionsFor(episode);
+        final item = options.firstOrNull?.media ?? episode;
         return MediaDetailsEpisodeTile(
           key: ValueKey('series-episode:${item.id}'),
           model: model,
@@ -2573,12 +2631,12 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
                 value: 'file-details',
                 child: Text('查看文件详情'),
               ),
-              if (_snapshot.versionsFor(item).length > 1)
+              if (options.length > 1)
                 const PopupMenuItem(
                   height: GlassMetrics.menuItemHeight,
                   padding: GlassMetrics.menuItemPadding,
                   value: 'versions',
-                  child: Text('选择视频版本'),
+                  child: Text('切换版本与来源'),
                 ),
               if (widget.onAction != null) ...[
                 const PopupMenuItem(
@@ -2653,6 +2711,7 @@ class _HistorySnapshotContentState extends State<_HistorySnapshotContent>
     widget.model.store.recordsRevision('media'),
     widget.model.store.recordsRevision('progress'),
     widget.model.store.locationRevision,
+    _mediaChoicesRevision(widget.model),
     widget.query.trim().toLowerCase(),
     widget.query.trim().isEmpty ? null : widget.model.librarySearchRevision,
   );

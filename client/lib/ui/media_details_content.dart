@@ -8,6 +8,7 @@ import '../sources/source.dart';
 import 'glass.dart';
 import 'media_artwork.dart';
 import 'media_details_header.dart';
+import 'media_source_selection.dart';
 import 'theme/library_styles.dart';
 
 /// The complete details introduction used by library sheets and source folders.
@@ -354,14 +355,18 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
     );
   }
 
-  Widget? _episodeProgress(BuildContext context) {
+  Widget _episodeProgress(BuildContext context) {
     final label = _view.progress, technical = _view.technical;
-    if (label.isEmpty && technical.isEmpty) return null;
     return Padding(
       padding: const EdgeInsets.only(top: 3),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          MediaSourceBadge(
+            model: model,
+            item: widget.item,
+            sourceId: widget.sourceId,
+          ),
           if (technical.isNotEmpty)
             Text(
               technical,

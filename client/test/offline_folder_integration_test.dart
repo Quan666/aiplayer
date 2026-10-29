@@ -198,10 +198,16 @@ void main() {
             (nested, second),
           ]) {
             final local = await model.playbackLocation(record);
+            final download = model.downloads.entryFor(record.id)!;
             expect(local?['source'], 'local');
             expect(
               local?['path'],
-              endsWith(p.joinAll(['share', ...remotePath.split('/')])),
+              endsWith(
+                p.joinAll(
+                  download.downloadRelativePath?.split('/') ??
+                      ['share', ...remotePath.split('/')],
+                ),
+              ),
             );
             expect(await File(local!['path'] as String).readAsBytes(), bytes);
             expect(store.local('location:${record.id}')['path'], remotePath);

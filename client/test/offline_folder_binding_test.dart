@@ -12,6 +12,145 @@ import 'package:path/path.dart' as p;
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  for (final retainBinding in [false, true]) {
+    test('explicit folder download restores videos removed before selection '
+        'with ${retainBinding ? 'retained' : 'cleared'} bindings', () async {
+      final fixture = await _Fixture.create();
+      try {
+        final location = fixture.store.local('location:known');
+        await fixture.model.removeMedia(fixture.store.get('media', 'known')!);
+        expect(fixture.store.get('media', 'known')?.deleted, isTrue);
+        expect(fixture.store.local('location:known'), isNull);
+        if (retainBinding) {
+          fixture.store.setLocal('location:known', location);
+        }
+
+        await fixture.start();
+        fixture.release();
+        await _completed(fixture.model.downloads, 2);
+
+        expect(
+          fixture.gets,
+          unorderedEquals([
+            '/share/${_Fixture.knownPath}',
+            '/share/${_Fixture.keepPath}',
+          ]),
+        );
+        final restored = fixture.model.sourceMedia('dav', _Fixture.knownPath);
+        expect(restored, isNotNull);
+        expect(restored!.deleted, isFalse);
+        expect(
+          fixture.model.downloads.entryFor(restored.id)?.isComplete,
+          isTrue,
+        );
+        expect(fixture.store.all('media'), hasLength(2));
+      } finally {
+        await fixture.close();
+      }
+    });
+  }
+
+  test(
+    'restarted folder scan restores videos removed before selection',
+    () async {
+      final fixture = await _Fixture.create();
+      try {
+        await fixture.model.removeMedia(fixture.store.get('media', 'known')!);
+        await fixture.start();
+        final scan = fixture.model.downloads.entries.values.single;
+        await fixture.model.downloads.pause(scan.mediaId);
+        expect(fixture.model.sourceMedia('dav', _Fixture.knownPath), isNull);
+        await fixture.restart();
+        expect(
+          fixture.model.downloads.entryFor(scan.mediaId)?.userPaused,
+          isTrue,
+        );
+        await fixture.model.downloads.resume(scan.mediaId);
+        fixture.release();
+        await _completed(fixture.model.downloads, 2);
+
+        expect(
+          fixture.gets,
+          unorderedEquals([
+            '/share/${_Fixture.knownPath}',
+            '/share/${_Fixture.keepPath}',
+          ]),
+        );
+        final restored = fixture.model.sourceMedia('dav', _Fixture.knownPath);
+        expect(restored, isNotNull);
+        expect(
+          fixture.model.downloads.entryFor(restored!.id)?.isComplete,
+          isTrue,
+        );
+        expect(fixture.store.all('media'), hasLength(2));
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  test(
+    'queued folder scan respects a deletion made before discovery',
+    () async {
+      final fixture = await _Fixture.create();
+      try {
+        fixture.model.downloads.setActive(false);
+        await fixture.enqueue();
+        expect(fixture.model.downloads.pausedCount, 1);
+        expect(fixture.heldStarted.isCompleted, isFalse);
+        await fixture.model.removeMedia(fixture.store.get('media', 'known')!);
+        fixture.model.downloads.setActive(true);
+        await fixture.heldStarted.future.timeout(const Duration(seconds: 10));
+        fixture.release();
+        await _completed(fixture.model.downloads, 1);
+
+        expect(fixture.gets, ['/share/${_Fixture.keepPath}']);
+        expect(fixture.model.sourceMedia('dav', _Fixture.knownPath), isNull);
+        expect(fixture.store.get('media', 'known')?.deleted, isTrue);
+        expect(fixture.store.all('media'), hasLength(1));
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  test(
+    'restarted scan does not restore a historically removed video deleted again',
+    () async {
+      final fixture = await _Fixture.create();
+      try {
+        await fixture.model.removeMedia(fixture.store.get('media', 'known')!);
+        await fixture.start();
+        final scan = fixture.model.downloads.entries.values.single;
+        await fixture.model.downloads.pause(scan.mediaId);
+        final restoredId = fixture.model.addMedia(
+          'dav',
+          const SourceEntry(
+            name: 'Show S01E01.mkv',
+            path: _Fixture.knownPath,
+            size: 4096,
+          ),
+        );
+        expect(fixture.store.get('media', restoredId)?.deleted, isFalse);
+        await fixture.model.removeMedia(
+          fixture.store.get('media', restoredId)!,
+        );
+        await fixture.restart();
+        await fixture.model.downloads.resume(scan.mediaId);
+        fixture.release();
+        await _completed(fixture.model.downloads, 1);
+
+        expect(fixture.gets, ['/share/${_Fixture.keepPath}']);
+        expect(fixture.model.sourceMedia('dav', _Fixture.knownPath), isNull);
+        expect(fixture.store.get('media', restoredId)?.deleted, isTrue);
+        expect(fixture.model.downloads.entryFor(restoredId), isNull);
+        expect(fixture.store.all('media'), hasLength(1));
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
   test(
     'restored folder scan never revives a video deleted after discovery',
     () async {
@@ -124,10 +263,20 @@ Future<void> _completed(OfflineDownloads downloads, int count) async {
       done.completeError(
         StateError('Unexpected download: ${downloads.entries.keys}'),
       );
-    } else if (downloads.completedCount == count &&
+    } else if (downloads.completedCount > 0 &&
         downloads.activeCount == 0 &&
         downloads.pausedCount == 0) {
-      done.complete();
+      if (downloads.completedCount == count) {
+        done.complete();
+      } else {
+        done.completeError(
+          StateError(
+            'Expected $count completed downloads, got '
+            '${downloads.completedCount}: '
+            '${downloads.entries.values.map((entry) => entry.remotePath).toList()}',
+          ),
+        );
+      }
     }
   }
 
@@ -199,10 +348,12 @@ class _Fixture {
     return _Fixture(directory, store, server);
   }
 
+  Future<void> enqueue() => model.downloadSourceEntries('dav', [
+    const SourceEntry(name: 'folder', path: 'folder/', directory: true),
+  ]);
+
   Future<void> start() async {
-    await model.downloadSourceEntries('dav', [
-      const SourceEntry(name: 'folder', path: 'folder/', directory: true),
-    ]);
+    await enqueue();
     await heldStarted.future.timeout(const Duration(seconds: 10));
   }
 

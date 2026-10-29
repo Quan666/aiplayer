@@ -303,10 +303,27 @@ void main() {
             ),
             findsOneWidget,
           );
-          expect(
-            find.byType(MediaDetailsEpisodeTile),
-            findsNWidgets(episodeCount),
+          final detailsList = tester.widget<ListView>(
+            find.byKey(const ValueKey('series-details-list')),
           );
+          expect(
+            detailsList.childrenDelegate.estimatedChildCount,
+            episodeCount + 1,
+          );
+          expect(
+            find.byType(MediaDetailsEpisodeTile).evaluate().length,
+            lessThanOrEqualTo(episodeCount),
+          );
+          if (episodeCount > 1) {
+            await tester.scrollUntilVisible(
+              find.byKey(ValueKey('series-episode:episode-$episodeCount')),
+              160,
+              scrollable: find.descendant(
+                of: find.byKey(const ValueKey('series-details-list')),
+                matching: find.byType(Scrollable),
+              ),
+            );
+          }
           expect(tester.takeException(), isNull);
           await tester.pumpWidget(const SizedBox());
         },
@@ -352,7 +369,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.text('选择视频版本'));
+      await tester.tap(find.text('切换版本与来源'));
       await tester.pumpAndSettle();
       expect(find.text('系列作品 S01E1.mkv'), findsOneWidget);
       expect(find.text('系列作品 S01E1.mp4'), findsOneWidget);

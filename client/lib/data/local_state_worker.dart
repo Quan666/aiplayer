@@ -5,6 +5,7 @@ import 'dart:isolate';
 import '../core/network.dart';
 import 'store.dart';
 import 'local_video_removal.dart';
+import 'media_technical_info.dart';
 
 /// Serializes local state on one connection outside the UI isolate.
 class LocalStateWorker {
@@ -133,6 +134,15 @@ class LocalStateWorker {
       await _call('deleteLocalVideo', [documentsPath, id, expected], cancel) ==
       true;
 
+  Future<Map<String, String>> readMediaTechnicalLabels(
+    List<String> ids, {
+    CancelToken? cancel,
+  }) async => Map<String, String>.unmodifiable(
+    Map<String, String>.from(
+      await _call('mediaTechnicalLabels', [ids], cancel),
+    ),
+  );
+
   /// Drain accepted checkpoints; optional browse work is cancelled on close.
   Future<void> close() {
     if (!_closing) {
@@ -172,46 +182,54 @@ void _localStateWorkerMain(List<Object?> startup) async {
       final cancel = cancellable[id];
       try {
         dynamic result;
-        await retryStoreBusy(() {
-          cancel?.check();
-          if (row[0] == 'deleteLocalVideo') {
-            result = removeLocalVideo(
-              store,
-              row[2] as String,
-              row[3] as String,
-              row[4] as Map<String, dynamic>,
-            );
-            return;
-          }
-          store.transaction(() {
+        if (row[0] == 'mediaTechnicalLabels') {
+          result = await _readMediaTechnicalLabels(
+            store,
+            (row[2] as List).cast<String>(),
+            cancel!,
+          );
+        } else {
+          await retryStoreBusy(() {
             cancel?.check();
-            if (row[0] == 'metadata') {
-              store.setLocal('metadata:pending-tasks', row[2]);
-            } else {
-              final mediaId = row[2] as String;
-              final source = row[3] as String;
-              final path = row[4] as String;
-              final size = row[5] as int;
-              final location = store.locationFor(source, path);
-              if (location != null &&
-                  store.get('media', location['id'])?.deleted == false) {
-                return;
-              }
-              store.setLocal('browse:$mediaId', {
-                'source': source,
-                'path': path,
-                'size': size,
-              });
-              final index = List<String>.from(
-                store.local('browse:index') ?? <String>[],
+            if (row[0] == 'deleteLocalVideo') {
+              result = removeLocalVideo(
+                store,
+                row[2] as String,
+                row[3] as String,
+                row[4] as Map<String, dynamic>,
               );
-              if (!index.contains(mediaId)) {
-                index.add(mediaId);
-                store.setLocal('browse:index', index);
-              }
+              return;
             }
+            store.transaction(() {
+              cancel?.check();
+              if (row[0] == 'metadata') {
+                store.setLocal('metadata:pending-tasks', row[2]);
+              } else {
+                final mediaId = row[2] as String;
+                final source = row[3] as String;
+                final path = row[4] as String;
+                final size = row[5] as int;
+                final location = store.locationFor(source, path);
+                if (location != null &&
+                    store.get('media', location['id'])?.deleted == false) {
+                  return;
+                }
+                store.setLocal('browse:$mediaId', {
+                  'source': source,
+                  'path': path,
+                  'size': size,
+                });
+                final index = List<String>.from(
+                  store.local('browse:index') ?? <String>[],
+                );
+                if (!index.contains(mediaId)) {
+                  index.add(mediaId);
+                  store.setLocal('browse:index', index);
+                }
+              }
+            });
           });
-        });
+        }
         reply.send(['result', id, result]);
       } catch (error) {
         reply.send([
@@ -239,7 +257,9 @@ void _localStateWorkerMain(List<Object?> startup) async {
     } else if (row[0] == 'cancel') {
       cancellable[row[1]]?.cancel();
     } else {
-      if (row[0] == 'browse' || row[0] == 'deleteLocalVideo') {
+      if (row[0] == 'browse' ||
+          row[0] == 'deleteLocalVideo' ||
+          row[0] == 'mediaTechnicalLabels') {
         cancellable[row[1] as int] = CancelToken();
       }
       queue.add(row);
@@ -247,4 +267,31 @@ void _localStateWorkerMain(List<Object?> startup) async {
     }
   });
   reply.send(commands.sendPort);
+}
+
+Future<Map<String, String>> _readMediaTechnicalLabels(
+  AppStore store,
+  List<String> ids,
+  CancelToken cancel,
+) async {
+  final labels = <String, String>{};
+  for (var offset = 0; offset < ids.length; offset += 32) {
+    await retryStoreBusy(() {
+      cancel.check();
+      final end = (offset + 32).clamp(0, ids.length);
+      for (var index = offset; index < end; index++) {
+        final id = ids[index];
+        if (labels.containsKey(id)) continue;
+        final record = store.get('media', id);
+        if (record != null && !record.deleted) {
+          labels[id] = MediaTechnicalInfo.forRecord(store, record).label;
+        }
+      }
+    });
+    // This is the state worker, not the UI isolate. Let its port receive
+    // cancellation between bounded read batches without opening more workers.
+    if (offset + 32 < ids.length) await Future<void>.delayed(Duration.zero);
+  }
+  cancel.check();
+  return labels;
 }

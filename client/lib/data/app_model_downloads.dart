@@ -131,15 +131,50 @@ extension AppModelDownloads on AppModel {
 
   /// Resolving the local copy precedes credentials, network stat and bridges.
   /// The remote binding stays intact for fallback and shared progress keys.
-  Future<Map<String, dynamic>?> _playbackLocation(SyncRecord media) async {
+  Future<Map<String, dynamic>?> _playbackLocation(
+    SyncRecord media, {
+    required PlaybackSourcePreference preference,
+    Map<String, dynamic>? expectedBinding,
+  }) async {
     if (_disposed) throw const Cancelled();
+    final expected = playbackBindingSnapshot(expectedBinding);
+    void checkBinding(dynamic current) {
+      if (expected != null &&
+          (expected.isEmpty
+              ? current != null
+              : current is! Map ||
+                    current['source'] != expected['source'] ||
+                    current['path'] != expected['path'] ||
+                    (current['previewRevision'] ?? '') !=
+                        expected['previewRevision'])) {
+        throw const AppFailure('视频位置已改变，请重新选择播放来源。');
+      }
+    }
+
+    bool deleted() {
+      final record = store.get('media', media.id);
+      if (expected != null && (record == null || record.deleted)) {
+        throw const AppFailure('视频已移除，请重新选择播放来源。');
+      }
+      return record?.deleted == true;
+    }
+
+    if (expected != null) checkBinding(store.local('location:${media.id}'));
+    if (preference == PlaybackSourcePreference.original) {
+      if (deleted()) return null;
+      final location = store.local('location:${media.id}');
+      checkBinding(location);
+      return location is Map ? Map<String, dynamic>.from(location) : null;
+    }
+    final requireOffline = preference == PlaybackSourcePreference.offline;
     final manager = downloads;
     if (store.path != ':memory:' && !manager.initialized) {
       await _restoreDownloads();
     }
     if (_disposed) throw const Cancelled();
-    if (store.get('media', media.id)?.deleted == true) return null;
+    if (deleted()) return null;
     final location = store.local('location:${media.id}');
+    checkBinding(location);
     final downloaded = manager.entryFor(media.id);
     final matching =
         downloaded != null &&
@@ -153,28 +188,43 @@ extension AppModelDownloads on AppModel {
       try {
         path = await manager.localPath(media.id);
       } catch (error) {
-        if (!_disposed) {
-          AppLog.instance.warning('离线下载', safeFailure(error).message);
-        }
+        if (_disposed) throw const Cancelled();
+        if (requireOffline) rethrow;
+        AppLog.instance.warning('离线下载', safeFailure(error).message);
       }
     }
     if (_disposed) throw const Cancelled();
-    if (store.get('media', media.id)?.deleted == true) return null;
+    if (deleted()) return null;
     final latest = store.local('location:${media.id}');
+    checkBinding(latest);
     if (latest?['source'] != location?['source'] ||
         latest?['path'] != location?['path'] ||
         latest?['previewRevision'] != location?['previewRevision']) {
+      if (requireOffline) {
+        throw const AppFailure('视频位置已改变，请重新选择播放来源。');
+      }
       return latest is Map ? Map<String, dynamic>.from(latest) : null;
     }
     final entry = manager.entryFor(media.id);
-    if (path != null && entry?.isComplete == true && entry?.localPath == path) {
+    final stillMatching =
+        entry != null &&
+        entry.sourceId == downloaded?.sourceId &&
+        entry.remotePath == downloaded?.remotePath &&
+        entry.bindingRevision == downloaded?.bindingRevision;
+    if (path != null &&
+        stillMatching &&
+        entry.isComplete &&
+        entry.localPath == path) {
       return {
         'id': media.id,
         'source': 'local',
         'path': path,
-        'size': entry!.total,
+        'size': entry.total,
         'offline': true,
       };
+    }
+    if (requireOffline) {
+      throw const AppFailure('本地下载不可用，请重新下载或选择原始来源。');
     }
     return location is Map ? Map<String, dynamic>.from(location) : null;
   }

@@ -157,7 +157,7 @@ class AppStore {
   }
 
   void _createChangeCounters() {
-    const version = 4;
+    const version = 5;
     int schemaVersion() =>
         db.select('PRAGMA user_version').first.values.first as int;
     if (schemaVersion() >= version) return;
@@ -171,6 +171,7 @@ class AppStore {
           db.execute('DROP TRIGGER IF EXISTS store_change_local_$event');
         }
         _installChangeCounters();
+        _installImportExclusionVersions();
         db.execute('PRAGMA user_version=$version');
       }
       db.execute('COMMIT');
@@ -178,6 +179,41 @@ class AppStore {
       db.execute('ROLLBACK');
       rethrow;
     }
+  }
+
+  void _installImportExclusionVersions() {
+    const prefix = 'automatic-import-excluded:';
+    const upper = 'automatic-import-excluded;';
+    String excluded(String row) => "$row.key>='$prefix' AND $row.key<'$upper'";
+    db.execute(
+      'CREATE TABLE IF NOT EXISTS automatic_import_exclusion_versions('
+      'revision INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL UNIQUE)',
+    );
+    db.execute(
+      'CREATE TRIGGER IF NOT EXISTS import_exclusion_insert '
+      'AFTER INSERT ON local WHEN ${excluded('NEW')} BEGIN '
+      'INSERT OR REPLACE INTO automatic_import_exclusion_versions(key) '
+      'VALUES(NEW.key); END',
+    );
+    db.execute(
+      'CREATE TRIGGER IF NOT EXISTS import_exclusion_update '
+      'AFTER UPDATE ON local '
+      'WHEN (${excluded('OLD')}) OR (${excluded('NEW')}) BEGIN '
+      'DELETE FROM automatic_import_exclusion_versions WHERE key=OLD.key; '
+      'INSERT OR REPLACE INTO automatic_import_exclusion_versions(key) '
+      'SELECT NEW.key WHERE ${excluded('NEW')}; END',
+    );
+    db.execute(
+      'CREATE TRIGGER IF NOT EXISTS import_exclusion_delete '
+      'AFTER DELETE ON local WHEN ${excluded('OLD')} BEGIN '
+      'DELETE FROM automatic_import_exclusion_versions WHERE key=OLD.key; END',
+    );
+    // Migrate old removals once, under the schema migration's writer lock.
+    // The key range uses local's primary index and ignores unrelated state.
+    db.execute(
+      'INSERT OR IGNORE INTO automatic_import_exclusion_versions(key) '
+      "SELECT key FROM local WHERE key>='$prefix' AND key<'$upper'",
+    );
   }
 
   void _installChangeCounters() {
@@ -243,6 +279,25 @@ class AppStore {
 
   void _execute(String sql, [List<Object?> parameters = const []]) =>
       _statement(sql).execute(parameters);
+
+  /// Durable download-admission boundary, read on the background connection.
+  /// AUTOINCREMENT retains the boundary even after every exclusion is cleared.
+  int get importExclusionSequence {
+    final rows = _select(
+      'SELECT seq FROM sqlite_sequence '
+      "WHERE name='automatic_import_exclusion_versions'",
+    );
+    return rows.isEmpty ? 0 : rows.first['seq'] as int;
+  }
+
+  /// Changes from other connections and direct SQL are visible without a cache.
+  int? importExclusionRevision(String key) {
+    final rows = _select(
+      'SELECT revision FROM automatic_import_exclusion_versions WHERE key=?',
+      [key],
+    );
+    return rows.isEmpty ? null : rows.first['revision'] as int;
+  }
 
   /// Track only requested keys, so preview/cache writes cannot invalidate
   /// settings or force large media-binding lists to be decoded again.
@@ -354,10 +409,12 @@ class AppStore {
     _dataVersion = version;
   }
 
-  void _written({String? kind, String? localKey}) {
+  void _written({String? kind, String? localKey, int? changes}) {
     final count = db.updatedRows;
     // Each app-table mutation also changes one durable counter via its trigger.
-    _knownChanges += count * 2;
+    // Exclusion mutations additionally maintain their durable admission clock.
+    // Add only this statement's changes, preserving any earlier unknown writes.
+    _knownChanges += changes ?? count * 2;
     if (count == 0) return;
     final scope = kind == 'progress' || kind == 'watched'
         ? kind!
@@ -874,11 +931,17 @@ class AppStore {
         value,
       );
     }
+    final before = key.startsWith('automatic-import-excluded:')
+        ? _totalChanges
+        : null;
     _execute('INSERT OR REPLACE INTO local(key,value) VALUES(?,?)', [
       key,
       encoded,
     ]);
-    _written(localKey: key);
+    _written(
+      localKey: key,
+      changes: before == null ? null : _totalChanges - before,
+    );
     if (key.startsWith('location:') && _locationIndex != null) {
       _indexLocation(key.substring('location:'.length), value);
     }
@@ -918,12 +981,21 @@ class AppStore {
         markLocalModified(key);
       }
     }
+    final before = key.startsWith('automatic-import-excluded:')
+        ? _totalChanges
+        : null;
     _execute('DELETE FROM local WHERE key=?', [key]);
-    _written(localKey: key);
+    _written(
+      localKey: key,
+      changes: before == null ? null : _totalChanges - before,
+    );
     if (key.startsWith('location:') && _locationIndex != null) {
       _indexLocation(key.substring('location:'.length), null);
     }
   }
+
+  int get _totalChanges =>
+      _select('SELECT total_changes() AS count').single['count'] as int;
 
   void _indexLocation(String id, dynamic value) {
     final previous = _locationKeys.remove(id);

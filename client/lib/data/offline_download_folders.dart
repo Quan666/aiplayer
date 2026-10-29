@@ -11,6 +11,24 @@ String _canonicalDownloadPath(String path) {
 
 String _downloadBindingKey(String source, String path) => '$source\u0000$path';
 
+String _downloadExclusionKey(String source, String path) =>
+    'automatic-import-excluded:${sha256.convert(utf8.encode(jsonEncode([source, path])))}';
+
+String _folderDownloadRelativePath(Map<String, dynamic> folder, String path) {
+  final selected = folder['downloadRoot'] as String;
+  final relative = p.posix.relative(
+    path,
+    from: selected.isEmpty ? '.' : selected,
+  );
+  _checkedSegments(relative);
+  final segments = _checkedSegments(selected);
+  var name =
+      segments.lastOrNull ??
+      p.posix.basename((folder['name'] as String).replaceAll('\\', '/'));
+  if (name.isEmpty || name == '.' || name == '..' || name == '/') name = '下载';
+  return p.posix.join(name, relative);
+}
+
 extension _OfflineFolderWork on _OfflineWorker {
   Future<void> _enqueueFolder(Map<String, dynamic> input) async {
     final source = input['sourceId'] as String;
@@ -40,8 +58,12 @@ extension _OfflineFolderWork on _OfflineWorker {
       'mediaId': id,
       'sourceId': source,
       'remotePath': path,
+      'downloadRoot': path,
       'name': input['name'] as String? ?? '文件夹',
       'isDirectory': true,
+      // An explicit folder selection may restore older library removals, but
+      // must never undo deletions made while this task is queued or paused.
+      'exclusionSequence': store?.importExclusionSequence ?? 0,
       'discoveredFiles': 0,
       'scannedFolders': 0,
       'received': 0,
@@ -186,9 +208,12 @@ extension _OfflineFolderWork on _OfflineWorker {
                   row['sourceId'] as String,
                   child,
                 );
+                final record = location == null
+                    ? null
+                    : store?.get('media', location['id'] as String);
                 db!.execute(
-                  'INSERT OR IGNORE INTO download_folder_files(task,path,name,size,modified,expected_id,expected_revision) '
-                  'VALUES(?,?,?,?,?,?,?)',
+                  'INSERT OR IGNORE INTO download_folder_files(task,path,name,size,modified,expected_id,expected_revision,expected_deleted,expected_record_revision) '
+                  'VALUES(?,?,?,?,?,?,?,?,?)',
                   [
                     id,
                     child,
@@ -197,6 +222,8 @@ extension _OfflineFolderWork on _OfflineWorker {
                     entry.modified,
                     location?['id'],
                     location == null ? null : location['previewRevision'] ?? '',
+                    record?.deleted == true ? 1 : 0,
+                    record?.revision,
                   ],
                 );
               }
@@ -259,19 +286,35 @@ extension _OfflineFolderWork on _OfflineWorker {
 
   bool _folderFileIsCurrent(
     AppStore library,
-    String source,
+    Map<String, dynamic> folder,
     Map<String, Object?> file,
   ) {
+    final source = folder['sourceId'] as String;
     final path = file['path'] as String;
-    final excluded =
-        'automatic-import-excluded:${sha256.convert(utf8.encode(jsonEncode([source, path])))}';
-    if (library.local(excluded) == true) return false;
+    final excluded = _downloadExclusionKey(source, path);
+    var restoreRemoved = false;
+    if (library.local(excluded) == true) {
+      final revision = library.importExclusionRevision(excluded);
+      restoreRemoved =
+          revision != null &&
+          revision <= (folder['exclusionSequence'] as int? ?? 0);
+      if (!restoreRemoved) return false;
+    }
     final expected = file['expected_id'] as String?;
     if (expected != null) {
       final record = library.get('media', expected);
       final location = library.local('location:$expected') as Map?;
-      return record != null &&
-          !record.deleted &&
+      // Sync can deliver a location before its media record. A binding that
+      // was already orphaned when discovered is still a downloadable file;
+      // a record removed after discovery must retain its deletion protection.
+      final recordIsCurrent = record == null
+          ? file['expected_record_revision'] == null &&
+                file['expected_deleted'] == 0
+          : (!record.deleted ||
+                (restoreRemoved &&
+                    file['expected_deleted'] == 1 &&
+                    record.revision == file['expected_record_revision']));
+      return recordIsCurrent &&
           location?['source'] == source &&
           location?['path'] == path &&
           (location?['previewRevision'] ?? '') ==
@@ -280,15 +323,16 @@ extension _OfflineFolderWork on _OfflineWorker {
     final location = library.locationFor(source, path);
     // A record may have been imported and then deleted while this scan paused.
     // Even direct tombstones without an exclusion must not be resurrected.
+    // A newly synchronized orphan binding still has no deletion to preserve.
     return location == null ||
-        library.get('media', location['id'])?.deleted == false;
+        library.get('media', location['id'])?.deleted != true;
   }
 
   void _admitFolder(Map<String, dynamic> folder) {
     final id = folder['mediaId'] as String,
         sourceId = folder['sourceId'] as String;
     final discovered = db!.select(
-      'SELECT path,name,size,modified,expected_id,expected_revision '
+      'SELECT path,name,size,modified,expected_id,expected_revision,expected_deleted,expected_record_revision '
       'FROM download_folder_files WHERE task=? ORDER BY rowid',
       [id],
     );
@@ -298,20 +342,32 @@ extension _OfflineFolderWork on _OfflineWorker {
     // Metadata edits keep the current record and are not overwritten.
     final library = store ??= AppStore(':memory:');
     final admitted = <Map<String, dynamic>>[];
+    var skipped = 0, bound = 0, added = 0, retried = 0, existingFiles = 0;
     db!.execute('BEGIN IMMEDIATE');
     try {
       library.transaction(() {
         _validateFolderSource(folder);
-        final files = [
-          for (final file in discovered)
-            if (_folderFileIsCurrent(library, sourceId, file))
-              SourceEntry(
-                name: file['name'] as String,
-                path: file['path'] as String,
-                size: file['size'] as int,
-                modified: file['modified'] as int,
-              ),
-        ];
+        final files = <SourceEntry>[];
+        for (final file in discovered) {
+          if (!_folderFileIsCurrent(library, folder, file)) {
+            skipped++;
+            continue;
+          }
+          final path = file['path'] as String;
+          final excluded = _downloadExclusionKey(sourceId, path);
+          // Clear only removals validated against this task's original cutoff,
+          // under the same transaction as registration. A failed admission rolls
+          // this back too; scanning/cancelling alone never changes exclusions.
+          if (library.local(excluded) == true) library.removeLocal(excluded);
+          files.add(
+            SourceEntry(
+              name: file['name'] as String,
+              path: path,
+              size: file['size'] as int,
+              modified: file['modified'] as int,
+            ),
+          );
+        }
         final existing = {
           for (final task in rows.values)
             if (task['isDirectory'] != true)
@@ -342,6 +398,7 @@ extension _OfflineFolderWork on _OfflineWorker {
           inTransaction: true,
           restoreExcluded: false,
         );
+        bound = bindings.length;
         for (final (media, location) in bindings) {
           final sameId = rows[media.id];
           if (sameId != null &&
@@ -374,6 +431,9 @@ extension _OfflineFolderWork on _OfflineWorker {
               };
               _save(retry, notify: false);
               admitted.add(retry);
+              retried++;
+            } else {
+              existingFiles++;
             }
             continue;
           }
@@ -381,6 +441,13 @@ extension _OfflineFolderWork on _OfflineWorker {
             'mediaId': media.id,
             'sourceId': sourceId,
             'remotePath': location['path'],
+            if (folder['downloadRoot'] is String) ...{
+              'downloadRoot': folder['downloadRoot'],
+              'downloadRelativePath': _folderDownloadRelativePath(
+                folder,
+                location['path'] as String,
+              ),
+            },
             'bindingRevision': location['previewRevision'] as String? ?? '',
             'name':
                 media.data['fileName'] ?? media.data['title'] ?? 'video.mp4',
@@ -395,6 +462,7 @@ extension _OfflineFolderWork on _OfflineWorker {
           };
           _save(row, notify: false);
           admitted.add(row);
+          added++;
         }
         _deleteFolderState(id);
         db!.execute('DELETE FROM downloads WHERE id=?', [id]);
@@ -410,6 +478,23 @@ extension _OfflineFolderWork on _OfflineWorker {
       rows[row['mediaId'] as String] = row;
     }
     rows.remove(id);
-    if (!closing) reply.send(['admitted', id, admitted]);
+    if (!closing) {
+      // One bounded summary per successful scan, never filenames, URLs,
+      // credentials or per-file/progress log traffic.
+      reply.send([
+        'admitted',
+        id,
+        admitted,
+        {
+          'folders': folder['scannedFolders'],
+          'discovered': discovered.length,
+          'bound': bound,
+          'added': added,
+          'retried': retried,
+          'existing': existingFiles,
+          'skipped': skipped,
+        },
+      ]);
+    }
   }
 }

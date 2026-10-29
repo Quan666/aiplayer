@@ -10,6 +10,7 @@ import '../core/network.dart';
 import '../core/logger.dart';
 import '../data/app_model.dart';
 import '../data/preferences.dart';
+import '../data/playback_source.dart';
 import '../data/store.dart';
 import '../data/media_technical_info.dart';
 import '../data/media_identity.dart';
@@ -50,7 +51,10 @@ class PlaybackSession extends ChangeNotifier {
   // not the variable font's typographic family "Noto Sans SC" (name ID 16).
   static const _subtitleFontFamily = 'Noto Sans SC Thin';
   final AppModel model;
-  final SyncRecord media;
+  SyncRecord _media;
+  SyncRecord get media => _media;
+  final PlaybackSourcePreference sourcePreference;
+  final Map<String, dynamic>? expectedBinding;
   late final Player player = Player(
     configuration: const PlayerConfiguration(
       libass: true,
@@ -114,6 +118,7 @@ class PlaybackSession extends ChangeNotifier {
   Map<String, int> get startupTimings => Map.unmodifiable(_startupTimings);
   String? _subtitleSearchPath;
   Map<String, dynamic>? _playbackLocation;
+  Future<Map<String, dynamic>?>? _playbackLocationWork;
   static const _playbackErrorMessage = '播放发生错误，可尝试软解或重新打开视频。';
   final _clock = Stopwatch();
   // Position has its own notifier: moving the seek thumb must not rebuild the
@@ -275,8 +280,54 @@ class PlaybackSession extends ChangeNotifier {
   void addCloseHook(Future<void> Function() hook) => _closeHooks.add(hook);
   void removeCloseHook(Future<void> Function() hook) =>
       _closeHooks.remove(hook);
-  PlaybackSession(this.model, this.media) {
+  PlaybackSession(
+    this.model,
+    SyncRecord media, {
+    this.sourcePreference = PlaybackSourcePreference.automatic,
+    Map<String, dynamic>? expectedBinding,
+  }) : _media = media,
+       expectedBinding = playbackBindingSnapshot(expectedBinding) {
     model.addListener(_preferencesChanged);
+  }
+
+  /// Playback, subtitle extraction, seeking previews and casting must use the
+  /// same physical file even if a download finishes while this session plays.
+  Future<Map<String, dynamic>?> resolvePlaybackLocation() {
+    if (closed) return Future.error(const Cancelled());
+    return _playbackLocationWork ??= _resolvePlaybackLocation();
+  }
+
+  Future<Map<String, dynamic>?> _resolvePlaybackLocation() async {
+    final choice =
+        sourcePreference == PlaybackSourcePreference.automatic &&
+            expectedBinding == null
+        ? await subtitleCancelable(
+            model.preferredPlaybackChoice(media, cancel: _startupCancel),
+            _startupCancel,
+          )
+        : MediaPlaybackChoice(
+            media,
+            sourcePreference,
+            expectedBinding: expectedBinding,
+          );
+    _startupCancel.check();
+    final changed = _media.id != choice.media.id;
+    _media = choice.media;
+    if (_openCalled) model.activePlaybackMediaId = media.id;
+    if (changed) notifyListeners();
+    final location = await subtitleCancelable(
+      model.playbackLocation(
+        media,
+        preference: choice.preference,
+        expectedBinding: choice.expectedBinding,
+      ),
+      _startupCancel,
+    );
+    _startupCancel.check();
+    _playbackLocation = location == null
+        ? null
+        : Map<String, dynamic>.unmodifiable(location);
+    return _playbackLocation;
   }
 
   void _preferencesChanged() {
@@ -727,13 +778,11 @@ class PlaybackSession extends ChangeNotifier {
   }
 
   Future<(String, String)> _preparePlaybackSource() async {
-    final location = await subtitleCancelable(
-      model.playbackLocation(media),
-      _startupCancel,
-    );
+    final location = await resolvePlaybackLocation();
     _startupCancel.check();
     if (location == null) throw const AppFailure('请先关联本机视频位置。');
-    _playbackLocation = location;
+    // Matching and cached subtitles must bind to the selected file version.
+    unawaited(_prepareDanmaku());
     final sourceId = location['source'] as String;
     final opened = await _openSource(sourceId, _startupCancel);
     if (closed) {
@@ -793,7 +842,6 @@ class PlaybackSession extends ChangeNotifier {
     final initiallyAllowedToPlay = !_backgroundPlaybackBlocked;
     _startupClock.start();
     model.activePlaybackMediaId = media.id;
-    unawaited(_prepareDanmaku());
     try {
       _previewsPaused = true;
       // Source connection, decoder configuration and preview cleanup are

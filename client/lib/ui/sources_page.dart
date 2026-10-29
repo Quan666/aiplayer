@@ -15,8 +15,10 @@ import '../data/app_model.dart';
 import '../data/store.dart';
 import '../data/library_catalog.dart';
 import '../data/library_snapshot.dart';
+import '../data/local_directory_removal.dart';
 import '../data/media_presentation.dart';
 import '../data/media_technical_info.dart';
+import '../data/playback_source.dart';
 import '../sources/configuration.dart';
 import '../sources/discovery.dart';
 import '../sources/directory_sort.dart';
@@ -32,6 +34,7 @@ import 'media_details_content.dart';
 import 'library_page.dart' show showLibraryMediaDetails;
 import 'offline_download_controls.dart';
 import 'media_file_details.dart';
+import 'media_source_selection.dart';
 import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
 import 'metadata_tasks_sheet.dart';
@@ -242,6 +245,10 @@ class _KnownFolderIndex {
       model.store,
       model.store.recordsRevision('media'),
       model.store.locationRevision,
+      model.store.localPrefixRevision('technical:'),
+      model.store.localKeyRevision('sources'),
+      model.store.localPrefixRevision('externalSource:'),
+      model.downloads.completedRevision,
     );
     _folders = loaded.folders;
   }
@@ -363,6 +370,7 @@ class SourcesPage extends StatefulWidget {
   final bool active;
   final Future<void> Function() onImport;
   final Future<void> Function(SyncRecord) onPlay;
+  final Future<void> Function(MediaPlaybackChoice)? onPlaySource;
   final LanDiscovery? discovery;
   final SourcesController? controller;
   const SourcesPage({
@@ -370,6 +378,7 @@ class SourcesPage extends StatefulWidget {
     required this.model,
     required this.onImport,
     required this.onPlay,
+    this.onPlaySource,
     this.active = true,
     this.discovery,
     this.controller,
@@ -399,6 +408,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   final _localPaths = <String>[''];
   final _localQueries = <String, (String, bool)>{};
   final _localDeleting = <String>{};
+  String? _localFolderDeleting;
+  CancelToken? _localFolderDeleteCancel;
   Map<String, String> _localSourceNames = const {};
   Object? _localSourceNamesRevision;
   int _localHiddenEntries = 0,
@@ -453,6 +464,9 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       widget.controller?.addListener(_showRoot);
     }
     if (oldWidget.model != widget.model) {
+      _localFolderDeleteCancel?.cancel();
+      _localFolderDeleteCancel = null;
+      _localFolderDeleting = null;
       _knownFolderIndex.clear();
       _localSnapshotCancel?.cancel();
       _localEntriesKey = null;
@@ -767,6 +781,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     widget.controller?.removeListener(_showRoot);
     widget.model.removeListener(_refreshRoot);
     _localSnapshotCancel?.cancel();
+    _localFolderDeleteCancel?.cancel();
     _localSearch.dispose();
     _localSorter.close();
     _rootScroll.dispose();
@@ -1269,6 +1284,113 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     }
   }
 
+  Widget _localDirectoryMenu(LocalDirectorySnapshot directory) =>
+      PopupMenuButton<String>(
+        key: ValueKey('local-folder-options:${directory.path}'),
+        tooltip: '文件夹选项',
+        enabled: _localFolderDeleting == null,
+        icon: const Icon(Icons.more_horiz_rounded, size: 20),
+        onOpened: _localSearch.dismiss,
+        onSelected: (_) => unawaited(_deleteLocalDirectory(directory)),
+        itemBuilder: (_) => const [
+          PopupMenuItem(
+            height: GlassMetrics.menuItemHeight,
+            padding: GlassMetrics.menuItemPadding,
+            value: 'delete',
+            child: Text('删除文件夹'),
+          ),
+        ],
+      );
+
+  Future<void> _deleteLocalDirectory(LocalDirectorySnapshot directory) async {
+    if (_localFolderDeleting != null || directory.path.isEmpty) return;
+    _localSearch.dismiss();
+    final owner = model;
+    final token = _localFolderDeleteCancel = CancelToken();
+    LocalDirectoryRemovalPlan? plan;
+    setState(() => _localFolderDeleting = directory.path);
+    try {
+      plan = await owner.prepareLocalDirectoryRemoval(
+        directory.path,
+        cancel: token,
+      );
+      if (!mounted || !identical(owner, model) || token.cancelled) return;
+      final summary = plan;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('删除文件夹？'),
+          content: Text(
+            '将删除“${_localDirectoryName(directory)}”及子文件夹中的 ${summary.count} 个本地视频。'
+            '${summary.downloads > 0 ? '下载视频的原始来源和影视资料保留。' : ''}'
+            '${summary.managed > 0 ? '导入副本及其影视库记录会一并删除。' : ''}'
+            '${summary.linked > 0 ? '链接的视频仅移除记录，原文件保留。' : ''}',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true ||
+          !mounted ||
+          !identical(owner, model) ||
+          token.cancelled) {
+        return;
+      }
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('正在删除“${_localDirectoryName(directory)}”…'),
+          duration: const Duration(days: 1),
+          action: SnackBarAction(label: '取消', onPressed: token.cancel),
+        ),
+      );
+      final result = await owner.deleteLocalDirectory(summary, cancel: token);
+      if (!mounted || !identical(owner, model)) return;
+      messenger.hideCurrentSnackBar();
+      await _loadLocalSnapshot();
+      if (!mounted || !identical(owner, model)) return;
+      final details = [
+        '已移除 ${result.removed} 个视频',
+        if (result.cancelled) '已取消剩余操作',
+        if (result.skipped > 0) '${result.skipped} 个位置已改变，未删除',
+        if (result.failed > 0) '${result.failed} 个删除失败',
+      ].join('，');
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(details)));
+      if (result.failed > 0) AppLog.instance.warning('本地视频', result.error);
+    } on Cancelled {
+      // The user cancelled or the page/model was disposed while preparing.
+      if (mounted && identical(owner, model)) {
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      }
+    } catch (failure) {
+      if (mounted && identical(owner, model)) {
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+        await _sourceFailure(context, failure, '删除文件夹失败');
+      }
+    } finally {
+      token.cancel();
+      if (plan != null) {
+        try {
+          await owner.discardLocalDirectoryRemoval(plan);
+        } catch (_) {}
+      }
+      if (mounted && identical(owner, model)) {
+        _localFolderDeleteCancel = null;
+        setState(() => _localFolderDeleting = null);
+      }
+    }
+  }
+
   Future<void> _localDetails(SyncRecord item) async {
     _localSearch.dismiss();
     final owner = model;
@@ -1281,6 +1403,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
         snapshot: snapshot,
         anchor: snapshot.byId[item.id] ?? item,
         onPlay: widget.onPlay,
+        onPlaySource: widget.onPlaySource,
       );
     } catch (failure) {
       if (mounted) await _sourceFailure(context, failure, '打开影视详情失败');
@@ -1307,6 +1430,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
               title: _localDirectoryName(folder),
               subtitle: '',
               onTap: () => _openLocalDirectory(entry.path),
+              trailing: _localDirectoryMenu(folder),
+              onLongPress: () => _deleteLocalDirectory(folder),
             );
           }
           final item = _localSearch.resultRecords[entry.path];
@@ -1360,19 +1485,35 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
                 onPressed: widget.onImport,
                 icon: const Icon(Icons.add_rounded),
               ),
-              if (!Platform.isAndroid && !Platform.isIOS)
+              if ((!Platform.isAndroid && !Platform.isIOS) ||
+                  _localPath.isNotEmpty)
                 PopupMenuButton<String>(
                   tooltip: '本地视频选项',
                   icon: const Icon(Icons.more_horiz_rounded),
-                  onSelected: (_) => _scanFolder(),
+                  onSelected: (action) {
+                    if (action == 'delete' && directory != null) {
+                      unawaited(_deleteLocalDirectory(directory));
+                    } else {
+                      _scanFolder();
+                    }
+                  },
                   itemBuilder: (_) => [
-                    PopupMenuItem(
-                      height: GlassMetrics.menuItemHeight,
-                      padding: GlassMetrics.menuItemPadding,
-                      enabled: !model.scanning,
-                      value: 'scan',
-                      child: const Text('扫描文件夹'),
-                    ),
+                    if (_localPath.isNotEmpty && directory != null)
+                      PopupMenuItem(
+                        height: GlassMetrics.menuItemHeight,
+                        padding: GlassMetrics.menuItemPadding,
+                        enabled: _localFolderDeleting == null,
+                        value: 'delete',
+                        child: const Text('删除文件夹'),
+                      ),
+                    if (!Platform.isAndroid && !Platform.isIOS)
+                      PopupMenuItem(
+                        height: GlassMetrics.menuItemHeight,
+                        padding: GlassMetrics.menuItemPadding,
+                        enabled: !model.scanning,
+                        value: 'scan',
+                        child: const Text('扫描文件夹'),
+                      ),
                   ],
                 ),
             ],
@@ -1454,6 +1595,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
           _syncLocalSearch();
         },
         onPlay: widget.onPlay,
+        onPlaySource: widget.onPlaySource,
         onEdit: () => _configure(existing: source),
         onRemove: () => _remove(source),
       );
@@ -2407,6 +2549,7 @@ class SourceBrowser extends StatefulWidget {
   final bool embedded, active;
   final VoidCallback? onExit, onEdit, onRemove;
   final Future<void> Function(SyncRecord)? onPlay;
+  final Future<void> Function(MediaPlaybackChoice)? onPlaySource;
   const SourceBrowser({
     super.key,
     required this.model,
@@ -2420,6 +2563,7 @@ class SourceBrowser extends StatefulWidget {
     this.onEdit,
     this.onRemove,
     this.onPlay,
+    this.onPlaySource,
   });
   @override
   State<SourceBrowser> createState() => _SourceBrowserState();
@@ -2440,6 +2584,8 @@ class _SourceBrowserState extends State<SourceBrowser>
   bool playing = false;
   String error = '';
   int generation = 0;
+  int _sourceSelectionRevision = 0;
+  CancelToken? _sourceSelectionCancel;
   final cancel = CancelToken();
   CancelToken _directoryCancel = CancelToken();
   final scroll = ScrollController();
@@ -2709,6 +2855,10 @@ class _SourceBrowserState extends State<SourceBrowser>
   void didUpdateWidget(SourceBrowser oldWidget) {
     super.didUpdateWidget(oldWidget);
     final sourceChanged = !mapEquals(oldWidget.source, widget.source);
+    if (oldWidget.model != widget.model || sourceChanged || !widget.active) {
+      _sourceSelectionRevision++;
+      _sourceSelectionCancel?.cancel();
+    }
     if (oldWidget.model != widget.model || sourceChanged) {
       _directoryCancel.cancel();
       _refreshCancel?.cancel();
@@ -2743,6 +2893,12 @@ class _SourceBrowserState extends State<SourceBrowser>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final wasForeground = _foreground;
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _sourceSelectionRevision++;
+      _sourceSelectionCancel?.cancel();
+    }
     _foreground = state == AppLifecycleState.resumed;
     if (!_foreground) {
       _pauseRefresh();
@@ -3874,6 +4030,81 @@ class _SourceBrowserState extends State<SourceBrowser>
     }
   }
 
+  Future<void> _chooseVideoFile(SourceEntry entry) async {
+    if (playing ||
+        busy ||
+        entry.directory ||
+        widget.associateId != null ||
+        !widget.active ||
+        !_foreground) {
+      return;
+    }
+    _search.dismiss();
+    final owner = widget.model;
+    final ticket = generation;
+    final revision = ++_sourceSelectionRevision;
+    final token = _sourceSelectionCancel = CancelToken();
+    final sourceId = widget.source['id'] as String;
+    bool current() =>
+        mounted &&
+        identical(owner, widget.model) &&
+        generation == ticket &&
+        revision == _sourceSelectionRevision &&
+        !token.cancelled &&
+        widget.active &&
+        _foreground &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
+    setState(() => playing = true);
+    _pauseRefresh();
+    try {
+      final media = await owner.prepareSourceMediaForPlayback(
+        sourceId,
+        entry,
+        cancel: token,
+      );
+      if (!mounted || !current()) return;
+      final choice = await showMediaSourceSelection(
+        context,
+        model: owner,
+        item: media,
+        cancel: token,
+      );
+      if (choice == null || !current()) return;
+      if (widget.onPlaySource case final play?) {
+        await play(choice);
+      } else {
+        await PlayerPage.waitForDisposals();
+        if (!mounted || !current()) return;
+        await Navigator.push(
+          context,
+          PageRouteBuilder(
+            transitionDuration: Duration.zero,
+            reverseTransitionDuration: Duration.zero,
+            pageBuilder: (_, _, _) => PlayerPage(
+              model: owner,
+              media: choice.media,
+              sourcePreference: choice.preference,
+              expectedBinding: choice.expectedBinding,
+            ),
+          ),
+        );
+      }
+    } catch (failure) {
+      if (mounted && current()) {
+        await _sourceFailure(context, failure, '打开视频失败');
+      }
+    } finally {
+      token.cancel();
+      if (identical(_sourceSelectionCancel, token)) {
+        _sourceSelectionCancel = null;
+      }
+      if (mounted) {
+        setState(() => playing = false);
+        _queueRefresh();
+      }
+    }
+  }
+
   bool get _canDownloadFromSource =>
       widget.associateId == null &&
       widget.source['id'] != 'local' &&
@@ -3991,6 +4222,15 @@ class _SourceBrowserState extends State<SourceBrowser>
     ],
   );
 
+  bool _hasPlaybackAlternatives(SourceEntry entry) {
+    if (entry.directory || widget.associateId != null) return false;
+    final record = _mediaByPath[entry.path.replaceAll('\\', '/')];
+    if (record == null) return false;
+    return (_knownFolderIndex.snapshot?.playbackOptionsFor(record).length ??
+            0) >
+        1;
+  }
+
   Future<void> _entryOptions(SourceEntry entry) async {
     _search.dismiss();
     final action = await showGlassBottomSheet<String>(
@@ -4005,6 +4245,12 @@ class _SourceBrowserState extends State<SourceBrowser>
                 title: const Text('下载文件夹'),
                 subtitle: const Text('包含子文件夹内的视频'),
                 onTap: () => Navigator.pop(context, 'download-folder'),
+              ),
+            if (_hasPlaybackAlternatives(entry))
+              ListTile(
+                leading: const Icon(Icons.video_file_outlined),
+                title: const Text('切换版本与来源'),
+                onTap: () => Navigator.pop(context, 'select-file'),
               ),
             if (!entry.directory)
               ListTile(
@@ -4046,6 +4292,10 @@ class _SourceBrowserState extends State<SourceBrowser>
 
   Future<void> _runEntryAction(SourceEntry entry, String action) async {
     if (!mounted) return;
+    if (action == 'select-file') {
+      await _chooseVideoFile(entry);
+      return;
+    }
     if (action == 'download-folder') {
       await _downloadFolder(entry);
       return;
@@ -4137,6 +4387,7 @@ class _SourceBrowserState extends State<SourceBrowser>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _refreshCancel?.cancel();
+    _sourceSelectionCancel?.cancel();
     _remember();
     widget.model.removeListener(_modelChanged);
     _search.dispose();
@@ -4458,6 +4709,9 @@ class _SourceBrowserState extends State<SourceBrowser>
                                     : null,
                                 trailing: widget.associateId == null
                                     ? IconButton(
+                                        key: ValueKey(
+                                          'video-options:${entry.path}',
+                                        ),
                                         tooltip: '视频选项',
                                         icon: const Icon(Icons.more_vert),
                                         onPressed: () => _entryOptions(entry),
@@ -4567,13 +4821,31 @@ class _SourceBrowserState extends State<SourceBrowser>
                                         ],
                                       )
                                     : !entry.directory &&
-                                          widget.associateId == null &&
-                                          widget.source['id'] != 'local'
-                                    ? OfflineDownloadButton(
-                                        model: widget.model,
-                                        item: specRecord,
-                                        sourceId: widget.source['id'] as String,
-                                        sourceEntry: entry,
+                                          widget.associateId == null
+                                    ? Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          if (widget.source['id'] != 'local')
+                                            OfflineDownloadButton(
+                                              model: widget.model,
+                                              item: specRecord,
+                                              sourceId:
+                                                  widget.source['id'] as String,
+                                              sourceEntry: entry,
+                                            ),
+                                          IconButton(
+                                            key: ValueKey(
+                                              'video-options:${entry.path}',
+                                            ),
+                                            tooltip: '视频选项',
+                                            icon: const Icon(
+                                              Icons.more_horiz_rounded,
+                                              size: 20,
+                                            ),
+                                            onPressed: () =>
+                                                _entryOptions(entry),
+                                          ),
+                                        ],
                                       )
                                     : entry.directory &&
                                           favorites.contains(

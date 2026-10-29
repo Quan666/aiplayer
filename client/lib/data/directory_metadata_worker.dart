@@ -39,9 +39,10 @@ List<OfflineMediaBinding> prepareOfflineMediaBindings(
   List<SourceEntry> entries = const [],
   bool inTransaction = false,
   bool restoreExcluded = true,
+  bool allowLocal = false,
 }) {
   final selected = <String>{...ids};
-  if (sourceId != null && sourceId != 'local') {
+  if (sourceId != null && (sourceId != 'local' || allowLocal)) {
     final configured =
         (store.local('sources') as List? ?? const [])
             .whereType<Map>()
@@ -115,7 +116,7 @@ List<OfflineMediaBinding> prepareOfflineMediaBindings(
       if (store.get('media', id) case final record?)
         if (!record.deleted)
           if (store.local('location:$id') case final Map location)
-            if (location['source'] != 'local' &&
+            if ((location['source'] != 'local' || allowLocal) &&
                 location['source'] is String &&
                 location['path'] is String)
               (record, Map<String, dynamic>.unmodifiable(location)),
@@ -632,7 +633,14 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
             store.local(_exclusionKey(sourceId, entry.path)) == true) {
           continue;
         }
-        final id = const Uuid().v4();
+        final existingLocation = store.locationFor(sourceId, entry.path);
+        final orphanId = existingLocation?['id'];
+        // A synchronized binding can arrive before its media record. Preserve
+        // that identity so the later record enriches this file instead of
+        // creating a competing library entry. Tombstones remain new imports.
+        final id = orphanId is String && store.get('media', orphanId) == null
+            ? orphanId
+            : const Uuid().v4();
         final identity =
             resolved.identities[entry.path] ?? sourceEntryIdentity(entry);
         store.save('media', id, {
@@ -651,6 +659,8 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
           'path': entry.path,
           'size': entry.size,
           'modified': entry.modified,
+          if (id == orphanId && existingLocation?['previewRevision'] is String)
+            'previewRevision': existingLocation!['previewRevision'],
         });
         record = store.get('media', id)!;
         imported.add(id);
@@ -1103,8 +1113,10 @@ class DirectoryMetadataWorker {
     List<String> ids = const [],
     String? sourceId,
     List<SourceEntry> entries = const [],
+    bool allowLocal = false,
     CancelToken? cancel,
-  }) => _call('downloads', [ids, sourceId, entries], cancel: cancel);
+  }) =>
+      _call('downloads', [ids, sourceId, entries, allowLocal], cancel: cancel);
 
   Future<DirectoryInspection> prepareInspection(
     String sourceId,
@@ -1262,6 +1274,7 @@ void _directoryWorkerMain(List<dynamic> startup) async {
             ids: row[2] as List<String>,
             sourceId: row[3] as String?,
             entries: row[4] as List<SourceEntry>,
+            allowLocal: row[5] as bool,
           );
         });
       } else if (row[0] == 'records') {

@@ -116,7 +116,10 @@ void main() {
       expect(sampled.save(store, media), isTrue);
       expect(sampled.save(store, media), isFalse);
       final info = MediaTechnicalInfo.forRecord(store, media);
-      expect(info.label, 'MKV · H.265 / HEVC · 3840 × 2160 · 1.00 GiB');
+      expect(
+        info.label,
+        'MKV · H.265 / HEVC · 3840 × 2160 · 12.5 Mbps · 1.00 GiB',
+      );
       expect(info.bitrate, 12500000);
       expect(info.duration, 125.5);
       expect(info.resolutionHint, isEmpty);
@@ -182,7 +185,7 @@ void main() {
         saved,
         saved.get('media', 'cached')!,
       );
-      expect(restored.label, 'MP4 · AV1 · 1920 × 1080 · 1.0 KiB');
+      expect(restored.label, 'MP4 · AV1 · 1920 × 1080 · 2 Mbps · 1.0 KiB');
       expect(restored.bitrate, 2000000);
       expect(restored.duration, 60.5);
     } finally {
@@ -268,7 +271,7 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('正式作品'), findsOneWidget);
         expect(
-          find.textContaining('H.264 · 1920 × 1080 · 1.00 GiB'),
+          find.textContaining('H.264 · 1920 × 1080 · 5 Mbps · 1.00 GiB'),
           findsOneWidget,
         );
         expect(find.textContaining('视频约'), findsNothing);
@@ -295,6 +298,12 @@ void main() {
         id: 'b',
         extra: {'fileName': 'other.mp4', 'size': 2147483648},
       );
+      for (final media in [first, second]) {
+        store.setLocal('location:${media.id}', {
+          'source': 'local',
+          'path': '${root.path}/${media.data['fileName']}',
+        });
+      }
       const MediaTechnicalInfo(
         codec: 'H.264',
         width: 1920,
@@ -326,7 +335,7 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        await tester.tap(find.text('选择视频版本'));
+        await tester.tap(find.text('切换版本与来源'));
         await tester.pumpAndSettle();
         expect(
           find

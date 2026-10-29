@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/local_state_worker.dart';
+import 'package:aiplayer/data/media_technical_info.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -21,6 +22,48 @@ void main() {
     store.dispose();
     await directory.delete(recursive: true);
   });
+
+  test(
+    'technical labels include only selected live records and cancellation keeps the worker usable',
+    () async {
+      store.save('media', 'selected', {
+        'title': 'Show 1080p.mkv',
+        'fileName': 'Show 1080p.mkv',
+        'size': 4096,
+      });
+      store.save('media', 'deleted', {'title': 'deleted.mkv'}, deleted: true);
+      store.save('media', 'unselected', {'title': 'Other.mp4'});
+      const MediaTechnicalInfo(
+        container: 'matroska',
+        codec: 'H.264',
+        width: 1920,
+        height: 1080,
+      ).save(store, store.get('media', 'selected')!);
+
+      final labels = await worker.readMediaTechnicalLabels([
+        'selected',
+        'selected',
+        'deleted',
+        'missing',
+      ]);
+      expect(labels.keys, ['selected']);
+      expect(labels['selected'], 'MKV · H.264 · 1920 × 1080 · 4.0 KiB');
+      expect(() => labels.clear(), throwsUnsupportedError);
+
+      final cancel = CancelToken();
+      final pending = worker.readMediaTechnicalLabels(
+        List.generate(10000, (index) => 'missing-$index'),
+        cancel: cancel,
+      );
+      final rejected = expectLater(pending, throwsA(isA<Cancelled>()));
+      cancel.cancel();
+      await rejected;
+      expect(
+        (await worker.readMediaTechnicalLabels(['selected']))['selected'],
+        labels['selected'],
+      );
+    },
+  );
 
   test(
     'checkpoint lock contention leaves the caller responsive and preserves order',
@@ -244,7 +287,7 @@ void main() {
       store = await AppStore.open('${directory.path}/test.db');
       final external = AppStore.openExisting(store.path);
       addTearDown(external.dispose);
-      expect(store.db.select('PRAGMA user_version').single.values.single, 4);
+      expect(store.db.select('PRAGMA user_version').single.values.single, 5);
       final media = store.recordsRevision('media');
       final settings = store.localKeyRevision('settings');
       final checkpoint = store.localKeyRevision('metadata:pending-tasks');

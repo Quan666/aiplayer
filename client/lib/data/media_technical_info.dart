@@ -125,8 +125,21 @@ class MediaTechnicalInfo {
     if (codec.isNotEmpty) codec,
     if (width != null && height != null) '$width × $height',
     if (resolutionHint.isNotEmpty) '$resolutionHint（文件名标注）',
+    if (bitrate != null && bitrate! > 0) mediaBitrate(bitrate!),
     if (size != null && size! > 0) mediaFileSize(size!),
   ].join(' · ');
+}
+
+String mediaBitrate(int bitsPerSecond) {
+  String number(num value) =>
+      value.toStringAsFixed(2).replaceFirst(RegExp(r'\.?0+$'), '');
+  if (bitsPerSecond >= 1000000) {
+    return '${number(bitsPerSecond / 1000000)} Mbps';
+  }
+  if (bitsPerSecond >= 1000) {
+    return '${number(bitsPerSecond / 1000)} Kbps';
+  }
+  return '$bitsPerSecond bps';
 }
 
 String mediaFileSize(int size) {

@@ -33,8 +33,11 @@ import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
 import 'local_state_worker.dart';
 import 'local_video_removal.dart';
+import 'local_directory_removal.dart';
 import 'offline_downloads.dart';
+import 'playback_source.dart';
 import 'media_presentation.dart';
+import 'media_technical_info.dart';
 import 'media_title_translation.dart';
 import 'poster_cache.dart';
 import 'source_preview.dart';
@@ -122,6 +125,67 @@ class AppModel extends ChangeNotifier {
   ) => _downloadSourceEntries(sourceId, entries);
   Future<void> deleteDownload(String id) => downloads.delete(id);
 
+  Future<LocalDirectoryRemovalPlan> prepareLocalDirectoryRemoval(
+    String path, {
+    CancelToken? cancel,
+  }) {
+    if (_disposed) throw const Cancelled();
+    return downloads.prepareLocalDirectoryRemoval(
+      path,
+      documents.path,
+      cancel: cancel ?? _metadataCancel,
+    );
+  }
+
+  Future<LocalDirectoryRemovalResult> deleteLocalDirectory(
+    LocalDirectoryRemovalPlan plan, {
+    CancelToken? cancel,
+  }) {
+    if (_disposed) throw const Cancelled();
+    return downloads.deleteLocalDirectory(
+      plan,
+      cancel: cancel ?? _metadataCancel,
+    );
+  }
+
+  Future<void> discardLocalDirectoryRemoval(LocalDirectoryRemovalPlan plan) =>
+      downloads.discardLocalDirectoryRemoval(plan);
+
+  /// Register one explicitly selected file on the metadata worker. This shares
+  /// identity preservation with downloads without creating a transfer task.
+  Future<SyncRecord> prepareSourceMediaForPlayback(
+    String sourceId,
+    SourceEntry entry, {
+    CancelToken? cancel,
+  }) async {
+    if (_disposed || _clearingCaches) throw const Cancelled();
+    cancel?.check();
+    final before = _directoryContentRevision;
+    try {
+      final bindings = store.path == ':memory:'
+          ? prepareOfflineMediaBindings(
+              store,
+              sourceId: sourceId,
+              entries: [entry],
+              allowLocal: true,
+            )
+          : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+              store.path,
+            )).prepareDownloads(
+              sourceId: sourceId,
+              entries: [entry],
+              allowLocal: true,
+              cancel: cancel ?? _metadataCancel,
+            );
+      if (_disposed) throw const Cancelled();
+      cancel?.check();
+      if (bindings.isEmpty) throw const AppFailure('没有可用的视频文件。');
+      return bindings.single.$1;
+    } finally {
+      if (!_disposed && before != _directoryContentRevision) notifyListeners();
+    }
+  }
+
   /// Delete the local copy without removing a downloaded video's remote identity.
   Future<void> deleteLocalVideo(SyncRecord record) async {
     if (_disposed) throw const Cancelled();
@@ -166,8 +230,74 @@ class AppModel extends ChangeNotifier {
     if (changed) notifyListeners();
   }
 
-  Future<Map<String, dynamic>?> playbackLocation(SyncRecord media) =>
-      _playbackLocation(media);
+  Future<Map<String, dynamic>?> playbackLocation(
+    SyncRecord media, {
+    PlaybackSourcePreference preference = PlaybackSourcePreference.automatic,
+    Map<String, dynamic>? expectedBinding,
+  }) => _playbackLocation(
+    media,
+    preference: preference,
+    expectedBinding: expectedBinding,
+  );
+
+  /// Select from the worker's ordered same-episode files. Local filesystem
+  /// checks use Dart's asynchronous platform I/O, never synchronous UI reads.
+  Future<MediaPlaybackChoice> preferredPlaybackChoice(
+    SyncRecord media, {
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    if (media.data['transient'] == true) {
+      // Explicitly opened external files retain their own playback and cleanup
+      // identity, even when their parsed episode matches a library record.
+      return MediaPlaybackChoice(media, PlaybackSourcePreference.automatic);
+    }
+    if (store.path != ':memory:' && !downloads.initialized) {
+      await _restoreDownloads();
+    }
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    final snapshot = await loadLibrarySnapshot(cancel: cancel);
+    final options = snapshot.playbackOptionsFor(media);
+    if (options.isEmpty) {
+      if (snapshot.byId.containsKey(media.id)) {
+        throw const AppFailure('没有可用的视频位置，请重新关联来源。');
+      }
+      // A transient source-browser item may not be in the library yet.
+      return MediaPlaybackChoice(media, PlaybackSourcePreference.automatic);
+    }
+    for (final option in options) {
+      cancel?.check();
+      if (_disposed) throw const Cancelled();
+      if (!option.isLocal) return option.choice;
+      try {
+        if (option.preference == PlaybackSourcePreference.offline) {
+          final location = await playbackLocation(
+            option.media,
+            preference: option.preference,
+            expectedBinding: option.choice.expectedBinding,
+          );
+          cancel?.check();
+          if (_disposed) throw const Cancelled();
+          if (location != null) return option.choice;
+        } else {
+          final exists = await File(option.path).exists();
+          cancel?.check();
+          if (_disposed) throw const Cancelled();
+          if (exists) return option.choice;
+        }
+      } on Cancelled {
+        rethrow;
+      } on AppFailure {
+        // Invalid completed copies do not prevent trying the original file.
+      } on FileSystemException {
+        // A missing or unreadable imported file may have a remote alternative.
+      }
+    }
+    throw const AppFailure('没有可用的视频文件，请重新关联视频位置。');
+  }
+
   void _notifyDownloadsChanged() {
     if (!_disposed) notifyListeners();
   }
@@ -738,7 +868,13 @@ class AppModel extends ChangeNotifier {
   (int, int, int, int) get _libraryReadRevision => (
     store.recordsRevision('media'),
     store.recordsRevision('progress'),
-    max(store.locationRevision, store.localKeyRevision('sources')),
+    max(
+      max(store.locationRevision, store.localKeyRevision('sources')),
+      max(
+        store.localPrefixRevision('technical:'),
+        store.localPrefixRevision('externalSource:'),
+      ),
+    ),
     _downloads?.completedRevision ?? 0,
   );
 
@@ -2529,6 +2665,39 @@ class AppModel extends ChangeNotifier {
       if (height != null && height > 0) 'height': height,
     };
     if (!mapEquals(previous, next)) store.setLocal('mediaMetadata:$id', next);
+  }
+
+  Future<Map<String, String>> mediaSourceTechnicalLabels(
+    List<SyncRecord> records, {
+    CancelToken? cancel,
+  }) async {
+    if (_disposed) throw const Cancelled();
+    cancel?.check();
+    if (records.isEmpty) return const {};
+    if (store.path == ':memory:') {
+      // Only tests use an in-memory database; disk reads and fingerprinting
+      // share the existing worker and its independent connection below.
+      final labels = <String, String>{};
+      for (final record in records) {
+        cancel?.check();
+        final current = store.get('media', record.id);
+        if (current != null && !current.deleted) {
+          labels[record.id] = MediaTechnicalInfo.forRecord(
+            store,
+            current,
+          ).label;
+        }
+      }
+      return Map.unmodifiable(labels);
+    }
+    final result = await (_localStateWorker ??= LocalStateWorker(store.path))
+        .readMediaTechnicalLabels(
+          records.map((record) => record.id).toList(growable: false),
+          cancel: cancel ?? _metadataCancel,
+        );
+    if (_disposed) throw const Cancelled();
+    cancel?.check();
+    return result;
   }
 
   ({int width, int height})? mediaDimensions(SyncRecord record) {

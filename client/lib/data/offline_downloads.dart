@@ -10,14 +10,18 @@ import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
 import '../core/network.dart';
+import '../core/logger.dart';
 import '../core/system_proxy.dart';
 import '../sources/configuration.dart';
 import '../sources/source.dart';
 import 'store.dart';
+import 'local_directory_removal.dart';
+import 'local_video_removal.dart';
 import 'directory_metadata_worker.dart' show prepareOfflineMediaBindings;
 
 part 'offline_download_worker.dart';
 part 'offline_download_folders.dart';
+part 'offline_local_directory_removal.dart';
 
 enum OfflineDownloadStatus { queued, downloading, paused, completed, failed }
 
@@ -26,6 +30,10 @@ enum OfflineDownloadStatus { queued, downloading, paused, completed, failed }
 class OfflineDownload {
   final String mediaId, sourceId, remotePath, localPath, name, error;
   final String bindingRevision;
+
+  /// New folder downloads retain their selected root separately from the
+  /// remote binding; absent fields preserve legacy storage and navigation.
+  final String? downloadRoot, downloadRelativePath;
   final bool userPaused, isDirectory;
   final int discoveredFiles, scannedFolders;
   final OfflineDownloadStatus status;
@@ -42,6 +50,8 @@ class OfflineDownload {
     this.total = 0,
     this.error = '',
     this.bindingRevision = '',
+    this.downloadRoot,
+    this.downloadRelativePath,
     this.userPaused = false,
     this.isDirectory = false,
     this.discoveredFiles = 0,
@@ -66,6 +76,8 @@ class OfflineDownload {
     total: map['total'] as int? ?? 0,
     error: map['error'] as String? ?? '',
     bindingRevision: map['bindingRevision'] as String? ?? '',
+    downloadRoot: map['downloadRoot'] as String?,
+    downloadRelativePath: map['downloadRelativePath'] as String?,
     userPaused: map['userPaused'] == true,
     isDirectory: map['isDirectory'] == true,
     discoveredFiles: map['discoveredFiles'] as int? ?? 0,
@@ -178,11 +190,28 @@ class OfflineDownloads extends ChangeNotifier {
       case 'removed':
         _removeEntry(row[1] as String);
         if (!_disposed && !_closing) notifyListeners();
+      case 'directoryRemoved':
+        for (final id in row[1] as List) {
+          _removeEntry(id as String);
+        }
+        if (row[2] == true) libraryRevision++;
+        if (!_disposed && !_closing) notifyListeners();
       case 'admitted':
         for (final value in row[2] as List) {
           _updateEntry(OfflineDownload._fromMap(value as Map));
         }
         _removeEntry(row[1] as String);
+        final counts = row[3] as Map;
+        AppLog.instance.info(
+          '文件夹下载',
+          '扫描完成：${counts['folders']} 个目录，'
+              '发现 ${counts['discovered']} 个视频，'
+              '绑定 ${counts['bound']} 个，'
+              '新增 ${counts['added']} 个任务，'
+              '重试 ${counts['retried']} 个，'
+              '已有 ${counts['existing']} 个，'
+              '跳过已删除或位置改变的 ${counts['skipped']} 个。',
+        );
         // Folder admission registered media bindings on the worker connection.
         // Publish one catalogue refresh before the first file completes.
         libraryRevision++;
@@ -193,6 +222,8 @@ class OfflineDownloads extends ChangeNotifier {
         _pending.remove(row[1])?.complete(row[2]);
       case 'error':
         _pending.remove(row[1])?.completeError(AppFailure(row[2] as String));
+      case 'cancelled':
+        _pending.remove(row[1])?.completeError(const Cancelled());
       case 'closed':
         _stop(const Cancelled());
       default:
@@ -249,6 +280,9 @@ class OfflineDownloads extends ChangeNotifier {
         'remoteRevision': entry.bindingRevision,
         'remoteSource': entry.sourceId,
         'remotePath': entry.remotePath,
+        if (entry.downloadRoot != null) 'downloadRoot': entry.downloadRoot,
+        if (entry.downloadRelativePath != null)
+          'downloadRelativePath': entry.downloadRelativePath,
       });
     } else {
       _completedLocations.remove(entry.mediaId);
@@ -278,8 +312,14 @@ class OfflineDownloads extends ChangeNotifier {
     if (_stopped != null && !_stopped!.isCompleted) _stopped!.complete();
   }
 
-  Future<dynamic> _call(String operation, [dynamic payload]) async {
+  Future<dynamic> _call(
+    String operation, [
+    dynamic payload,
+    CancelToken? cancel,
+  ]) async {
+    cancel?.check();
     await initialize();
+    cancel?.check();
     if (_closing || _commands == null) throw const Cancelled();
     if (_pending.length >= 256) {
       throw const AppFailure('下载任务繁忙，请稍后重试。');
@@ -288,7 +328,14 @@ class OfflineDownloads extends ChangeNotifier {
     final result = Completer<dynamic>();
     _pending[id] = result;
     _commands!.send([operation, id, payload]);
-    return result.future;
+    final cancellation = cancel?.whenCancelled.asStream().listen((_) {
+      if (_pending.containsKey(id)) _commands?.send(['cancelOperation', id]);
+    });
+    try {
+      return await result.future;
+    } finally {
+      await cancellation?.cancel();
+    }
   }
 
   Future<void> enqueue({
@@ -335,6 +382,22 @@ class OfflineDownloads extends ChangeNotifier {
   Future<void> resumeAll() async => _call('resumeAll');
   Future<void> retry(String mediaId) async => _call('retry', mediaId);
   Future<void> delete(String mediaId) async => _call('delete', mediaId);
+  Future<LocalDirectoryRemovalPlan> prepareLocalDirectoryRemoval(
+    String path,
+    String documents, {
+    CancelToken? cancel,
+  }) async =>
+      await _call('prepareLocalDirectoryRemoval', [path, documents], cancel)
+          as LocalDirectoryRemovalPlan;
+  Future<LocalDirectoryRemovalResult> deleteLocalDirectory(
+    LocalDirectoryRemovalPlan plan, {
+    CancelToken? cancel,
+  }) async =>
+      await _call('deleteLocalDirectory', plan.token, cancel)
+          as LocalDirectoryRemovalResult;
+  Future<void> discardLocalDirectoryRemoval(
+    LocalDirectoryRemovalPlan plan,
+  ) async => _call('discardLocalDirectoryRemoval', plan.token);
   Future<String?> localPath(String mediaId) async =>
       await _call('localPath', mediaId) as String?;
 

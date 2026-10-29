@@ -11,6 +11,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../danmaku/overlay.dart';
 import '../data/app_model.dart';
+import '../data/playback_source.dart';
 import '../data/store.dart';
 import '../playback/session.dart';
 import '../playback/display.dart';
@@ -82,6 +83,8 @@ class PlayerPage extends StatefulWidget {
 
   final AppModel model;
   final SyncRecord media;
+  final PlaybackSourcePreference sourcePreference;
+  final Map<String, dynamic>? expectedBinding;
   final PlayerPageController? controller;
   final Future<void> Function()? onClose;
 
@@ -92,6 +95,8 @@ class PlayerPage extends StatefulWidget {
     super.key,
     required this.model,
     required this.media,
+    this.sourcePreference = PlaybackSourcePreference.automatic,
+    this.expectedBinding,
     this.controller,
     this.onClose,
     this.mobilePlaybackLifecycle,
@@ -101,7 +106,12 @@ class PlayerPage extends StatefulWidget {
 }
 
 class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
-  late PlaybackSession session = PlaybackSession(widget.model, widget.media);
+  late PlaybackSession session = PlaybackSession(
+    widget.model,
+    widget.media,
+    sourcePreference: widget.sourcePreference,
+    expectedBinding: widget.expectedBinding,
+  );
   bool _switchingMedia = false;
   int _handledCompletionRevision = 0;
   bool? _fullscreenLandscape;
@@ -125,6 +135,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   final mediaControls = PlayerMediaControls();
   (SyncRecord?, SyncRecord?) _mediaNeighbors = (null, null);
   Object? _mediaNeighborsRevision;
+  String? _configuredMediaId;
   Future<void>? _mediaNeighborsWork;
   final _settingsAnchor = GlobalKey();
   final _speedAnchor = GlobalKey();
@@ -221,6 +232,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   void _changed() {
+    if (_configuredMediaId != session.media.id) _refreshMediaControls();
     _presentFirstFrame();
     _scheduleNextEpisode();
     if (_nativeFullscreen && !windowMode.active && !session.closed) {
@@ -283,11 +295,13 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   Object get _navigationRevision => (
     session,
+    session.media.id,
     widget.model.store.recordsRevision('media'),
     widget.model.store.locationRevision,
   );
 
   void _configureMediaControls() {
+    _configuredMediaId = session.media.id;
     final current = session;
     final revision = _mediaNeighborsRevision;
     Future<void> select(SyncRecord media) async {
@@ -1323,7 +1337,7 @@ class _PlayerControlsState extends State<_PlayerControls>
     final owner = widget.model;
     final session = s;
     try {
-      final location = await owner.playbackLocation(session.media);
+      final location = await session.resolvePlaybackLocation();
       if (!mounted ||
           session.closed ||
           !identical(session, s) ||

@@ -5,6 +5,7 @@ import 'dart:ui';
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/danmaku/api.dart';
 import 'package:aiplayer/data/app_model.dart';
+import 'package:aiplayer/data/playback_source.dart';
 import 'package:aiplayer/data/preferences.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/playback/session.dart';
@@ -650,6 +651,50 @@ void main() {
     },
   );
 
+  test(
+    'automatic version selection binds danmaku and resume before source startup',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      final selection = model.selectionGate = Completer<MediaPlaybackChoice>();
+      final api = _Api();
+      model.credentials.complete(api);
+      final selected = SyncRecord(
+        id: 'preferred',
+        kind: 'media',
+        data: {'series': 'Selected Version', 'episode': '01'},
+      );
+      model.store.setLocal('location:preferred', {
+        'source': 'local',
+        'path': '/preferred.mkv',
+      });
+      model.store.save('progress', 'preferred', {
+        'position': 15,
+        'duration': 100,
+      });
+      final opening = session.open(play: true);
+      await Future<void>.delayed(Duration.zero);
+      expect(api.searches, isEmpty);
+      expect(model.openedSources, isEmpty);
+      session.setBackgroundPlaybackBlocked(true);
+      session.setBackgroundPlaybackBlocked(false);
+      selection.complete(
+        MediaPlaybackChoice(selected, PlaybackSourcePreference.original),
+      );
+      await api.searchStarted.future;
+      expect(api.searches, ['Selected Version / 01']);
+      expect(session.media.id, 'preferred');
+      expect(model.activePlaybackMediaId, 'preferred');
+      model.source.complete(_Source());
+      await opening;
+      expect(session.ready, isTrue);
+      expect(session.player.playRequests, [false]);
+      expect(session.playbackUri, contains('preferred.mkv'));
+      expect(session.player.requestedStart, const Duration(seconds: 15));
+    },
+  );
+
   test('slow danmaku credentials never hold video open or close', () async {
     final model = _Model();
     final session = _Session(model);
@@ -740,6 +785,7 @@ void main() {
     _cleanup(model, session);
     model.source.complete(_Source());
     final opening = session.open();
+    await model.adapterOpened.future;
     model.credentials.completeError(
       StateError('credential storage unavailable'),
     );
@@ -849,6 +895,7 @@ class _Model extends ChangeNotifier implements AppModel {
   final openedSources = <String>[];
   Map<String, dynamic>? resolvedLocation;
   Completer<Map<String, dynamic>?>? locationGate;
+  Completer<MediaPlaybackChoice>? selectionGate;
   final _preferences = <String, dynamic>{};
   @override
   final store = AppStore(':memory:');
@@ -874,7 +921,19 @@ class _Model extends ChangeNotifier implements AppModel {
   }
 
   @override
-  Future<Map<String, dynamic>?> playbackLocation(SyncRecord media) async =>
+  Future<MediaPlaybackChoice> preferredPlaybackChoice(
+    SyncRecord media, {
+    CancelToken? cancel,
+  }) async =>
+      await selectionGate?.future ??
+      MediaPlaybackChoice(media, PlaybackSourcePreference.automatic);
+
+  @override
+  Future<Map<String, dynamic>?> playbackLocation(
+    SyncRecord media, {
+    PlaybackSourcePreference preference = PlaybackSourcePreference.automatic,
+    Map<String, dynamic>? expectedBinding,
+  }) async =>
       await locationGate?.future ??
       resolvedLocation ??
       Map<String, dynamic>.from(store.local('location:${media.id}'));
@@ -1023,6 +1082,7 @@ class _Player implements Player {
   int plays = 0;
   Completer<void>? pauseGate, playGate;
   final playRequests = <bool>[];
+  Duration? requestedStart;
   final _playing = StreamController<bool>.broadcast();
   final openStarted = Completer<void>();
   Completer<void>? openGate;
@@ -1031,6 +1091,7 @@ class _Player implements Player {
   Future<void> open(Playable playable, {bool play = true}) async {
     opens++;
     playRequests.add(play);
+    if (playable is Media) requestedStart = playable.start;
     openStarted.complete();
     await openGate?.future;
     emitPlaying(play);

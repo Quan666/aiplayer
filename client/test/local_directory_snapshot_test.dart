@@ -10,6 +10,57 @@ import 'package:path/path.dart' as p;
 
 void main() {
   test(
+    'folder downloads start at their selected directory without a source root',
+    () async {
+      final fixture = await _Fixture.create();
+      try {
+        fixture.store.setLocal('sources', [
+          {'id': 'nas-a', 'label': 'NAS'},
+          {'id': 'nas-b', 'label': 'Other NAS'},
+        ]);
+        for (final (id, source, selected, relative) in [
+          ('one', 'nas-a', '2026-10/Show', 'Show/Season 1/one.mkv'),
+          ('two', 'nas-a', '2026-10/Show', 'Show/Season 1/two.mkv'),
+          ('other', 'nas-b', '2026-10/Show', 'Show/Season 1/one.mkv'),
+          ('archive', 'nas-a', 'Archive/Show', 'Show/one.mkv'),
+        ]) {
+          fixture.add(
+            id,
+            source,
+            '$selected/${relative.substring('Show/'.length)}',
+          );
+          fixture.offlineLocations[id]!.addAll({
+            'downloadRoot': selected,
+            'downloadRelativePath': relative,
+          });
+        }
+        final snapshot = await fixture.read();
+        final roots = snapshot.localDirectories['']!.entries;
+        expect(roots.map((entry) => entry.name), ['Show', 'Show', 'Show']);
+        expect(roots.map((entry) => entry.path).toSet(), hasLength(3));
+        expect(
+          snapshot.localDirectories.values.any(
+            (entry) =>
+                ['NAS', 'Other NAS', '2026-10', 'Archive'].contains(entry.name),
+          ),
+          isFalse,
+        );
+        final season = snapshot.localDirectories.values.singleWhere(
+          (directory) => directory.records.containsKey('one'),
+        );
+        final show = snapshot.localDirectories[season.parentPath]!;
+        expect(show.sourceId, isNull);
+        expect(show.parentPath, '');
+        expect(season.name, 'Season 1');
+        expect(season.records.keys, unorderedEquals(['one', 'two']));
+        expect(fixture.store.fullReads, 0);
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  test(
     'worker prepares original folders for every completed download',
     () async {
       final fixture = await _Fixture.create();

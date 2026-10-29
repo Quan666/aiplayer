@@ -12,6 +12,8 @@ import '../sources/source.dart';
 import 'library_sort.dart';
 import 'media_episodes.dart';
 import 'media_presentation.dart';
+import 'playback_source.dart';
+import 'playback_options.dart';
 import 'media_title_translation.dart';
 import 'store.dart';
 
@@ -31,6 +33,7 @@ class LibrarySnapshot {
   final Map<String, String> seriesKeys;
   final Map<String, String> episodeKeys;
   final Map<String, List<SyncRecord>> episodeVersions, episodes;
+  final Map<String, List<MediaPlaybackOption>> playbackOptions;
   final Map<String, SyncRecord> representatives;
   final Map<String, SyncRecord> latestBySeries;
   final Map<String, MediaCollectionDetails> details;
@@ -57,6 +60,7 @@ class LibrarySnapshot {
     required this.seriesKeys,
     required this.episodeKeys,
     required this.episodeVersions,
+    this.playbackOptions = const {},
     required this.episodes,
     required this.representatives,
     required this.latestBySeries,
@@ -91,6 +95,9 @@ class LibrarySnapshot {
 
   List<SyncRecord> versionsFor(SyncRecord record) =>
       episodeVersions[episodeKeyFor(record)] ?? const [];
+
+  List<MediaPlaybackOption> playbackOptionsFor(SyncRecord record) =>
+      playbackOptions[episodeKeyFor(record)] ?? const [];
 
   List<SyncRecord> episodesFor(SyncRecord record) =>
       episodes[seriesKeyFor(record)] ?? const [];
@@ -161,10 +168,15 @@ class _LocalDirectoryIndex {
     var directory = directories['']!;
     final source = offline?['remoteSource'], remote = offline?['remotePath'];
     if (source is String && source.isNotEmpty && remote is String) {
+      final selected = offline?['downloadRoot'];
+      final hasSelection =
+          selected is String && offline?['downloadRelativePath'] is String;
       _LocalDirectoryBuilder child(String relative, String name) {
         // JSON preserves source/path boundaries even for names containing
         // separators. The private key remains stable across catalogue rebuilds.
-        final key = 'download-directory:${jsonEncode([source, relative])}';
+        final key = hasSelection
+            ? 'download-selection:${jsonEncode([source, selected, relative])}'
+            : 'download-directory:${jsonEncode([source, relative])}';
         return directories.putIfAbsent(key, () {
           directory.entries.add(
             SourceEntry(name: name, path: key, directory: true),
@@ -173,12 +185,12 @@ class _LocalDirectoryIndex {
             key,
             name,
             directory.path,
-            relative.isEmpty ? source : null,
+            !hasSelection && relative.isEmpty ? source : null,
           );
         });
       }
 
-      directory = child('', sourceNames[source] ?? source);
+      if (!hasSelection) directory = child('', sourceNames[source] ?? source);
       var relative = '';
       for (final name in parents) {
         relative = relative.isEmpty ? name : '$relative/$name';
@@ -292,8 +304,15 @@ class LibrarySnapshotReader {
                 store.all('media'),
                 store.records('progress'),
                 store.localEntries('location:'),
+                technicalFacts: store.localEntries('technical:'),
                 offlineLocations: offlineLocations,
                 sourceNames: _configuredSourceNames(store.local('sources')),
+                externalSources: {
+                  for (final entry
+                      in store.localEntries('externalSource:').entries)
+                    if (entry.value is Map)
+                      entry.key.substring('externalSource:'.length),
+                },
               );
         _memoryRevision = revision;
         _memoryOfflineRevision = offlineRevision;
@@ -486,7 +505,24 @@ void _snapshotWorker((String, SendPort) arguments) {
                           row['value'] as String,
                         ),
                     },
+                    technicalFacts: {
+                      for (final row in database.select(
+                        "SELECT key,value FROM local WHERE key>='technical:' AND key<'technical;'",
+                      ))
+                        row['key'] as String: jsonDecode(
+                          row['value'] as String,
+                        ),
+                    },
                     offlineLocations: offlineLocations,
+                    externalSources: {
+                      for (final row in database.select(
+                        "SELECT key,value FROM local WHERE key>='externalSource:' AND key<'externalSource;'",
+                      ))
+                        if (jsonDecode(row['value'] as String) is Map)
+                          (row['key'] as String).substring(
+                            'externalSource:'.length,
+                          ),
+                    },
                     sourceNames: _configuredSourceNames(
                       database
                           .select("SELECT value FROM local WHERE key='sources'")
@@ -692,6 +728,7 @@ class _SnapshotData {
   late final Map<String, String> seriesKeys;
   late final Map<String, String> episodeKeys;
   late final Map<String, List<SyncRecord>> episodeVersions, episodes;
+  late final Map<String, List<MediaPlaybackOption>> playbackOptions;
   late final Map<String, SyncRecord> representatives;
   late final Map<String, SyncRecord> latestBySeries;
   late final Map<String, MediaCollectionDetails> details;
@@ -715,6 +752,8 @@ class _SnapshotData {
     this.progress,
     Map<String, Map<String, dynamic>> offlineLocations,
     Map<String, String> sourceNames,
+    Map<String, dynamic> technicalFacts,
+    Set<String> externalSources,
   ) : byId = Map.unmodifiable({for (final record in media) record.id: record}) {
     final index = _LibrarySeriesIndex(media);
     series = index.groups;
@@ -731,14 +770,34 @@ class _SnapshotData {
         ).entries)
           versions.key: List<SyncRecord>.unmodifiable(versions.value),
     });
+    final availableSources = {'local', ...sourceNames.keys, ...externalSources};
+    playbackOptions = Map.unmodifiable({
+      for (final entry in episodeVersions.entries)
+        entry.key: preparePlaybackOptions(
+          entry.value,
+          locations,
+          offlineLocations,
+          technicalFacts,
+          availableSources,
+        ),
+    });
     episodes = Map.unmodifiable({
       for (final entry in series.entries)
         entry.key: List<SyncRecord>.unmodifiable(
           uniqueMediaEpisodes(
-            entry.value,
-            seriesKey: entry.key,
-            playable: (record) => locations.containsKey(record.id),
-          )..sort(compareMediaEpisodes),
+                entry.value,
+                seriesKey: entry.key,
+                playable: (record) => locations.containsKey(record.id),
+              )
+              .map(
+                (record) =>
+                    playbackOptions[episodeKeys[record.id]]
+                        ?.firstOrNull
+                        ?.media ??
+                    record,
+              )
+              .toList()
+            ..sort(compareMediaEpisodes),
         ),
     });
     folders = _groupFolders(media, locations, seriesKeys, history);
@@ -760,8 +819,11 @@ class _SnapshotData {
       if (location?['source'] != 'local') continue;
       imported[record.id] = record;
       final remote = offline?['remotePath'];
+      final relative = offline != null && offline['downloadRoot'] is String
+          ? offline['downloadRelativePath']
+          : null;
       final parents = matches && remote is String
-          ? _downloadParentSegments(remote)
+          ? _downloadParentSegments(relative is String ? relative : remote)
           : const <String>[];
       final entry = SourceEntry(
         name: '${record.data['fileName'] ?? record.data['title'] ?? ''}',
@@ -840,6 +902,7 @@ class _SnapshotData {
     seriesKeys = previous.seriesKeys;
     episodeKeys = previous.episodeKeys;
     episodeVersions = previous.episodeVersions;
+    playbackOptions = previous.playbackOptions;
     episodes = previous.episodes;
     representatives = previous.representatives;
     details = previous.details;
@@ -1003,6 +1066,8 @@ class _SnapshotData {
     Map<String, dynamic> savedLocations, {
     Map<String, Map<String, dynamic>> offlineLocations = const {},
     Map<String, String> sourceNames = const {},
+    Map<String, dynamic> technicalFacts = const {},
+    Set<String> externalSources = const {},
   }) {
     final media = List<SyncRecord>.unmodifiable(
       records
@@ -1025,6 +1090,8 @@ class _SnapshotData {
       progress,
       offlineLocations,
       sourceNames,
+      technicalFacts,
+      externalSources,
     );
   }
 
@@ -1118,6 +1185,7 @@ class _SnapshotData {
       seriesKeys: seriesKeys,
       episodeKeys: episodeKeys,
       episodeVersions: episodeVersions,
+      playbackOptions: playbackOptions,
       episodes: episodes,
       representatives: representatives,
       latestBySeries: latestBySeries,

@@ -171,7 +171,7 @@ class _CastSheetState extends State<_CastSheet> with WidgetsBindingObserver {
     _refresh();
     try {
       final location = await _startGuard.acquire(
-        session.model.playbackLocation(session.media),
+        session.resolvePlaybackLocation(),
         (_) {},
       );
       if (location == null) throw const AppFailure('视频尚未关联本机来源。');
