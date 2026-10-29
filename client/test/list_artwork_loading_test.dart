@@ -22,6 +22,7 @@ class _ListModel extends AppModel {
   final previews = <String>{};
   final records = <SyncRecord>[];
   final entries = <SourceEntry>[];
+  final directoryEntries = <String, List<SourceEntry>>{};
   bool folders = false;
 
   @override
@@ -47,7 +48,8 @@ class _ListModel extends AppModel {
   }) async => records;
 
   @override
-  Future<SourceAdapter> adapter(String id) async => _ListAdapter(entries);
+  Future<SourceAdapter> adapter(String id) async =>
+      _ListAdapter(entries, directoryEntries);
 
   @override
   Future<DirectoryCollection?> synchronizeDirectoryEntriesInBackground(
@@ -69,10 +71,12 @@ class _ListModel extends AppModel {
 }
 
 class _ListAdapter extends SourceAdapter {
-  _ListAdapter(this.entries);
+  _ListAdapter(this.entries, this.directoryEntries);
   final List<SourceEntry> entries;
+  final Map<String, List<SourceEntry>> directoryEntries;
   @override
-  Future<List<SourceEntry>> list(String path) async => entries;
+  Future<List<SourceEntry>> list(String path) async =>
+      directoryEntries[path] ?? entries;
   @override
   Future<SourceEntry> stat(String path) async =>
       SourceEntry(name: path, path: path);
@@ -329,13 +333,12 @@ void main() {
         model.entries.add(
           SourceEntry(name: folder, path: folder, directory: true),
         );
-        final id = model.addMedia(
-          'nas',
-          SourceEntry(
-            name: '$folder S01E01.mp4',
-            path: '$folder/$folder S01E01.mp4',
-          ),
+        final video = SourceEntry(
+          name: '$folder S01E01.mp4',
+          path: '$folder/$folder S01E01.mp4',
         );
+        model.directoryEntries[folder] = [video];
+        final id = model.addMedia('nas', video);
         final poster = 'https://example.com/folder-$index.png';
         final record = store.get('media', id)!;
         store.save('media', id, {
@@ -347,6 +350,10 @@ void main() {
         final file = model.posterCache.cachedFile(poster);
         await file.parent.create(recursive: true);
         await file.writeAsBytes(bytes);
+        // A complete directory listing is required before its saved media
+        // metadata can supply the folder poster.
+        await model.catalog.inspect('nas', folder, [video]);
+        expect(model.catalog.directoryPreview('nas', folder), isNotNull);
       }
     });
     await mount(
