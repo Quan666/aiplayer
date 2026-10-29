@@ -24,7 +24,9 @@ import 'theme/library_styles.dart';
 import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
 import 'metadata_tasks_sheet.dart';
+import 'download_tasks_sheet.dart';
 import 'media_details_content.dart';
+import 'offline_download_controls.dart';
 import 'media_file_details.dart';
 import 'search_header.dart';
 import 'navigation_reveal.dart';
@@ -569,6 +571,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       final managedCount = (await Future.wait(
         items.map(model.isManagedImport),
       )).where((managed) => managed).length;
+      final downloadCount = items
+          .where((item) => model.downloads.entryFor(item.id) != null)
+          .length;
       final single = items.length == 1;
       final managed = managedCount > 0;
       if (!mounted) return;
@@ -580,11 +585,17 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
           actionsPadding: GlassMetrics.dialogActionsPadding,
           title: Text(
             single
-                ? (managed ? '删除导入的视频？' : '从影视库移除？')
+                ? (downloadCount > 0
+                      ? '删除离线视频及记录？'
+                      : managed
+                      ? '删除导入的视频？'
+                      : '从影视库移除？')
                 : '移除这 ${items.length} 个视频？',
           ),
           content: Text(
-            !managed
+            downloadCount > 0
+                ? '将移除影视库记录，删除 $downloadCount 个离线下载及未完成文件${managed ? '和 $managedCount 个导入副本' : ''}，无法撤销。原始位置的文件会保留。'
+                : !managed
                 ? '仅移除影视库记录，原位置的视频文件会保留。'
                 : single
                 ? '将删除应用中导入的视频文件及其库记录，无法撤销。原始位置的文件不受影响。'
@@ -597,7 +608,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
             ),
             FilledButton(
               onPressed: () => Navigator.pop(c, true),
-              child: Text(managed ? '删除视频' : '移除'),
+              child: Text(managed || downloadCount > 0 ? '删除视频' : '移除'),
             ),
           ],
         ),
@@ -1515,21 +1526,35 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       onScrollActivityChanged: _onLibraryActivityChanged,
       child: Scaffold(
         extendBody: true,
-        floatingActionButton: model.metadataTasks.isEmpty
+        floatingActionButton:
+            !_routeCurrent || MediaQuery.viewInsetsOf(context).bottom > 0
             ? null
-            : FloatingActionButton.small(
-                heroTag: 'metadata-tasks',
-                tooltip: '识别任务',
-                onPressed: () => showMetadataTasks(context, model),
-                child: Badge(
-                  isLabelVisible: model.metadataTasks.any(
-                    (task) => task.running,
+            : Column(
+                key: const ValueKey('task-shortcuts'),
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (model.metadataTasks.isNotEmpty)
+                    FloatingActionButton.small(
+                      heroTag: null,
+                      tooltip: '识别任务',
+                      onPressed: () => showMetadataTasks(context, model),
+                      child: Badge(
+                        isLabelVisible: model.metadataTasks.any(
+                          (task) => task.running,
+                        ),
+                        label: Text(
+                          '${model.metadataTasks.where((task) => task.running).length}',
+                        ),
+                        child: const Icon(Icons.manage_search_rounded),
+                      ),
+                    ),
+                  DownloadTasksButton(
+                    model: model,
+                    padding: EdgeInsets.only(
+                      top: model.metadataTasks.isNotEmpty ? 8 : 0,
+                    ),
                   ),
-                  label: Text(
-                    '${model.metadataTasks.where((task) => task.running).length}',
-                  ),
-                  child: const Icon(Icons.manage_search_rounded),
-                ),
+                ],
               ),
         body: SafeArea(
           top: desktop,
@@ -2099,13 +2124,45 @@ class _PosterTileState extends State<_PosterTile> {
   }
 }
 
+/// Sources and the library share the same lazy details view and metadata.
+Future<void> showLibraryMediaDetails(
+  BuildContext context, {
+  required AppModel model,
+  required LibrarySnapshot snapshot,
+  required SyncRecord anchor,
+  required ValueChanged<SyncRecord> onPlay,
+  void Function(String, SyncRecord)? onAction,
+}) async {
+  await showGlassBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    builder: (sheet) => _SeriesDetailsSheet(
+      model: model,
+      snapshot: snapshot,
+      anchor: anchor,
+      onPlay: onPlay,
+      onMatch: (items) {
+        Navigator.pop(sheet);
+        showMetadataMatchDialog(
+          context,
+          model,
+          '${items.first.data['series'] ?? model.displayTitle(items.first)}',
+          season: '${items.first.data['season'] ?? ''}',
+          mediaIds: items.map((item) => item.id).toSet(),
+        );
+      },
+      onAction: onAction,
+    ),
+  );
+}
+
 class _SeriesDetailsSheet extends StatefulWidget {
   final AppModel model;
   final LibrarySnapshot snapshot;
   final SyncRecord anchor;
   final ValueChanged<SyncRecord> onPlay;
   final ValueChanged<List<SyncRecord>> onMatch;
-  final void Function(String, SyncRecord) onAction;
+  final void Function(String, SyncRecord)? onAction;
   const _SeriesDetailsSheet({
     required this.model,
     required this.snapshot,
@@ -2363,6 +2420,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
       latest: _latest,
       onPlay: widget.onPlay,
       onSort: _sortMenu,
+      onDownload: () => showDownloadSelection(context, model, _episodes),
       onMatch: () => widget.onMatch(_allEpisodes),
     );
   }
@@ -2505,7 +2563,7 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
               } else if (action == 'versions') {
                 _chooseVersion(item);
               } else {
-                widget.onAction(action, item);
+                widget.onAction?.call(action, item);
               }
             },
             itemBuilder: (_) => [
@@ -2522,30 +2580,32 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
                   value: 'versions',
                   child: Text('选择视频版本'),
                 ),
-              const PopupMenuItem(
-                height: GlassMetrics.menuItemHeight,
-                padding: GlassMetrics.menuItemPadding,
-                value: 'edit',
-                child: Text('更正作品与集数'),
-              ),
-              const PopupMenuItem(
-                height: GlassMetrics.menuItemHeight,
-                padding: GlassMetrics.menuItemPadding,
-                value: 'link',
-                child: Text('重新关联视频位置'),
-              ),
-              const PopupMenuItem(
-                height: GlassMetrics.menuItemHeight,
-                padding: GlassMetrics.menuItemPadding,
-                value: 'watched',
-                child: Text('切换已看状态'),
-              ),
-              const PopupMenuItem(
-                height: GlassMetrics.menuItemHeight,
-                padding: GlassMetrics.menuItemPadding,
-                value: 'delete',
-                child: Text('从影视库移除'),
-              ),
+              if (widget.onAction != null) ...[
+                const PopupMenuItem(
+                  height: GlassMetrics.menuItemHeight,
+                  padding: GlassMetrics.menuItemPadding,
+                  value: 'edit',
+                  child: Text('更正作品与集数'),
+                ),
+                const PopupMenuItem(
+                  height: GlassMetrics.menuItemHeight,
+                  padding: GlassMetrics.menuItemPadding,
+                  value: 'link',
+                  child: Text('重新关联视频位置'),
+                ),
+                const PopupMenuItem(
+                  height: GlassMetrics.menuItemHeight,
+                  padding: GlassMetrics.menuItemPadding,
+                  value: 'watched',
+                  child: Text('切换已看状态'),
+                ),
+                const PopupMenuItem(
+                  height: GlassMetrics.menuItemHeight,
+                  padding: GlassMetrics.menuItemPadding,
+                  value: 'delete',
+                  child: Text('从影视库移除'),
+                ),
+              ],
             ],
           ),
         );

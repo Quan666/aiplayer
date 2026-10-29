@@ -1313,16 +1313,31 @@ class _PlayerControlsState extends State<_PlayerControls>
     widget.display.readBrightness().then((value) {
       if (mounted) brightness = value;
     });
-    final location = widget.model.store.local('location:${s.media.id}');
-    if (location != null) {
-      seekPreview = SeekPreviewController(
-        openSource: () => widget.model.adapter('${location['source']}'),
-        path: '${location['path']}',
-      );
-    }
+    unawaited(_prepareSeekPreview());
     reveal();
     _controlsState = _visibleSessionState;
     _maybeAutoFullscreen();
+  }
+
+  Future<void> _prepareSeekPreview() async {
+    final owner = widget.model;
+    final session = s;
+    try {
+      final location = await owner.playbackLocation(session.media);
+      if (!mounted ||
+          session.closed ||
+          !identical(session, s) ||
+          !identical(owner, widget.model) ||
+          location == null) {
+        return;
+      }
+      seekPreview = SeekPreviewController(
+        openSource: () => owner.adapter('${location['source']}'),
+        path: '${location['path']}',
+      );
+    } catch (_) {
+      // Optional previews must not interfere with playback startup.
+    }
   }
 
   @override

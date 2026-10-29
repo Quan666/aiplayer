@@ -31,6 +31,7 @@ import 'library_sort.dart';
 import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
 import 'local_state_worker.dart';
+import 'offline_downloads.dart';
 import 'media_presentation.dart';
 import 'media_title_translation.dart';
 import 'poster_cache.dart';
@@ -44,6 +45,7 @@ part 'app_model_metadata_tasks.dart';
 part 'app_model_directory_recognition.dart';
 part 'app_model_cache.dart';
 part 'app_model_library_refresh.dart';
+part 'app_model_downloads.dart';
 
 Duration _syncRetryDelay(int failures) {
   const seconds = [3, 6, 12, 24, 48, 96, 180, 300];
@@ -104,6 +106,25 @@ class AppModel extends ChangeNotifier {
   final Directory documents;
   final bool backgroundWork;
   final FlutterSecureStorage secrets;
+  OfflineDownloads? _downloads;
+  Future<void>? _downloadsRestoreWork;
+  int _downloadCompletedRevision = 0;
+  int _downloadLibraryRevision = 0;
+  OfflineDownloads get downloads => _getDownloads();
+  bool canDownload(SyncRecord media) => _canDownload(media);
+  Future<void> downloadMedia(Iterable<SyncRecord> records) =>
+      _downloadMedia(records);
+  Future<void> downloadSourceEntries(
+    String sourceId,
+    Iterable<SourceEntry> entries,
+  ) => _downloadSourceEntries(sourceId, entries);
+  Future<void> deleteDownload(String id) => downloads.delete(id);
+  Future<Map<String, dynamic>?> playbackLocation(SyncRecord media) =>
+      _playbackLocation(media);
+  void _notifyDownloadsChanged() {
+    if (!_disposed) notifyListeners();
+  }
+
   PosterCache? _posterCache;
   PosterCache get posterCache => _posterCache ??= (PosterCache(
     directory: Directory(p.join(documents.path, 'poster-cache-v1')),
@@ -535,6 +556,7 @@ class AppModel extends ChangeNotifier {
   void setForeground(bool foreground) {
     if (_disposed || _foreground == foreground) return;
     _foreground = foreground;
+    _downloads?.setActive(foreground);
     _posterCache?.setActive(foreground && !_clearingCaches);
     if (!foreground) {
       _librarySourceRefreshCancel?.cancel();
@@ -618,7 +640,7 @@ class AppModel extends ChangeNotifier {
   List<SyncRecord> _mediaSnapshot = const [];
   LibrarySnapshotReader? _librarySnapshotReader;
   LibrarySnapshot? _librarySnapshot;
-  (int, int, int)? _librarySnapshotRevision;
+  (int, int, int, int)? _librarySnapshotRevision;
   LibrarySearchRevision? _librarySnapshotSearchRevision;
   Future<void>? _librarySnapshotWork;
   ContinueWatchingPresentationReader? _continueWatchingReader;
@@ -666,10 +688,11 @@ class AppModel extends ChangeNotifier {
     }
   }
 
-  (int, int, int) get _libraryReadRevision => (
+  (int, int, int, int) get _libraryReadRevision => (
     store.recordsRevision('media'),
     store.recordsRevision('progress'),
     store.locationRevision,
+    _downloads?.completedRevision ?? 0,
   );
 
   /// Local display overrides affect active searches, never the structural
@@ -689,6 +712,12 @@ class AppModel extends ChangeNotifier {
     String query = '',
     CancelToken? cancel,
   }) async {
+    if (_disposed) throw const Cancelled();
+    // Restoration must not delay browsing the existing library. Its completed
+    // membership notification refreshes the snapshot once the worker is ready.
+    if (store.path != ':memory:' && !downloads.initialized) {
+      unawaited(_restoreDownloads());
+    }
     final search = query.trim().toLowerCase();
     while (true) {
       cancel?.check();
@@ -719,14 +748,16 @@ class AppModel extends ChangeNotifier {
 
   Future<void> _prepareLibrarySnapshot(
     String query,
-    (int, int, int) revision,
+    (int, int, int, int) revision,
     LibrarySort sort,
     LibrarySearchRevision? searchRevision,
   ) async {
     final reader = _librarySnapshotReader ??= LibrarySnapshotReader(store);
     final snapshot = await reader.read(
       query: query,
-      revision: revision,
+      revision: (revision.$1, revision.$2, revision.$3),
+      offlineRevision: revision.$4,
+      offlineLocations: _downloads?.completedLocations ?? const {},
       sort: sort,
       searchRevision: searchRevision,
     );
@@ -2529,6 +2560,13 @@ class AppModel extends ChangeNotifier {
   Future<void> removeMedia(SyncRecord record) async {
     final current = store.get('media', record.id);
     if (current == null || current.deleted) return;
+    if (store.path != ':memory:' && !downloads.initialized) {
+      await downloads.initialize();
+    }
+    if (_downloads?.entryFor(record.id) != null) {
+      await downloads.delete(record.id);
+    }
+    if (_disposed) throw const Cancelled();
     _previews?.forget(record.id);
     final owned = await _managedImportFile(current);
     if (owned != null) {
@@ -3058,6 +3096,8 @@ class AppModel extends ChangeNotifier {
       _persistMetadataTasks();
     }
     _disposed = true;
+    _downloads?.removeListener(_downloadsChanged);
+    unawaited(_downloads?.close());
     _localStateShutdown = _closeLocalState();
     _discardBrowsePreviews();
     _browsePreviewCapacity.dispose();

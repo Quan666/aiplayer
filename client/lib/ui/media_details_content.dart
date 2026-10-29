@@ -8,6 +8,7 @@ import '../sources/source.dart';
 import 'glass.dart';
 import 'media_artwork.dart';
 import 'media_details_header.dart';
+import 'offline_download_controls.dart';
 import 'theme/library_styles.dart';
 
 /// The complete details introduction used by library sheets and source folders.
@@ -20,6 +21,7 @@ class MediaDetailsOverview extends StatelessWidget {
   final ValueChanged<SyncRecord> onPlay;
   final VoidCallback? onMatch;
   final VoidCallback onSort;
+  final VoidCallback? onDownload;
   final String? availabilityLabel;
 
   const MediaDetailsOverview({
@@ -32,6 +34,7 @@ class MediaDetailsOverview extends StatelessWidget {
     required this.onSort,
     this.onMatch,
     this.availabilityLabel,
+    this.onDownload,
   });
 
   @override
@@ -46,7 +49,7 @@ class MediaDetailsOverview extends StatelessWidget {
         availabilityLabel: availabilityLabel,
       ),
       MediaDetailsContinue(model: model, latest: latest, onPlay: onPlay),
-      MediaDetailsPlaylistHeader(onSort: onSort),
+      MediaDetailsPlaylistHeader(onSort: onSort, onDownload: onDownload),
     ],
   );
 }
@@ -83,13 +86,24 @@ class MediaDetailsContinue extends StatelessWidget {
 
 class MediaDetailsPlaylistHeader extends StatelessWidget {
   final VoidCallback onSort;
+  final VoidCallback? onDownload;
 
-  const MediaDetailsPlaylistHeader({super.key, required this.onSort});
+  const MediaDetailsPlaylistHeader({
+    super.key,
+    required this.onSort,
+    this.onDownload,
+  });
 
   @override
   Widget build(BuildContext context) => Row(
     children: [
       Expanded(child: Text('播放列表', style: AppStyles.of(context).strong)),
+      if (onDownload != null)
+        IconButton(
+          tooltip: '选择下载',
+          onPressed: onDownload,
+          icon: const Icon(Icons.download_outlined),
+        ),
       IconButton(
         tooltip: '排序与显示',
         onPressed: onSort,
@@ -332,10 +346,24 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile> {
         onLongPress: widget.onLongPress,
         trailing: SizedBox(
           key: const ValueKey('episode-action'),
-          width: 40,
+          width: 80,
           height: 48,
-          child:
-              widget.trailing ?? const Icon(Icons.play_arrow_rounded, size: 20),
+          child: Row(
+            children: [
+              OfflineDownloadButton(
+                model: model,
+                item: item,
+                sourceId: widget.sourceId,
+                sourceEntry: widget.sourceEntry,
+              ),
+              SizedBox(
+                width: 40,
+                child:
+                    widget.trailing ??
+                    const Icon(Icons.play_arrow_rounded, size: 20),
+              ),
+            ],
+          ),
         ),
       ),
     );

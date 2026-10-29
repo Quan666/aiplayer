@@ -16,6 +16,68 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 void main() {
+  test(
+    'resolved offline playback opens local data without remote connection',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      final file = await File(
+        '${model.documents.path}/offline/video.mkv',
+      ).create(recursive: true);
+      await file.writeAsBytes(List.filled(100, 1));
+      model.store.setLocal('location:video', {
+        'source': 'remote-smb',
+        'path': 'share/video.mkv',
+        'size': 999,
+      });
+      model.resolvedLocation = {
+        'source': 'local',
+        'path': file.path,
+        'size': 100,
+        'offline': true,
+      };
+      model.credentials.complete(null);
+      model.source.complete(LocalSource());
+
+      await session.open();
+
+      expect(session.ready, isTrue);
+      expect(model.openedSources, ['local']);
+      expect(session.playbackUri, file.uri.toString());
+      expect(model.store.local('location:video')['source'], 'remote-smb');
+      expect(model.store.local('location:video')['size'], 999);
+    },
+  );
+
+  test(
+    'background pause during offline validation suppresses late autoplay',
+    () async {
+      final model = _Model();
+      final session = _Session(model);
+      _cleanup(model, session);
+      final resolution = model.locationGate =
+          Completer<Map<String, dynamic>?>();
+      model.credentials.complete(null);
+      model.source.complete(_Source());
+      final opening = session.open(play: true);
+      session.setBackgroundPlaybackBlocked(true);
+      session.setBackgroundPlaybackBlocked(false);
+      resolution.complete({
+        'source': 'local',
+        'path': '/offline/video.mkv',
+        'size': 100,
+        'offline': true,
+      });
+
+      await opening;
+
+      expect(session.ready, isTrue);
+      expect(session.player.playRequests, [false]);
+      expect(session.player.state.playing, isFalse);
+    },
+  );
+
   for (final pausePlayback in [true, false]) {
     test('invisible startup stops first-frame polling '
         '(pause playback: $pausePlayback)', () async {
@@ -432,6 +494,7 @@ void main() {
     _cleanup(model, session);
     model.credentials.complete(null);
     final opening = session.open();
+    await model.adapterOpened.future;
     await session.close().timeout(const Duration(seconds: 2));
     await opening.timeout(const Duration(seconds: 2));
     expect(session.player.opens, 0);
@@ -782,6 +845,10 @@ class _Model extends ChangeNotifier implements AppModel {
 
   final credentials = Completer<DanmuApiClient?>();
   final source = Completer<SourceAdapter>();
+  final adapterOpened = Completer<void>();
+  final openedSources = <String>[];
+  Map<String, dynamic>? resolvedLocation;
+  Completer<Map<String, dynamic>?>? locationGate;
   final _preferences = <String, dynamic>{};
   @override
   final store = AppStore(':memory:');
@@ -800,7 +867,17 @@ class _Model extends ChangeNotifier implements AppModel {
   @override
   Future<DanmuApiClient?> danmu() => credentials.future;
   @override
-  Future<SourceAdapter> adapter(String id) => source.future;
+  Future<SourceAdapter> adapter(String id) {
+    openedSources.add(id);
+    if (!adapterOpened.isCompleted) adapterOpened.complete();
+    return source.future;
+  }
+
+  @override
+  Future<Map<String, dynamic>?> playbackLocation(SyncRecord media) async =>
+      await locationGate?.future ??
+      resolvedLocation ??
+      Map<String, dynamic>.from(store.local('location:${media.id}'));
   @override
   Future<void> pausePreviews() async {}
   @override

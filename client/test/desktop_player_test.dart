@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:aiplayer/data/app_model.dart';
+import 'package:aiplayer/data/offline_downloads.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/main.dart';
 import 'package:aiplayer/playback/desktop_window.dart';
@@ -49,15 +50,22 @@ void main() {
   });
 
   group('main desktop window', () {
-    test('fullscreen works in the main window without a player-window flag', () async {
-      expect(await DesktopWindow.setFullscreen(true), isTrue);
-      expect(await DesktopWindow.setFullscreen(false), isFalse);
-      expect(windowCalls.map((call) => call.method),
-          ['setVideoFullscreen', 'setVideoFullscreen']);
-      expect(windowCalls.map((call) => call.arguments),
-          [{'enabled': true}, {'enabled': false}]);
-      expect(desktopCalls, isEmpty);
-    });
+    test(
+      'fullscreen works in the main window without a player-window flag',
+      () async {
+        expect(await DesktopWindow.setFullscreen(true), isTrue);
+        expect(await DesktopWindow.setFullscreen(false), isFalse);
+        expect(windowCalls.map((call) => call.method), [
+          'setVideoFullscreen',
+          'setVideoFullscreen',
+        ]);
+        expect(windowCalls.map((call) => call.arguments), [
+          {'enabled': true},
+          {'enabled': false},
+        ]);
+        expect(desktopCalls, isEmpty);
+      },
+    );
 
     test('close requests await cleanup and can be detached', () async {
       final cleanup = Completer<void>();
@@ -79,47 +87,85 @@ void main() {
       expect(calls, 1);
     });
 
-    testWidgets('application close waits for saved previews and runs once', (tester) async {
-      FlutterSecureStorage.setMockInitialValues({});
-      final root = Directory.systemTemp.createTempSync('aiplayer-close-');
-      final store = AppStore('${root.path}/test.db');
-      final model = _ClosingModel(store, root);
-      try {
-        await tester.pumpWidget(AIPlayerApp(model: model));
-        await tester.pump();
-        expect(desktopCalls.map((call) => call.method), ['ready']);
-        final closing = native('closeRequested');
-        await tester.pump();
-        await tester.pump();
-        expect(model.flushes, 1);
-        expect(desktopCalls.where((call) => call.method == 'closeWindow'), isEmpty);
-        await native('closeRequested');
-        expect(model.flushes, 1);
-        model.saved.complete();
-        await tester.pump();
-        await closing;
-        expect(desktopCalls.map((call) => call.method), ['ready', 'closeWindow']);
-        expect(tester.takeException(), isNull);
-      } finally {
-        if (!model.saved.isCompleted) model.saved.complete();
-        await tester.pumpWidget(const SizedBox());
-        model.dispose();
-        store.dispose();
-        root.deleteSync(recursive: true);
-      }
-    });
+    testWidgets(
+      'application close waits for download checkpoints and saved previews once',
+      (tester) async {
+        FlutterSecureStorage.setMockInitialValues({});
+        final root = Directory.systemTemp.createTempSync('aiplayer-close-');
+        final store = AppStore('${root.path}/test.db');
+        final model = _ClosingModel(store, root);
+        try {
+          await tester.pumpWidget(AIPlayerApp(model: model));
+          await tester.pump();
+          expect(desktopCalls.map((call) => call.method), ['ready']);
+          final closing = native('closeRequested');
+          await tester.pump();
+          await tester.pump();
+          expect(model.downloads.closes, 1);
+          expect(model.flushes, 0);
+          expect(
+            desktopCalls.where((call) => call.method == 'closeWindow'),
+            isEmpty,
+          );
+          await native('closeRequested');
+          expect(model.downloads.closes, 1);
+          model.downloads.saved.complete();
+          await tester.pump();
+          expect(model.flushes, 1);
+          model.saved.complete();
+          await tester.pump();
+          await closing;
+          expect(desktopCalls.map((call) => call.method), [
+            'ready',
+            'closeWindow',
+          ]);
+          expect(tester.takeException(), isNull);
+        } finally {
+          if (!model.downloads.saved.isCompleted) {
+            model.downloads.saved.complete();
+          }
+          if (!model.saved.isCompleted) model.saved.complete();
+          await tester.pumpWidget(const SizedBox());
+          model.dispose();
+          store.dispose();
+          root.deleteSync(recursive: true);
+        }
+      },
+    );
   }, skip: !DesktopWindow.supported);
 }
 
 class _ClosingModel extends AppModel {
   final saved = Completer<void>();
   int flushes = 0;
+  @override
+  late final _ClosingDownloads downloads = _ClosingDownloads(documents);
   _ClosingModel(super.store, super.documents)
-      : super(enableThumbnails: false, backgroundWork: false);
+    : super(enableThumbnails: false, backgroundWork: false);
 
   @override
   Future<void> flushPlaybackPreviews() {
     flushes++;
+    return saved.future;
+  }
+}
+
+class _ClosingDownloads extends OfflineDownloads {
+  final saved = Completer<void>();
+  int closes = 0;
+  _ClosingDownloads(Directory directory)
+    : super(
+        directory: directory,
+        storePath: ':memory:',
+        sourceConfiguration: (_) async => null,
+      );
+
+  @override
+  bool get initialized => true;
+
+  @override
+  Future<void> close() {
+    closes++;
     return saved.future;
   }
 }

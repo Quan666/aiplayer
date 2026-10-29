@@ -30,11 +30,15 @@ Future<void> showMediaFileDetails(
     cancel.check();
     final stored = item == null
         ? null
-        : model.store.local('location:${item.id}') ??
+        : await model.playbackLocation(item) ??
               model.store.local('browse:${item.id}');
+    cancel.check();
     final location = stored is Map ? stored : const {};
-    final source = sourceId ?? location['source'] as String? ?? '';
-    final path = entry?.path ?? location['path'] as String? ?? '';
+    final offline = location['offline'] == true;
+    final source =
+        (offline ? null : sourceId) ?? location['source'] as String? ?? '';
+    final path =
+        (offline ? null : entry?.path) ?? location['path'] as String? ?? '';
     if (source.isEmpty || path.isEmpty) {
       throw const AppFailure('尚未关联视频文件，请先关联视频位置。');
     }
@@ -53,6 +57,7 @@ Future<void> showMediaFileDetails(
     item == null ? null : model.store.localKeyRevision('location:${item.id}'),
     item == null ? null : model.store.localKeyRevision('browse:${item.id}'),
     model.store.localPrefixRevision('externalSource:'),
+    model.downloads.completedRevision,
   );
 
   await showGlassBottomSheet<void>(

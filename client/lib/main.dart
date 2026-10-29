@@ -160,6 +160,9 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
     await WidgetsBinding.instance.endOfFrame;
     await PlayerPage.waitForDisposals();
     try {
+      // Finish cancellation and persist partial-file checkpoints before native
+      // window teardown; a later frame is not guaranteed during application exit.
+      await model.downloads.close();
       await model.flushPlaybackPreviews();
       await AppLog.instance.flush();
     } finally {

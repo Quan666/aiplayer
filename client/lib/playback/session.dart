@@ -113,6 +113,7 @@ class PlaybackSession extends ChangeNotifier {
   final _startupTimings = <String, int>{};
   Map<String, int> get startupTimings => Map.unmodifiable(_startupTimings);
   String? _subtitleSearchPath;
+  Map<String, dynamic>? _playbackLocation;
   static const _playbackErrorMessage = '播放发生错误，可尝试软解或重新打开视频。';
   final _clock = Stopwatch();
   // Position has its own notifier: moving the seek thumb must not rebuild the
@@ -726,8 +727,13 @@ class PlaybackSession extends ChangeNotifier {
   }
 
   Future<(String, String)> _preparePlaybackSource() async {
-    final location = model.store.local('location:${media.id}');
+    final location = await subtitleCancelable(
+      model.playbackLocation(media),
+      _startupCancel,
+    );
+    _startupCancel.check();
     if (location == null) throw const AppFailure('请先关联本机视频位置。');
+    _playbackLocation = location;
     final sourceId = location['source'] as String;
     final opened = await _openSource(sourceId, _startupCancel);
     if (closed) {
@@ -754,7 +760,7 @@ class PlaybackSession extends ChangeNotifier {
       uri = serving.uri.toString();
     }
     if (closed) return ('', '');
-    if (location['size'] != stat.size) {
+    if (location['offline'] != true && location['size'] != stat.size) {
       await model.store.updatePlaybackLocationSize(
         media.id,
         sourceId: sourceId,
@@ -1044,7 +1050,8 @@ class PlaybackSession extends ChangeNotifier {
     final token = CancelToken();
     _subtitleCancel = token;
     final generation = _subtitleGeneration;
-    final location = model.store.local('location:${media.id}');
+    final location = _playbackLocation;
+    if (location == null) throw const AppFailure('视频来源尚未准备好。');
     final adapter = await _openSource(location['source'] as String, token);
     try {
       final stat = await subtitleCancelable(adapter.stat(entry.path), token);
@@ -1174,7 +1181,8 @@ class PlaybackSession extends ChangeNotifier {
     }
     final index = _embeddedSubtitleTracks.indexWhere((t) => t.id == track.id);
     if (index < 0) throw const AppFailure('无法找到原始字幕轨道，请重新选择内嵌字幕或加载外挂字幕。');
-    final location = model.store.local('location:${media.id}');
+    final location = _playbackLocation;
+    if (location == null) throw const AppFailure('视频来源尚未准备好。');
     final adapter = await _openSource(location['source'] as String, token);
     try {
       final path = location['path'] as String;

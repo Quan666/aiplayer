@@ -28,6 +28,8 @@ import 'theme/settings_styles.dart';
 import 'player_page.dart';
 import 'navigation_reveal.dart';
 import 'media_details_content.dart';
+import 'library_page.dart' show showLibraryMediaDetails;
+import 'offline_download_controls.dart';
 import 'media_file_details.dart';
 import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
@@ -407,6 +409,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
 
   Object get _rootRevision => (
     model.store,
+    model.downloads.completedRevision,
     model.store.recordsRevision('media'),
     model.store.locationRevision,
     model.store.localKeyRevision('sources'),
@@ -539,6 +542,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
 
   Object get _localSnapshotKey => (
     model.store,
+    model.downloads.completedRevision,
     model.store.recordsRevision('media'),
     model.store.locationRevision,
   );
@@ -979,6 +983,11 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
+              leading: const Icon(Icons.movie_outlined),
+              title: const Text('影视详情'),
+              onTap: () => Navigator.pop(context, 'details'),
+            ),
+            ListTile(
               leading: const Icon(Icons.description_outlined),
               title: const Text('查看文件详情'),
               onTap: () => Navigator.pop(context, 'file-details'),
@@ -998,6 +1007,10 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       ),
     );
     if (action == null || !mounted) return;
+    if (action == 'details') {
+      await _localDetails(item);
+      return;
+    }
     if (action == 'file-details') {
       await showMediaFileDetails(context, model: model, item: item);
       return;
@@ -1006,6 +1019,24 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       item,
     ], automatic: action == 'auto');
     if (mounted) setState(() {});
+  }
+
+  Future<void> _localDetails(SyncRecord item) async {
+    _localSearch.dismiss();
+    final owner = model;
+    try {
+      final snapshot = await owner.loadLibrarySnapshot();
+      if (!mounted || !identical(owner, model)) return;
+      await showLibraryMediaDetails(
+        context,
+        model: owner,
+        snapshot: snapshot,
+        anchor: snapshot.byId[item.id] ?? item,
+        onPlay: widget.onPlay,
+      );
+    } catch (failure) {
+      if (mounted) await _sourceFailure(context, failure, '打开影视详情失败');
+    }
   }
 
   Widget _local() {
@@ -1032,6 +1063,18 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
             ].where((line) => line.isNotEmpty).join('\n'),
             video: true,
             leading: _localArtwork(item),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (model.downloads.entryFor(item.id)?.isComplete == true)
+                  OfflineDownloadButton(model: model, item: item),
+                IconButton(
+                  tooltip: '影视详情',
+                  icon: const Icon(Icons.info_outline_rounded, size: 20),
+                  onPressed: () => _localDetails(item),
+                ),
+              ],
+            ),
             onTap: () {
               _localSearch.dismiss();
               widget.onPlay(item);
@@ -3237,6 +3280,7 @@ class _SourceBrowserState extends State<SourceBrowser>
           );
         },
         onSort: _sortMenu,
+        onDownload: _canDownloadFromSource ? _selectDownloads : null,
       ),
     );
   }
@@ -3550,6 +3594,50 @@ class _SourceBrowserState extends State<SourceBrowser>
     }
   }
 
+  bool get _canDownloadFromSource =>
+      widget.associateId == null &&
+      widget.source['id'] != 'local' &&
+      !busy &&
+      error.isEmpty;
+
+  Future<void> _selectDownloads() async {
+    _search.dismiss();
+    await showSourceDownloadSelection(
+      context,
+      widget.model,
+      widget.source['id'] as String,
+      displayedEntries
+          .where(
+            (entry) =>
+                entry.directory ||
+                isVideo(entry.name) ||
+                widget.source['kind'] == 'http',
+          )
+          .toList(),
+    );
+  }
+
+  Future<void> _downloadFolder(SourceEntry entry) async {
+    if (!_canDownloadFromSource || !entry.directory) return;
+    _search.dismiss();
+    try {
+      await widget.model.downloadSourceEntries(widget.source['id'] as String, [
+        entry,
+      ]);
+      if (mounted) showGlassSuccess(context, '已加入下载任务');
+    } catch (failure) {
+      if (mounted) await _sourceFailure(context, failure, '添加下载失败');
+    }
+  }
+
+  Future<void> _downloadCurrentFolder() => _downloadFolder(
+    SourceEntry(
+      name: paths.lastOrNull?.name ?? '${widget.source['label'] ?? '来源'}',
+      path: current,
+      directory: true,
+    ),
+  );
+
   Future<void> _recognizeDirectory([String? path]) async {
     final model = widget.model;
     if (!model.recognizingDirectory) {
@@ -3592,6 +3680,13 @@ class _SourceBrowserState extends State<SourceBrowser>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (entry.directory && _canDownloadFromSource)
+              ListTile(
+                leading: const Icon(Icons.download_outlined),
+                title: const Text('下载文件夹'),
+                subtitle: const Text('包含子文件夹内的视频'),
+                onTap: () => Navigator.pop(context, 'download-folder'),
+              ),
             if (!entry.directory)
               ListTile(
                 leading: const Icon(Icons.description_outlined),
@@ -3627,6 +3722,10 @@ class _SourceBrowserState extends State<SourceBrowser>
       ),
     );
     if (action == null || !mounted) return;
+    if (action == 'download-folder') {
+      await _downloadFolder(entry);
+      return;
+    }
     if (action == 'file-details') {
       await showMediaFileDetails(
         context,
@@ -3775,12 +3874,21 @@ class _SourceBrowserState extends State<SourceBrowser>
                       onPressed: _sortMenu,
                       icon: const Icon(Icons.sort_rounded, size: 21),
                     ),
+                  if (!hasCollectionHeader && _canDownloadFromSource)
+                    IconButton(
+                      tooltip: '选择下载',
+                      onPressed: _selectDownloads,
+                      icon: const Icon(Icons.download_rounded, size: 21),
+                    ),
                   PopupMenuButton<String>(
                     tooltip: '文件夹选项',
                     icon: const Icon(Icons.more_horiz_rounded),
                     onSelected: (action) {
                       if (action == 'refresh') unawaited(_refreshManually());
                       if (action == 'scan') _scan();
+                      if (action == 'download-folder') {
+                        unawaited(_downloadCurrentFolder());
+                      }
                       if (action == 'recognize') _recognizeDirectory();
                       if (action == 'cancelRecognition') {
                         widget.model.cancelDirectoryRecognition();
@@ -3819,6 +3927,14 @@ class _SourceBrowserState extends State<SourceBrowser>
                         enabled: !busy,
                         child: const Text('刷新目录'),
                       ),
+                      if (_canDownloadFromSource &&
+                          widget.source['kind'] != 'http')
+                        const PopupMenuItem(
+                          height: GlassMetrics.menuItemHeight,
+                          padding: GlassMetrics.menuItemPadding,
+                          value: 'download-folder',
+                          child: Text('下载当前文件夹（含子目录）'),
+                        ),
                       if (widget.associateId == null &&
                           widget.source['kind'] != 'http')
                         PopupMenuItem(
@@ -4099,6 +4215,15 @@ class _SourceBrowserState extends State<SourceBrowser>
                                     : null,
                                 trailing: !playable
                                     ? const SizedBox(width: 20)
+                                    : !entry.directory &&
+                                          widget.associateId == null &&
+                                          widget.source['id'] != 'local'
+                                    ? OfflineDownloadButton(
+                                        model: widget.model,
+                                        item: specRecord,
+                                        sourceId: widget.source['id'] as String,
+                                        sourceEntry: entry,
+                                      )
                                     : entry.directory &&
                                           favorites.contains(
                                             widget.source['id'],

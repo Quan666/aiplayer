@@ -28,6 +28,100 @@ class DirectoryMetadataResult {
   const DirectoryMetadataResult(this.collection, this.changed, this.mediaIds);
 }
 
+typedef OfflineMediaBinding = (SyncRecord, Map<String, dynamic>);
+
+/// Manual download admission shares the directory worker's connection. It
+/// preserves existing IDs and metadata and registers only selected files.
+List<OfflineMediaBinding> prepareOfflineMediaBindings(
+  AppStore store, {
+  List<String> ids = const [],
+  String? sourceId,
+  List<SourceEntry> entries = const [],
+  bool inTransaction = false,
+  bool restoreExcluded = true,
+}) {
+  final selected = <String>{...ids};
+  if (sourceId != null && sourceId != 'local') {
+    final configured =
+        (store.local('sources') as List? ?? const [])
+            .whereType<Map>()
+            .where((source) => source['id'] == sourceId)
+            .firstOrNull ??
+        store.local('externalSource:$sourceId') as Map?;
+    final direct = configured?['kind'] == 'http';
+    final folders = <String, List<SourceEntry>>{};
+    for (final entry in entries) {
+      if (entry.directory || (!direct && !isVideo(entry.name))) continue;
+      if (!restoreExcluded &&
+          store.local(_exclusionKey(sourceId, entry.path)) == true) {
+        continue;
+      }
+      final existing = _sourceRecord(store, sourceId, entry.path);
+      if (existing != null) {
+        selected.add(existing.id);
+        continue;
+      }
+      (folders[p.posix.dirname(entry.path.replaceAll('\\', '/'))] ??= []).add(
+        entry,
+      );
+    }
+    for (final folder in folders.entries) {
+      final cached = readDirectoryPreview(
+        store,
+        sourceId,
+        folder.key,
+      )?.collection;
+      final parsed =
+          cached ??
+          identifyStoredDirectory(store, sourceId, folder.key, folder.value);
+      final matching = folder.value
+          .where((entry) => parsed?.identities.containsKey(entry.path) == true)
+          .toList();
+      final remaining = folder.value
+          .where((entry) => parsed?.identities.containsKey(entry.path) != true)
+          .toList();
+      for (final group in [matching, remaining]) {
+        if (group.isEmpty) continue;
+        final belongs = identical(group, matching);
+        final collection = DirectoryCollection(
+          title: parsed?.title ?? '',
+          season: parsed?.season ?? '',
+          videos: group,
+          identities: {
+            for (final entry in group)
+              entry.path:
+                  parsed?.identities[entry.path] ?? sourceEntryIdentity(entry),
+          },
+          subject: belongs ? parsed?.subject : null,
+          episodeTitles: belongs ? parsed?.episodeTitles ?? const {} : const {},
+          episodeCount: parsed?.episodeCount ?? folder.value.length,
+          listedVideoCount: parsed?.listedVideoCount ?? folder.value.length,
+        );
+        selected.addAll(
+          synchronizeDirectoryCollection(
+            store,
+            sourceId,
+            collection,
+            importMissing: true,
+            restoreExcluded: restoreExcluded,
+            transactional: !inTransaction,
+          ).mediaIds,
+        );
+      }
+    }
+  }
+  return List.unmodifiable([
+    for (final id in selected)
+      if (store.get('media', id) case final record?)
+        if (!record.deleted)
+          if (store.local('location:$id') case final Map location)
+            if (location['source'] != 'local' &&
+                location['source'] is String &&
+                location['path'] is String)
+              (record, Map<String, dynamic>.unmodifiable(location)),
+  ]);
+}
+
 /// Keeps a manual library refresh attached to an existing device binding,
 /// independently of the optional series identity used to recognize siblings.
 class DirectoryListingGuard {
@@ -421,9 +515,11 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
   bool replaceAutomaticMetadata = false,
   Map<String, (String, int)?>? expectedRecords,
   DirectoryListingGuard? guard,
+  bool restoreExcluded = false,
+  bool transactional = true,
 }) {
   late DirectoryMetadataResult result;
-  store.transaction(() {
+  void synchronize() {
     guard?.check(store);
     if (anchorId != null && store.get('media', anchorId)?.deleted != false) {
       result = DirectoryMetadataResult(value, false, const []);
@@ -520,6 +616,9 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
         }
       }
       if (record == null) {
+        if (restoreExcluded) {
+          store.removeLocal(_exclusionKey(sourceId, entry.path));
+        }
         if (!(importMissing ?? resolved.subject != null) ||
             store.local(_exclusionKey(sourceId, entry.path)) == true) {
           continue;
@@ -622,7 +721,13 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
     );
     result = DirectoryMetadataResult(resolved, changed, List.unmodifiable(ids));
     donorCache?._checkpoint(store);
-  });
+  }
+
+  if (transactional) {
+    store.transaction(synchronize);
+  } else {
+    synchronize();
+  }
   return result;
 }
 
@@ -985,6 +1090,13 @@ class DirectoryMetadataWorker {
     anchorId,
   ], cancel: cancel);
 
+  Future<List<OfflineMediaBinding>> prepareDownloads({
+    List<String> ids = const [],
+    String? sourceId,
+    List<SourceEntry> entries = const [],
+    CancelToken? cancel,
+  }) => _call('downloads', [ids, sourceId, entries], cancel: cancel);
+
   Future<DirectoryInspection> prepareInspection(
     String sourceId,
     String path,
@@ -1131,6 +1243,18 @@ void _directoryWorkerMain(List<dynamic> startup) async {
           config: config,
           cancel: cancel,
         );
+      } else if (row[0] == 'downloads') {
+        await Future<void>.delayed(Duration.zero);
+        cancel.check();
+        result = await retryStoreBusy(() {
+          cancel.check();
+          return prepareOfflineMediaBindings(
+            store,
+            ids: row[2] as List<String>,
+            sourceId: row[3] as String?,
+            entries: row[4] as List<SourceEntry>,
+          );
+        });
       } else if (row[0] == 'records') {
         final records = <SyncRecord>[];
         var processed = 0;

@@ -144,6 +144,7 @@ class LibrarySnapshotReader {
   bool _disposed = false;
   _SnapshotData? _memoryData;
   (int, int, int)? _memoryRevision;
+  int _memoryOfflineRevision = -1;
   _LibrarySearchLabels? _memorySearchLabels;
   (int, LibrarySearchRevision)? _memorySearchRevision;
 
@@ -152,6 +153,8 @@ class LibrarySnapshotReader {
     required (int, int, int) revision,
     LibrarySort sort = const LibrarySort(),
     LibrarySearchRevision? searchRevision,
+    int offlineRevision = 0,
+    Map<String, Map<String, dynamic>> offlineLocations = const {},
   }) async {
     if (_disposed) throw const Cancelled();
     if (query.isNotEmpty && searchRevision == null) {
@@ -165,19 +168,24 @@ class LibrarySnapshotReader {
     if (store.path == ':memory:') {
       // Private in-memory databases cannot be opened by another connection.
       // This equivalent path is for tests; production uses the disk worker.
-      if (_memoryData == null || _memoryRevision != revision) {
+      if (_memoryData == null ||
+          _memoryRevision != revision ||
+          _memoryOfflineRevision != offlineRevision) {
         final previous = _memoryRevision;
         _memoryData =
             _memoryData != null &&
                 previous?.$1 == revision.$1 &&
-                previous?.$3 == revision.$3
+                previous?.$3 == revision.$3 &&
+                _memoryOfflineRevision == offlineRevision
             ? _memoryData!.withProgress(store.records('progress'))
             : _SnapshotData.fromRecords(
                 store.all('media'),
                 store.records('progress'),
                 store.localEntries('location:'),
+                offlineLocations: offlineLocations,
               );
         _memoryRevision = revision;
+        _memoryOfflineRevision = offlineRevision;
       }
       if (query.isNotEmpty &&
           _memorySearchRevision != (revision.$1, searchRevision!)) {
@@ -199,7 +207,15 @@ class LibrarySnapshotReader {
     final id = _nextRequest++;
     final result = Completer<LibrarySnapshot>();
     _pending[id] = result;
-    port.send((id, revision, query, sort, searchRevision));
+    port.send((
+      id,
+      revision,
+      query,
+      sort,
+      searchRevision,
+      offlineRevision,
+      offlineLocations,
+    ));
     return result.future;
   }
 
@@ -291,6 +307,7 @@ void _snapshotWorker((String, SendPort) arguments) {
   final requests = ReceivePort();
   _SnapshotData? data;
   (int, int, int)? currentRevision;
+  int currentOfflineRevision = -1;
   _LibrarySearchLabels? searchLabels;
   (int, LibrarySearchRevision)? currentSearchRevision;
   replies.send(requests.sendPort);
@@ -306,10 +323,23 @@ void _snapshotWorker((String, SendPort) arguments) {
       query,
       sort,
       searchRevision,
+      offlineRevision,
+      offlineLocations,
     ) = message
-        as (int, (int, int, int), String, LibrarySort, LibrarySearchRevision?);
+        as (
+          int,
+          (int, int, int),
+          String,
+          LibrarySort,
+          LibrarySearchRevision?,
+          int,
+          Map<String, Map<String, dynamic>>,
+        );
     try {
-      final refreshData = data == null || revision != currentRevision;
+      final refreshData =
+          data == null ||
+          revision != currentRevision ||
+          offlineRevision != currentOfflineRevision;
       final refreshSearch =
           query.isNotEmpty &&
           currentSearchRevision != (revision.$1, searchRevision!);
@@ -327,7 +357,8 @@ void _snapshotWorker((String, SendPort) arguments) {
             data =
                 data != null &&
                     previous?.$1 == revision.$1 &&
-                    previous?.$3 == revision.$3
+                    previous?.$3 == revision.$3 &&
+                    currentOfflineRevision == offlineRevision
                 ? data!.withProgress(history)
                 : _SnapshotData.fromRecords(
                     database
@@ -344,6 +375,7 @@ void _snapshotWorker((String, SendPort) arguments) {
                           row['value'] as String,
                         ),
                     },
+                    offlineLocations: offlineLocations,
                   );
           }
           if (refreshSearch) {
@@ -362,6 +394,7 @@ void _snapshotWorker((String, SendPort) arguments) {
           rethrow;
         }
         currentRevision = revision;
+        currentOfflineRevision = offlineRevision;
         if (refreshSearch) {
           currentSearchRevision = (revision.$1, searchRevision);
         }
@@ -562,6 +595,7 @@ class _SnapshotData {
     List<SyncRecord> history,
     this.locations,
     this.progress,
+    Map<String, Map<String, dynamic>> offlineLocations,
   ) : byId = Map.unmodifiable({for (final record in media) record.id: record}) {
     final index = _LibrarySeriesIndex(media);
     series = index.groups;
@@ -593,7 +627,16 @@ class _SnapshotData {
     final imported = <String, SyncRecord>{};
     var hiddenEntries = 0, subtitleEntries = 0, hiddenSubtitleEntries = 0;
     for (final record in media) {
-      final location = locations[record.id];
+      final binding = locations[record.id];
+      final offline = offlineLocations[record.id];
+      final matches =
+          offline != null &&
+          (binding == null ||
+              (offline['remoteSource'] == binding['source'] &&
+                  offline['remotePath'] == binding['path'] &&
+                  (offline['remoteRevision'] ?? '') ==
+                      (binding['previewRevision'] ?? '')));
+      final location = matches ? offline : binding;
       if (location?['source'] != 'local') continue;
       imported[record.id] = record;
       final entry = SourceEntry(
@@ -829,8 +872,9 @@ class _SnapshotData {
   factory _SnapshotData.fromRecords(
     Iterable<SyncRecord> records,
     Iterable<SyncRecord> history,
-    Map<String, dynamic> savedLocations,
-  ) {
+    Map<String, dynamic> savedLocations, {
+    Map<String, Map<String, dynamic>> offlineLocations = const {},
+  }) {
     final media = List<SyncRecord>.unmodifiable(
       records
           .where(
@@ -850,6 +894,7 @@ class _SnapshotData {
       _history(media, locations, progress),
       locations,
       progress,
+      offlineLocations,
     );
   }
 

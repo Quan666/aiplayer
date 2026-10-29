@@ -1,5 +1,8 @@
 Avoid unnecessary secondary labels and descriptions. Let the layout do the explaining.
 
+
+相关UI设计使用统一风格，且紧凑有序，简洁高效
+
 ## 性能开发要求
 
 - **不得把任何可能阻塞界面或导致掉帧的任务放在 UI 线程（Flutter 主 isolate）执行。** UI 线程只负责交互、界面状态和轻量渲染准备。同步文件读写、数据库全表读取与批量写入、锁等待、大量 JSON 编解码、加解密、压缩、图片处理、哈希、扫描、大集合排序及聚合等工作必须放到后台 isolate 或平台工作线程。
