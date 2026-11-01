@@ -192,16 +192,18 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
   void _saveDraft() {
     final id = _resultRecordId;
     if (id == null) return;
-    _drafts[id] = _MetadataRecordDraft(
-      name: _input.text,
-      season: _season.text,
-      error: _error,
-      identity: _identity,
-      match: _shownMatch,
-      results: _results,
-      searched: _searched,
-    );
+    _drafts[id] = _currentDraft;
   }
+
+  _MetadataRecordDraft get _currentDraft => _MetadataRecordDraft(
+    name: _input.text,
+    season: _season.text,
+    error: _error,
+    identity: _identity,
+    match: _shownMatch,
+    results: _results,
+    searched: _searched,
+  );
 
   void _loadRecord(String id) {
     _resultRecordId = id;
@@ -412,7 +414,12 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
         parentTask: parent,
       );
       if (parent == null) {
+        final draft = _currentDraft;
         _attachTask(selection);
+        if (_resultRecordId case final id?) {
+          _drafts[id] = draft;
+          _loadRecord(id);
+        }
       } else {
         _advanceAfterId = _resultRecordId;
       }
@@ -456,6 +463,8 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
         ? _error
         : selectionApplies
         ? selection!.error
+        : task?.isSelection == true
+        ? task!.error
         : _searched ||
               _searching ||
               (selectedId != null && task?.isMatched(selectedId) == true)

@@ -109,6 +109,74 @@ void main() {
     await root.delete(recursive: true);
   });
 
+  for (final provider in ['bangumi', 'tmdb']) {
+    test(
+      'a matched $provider movie identifies its subtitle version without an episode',
+      () async {
+        const title = 'GROTESQQQUE -グロテスク-';
+        final entries = [
+          for (final script in ['简体', '繁体'])
+            SourceEntry(
+              name: '$title [北宇治字幕组] [$script].mkv',
+              path: '$title/$title [北宇治字幕组] [$script].mkv',
+              size: 12,
+            ),
+        ];
+        _save(store, entries.first, 'simplified', '');
+        store.save('media', 'simplified', {
+          'fileName': entries.first.name,
+          'title': entries.first.name,
+          // Existing installations may retain the old parser's group suffix.
+          'series': '$title [北宇治字幕组]',
+          'season': '',
+          'episode': '',
+          if (provider == 'tmdb') 'tmdbId': '42' else 'bangumiId': '42',
+          'metadataType': 'movie',
+          'metadataTitle': '已识别剧场版',
+        });
+        store.setLocal('manualMetadata:simplified', true);
+        store.save('progress', 'simplified', {'position': 350});
+
+        final prepared = await worker.prepareInspection(
+          'nas',
+          title,
+          'test',
+          entries,
+        );
+        expect(prepared.collection!.videos, hasLength(2));
+        expect(prepared.collection!.membershipComplete, isTrue);
+        expect(prepared.collection!.episodeCount, 0);
+        final synced = await worker.synchronizeListing(
+          'nas',
+          title,
+          entries,
+          hideHidden: true,
+        );
+        expect(synced!.collection.videos, hasLength(2));
+        expect(synced.collection.subject!['provider'], provider);
+        expect(synced.collection.episodeCount, 0);
+        final records = store.records('media');
+        expect(records, hasLength(2));
+        final traditional = records.singleWhere(
+          (item) => item.id != 'simplified',
+        );
+        expect(traditional.data['metadataTitle'], '已识别剧场版');
+        expect(traditional.data['${provider}Id'], '42');
+        expect(traditional.data['episode'], isEmpty);
+        expect(store.get('progress', traditional.id), isNull);
+        expect(store.get('progress', 'simplified')!.data['position'], 350);
+        final repeated = await worker.synchronizeListing(
+          'nas',
+          title,
+          entries,
+          hideHidden: true,
+        );
+        expect(repeated!.changed, isFalse);
+        expect(repeated.collection.videos, hasLength(2));
+      },
+    );
+  }
+
   test(
     'a recognized movie cannot identify a parent containing other works',
     () async {

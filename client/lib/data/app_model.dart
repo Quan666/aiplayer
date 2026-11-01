@@ -1883,8 +1883,12 @@ class AppModel extends ChangeNotifier {
     }
   }
 
-  String _identityKey(SyncRecord record) =>
-      '${normalizedSeries('${record.data['series'] ?? ''}')}:${record.data['season']?.toString().isNotEmpty == true ? record.data['season'] : '1'}';
+  String _identityKey(SyncRecord record) {
+    // Donors and unrecognized siblings share the release title even when the
+    // catalogue supplies a different localized display title.
+    final identity = mediaRecordIdentity({...record.data, 'metadataTitle': ''});
+    return '${normalizedSeries(identity.anime)}:${record.data['season']?.toString().isNotEmpty == true ? record.data['season'] : '1'}';
+  }
 
   void _reuseVerifiedMetadata(String id) {
     final record = store.get('media', id);

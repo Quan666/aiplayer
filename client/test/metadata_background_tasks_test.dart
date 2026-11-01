@@ -456,6 +456,53 @@ void main() {
   );
 
   test(
+    'manual selection refreshes an old reviewed snapshot on the database worker',
+    () async {
+      final record = add('stale-selection');
+      store.save('media', record.id, {...record.data, 'duration': 2462});
+      final currentRevision = store.get('media', record.id)!.revision;
+      expect(currentRevision, isNot(record.revision));
+      final selection = model.startMetadataSelectionTask(
+        [record],
+        _subject('Chosen'),
+        season: '1',
+      );
+      await selection.done;
+      expect(selection.matched, 1);
+      expect(selection.error, isEmpty);
+      expect(store.get('media', record.id)!.data['metadataTitle'], 'Chosen');
+      expect(store.get('media', record.id)!.data['duration'], 2462);
+    },
+  );
+
+  test(
+    'manual selection rejects renamed or removed files before fetching details',
+    () async {
+      for (final removed in [false, true]) {
+        final record = add('changed-selection-$removed');
+        store.save('media', record.id, {
+          ...record.data,
+          if (!removed) 'fileName': 'Different E01.mkv',
+        }, deleted: removed);
+        final selection = model.startMetadataSelectionTask(
+          [record],
+          _subject('Chosen'),
+          season: '1',
+        );
+        await selection.done;
+        expect(selection.matched, 0);
+        expect(selection.failed, 1);
+        expect(
+          selection.error,
+          removed ? '视频已被移除，请重新打开匹配。' : '视频文件已变更，请重新打开匹配。',
+        );
+        expect(store.get('media', record.id)!.data['bangumiId'], isNull);
+      }
+      expect(model.fakeCatalog.detailsCalls, 0);
+    },
+  );
+
+  test(
     'matched records remain selectable and removing the last clears the task',
     () async {
       final record = add('rematch');

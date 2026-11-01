@@ -81,6 +81,59 @@ void main() {
       '1',
     );
   });
+  test('title-only subtitle versions form one complete directory', () {
+    const title = 'GROTESQQQUE -グロテスク-';
+    final files = [
+      for (final script in ['简体', '繁体'])
+        SourceEntry(
+          name: '$title [北宇治字幕组] [$script].mkv',
+          path: '/$title/$script.mkv',
+        ),
+    ];
+    final collection = identifyDirectory('/$title', files)!;
+    expect(collection.title, title);
+    expect(collection.videos, hasLength(2));
+    expect(collection.membershipComplete, isTrue);
+    expect(collection.episodeCount, 0);
+    expect(
+      collection.identities.values.every((value) => value.episode.isEmpty),
+      isTrue,
+    );
+    expect(identifyDirectory('/Unrelated', files), isNull);
+    expect(
+      identifyDirectory('/$title', [
+        ...files,
+        const SourceEntry(name: 'Other.mkv', path: '/$title/Other.mkv'),
+      ]),
+      isNull,
+    );
+    expect(
+      identifyDirectory('/$title', [
+        ...files,
+        const SourceEntry(
+          name: 'Other',
+          path: '/$title/Other',
+          directory: true,
+        ),
+      ]),
+      isNull,
+    );
+  });
+  test('title-only versions cannot merge conflicting seasons', () {
+    SourceEntry file(String name) =>
+        SourceEntry(name: name, path: '/Show/$name');
+    expect(
+      identifyDirectory('/Show', [file('Show S01.mkv'), file('Show S02.mkv')]),
+      isNull,
+    );
+    expect(
+      identifyDirectory('/Show S02', [
+        file('Show S01.mkv'),
+        file('Show S01.mp4'),
+      ]),
+      isNull,
+    );
+  });
   test('omitted first-season markers share one ordered directory series', () {
     final collection = identifyDirectory('/Show', const [
       SourceEntry(name: 'Show E02.mkv', path: '/Show/Show E02.mkv'),

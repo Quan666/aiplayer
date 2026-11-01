@@ -530,29 +530,44 @@ DirectoryCollection? identifyDirectory(
     identities[video.path] = ReleaseName(name, resolvedSeason, parsed.episode);
   }
   if (videos.isEmpty) {
-    final single = entries
+    final versions = entries
         .where((entry) => !entry.directory && isVideo(entry.name))
-        .singleOrNull;
-    if (single == null || folder.anime.isEmpty) return null;
-    final identity = parseReleaseName(single.name);
-    // A folder and its single title-only file agree on the title. Make that
-    // file's details available before lookup/playback without inventing an
-    // episode number or treating unrelated personal videos as one series.
-    if (identity.episode.isNotEmpty ||
-        normalizedSeries(identity.anime) != normalizedSeries(folder.anime) ||
-        (identity.season.isNotEmpty &&
-            folder.season.isNotEmpty &&
-            identity.season != folder.season)) {
-      return null;
+        .toList();
+    final folderTitle = normalizedSeries(folder.anime);
+    if (versions.isEmpty || folderTitle.isEmpty) return null;
+    String? versionSeason;
+    // Subtitle/encode versions of a title-only release share its details.
+    // Every file must agree with the folder and with the other versions; no
+    // episode number is invented and unrelated videos cannot join the work.
+    for (final video in versions) {
+      final identity = parseReleaseName(video.name);
+      if (identity.episode.isNotEmpty ||
+          normalizedSeries(identity.anime) != folderTitle ||
+          (identity.season.isNotEmpty &&
+              folder.season.isNotEmpty &&
+              identity.season != folder.season)) {
+        return null;
+      }
+      final resolvedSeason = identity.season.isEmpty
+          ? folder.season
+          : identity.season;
+      if (versionSeason != null &&
+          seasonKey(versionSeason) != seasonKey(resolvedSeason)) {
+        return null;
+      }
+      if (versionSeason == null || resolvedSeason.isNotEmpty) {
+        versionSeason = resolvedSeason;
+      }
     }
-    final singleSeason = identity.season.isEmpty
-        ? folder.season
-        : identity.season;
+    versions.sort((a, b) => a.name.compareTo(b.name));
     return DirectoryCollection(
       title: folder.anime,
-      season: singleSeason,
-      videos: [single],
-      identities: {single.path: ReleaseName(folder.anime, singleSeason)},
+      season: versionSeason ?? '',
+      videos: versions,
+      identities: {
+        for (final video in versions)
+          video.path: ReleaseName(folder.anime, versionSeason ?? ''),
+      },
       episodeCount: 0,
     );
   }

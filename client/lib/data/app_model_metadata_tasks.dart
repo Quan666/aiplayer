@@ -44,6 +44,7 @@ class MetadataTask extends ChangeNotifier {
        _parentTask = parentTask;
   late final List<SyncRecord> records = UnmodifiableListView(_records);
   bool get removed => _removed;
+  bool get isSelection => _selection != null;
   bool isMatched(String id) => _matchedIds.contains(id);
   bool containsMedia(String id) => _recordPositions.containsKey(id);
   MetadataTask? get selectionTask => _selectionTask;
@@ -678,11 +679,12 @@ extension MetadataBackgroundTasks on AppModel {
             _checkTaskReady(task);
             if (_disposed) throw const Cancelled();
             final first = records.first;
+            final identity = mediaRecordIdentity(first.data);
             Map<String, dynamic>? subject;
             try {
               subject = await catalog.resolve(
-                '${first.data['series']}',
-                '${first.data['season'] ?? ''}',
+                identity.anime,
+                identity.season,
                 force: task.manual,
                 cancel: token,
               );
@@ -817,6 +819,33 @@ extension MetadataBackgroundTasks on AppModel {
 
   Future<void> _runMetadataSelection(MetadataTask task) async {
     final token = task._workCancel;
+    task.status = '正在准备匹配…';
+    _taskChanged(task);
+    // Completed review tasks may retain snapshots from before later browsing,
+    // sync or metadata enrichment. A fresh explicit choice targets the current
+    // version of that same file. Read only the selected records on the shared
+    // worker, then retain the normal revision check during network requests.
+    final currentRecords = store.path == ':memory:'
+        ? [for (final record in task._records) ?store.get('media', record.id)]
+        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+            store.path,
+          )).readRecords(task.mediaIds, cancel: token);
+    _checkTaskReady(task);
+    final byId = {for (final record in currentRecords) record.id: record};
+    for (var index = 0; index < task._records.length; index++) {
+      final previous = task._records[index];
+      final current = byId[previous.id];
+      if (current == null || current.deleted) {
+        task.error = '视频已被移除，请重新打开匹配。';
+        _taskCompleteRecord(task, previous, false);
+      } else if (metadataFileName(current) != metadataFileName(previous)) {
+        task.error = '视频文件已变更，请重新打开匹配。';
+        _taskCompleteRecord(task, previous, false);
+      } else {
+        task._records[index] = current;
+      }
+    }
+    if (task.completed == task.total) return;
     task.status = '正在读取作品资料…';
     _taskChanged(task);
     var detailsAvailable = true;
@@ -830,6 +859,7 @@ extension MetadataBackgroundTasks on AppModel {
     if (task._identity != null) {
       final unresolved = <String>[];
       for (final record in task._records) {
+        if (task._completedIds.contains(record.id)) continue;
         final filename = MediaAiRecognition.filenameOnly(
           metadataFileName(record),
         );
@@ -861,6 +891,7 @@ extension MetadataBackgroundTasks on AppModel {
     _taskChanged(task);
     for (final record in task._records) {
       if (_disposed) throw const Cancelled();
+      if (task._completedIds.contains(record.id)) continue;
       var applied = false;
       if (_taskMayApply(task, record)) {
         if (task._identity != null) {
@@ -899,6 +930,9 @@ extension MetadataBackgroundTasks on AppModel {
           );
           applied = true;
         }
+      }
+      if (!applied && !token.cancelled) {
+        task.error = '视频资料已更新，请重新选择作品。';
       }
       _taskCompleteRecord(task, record, applied);
     }

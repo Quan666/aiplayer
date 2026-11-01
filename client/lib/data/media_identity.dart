@@ -1,5 +1,5 @@
 /// Persisted directory identities must be rebuilt when parsing rules change.
-const mediaIdentityRevision = 3;
+const mediaIdentityRevision = 4;
 
 class ReleaseName {
   final String anime, season, episode;
@@ -64,13 +64,28 @@ String _previousReleaseTitle(String filename) {
   return _parseIdentity(
     title.replaceFirst(_mediaExtension, '').replaceAll('_', ' '),
     stripEpisodeSeparator: false,
+    stripTrailingGroups: false,
   ).anime;
 }
 
 // Release tags are evidence, brackets themselves are not. In particular an
 // embedded 【name】 or [name] is part of the work's title unless it is a known
 // technical tag. Unknown groups stay intact rather than destroying a title.
-String _withoutReleaseTags(String title) {
+String _withoutReleaseTags(String title, {bool stripTrailingGroups = true}) {
+  final trailingGroups = <int>{};
+  if (stripTrailingGroups) {
+    var suffixStart = title.length;
+    for (final match in _bracketGroups.allMatches(title).toList().reversed) {
+      if (title.substring(match.end, suffixStart).trim().isNotEmpty) break;
+      final content = (match[1] ?? match[2] ?? match[3]!).trim();
+      if (!_technicalTag.hasMatch(content) &&
+          !_releaseGroup.hasMatch(content)) {
+        break;
+      }
+      trailingGroups.add(match.start);
+      suffixStart = match.start;
+    }
+  }
   var previousEnd = 0;
   var hasTitle = false;
   return title.replaceAllMapped(_bracketGroups, (match) {
@@ -80,7 +95,8 @@ String _withoutReleaseTags(String title) {
     previousEnd = match.end;
     final content = (match[1] ?? match[2] ?? match[3]!).trim();
     if (_technicalTag.hasMatch(content) ||
-        (!hasTitle && _releaseGroup.hasMatch(content))) {
+        ((!hasTitle || trailingGroups.contains(match.start)) &&
+            _releaseGroup.hasMatch(content))) {
       return ' ';
     }
     hasTitle = true;
@@ -109,8 +125,11 @@ ReleaseName _parseIdentity(
   String input, {
   bool release = true,
   bool stripEpisodeSeparator = true,
+  bool stripTrailingGroups = true,
 }) {
-  var title = release ? _withoutReleaseTags(input) : input;
+  var title = release
+      ? _withoutReleaseTags(input, stripTrailingGroups: stripTrailingGroups)
+      : input;
   final dottedRelease = !RegExp(r'\s').hasMatch(title.trim());
   var season = '', episode = '';
   final ordinal = RegExp(
@@ -312,6 +331,13 @@ ReleaseName mediaRecordIdentity(Map<String, dynamic> data) {
     } else if (series != parsed.anime &&
         (series.contains('%') || series.endsWith(' -')) &&
         series == _previousReleaseTitle(fileName)) {
+      name = parsed.anime;
+    } else if (series != parsed.anime &&
+        series ==
+            _parseIdentity(
+              _fileStem(fileName).replaceAll('_', ' '),
+              stripTrailingGroups: false,
+            ).anime) {
       name = parsed.anime;
     }
   }

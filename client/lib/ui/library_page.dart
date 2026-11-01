@@ -2611,6 +2611,11 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
           key: ValueKey('series-episode:${item.id}'),
           model: model,
           item: item,
+          title:
+              _collectionDetails.availableEpisodes == 0 &&
+                  _collectionDetails.videoCount > 1
+              ? '${item.data['fileName'] ?? item.data['title'] ?? ''}'
+              : null,
           showTechnical: _allEpisodes.length != 1,
           onPlay: () => widget.onPlay(item),
           trailing: PopupMenuButton<String>(

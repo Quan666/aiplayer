@@ -69,6 +69,66 @@ void main() {
     }
   });
 
+  test(
+    'title-only release variants remove trailing fansub and language tags',
+    () {
+      const title = 'GROTESQQQUE -グロテスク-';
+      for (final suffix in [
+        '[北宇治字幕组] [简体]',
+        '[北宇治字幕組] [繁体]',
+        '［北宇治字幕組］［繁體］',
+        '[北宇治字幕组] [1080p HEVC] [CHT]',
+        '[LoliHouse] [CHS]',
+      ]) {
+        final fileName = '$title $suffix.mkv';
+        final parsed = parseReleaseName(fileName);
+        expect([parsed.anime, parsed.season, parsed.episode], [title, '', '']);
+        expect(metadataQuery(fileName), title);
+        expect(directoryIdentity('/$title $suffix').anime, title);
+      }
+      for (final title in [
+        '我的[字幕组]生活',
+        'Movie [Original]',
+        'Movie [Special Edition]',
+        'Movie [Fansub] After Story',
+      ]) {
+        expect(parseReleaseName('$title [繁体].mkv').anime, title);
+      }
+    },
+  );
+
+  test(
+    'saved trailing group guesses are repaired without changing chosen names',
+    () {
+      const title = 'GROTESQQQUE -グロテスク-';
+      const fileName = '$title [北宇治字幕组] [繁体].mkv';
+      expect(
+        mediaRecordIdentity({
+          'fileName': fileName,
+          'series': '$title [北宇治字幕组]',
+        }).anime,
+        title,
+      );
+      for (final savedName in ['人工修正的作品', '$title [完整版]']) {
+        expect(
+          mediaRecordIdentity({
+            'fileName': fileName,
+            'series': savedName,
+          }).anime,
+          savedName,
+        );
+      }
+      expect(
+        mediaRecordIdentity({
+          'fileName': fileName,
+          'series': '$title [北宇治字幕组]',
+          'metadataTitle': '已确认的标题 [字幕组]',
+        }).anime,
+        '已确认的标题 [字幕组]',
+      );
+    },
+  );
+
   test('percent decoding is single pass and preserves invalid sequences', () {
     const cases = {
       '命运100%?%20-%20E04.mp4': '命运100%?',

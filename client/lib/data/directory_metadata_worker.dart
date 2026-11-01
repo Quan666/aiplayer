@@ -261,7 +261,10 @@ DirectoryCollection? _mergeStoredDirectory(
           ? original!.episode
           : '${record.data['episode'] ?? ''}';
       if (episode.isEmpty) episode = original?.episode ?? '';
-      if (episode.isEmpty && parsed != null) continue;
+      // Title-only movie versions are valid members without episode numbers.
+      // An opaque file outside the parsed group still needs its own episode
+      // evidence before joining an episodic collection.
+      if (episode.isEmpty && parsed != null && original == null) continue;
       final name = recordsByPath == null
           ? _episodeTitle(store, record)
           : '${record.data['episodeTitle'] ?? ''}';

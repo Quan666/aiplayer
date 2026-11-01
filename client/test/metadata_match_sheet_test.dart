@@ -242,6 +242,67 @@ void main() {
   );
 
   testWidgets(
+    'a reviewed candidate uses the latest record and preserves unrelated updates',
+    (tester) async {
+      await tester.pumpWidget(app());
+      final task = model.startMetadataTask([media]);
+      await tester.pump();
+      model._fakeCatalog.resolveGate.complete(null);
+      await tester.pumpAndSettle();
+      expect(task.failed, 1);
+      await open(tester);
+      await tester.tap(find.byTooltip('搜索资料'));
+      await tester.pumpAndSettle();
+
+      // The review task outlives updates from browsing, sync or enrichment.
+      store.save('media', media.id, {...media.data, 'duration': 2462});
+      final candidate = find.widgetWithText(ListTile, '正式作品');
+      await tester.ensureVisible(candidate);
+      await tester.tap(candidate);
+      await tester.pumpAndSettle();
+      model._fakeCatalog.detailsGate.complete(_subject);
+      await tester.pumpAndSettle();
+      expect(task.selectionTask!.matched, 1);
+      expect(task.matched, 1);
+      expect(task.failed, 0);
+      expect(store.get('media', media.id)!.data['bangumiId'], '42');
+      expect(store.get('media', media.id)!.data['duration'], 2462);
+      expect(find.text('已匹配 1 个视频'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'a conflicting edit during selection is visible and a new choice retries it',
+    (tester) async {
+      await tester.pumpWidget(app());
+      await open(tester);
+      await tester.tap(find.byTooltip('搜索资料'));
+      await tester.pumpAndSettle();
+      final candidate = find.widgetWithText(ListTile, '正式作品');
+      await tester.ensureVisible(candidate);
+      await tester.tap(candidate);
+      await tester.pumpAndSettle();
+      store.save('media', media.id, {
+        ...media.data,
+        'metadataTitle': '其他设备刚更新的资料',
+      });
+      model._fakeCatalog.detailsGate.complete(_subject);
+      await tester.pumpAndSettle();
+      expect(store.get('media', media.id)!.data['bangumiId'], isNull);
+      expect(find.text('视频资料已更新，请重新选择作品。'), findsOneWidget);
+      await tester.ensureVisible(candidate);
+      await tester.tap(candidate);
+      await tester.pumpAndSettle();
+      expect(store.get('media', media.id)!.data['bangumiId'], '42');
+      expect(find.text('视频资料已更新，请重新选择作品。'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
     'source reidentification starts in the background and leaves browsing usable',
     (tester) async {
       store.setLocal('location:one', {

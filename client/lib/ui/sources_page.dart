@@ -1572,7 +1572,9 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
               key: ValueKey('local-video:${item.id}'),
               model: model,
               item: item,
-              title: _localEpisodeTitle(item),
+              title: details.availableEpisodes == 0 && details.videoCount > 1
+                  ? entry.name
+                  : _localEpisodeTitle(item),
               showTechnical: directory!.episodes.length != 1,
               onPlay: () {
                 _localSearch.dismiss();
@@ -4869,7 +4871,13 @@ class _SourceBrowserState extends State<SourceBrowser>
                                         'size': entry.size,
                                       },
                                     ),
-                                title: episode.isEmpty ? null : episode,
+                                title:
+                                    collection!.episodeCount == 0 &&
+                                        collection!.videos.length > 1
+                                    ? entry.name
+                                    : episode.isEmpty
+                                    ? null
+                                    : episode,
                                 sourceId: sourceId,
                                 sourceEntry: entry,
                                 showTechnical:
