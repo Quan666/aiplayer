@@ -35,6 +35,7 @@ import 'navigation_reveal.dart';
 import 'device_icon.dart';
 import 'continue_watching_content.dart';
 import 'artwork_scroll_scope.dart';
+import 'desktop_window_frame.dart';
 
 Object _mediaChoicesRevision(AppModel model) => (
   model.store.localKeyRevision('sources'),
@@ -1456,25 +1457,6 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(10, 8, 10, 20),
-          child: Row(
-            children: [
-              ClipRRect(
-                borderRadius: LibraryStyles.compactRadius,
-                child: Image.asset(
-                  'assets/branding/app_icon.png',
-                  width: 28,
-                  height: 28,
-                  excludeFromSemantics: true,
-                ),
-              ),
-              if (!_navigationCollapsed) const SizedBox(width: 10),
-              if (!_navigationCollapsed)
-                Text('映库', style: AppStyles.of(context).panelTitle),
-            ],
-          ),
-        ),
         Stack(
           children: [
             Positioned.fill(
@@ -1534,6 +1516,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     _chromeKey = _chromeVersion;
     final desktop = MediaQuery.sizeOf(context).width >= 1000;
+    final inlineTitlebar = DesktopWindowFrame.usesInlineTitlebar(context);
     if (_libraryDesktop != desktop) {
       _libraryDesktop = desktop;
       _libraryContent = null;
@@ -1598,7 +1581,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                 ],
               ),
         body: SafeArea(
-          top: desktop,
+          top: desktop && !inlineTitlebar,
           bottom: false,
           child: DropTarget(
             onDragDone: (details) =>
@@ -1607,7 +1590,15 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
               children: [
                 if (desktop)
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 12, 0, 12),
+                    padding: EdgeInsets.fromLTRB(
+                      12,
+                      12 +
+                          (inlineTitlebar
+                              ? MediaQuery.paddingOf(context).top
+                              : 0),
+                      0,
+                      12,
+                    ),
                     child: SizedBox(
                       width: _navigationCollapsed ? 68 : 172,
                       child: GlassSurface(
@@ -1619,40 +1610,47 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                     ),
                   ),
                 Expanded(
-                  child: NavigationRevealRegion(
-                    onReveal: _revealNavigation,
-                    child: NotificationListener<ScrollNotification>(
-                      onNotification: _onScroll,
-                      child: PageView(
-                        controller: _pages,
-                        onPageChanged: (value) {
-                          setState(() {
-                            page = value;
-                            _navigationHidden.value = false;
-                            _scrollTravel = 0;
-                          });
-                          if (value == 0) {
-                            _refreshUncoveredLibrary();
-                          } else {
-                            _suspendLibrary();
-                          }
-                        },
-                        children: [
-                          _RetainedTab(
-                            active: page == 0,
-                            child: _libraryContent ??= Builder(
-                              builder: (context) => _library(context, desktop),
-                            ),
+                  child: Builder(
+                    builder: (context) => MediaQuery.removePadding(
+                      context: context,
+                      removeTop: inlineTitlebar,
+                      child: NavigationRevealRegion(
+                        onReveal: _revealNavigation,
+                        child: NotificationListener<ScrollNotification>(
+                          onNotification: _onScroll,
+                          child: PageView(
+                            controller: _pages,
+                            onPageChanged: (value) {
+                              setState(() {
+                                page = value;
+                                _navigationHidden.value = false;
+                                _scrollTravel = 0;
+                              });
+                              if (value == 0) {
+                                _refreshUncoveredLibrary();
+                              } else {
+                                _suspendLibrary();
+                              }
+                            },
+                            children: [
+                              _RetainedTab(
+                                active: page == 0,
+                                child: _libraryContent ??= Builder(
+                                  builder: (context) =>
+                                      _library(context, desktop),
+                                ),
+                              ),
+                              _RetainedTab(
+                                active: page == 1,
+                                child: _sourcesContent!,
+                              ),
+                              _RetainedTab(
+                                active: page == 2,
+                                child: _settingsContent!,
+                              ),
+                            ],
                           ),
-                          _RetainedTab(
-                            active: page == 1,
-                            child: _sourcesContent!,
-                          ),
-                          _RetainedTab(
-                            active: page == 2,
-                            child: _settingsContent!,
-                          ),
-                        ],
+                        ),
                       ),
                     ),
                   ),

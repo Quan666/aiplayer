@@ -72,6 +72,194 @@ void main() {
     }
   }
 
+  Future<File> waitForSource(String address) async {
+    final ready = Completer<File>();
+    void changed() {
+      final file = cache.resolvedFile(address);
+      if (file?.path == cache.sourceFile(address).path && !ready.isCompleted) {
+        ready.complete(file);
+      }
+    }
+
+    cache.changes.addListener(changed);
+    changed();
+    try {
+      return await ready.future.timeout(const Duration(seconds: 3));
+    } finally {
+      cache.changes.removeListener(changed);
+    }
+  }
+
+  test(
+    'visible portable covers upgrade once without losing offline bytes',
+    () async {
+      final address = url('upgrade');
+      final portable = images.encodePng(images.Image(width: 32, height: 48));
+      await cache.restore(address, portable);
+      final fallback = (await cache.load(address))!;
+      responseGate = Completer<void>();
+      expect(await cache.loadVisible(address), same(fallback));
+      await waitForRequests(1);
+      for (var i = 0; i < 12; i++) {
+        expect(await cache.loadVisible(address), same(fallback));
+      }
+      final upgraded = waitForSource(address);
+      responseGate!.complete();
+      final source = await upgraded;
+      expect(await source.readAsBytes(), png);
+      expect(await cache.cachedFile(address).readAsBytes(), portable);
+      expect(posterFileRevision(source), isNot(posterFileRevision(fallback)));
+      expect(await cache.loadVisible(address), same(source));
+      expect(requests, 1);
+
+      final changes = <PosterCacheChange>[];
+      cache.changes.addListener(() => changes.add(cache.changes.value!));
+      await cache.restore(address, portable, replace: true);
+      cache.fileChanged(address);
+      expect(cache.resolvedFile(address), same(source));
+      expect(changes, isEmpty);
+      cache.close();
+      cache = PosterCache(directory: directory, createClient: _client);
+      expect((await cache.load(address))!.path, source.path);
+      expect(requests, 1);
+    },
+  );
+
+  test('failed source upgrades retain fallback and back off', () async {
+    final address = url('broken');
+    await cache.restore(address, Uint8List.fromList(png));
+    final fallback = (await cache.load(address))!;
+    expect(await cache.loadVisible(address), same(fallback));
+    await waitForRequests(1);
+    await Future.doWhile(() async {
+      if (cache.hasFailed(address)) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 1));
+      return true;
+    }).timeout(const Duration(seconds: 2));
+    for (var i = 0; i < 12; i++) {
+      expect(await cache.loadVisible(address), same(fallback));
+    }
+    expect(requests, 1);
+    expect(await fallback.exists(), isTrue);
+    expect(await cache.sourceFile(address).exists(), isFalse);
+  });
+
+  test(
+    'a portable restore during download cannot mask the completed source',
+    () async {
+      final address = url('restore-during-download');
+      responseGate = Completer<void>();
+      final download = cache.loadVisible(address)!;
+      await waitForRequests(1);
+      await cache.restore(
+        address,
+        images.encodePng(images.Image(width: 20, height: 30)),
+      );
+      expect(cache.resolvedFile(address)!.path, cache.cachedFile(address).path);
+      final upgraded = waitForSource(address);
+      responseGate!.complete();
+      final source = await upgraded;
+      expect(await download, same(source));
+      expect(cache.resolvedFile(address), same(source));
+      expect(requests, 1);
+    },
+  );
+
+  test(
+    'fallback upgrades pause without frames and resume with bounded work',
+    () async {
+      responseGate = Completer<void>();
+      final addresses = [for (var i = 0; i < 9; i++) url('upgrade-$i')];
+      for (final address in addresses) {
+        await cache.restore(address, Uint8List.fromList(png));
+        expect(await cache.loadVisible(address), isNotNull);
+      }
+      await waitForRequests(4);
+      cache.setActive(false);
+      responseGate!.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 70));
+      expect(requests, 4);
+      for (final address in addresses) {
+        expect(await cache.sourceFile(address).exists(), isFalse);
+        expect(cache.hasFailed(address), isFalse);
+      }
+      final upgraded = [
+        for (final address in addresses) waitForSource(address),
+      ];
+      cache.setActive(true);
+      await Future.wait(upgraded);
+      expect(requests, 13);
+      expect(peak, lessThanOrEqualTo(4));
+    },
+  );
+
+  test(
+    'clear cancels fallback upgrades and late results cannot repopulate',
+    () async {
+      final address = url('clear-upgrade');
+      await cache.restore(address, Uint8List.fromList(png));
+      responseGate = Completer<void>();
+      expect(await cache.loadVisible(address), isNotNull);
+      await waitForRequests(1);
+      await cache.clear();
+      responseGate!.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(await directory.list().toList(), isEmpty);
+      expect(cache.resolvedFile(address), isNull);
+    },
+  );
+
+  test(
+    'queued upgrades drop hidden covers and retry on a later visible visit',
+    () async {
+      responseGate = Completer<void>();
+      final busy = [for (var i = 0; i < 4; i++) cache.load(url('occupied-$i'))];
+      await waitForRequests(4);
+      final address = url('hidden-upgrade');
+      await cache.restore(address, Uint8List.fromList(png));
+      var visible = true;
+      expect(
+        await cache.loadVisible(address, canStart: () => visible),
+        isNotNull,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      visible = false;
+      responseGate!.complete();
+      await Future.wait(busy);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(requests, 4);
+      expect(cache.hasFailed(address), isFalse);
+      expect(await cache.sourceFile(address).exists(), isFalse);
+      visible = true;
+      expect(
+        await cache.loadVisible(address, canStart: () => visible),
+        isNotNull,
+      );
+      await waitForSource(address);
+      expect(requests, 5);
+    },
+  );
+
+  test(
+    'suspended fallback upgrade does not restart a disposed cover',
+    () async {
+      final address = url('disposed-upgrade');
+      await cache.restore(address, Uint8List.fromList(png));
+      var visible = true;
+      cache.setActive(false);
+      expect(
+        await cache.loadVisible(address, canStart: () => visible),
+        isNotNull,
+      );
+      visible = false;
+      cache.setActive(true);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(requests, 0);
+      expect(await cache.sourceFile(address).exists(), isFalse);
+      expect(await cache.cachedFile(address).exists(), isTrue);
+    },
+  );
+
   test(
     'clear removes disk hits and backoff and keeps the cache reusable',
     () async {
@@ -638,9 +826,10 @@ void main() {
   );
 
   test(
-    'weakly retained handles still honor replacement and invalidation',
+    'weakly retained portable handles honor replacement and invalidation',
     () async {
       final address = url('retained-replacement');
+      await cache.restore(address, Uint8List.fromList(png));
       final original = (await cache.load(address))!;
       await churnResolvedHandles();
       cache.fileChanged(address);
@@ -666,7 +855,7 @@ void main() {
       await cache.invalidate(address, failedFile: replacement);
       expect(cache.resolvedFile(address), isNull);
       expect(await replacement.exists(), isFalse);
-      expect(requests, 1);
+      expect(requests, 0);
     },
   );
 
@@ -742,7 +931,8 @@ void main() {
       expect(requests, 4);
       responseGate!.complete();
       await Future.wait(downloads);
-      expect(requests, PosterCache.maxPending - 4);
+      await waitForSource(localUrl);
+      expect(requests, PosterCache.maxPending - 4 + 1);
     },
   );
 

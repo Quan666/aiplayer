@@ -384,7 +384,7 @@ Map<String, Object> _prepareFixture((String, int) args) {
           ...comment,
           ...jpg.skip(2),
         ];
-        cache.cachedFile(url).writeAsBytesSync(image);
+        cache.sourceFile(url).writeAsBytesSync(image);
         bytes += image.length;
         store.save('media', id, {
           'title': 'Poster $id S01E01.mkv',

@@ -133,7 +133,9 @@ class SyncArtwork {
       if (media == null || media.deleted || store.isPrivateMedia(id)) continue;
       final url = media.data['poster'];
       if (url is String && !result.containsKey('poster:$url')) {
-        final image = await _encode(posterCache.cachedFile(url));
+        final image =
+            await _encode(posterCache.sourceFile(url)) ??
+            await _encode(posterCache.cachedFile(url));
         if (image != null && valid('poster:$url', {'image': image})) {
           result['poster:$url'] = {'image': image};
         }
@@ -283,23 +285,46 @@ String? _portableImage(Uint8List bytes) {
     if (mime != null && bytes.length <= 134970) {
       return 'data:image/$mime;base64,${base64Encode(bytes)}';
     }
-    var image = decoded;
-    if (image.width > 960 || image.height > 960) {
-      image = images.copyResize(
-        image,
-        width: image.width >= image.height ? 960 : null,
-        height: image.height > image.width ? 960 : null,
-      );
+    // Keep the wire budget unchanged. Quality and dimensions are independent:
+    // a large image that fits at Q80 must not lose pixels just because Q88 was
+    // too large. Q72 is the floor; shrink only after that size cannot fit.
+    var source = decoded;
+    if (source.exif.imageIfd.hasOrientation &&
+        source.exif.imageIfd.orientation != 1) {
+      source = images.bakeOrientation(source);
     }
-    for (final quality in [85, 70, 55, 40]) {
-      final jpeg = images.encodeJpg(image, quality: quality);
-      if (jpeg.length <= 134970) {
-        return 'data:image/jpeg;base64,${base64Encode(jpeg)}';
+    if (source.hasPalette) source = source.convert(numChannels: 3);
+    final longest = source.width > source.height ? source.width : source.height;
+    final encoder = images.JpegEncoder(quality: 88);
+    Uint8List encode(images.Image image, int quality) {
+      encoder.setQuality(quality);
+      // 4:4:4 preserves colored lettering and line art in poster covers.
+      return encoder.encode(image, singleFrame: true);
+    }
+
+    var previousEdge = 0;
+    for (final limit in [1280, 1024, 832, 640, 512, 384]) {
+      final edge = longest.clamp(1, limit);
+      if (edge == previousEdge) continue;
+      previousEdge = edge;
+      // Always resample the source once, never the previous smaller candidate.
+      // Area averaging removes fine-pattern aliasing during downsampling.
+      final image = edge == longest
+          ? source
+          : images.copyResize(
+              source,
+              width: (source.width * edge / longest).round().clamp(1, edge),
+              height: (source.height * edge / longest).round().clamp(1, edge),
+              interpolation: images.Interpolation.average,
+            );
+      var jpeg = encode(image, 88);
+      if (jpeg.length > 134970) {
+        jpeg = encode(image, 72);
+        if (jpeg.length > 134970) continue;
+        final better = encode(image, 80);
+        if (better.length <= 134970) jpeg = better;
       }
-      image = images.copyResize(
-        image,
-        width: (image.width * .8).round().clamp(1, 960),
-      );
+      return 'data:image/jpeg;base64,${base64Encode(jpeg)}';
     }
     return null;
   } catch (_) {

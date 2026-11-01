@@ -193,8 +193,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     titleVisibility = .hidden
     titlebarAppearsTransparent = true
     if #available(macOS 11.0, *) { titlebarSeparatorStyle = .none }
-    // Leave AppKit's traffic lights, resize edges and titlebar gestures intact.
-    // Background dragging outside the dedicated strip would steal player input.
+    // Leave AppKit's traffic lights and resize edges intact. Flutter supplies
+    // explicit drag areas so page buttons and player input remain interactive.
     isMovableByWindowBackground = false
     applyControlsVisibility()
   }
@@ -230,37 +230,45 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   }
 
   override func sendEvent(_ event: NSEvent) {
-    if forwardHiddenTitlebarEvent(event) { return }
     if event.type == .leftMouseDown {
       dragMouseDown = event
     } else if event.type == .leftMouseUp {
       dragMouseDown = nil
     }
+    if forwardTitlebarEvent(event) { return }
     super.sendEvent(event)
   }
 
-  private func forwardHiddenTitlebarEvent(_ event: NSEvent) -> Bool {
+  private func forwardTitlebarEvent(_ event: NSEvent) -> Bool {
     guard let controller = contentViewController as? FlutterViewController,
           let content = contentView else { return false }
     let point = content.convert(event.locationInWindow, from: nil)
     let top = content.isFlipped ? content.bounds.minY : content.bounds.maxY - 36
-    let hiddenTitlebar = !controlsVisible && desktopWindowState["fullscreen"] != true &&
+    // Flutter also places page headers inside the visible titlebar. Keep the
+    // native traffic lights and the outer resize edges in AppKit's hands; the
+    // rest must reach Flutter's buttons, search inputs and dedicated drag areas.
+    let nativeControls = controlsVisible && point.x < content.bounds.minX + 80
+    let titlebarContent = desktopWindowState["fullscreen"] != true && !nativeControls &&
+      content.bounds.insetBy(dx: 4, dy: 4).contains(point) &&
       NSRect(x: content.bounds.minX, y: top, width: content.bounds.width, height: 36).contains(point)
-    // The transparent AppKit titlebar can still consume pointer events. Route
-    // its hidden strip to the existing Flutter view, without changing styles
-    // or moving focus. Keep a press routed through release even if hover or
+    // Keep a press routed through release even if it leaves the titlebar or
     // pointer-down reveals the native buttons underneath it.
     switch event.type {
-    case .mouseMoved where hiddenTitlebar:
+    case .mouseMoved where titlebarContent:
       controller.mouseMoved(with: event)
-    case .scrollWheel where hiddenTitlebar:
+    case .scrollWheel where titlebarContent:
       controller.scrollWheel(with: event)
     case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-      guard hiddenTitlebar else { return false }
+      guard titlebarContent else { return false }
       forwardedTitlebarButtons.insert(event.buttonNumber)
-      if event.type == .leftMouseDown { controller.mouseDown(with: event) }
-      else if event.type == .rightMouseDown { controller.rightMouseDown(with: event) }
-      else { controller.otherMouseDown(with: event) }
+      if event.type == .leftMouseDown {
+        if !isKeyWindow { makeKeyAndOrderFront(nil) }
+        controller.mouseDown(with: event)
+      } else if event.type == .rightMouseDown {
+        controller.rightMouseDown(with: event)
+      } else {
+        controller.otherMouseDown(with: event)
+      }
     case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
       guard forwardedTitlebarButtons.contains(event.buttonNumber) else { return false }
       if event.type == .leftMouseDragged { controller.mouseDragged(with: event) }
@@ -289,6 +297,7 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
             windowNumber: windowNumber, context: nil,
             eventNumber: down.eventNumber, clickCount: down.clickCount,
             pressure: 0) else { return }
+    forwardedTitlebarButtons.remove(down.buttonNumber)
     controller.mouseUp(with: up)
   }
 

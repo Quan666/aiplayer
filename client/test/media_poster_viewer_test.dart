@@ -355,10 +355,12 @@ void main() {
 
     try {
       await tester.runAsync(() async {
-        await model.posterCache.restore(
-          poster,
-          await File('assets/branding/app_icon.png').readAsBytes(),
-        );
+        await model.posterCache.directory.create(recursive: true);
+        await model.posterCache
+            .sourceFile(poster)
+            .writeAsBytes(
+              await File('assets/branding/app_icon.png').readAsBytes(),
+            );
       });
       await tester.pumpWidget(
         MaterialApp(

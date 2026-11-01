@@ -67,7 +67,8 @@ class _PosterCache extends PosterCache {
   File? resolvedFile(String url) => image;
 
   @override
-  Future<File?> loadVisible(String url) async => image;
+  Future<File?> loadVisible(String url, {bool Function()? canStart}) async =>
+      image;
 
   @override
   Future<File?> loadNearby(String url, {bool Function()? canStart}) async =>

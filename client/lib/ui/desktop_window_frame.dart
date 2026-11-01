@@ -12,9 +12,17 @@ import 'glass.dart';
 /// inset; artwork and video can continue underneath the transparent drag area.
 class DesktopWindowFrame extends StatefulWidget {
   static const titlebarHeight = 36.0;
+  static const inlineDragHeight = 12.0;
   final Widget child;
 
   const DesktopWindowFrame({super.key, required this.child});
+
+  // Wide macOS layouts keep the traffic lights above the sidebar, so the
+  // adjacent page header can use the titlebar's otherwise empty space.
+  static bool usesInlineTitlebar(BuildContext context) =>
+      !kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.macOS &&
+      MediaQuery.sizeOf(context).width >= 1000;
 
   @override
   State<DesktopWindowFrame> createState() => _DesktopWindowFrameState();
@@ -102,15 +110,18 @@ class _DesktopWindowFrameState extends State<DesktopWindowFrame> {
                     children: [
                       if (macOS) const SizedBox(width: 80),
                       Expanded(
-                        child: GestureDetector(
-                          key: const ValueKey('desktop-window-drag'),
-                          behavior: HitTestBehavior.opaque,
-                          excludeFromSemantics: true,
-                          onPanStart: (_) =>
-                              unawaited(DesktopWindow.startDrag()),
-                          onDoubleTap: () =>
-                              unawaited(DesktopWindow.toggleMaximize()),
-                          child: const SizedBox.expand(),
+                        child: Align(
+                          alignment: Alignment.topCenter,
+                          child: SizedBox(
+                            height:
+                                DesktopWindowFrame.usesInlineTitlebar(context)
+                                ? DesktopWindowFrame.inlineDragHeight
+                                : DesktopWindowFrame.titlebarHeight,
+                            child: const DesktopWindowDragArea(
+                              key: ValueKey('desktop-window-drag'),
+                              child: SizedBox.expand(),
+                            ),
+                          ),
                         ),
                       ),
                       if (!macOS) ...[
@@ -142,6 +153,38 @@ class _DesktopWindowFrameState extends State<DesktopWindowFrame> {
       ),
     );
   }
+}
+
+/// Only non-interactive header space opts in; adjacent buttons and text fields
+/// keep their own pointer gestures, including text selection and double click.
+class DesktopWindowDragArea extends StatelessWidget {
+  final Widget child;
+  final bool enabled;
+
+  const DesktopWindowDragArea({
+    super.key,
+    required this.child,
+    this.enabled = true,
+  });
+
+  @override
+  Widget build(BuildContext context) => enabled
+      ? GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          excludeFromSemantics: true,
+          onPanStart: (_) {
+            if (!DesktopWindow.state.value.fullscreen) {
+              unawaited(DesktopWindow.startDrag());
+            }
+          },
+          onDoubleTap: () {
+            if (!DesktopWindow.state.value.fullscreen) {
+              unawaited(DesktopWindow.toggleMaximize());
+            }
+          },
+          child: child,
+        )
+      : child;
 }
 
 class _WindowButton extends StatelessWidget {

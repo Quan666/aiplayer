@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:aiplayer/data/media_previews.dart';
@@ -94,6 +95,111 @@ void main() {
     expect(await from.snapshot(mediaIds: {}), isEmpty);
     expect((await from.snapshot()).length, 2);
   });
+
+  test(
+    'source posters survive synchronized fallbacks and seed snapshots',
+    () async {
+      await firstPosters.directory.create(recursive: true);
+      final source = images.encodePng(
+        images.Image(width: 640, height: 960)
+          ..setPixelRgb(10, 10, 30, 100, 240),
+      );
+      final sourceFile = firstPosters.sourceFile(url);
+      await sourceFile.writeAsBytes(source);
+      await from.apply('poster:$url', {'image': image}, deleted: false);
+      expect(await sourceFile.readAsBytes(), source);
+      final snapshot = await from.snapshot();
+      final portable = snapshot['poster:$url']['image'] as String;
+      expect(base64Decode(portable.split(',').last), source);
+      await to.apply('poster:$url', snapshot['poster:$url'], deleted: false);
+      expect((await to.snapshot())['poster:$url'], snapshot['poster:$url']);
+    },
+  );
+
+  test(
+    'downsampling averages fine poster patterns without repeated loss',
+    () async {
+      final source = images.Image(width: 2560, height: 1280);
+      for (final pixel in source) {
+        final value = (pixel.x + pixel.y).isEven ? 0 : 255;
+        pixel.setRgb(value, value, value);
+      }
+      // An uncompressed PNG forces the portable transcode path even though the
+      // deliberately fine pattern itself is easy for a PNG encoder to compress.
+      final original = images.encodePng(source, level: 0);
+      expect(original.length, greaterThan(134970));
+      await firstPosters.directory.create(recursive: true);
+      await firstPosters.cachedFile(url).writeAsBytes(original);
+      final snapshot = await from.snapshot();
+      final portable = snapshot['poster:$url']['image'] as String;
+      expect(portable.length, lessThanOrEqualTo(180000));
+      final bytes = base64Decode(portable.split(',').last);
+      expect(bytes.length, lessThanOrEqualTo(134970));
+      final restored = images.decodeImage(bytes)!;
+      expect((restored.width, restored.height), (1280, 640));
+      for (final point in [(100, 100), (401, 311), (900, 500)]) {
+        expect(restored.getPixel(point.$1, point.$2).r, closeTo(127, 3));
+      }
+      await to.apply('poster:$url', snapshot['poster:$url'], deleted: false);
+      expect((await to.snapshot())['poster:$url'], snapshot['poster:$url']);
+      expect(await firstPosters.cachedFile(url).readAsBytes(), original);
+    },
+  );
+
+  test(
+    'portable compression preserves mobile resolution and EXIF orientation',
+    () async {
+      final source = images.Image(width: 640, height: 1280);
+      final random = Random(42);
+      for (final pixel in source) {
+        final value = 90 + pixel.x ~/ 8 + random.nextInt(25);
+        pixel.setRgb(value, value, value);
+      }
+      source.exif.imageIfd.orientation = 6;
+      final original = images.encodeJpg(source, quality: 100);
+      expect(original.length, greaterThan(134970));
+      await firstPosters.directory.create(recursive: true);
+      await firstPosters.cachedFile(url).writeAsBytes(original);
+      final snapshot = await from.snapshot();
+      final portable = snapshot['poster:$url']['image'] as String;
+      expect(SyncArtwork.valid('poster:$url', {'image': portable}), isTrue);
+      final bytes = base64Decode(portable.split(',').last);
+      final restored = images.decodeImage(bytes)!;
+      expect((restored.width, restored.height), (1280, 640));
+      expect(
+        restored.getPixel(100, 50).r,
+        lessThan(restored.getPixel(100, 550).r),
+      );
+      expect(bytes.length, lessThanOrEqualTo(134970));
+      await to.apply('poster:$url', snapshot['poster:$url'], deleted: false);
+      expect((await to.snapshot())['poster:$url'], snapshot['poster:$url']);
+    },
+  );
+
+  test(
+    'high-entropy posters remain shareable within the wire budget',
+    () async {
+      final source = images.Image(width: 1280, height: 1280);
+      final random = Random(17);
+      for (final pixel in source) {
+        pixel.setRgb(
+          random.nextInt(256),
+          random.nextInt(256),
+          random.nextInt(256),
+        );
+      }
+      await firstPosters.directory.create(recursive: true);
+      await firstPosters.cachedFile(url).writeAsBytes(images.encodePng(source));
+      final snapshot = await from.snapshot();
+      final portable = snapshot['poster:$url']['image'] as String;
+      expect(SyncArtwork.valid('poster:$url', {'image': portable}), isTrue);
+      final bytes = base64Decode(portable.split(',').last);
+      expect(bytes.length, lessThanOrEqualTo(134970));
+      final restored = images.decodeImage(bytes)!;
+      expect(restored.width, inInclusiveRange(384, 1279));
+      expect(restored.width, restored.height);
+    },
+  );
 
   test(
     'preview restores matching fingerprint and does not accept another file version',

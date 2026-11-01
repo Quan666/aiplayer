@@ -3,6 +3,10 @@ import 'dart:io';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/main.dart';
+import 'package:aiplayer/playback/desktop_window.dart';
+import 'package:aiplayer/ui/search_header.dart';
+import 'package:aiplayer/ui/sources_page.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -66,6 +70,15 @@ void main() {
     await tester.pumpAndSettle();
     final first = find.byKey(const ValueKey('nav-item-0'));
     final expandedWidth = tester.getSize(first).width;
+    final branding = find.byWidgetPredicate(
+      (widget) =>
+          widget is Image &&
+          widget.image is AssetImage &&
+          (widget.image as AssetImage).assetName ==
+              'assets/branding/app_icon.png',
+    );
+    expect(branding, findsNothing);
+    expect(find.text('映库'), findsNothing);
     await tester.tap(find.byKey(const ValueKey('toggle-desktop-navigation')));
     await tester.pumpAndSettle();
     expect(tester.getSize(first).width, lessThan(expandedWidth));
@@ -73,6 +86,7 @@ void main() {
       find.descendant(of: first, matching: find.byType(Text)),
       findsNothing,
     );
+    expect(branding, findsNothing);
     expect(store.local('desktopNavigationCollapsed'), true);
     await tester.tap(find.byKey(const ValueKey('nav-item-2')));
     await tester.pumpAndSettle();
@@ -83,6 +97,147 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'wide macOS headers use the titlebar without blocking actions or search',
+    (tester) async {
+      size(tester, const Size(1440, 1000));
+      final calls = <String>[];
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(DesktopWindow.channel, (call) async {
+        calls.add(call.method);
+        return null;
+      });
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(DesktopWindow.channel, null),
+      );
+      final picker = _CancelledFilePicker();
+      FilePicker.platform = picker;
+      await tester.pumpWidget(AIPlayerApp(model: model));
+      await tester.pumpAndSettle();
+
+      Finder header(String title) => find.byWidgetPredicate(
+        (widget) => widget is SearchHeader && widget.title == title,
+      );
+      expect(tester.getTopLeft(header('我的影视库')).dy, 12);
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('nav-item-0'))).dy,
+        greaterThanOrEqualTo(36),
+      );
+      expect(
+        tester
+            .getSize(find.byKey(const ValueKey('desktop-window-drag')))
+            .height,
+        12,
+      );
+
+      calls.clear();
+      await tester.drag(
+        find.text('我的影视库'),
+        const Offset(80, 0),
+        kind: PointerDeviceKind.mouse,
+      );
+      expect(calls, contains('startDrag'));
+      calls.clear();
+      await tester.tap(find.text('我的影视库'));
+      await tester.pump(const Duration(milliseconds: 80));
+      await tester.tap(find.text('我的影视库'));
+      await tester.pump(const Duration(milliseconds: 80));
+      expect(calls, contains('toggleMaximize'));
+
+      // Exercise the part of each action that previously overlapped the
+      // full-width titlebar, rather than only its lower half.
+      final importBounds = tester.getRect(
+        find.widgetWithText(FilledButton, '导入视频'),
+      );
+      expect(importBounds.top, lessThan(36));
+      await tester.tapAt(Offset(importBounds.center.dx, importBounds.top + 2));
+      await tester.pumpAndSettle();
+      expect(picker.requests, 1);
+      final searchBounds = tester.getRect(find.byTooltip('搜索作品或文件名'));
+      expect(searchBounds.top, lessThan(36));
+      await tester.tapAt(Offset(searchBounds.center.dx, searchBounds.top + 2));
+      await tester.pumpAndSettle();
+      final librarySearch = find.descendant(
+        of: header('我的影视库'),
+        matching: find.byType(TextField),
+      );
+      await tester.enterText(librarySearch, '视频 1');
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(librarySearch).controller!.text, '视频 1');
+
+      await tester.tap(find.byKey(const ValueKey('nav-item-1')));
+      await tester.pumpAndSettle();
+      final addSourceBounds = tester.getRect(find.byTooltip('添加来源'));
+      expect(addSourceBounds.center.dy, 36);
+      expect(addSourceBounds.top, lessThan(36));
+      await tester.tapAt(
+        Offset(addSourceBounds.center.dx, addSourceBounds.top + 2),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(SourceEditorPage), findsOneWidget);
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey('nav-item-2')));
+      await tester.pumpAndSettle();
+      expect(tester.getTopLeft(header('设置')).dy, 12);
+      final settingsSearchBounds = tester.getRect(find.byTooltip('搜索设置'));
+      await tester.tapAt(
+        Offset(settingsSearchBounds.center.dx, settingsSearchBounds.top + 2),
+      );
+      await tester.pumpAndSettle();
+      final settingsSearch = find.descendant(
+        of: header('设置'),
+        matching: find.byType(TextField),
+      );
+      await tester.enterText(settingsSearch, '字幕');
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(settingsSearch).controller!.text, '字幕');
+      await tester.tap(find.byKey(const ValueKey('nav-item-0')));
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(librarySearch).controller!.text, '视频 1');
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.macOS),
+  );
+
+  testWidgets(
+    'narrow desktop headers stay below window controls after resizing',
+    (tester) async {
+      size(tester, const Size(1440, 1000));
+      await tester.pumpWidget(AIPlayerApp(model: model));
+      await tester.pumpAndSettle();
+      final header = find.byWidgetPredicate(
+        (widget) => widget is SearchHeader && widget.title == '我的影视库',
+      );
+      final platform = Theme.of(tester.element(header)).platform;
+      expect(
+        tester.getTopLeft(header).dy,
+        platform == TargetPlatform.macOS ? 12 : 48,
+      );
+      tester.view.physicalSize = const Size(900, 700);
+      await tester.pumpAndSettle();
+      expect(tester.getTopLeft(header).dy, 40);
+      expect(
+        tester
+            .getSize(find.byKey(const ValueKey('desktop-window-drag')))
+            .height,
+        36,
+      );
+      await tester.tap(find.byTooltip('搜索作品或文件名'));
+      await tester.pumpAndSettle();
+      expect(
+        find.descendant(of: header, matching: find.byType(TextField)),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+    variant: TargetPlatformVariant.desktop(),
+  );
 
   testWidgets('phone history has no scrollbar and no header status messages', (
     tester,
@@ -219,4 +374,27 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
+}
+
+class _CancelledFilePicker extends FilePicker {
+  int requests = 0;
+
+  @override
+  Future<FilePickerResult?> pickFiles({
+    String? dialogTitle,
+    String? initialDirectory,
+    FileType type = FileType.any,
+    List<String>? allowedExtensions,
+    Function(FilePickerStatus)? onFileLoading,
+    bool allowCompression = false,
+    int compressionQuality = 0,
+    bool allowMultiple = false,
+    bool withData = false,
+    bool withReadStream = false,
+    bool lockParentWindow = false,
+    bool readSequential = false,
+  }) async {
+    requests++;
+    return null;
+  }
 }

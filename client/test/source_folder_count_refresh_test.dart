@@ -61,7 +61,8 @@ class _PosterCache extends PosterCache {
   _PosterCache({required super.directory});
 
   @override
-  Future<File?>? loadVisible(String url) => Future.value();
+  Future<File?>? loadVisible(String url, {bool Function()? canStart}) =>
+      Future.value();
 
   @override
   Future<File?>? loadNearby(String url, {bool Function()? canStart}) =>

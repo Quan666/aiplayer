@@ -2,6 +2,30 @@ import 'package:aiplayer/data/poster_url.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'card sources upgrade thumbnails without downgrading larger originals',
+    () {
+      for (final size in ['w92', 'w342', 'w500', 'h632']) {
+        expect(
+          sourcePosterUrl('https://image.tmdb.org/t/p/$size/poster.jpg?tag=a'),
+          'https://image.tmdb.org/t/p/w780/poster.jpg?tag=a',
+        );
+      }
+      for (final size in ['w780', 'w1280', 'original']) {
+        final url = 'https://image.tmdb.org/t/p/$size/poster.jpg';
+        expect(sourcePosterUrl(url), url);
+      }
+      expect(
+        sourcePosterUrl('https://lain.bgm.tv/r/400/pic/cover/c/a.jpg?v=2'),
+        'https://lain.bgm.tv/pic/cover/l/a.jpg?v=2',
+      );
+      const signed = 'https://custom.example/t/p/w500/a.jpg?token=secret';
+      expect(sourcePosterUrl(signed), signed);
+      final excessiveWidth = 'https://image.tmdb.org/t/p/w${'9' * 80}/a.jpg';
+      expect(sourcePosterUrl(excessiveWidth), excessiveWidth);
+    },
+  );
+
   test('TMDB viewer uses the original asset at all thumbnail sizes', () {
     for (final size in ['w92', 'w342', 'w500', 'w780', 'h632']) {
       expect(

@@ -9,6 +9,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import '../core/network.dart';
 import '../core/system_proxy.dart';
+import 'poster_url.dart';
 
 // Weak file handles carry the content generation into Flutter's decoded cache.
 // No file access or image retention is needed when a widget builds.
@@ -54,6 +55,8 @@ class PosterCache {
   final _failedUntil = <String, DateTime>{};
   final _priority = <String>{};
   final _nearby = <String, _PosterNearbyRequest>{};
+  final _upgradeWaiting = <String, (File, _PosterNearbyRequest)>{};
+  final _upgrades = <String, _PosterNearbyRequest>{};
   final _capacity = ValueNotifier(0);
   final _changes = ValueNotifier<PosterCacheChange?>(null);
   final _work = <Future<void>>{};
@@ -102,6 +105,7 @@ class PosterCache {
     _resume = null;
     resume.complete();
     _dispatchWaiting();
+    _dispatchUpgrades();
   }
 
   void _cancelTransfers() {
@@ -147,6 +151,9 @@ class PosterCache {
   /// Called after another isolate atomically replaces an artwork file.
   void fileChanged(String url) {
     if (_closed || _clearing != null) return;
+    // Synchronization only replaces the portable fallback. An already loaded
+    // online source remains authoritative and keeps its decoded-cache key.
+    if (_isSource(_resolved[url] ?? _retained[url]?.file.target)) return;
     _forget(url);
     _failedUntil.remove(url);
     _changes.value = PosterCacheChange(url, null);
@@ -154,9 +161,14 @@ class PosterCache {
 
   /// Visible artwork takes the next free download slot ahead of prefetches.
   /// Null means admission was deferred, rather than that a download failed.
-  Future<File?>? loadVisible(String url) {
+  Future<File?>? loadVisible(String url, {bool Function()? canStart}) {
     if (_clearing != null) return null;
-    if (_closed || url.isEmpty || resolvedFile(url) != null) return load(url);
+    if (_closed || url.isEmpty) return load(url);
+    final cached = resolvedFile(url);
+    if (cached != null) {
+      _upgradeVisible(url, cached, canStart: canStart);
+      return SynchronousFuture(cached);
+    }
     if (!_pending.containsKey(url) && _pending.length >= maxPending) {
       final index = _waiting.indexWhere(
         (waiter) => !_priority.contains(waiter.url),
@@ -179,7 +191,54 @@ class PosterCache {
         waiter,
       );
     }
-    return load(url);
+    final result = load(url);
+    unawaited(
+      result.then((file) {
+        if (file != null) _upgradeVisible(url, file, canStart: canStart);
+      }),
+    );
+    return result;
+  }
+
+  void _upgradeVisible(String url, File file, {bool Function()? canStart}) {
+    final fileEpoch = _posterFileEpochs[file];
+    if (_closed ||
+        _clearing != null ||
+        (fileEpoch != null && !identical(fileEpoch, _epoch)) ||
+        _isSource(file) ||
+        canStart?.call() == false ||
+        (_failedUntil[url]?.isAfter(DateTime.now()) ?? false)) {
+      return;
+    }
+    if (_pending.containsKey(url)) {
+      if (canStart != null) _upgrades[url]?.canStart = canStart;
+      return;
+    }
+    final upgrade = _PosterNearbyRequest(canStart ?? () => true);
+    if (_resume != null || _pending.length >= maxPending) {
+      // Only visible fallback covers request upgrades; this bounded waiting
+      // set never scans the library or starts maintenance timers.
+      if (_upgradeWaiting.length < maxPending) {
+        _upgradeWaiting[url] = (file, upgrade);
+      }
+      return;
+    }
+    _upgrades[url] = upgrade;
+    _priority.add(url);
+    unawaited(_startLoad(url, sourceOnly: true));
+  }
+
+  void _dispatchUpgrades() {
+    if (_closed || _clearing != null || _resume != null) return;
+    while (_pending.length < maxPending && _upgradeWaiting.isNotEmpty) {
+      final url = _upgradeWaiting.keys.first;
+      final (file, upgrade) = _upgradeWaiting.remove(url)!;
+      _upgradeVisible(
+        url,
+        resolvedFile(url) ?? file,
+        canStart: upgrade.canStart,
+      );
+    }
   }
 
   /// At most three speculative lookups/downloads leave a slot for visible work.
@@ -237,8 +296,30 @@ class PosterCache {
   File _file(String url) =>
       File('${directory.path}/${sha256.convert(utf8.encode(url))}.image');
 
-  /// Read without fetching: synchronization only shares artwork already held.
+  /// Legacy and synchronized portable bytes, retained for offline fallback.
+  /// Synchronization checks [sourceFile] first when exporting existing artwork.
   File cachedFile(String url) => _file(url);
+
+  /// Online bytes are isolated from synchronized, potentially lossy copies.
+  /// The logical URL remains the key even when its provider source is upgraded.
+  File sourceFile(String url) => File(
+    '${directory.path}/${sha256.convert(utf8.encode(url))}.source.image',
+  );
+
+  bool _isSource(File? file) => file?.path.endsWith('.source.image') == true;
+
+  /// A visible card can retry an upgrade cancelled while it was offscreen.
+  /// This only reads path handles; no disk lookup or maintenance timer is used.
+  bool needsSourceUpgrade(String url) {
+    if (_closed ||
+        _clearing != null ||
+        _pending.containsKey(url) ||
+        (_failedUntil[url]?.isAfter(DateTime.now()) ?? false)) {
+      return false;
+    }
+    final file = _resolved[url] ?? _retained[url]?.file.target;
+    return file != null && !_isSource(file);
+  }
 
   /// A real download/decode failure, even after its retry delay expires.
   /// Deferred admissions and lifecycle cancellations do not count as failures.
@@ -331,18 +412,34 @@ class PosterCache {
         // A successful atomic rename already removed the temporary file.
       }
     }
+    final source = sourceFile(url);
+    final hasSource =
+        await _whenActive(epoch, source.exists) == true &&
+        (await _whenActive(epoch, source.length) ?? 0) > 0;
     await _whenActive(epoch, () {
       _failedUntil.remove(url);
-      _remember(url, file);
-      _changes.value = PosterCacheChange(url, file);
+      if (!hasSource &&
+          !_isSource(_resolved[url] ?? _retained[url]?.file.target)) {
+        _remember(url, file);
+        _changes.value = PosterCacheChange(url, file);
+      } else if (hasSource &&
+          !_isSource(_resolved[url] ?? _retained[url]?.file.target) &&
+          (_resolved.containsKey(url) || _retained.containsKey(url))) {
+        _forget(url);
+        _changes.value = PosterCacheChange(url, null);
+      }
     });
   }
 
   Future<File?> load(String url) {
     if (_closed || _clearing != null || url.isEmpty) return Future.value();
-    final epoch = _epoch;
     final cached = resolvedFile(url);
     if (cached != null) return SynchronousFuture(cached);
+    return _startLoad(url);
+  }
+
+  Future<File?> _startLoad(String url, {bool sourceOnly = false}) {
+    final epoch = _epoch;
     final pending = _pending[url];
     if (pending != null) return pending;
     // Keep four admissions for visible covers, including their disk lookup;
@@ -350,15 +447,20 @@ class PosterCache {
     final limit = _priority.contains(url) ? maxPending : maxPending - 4;
     if (_pending.length >= limit) return Future.value();
     late final Future<File?> result;
-    result = _load(url, epoch)
+    result = _load(url, epoch, sourceOnly: sourceOnly)
         .then((file) {
           if (!_current(epoch)) return null;
+          final previous = _resolved[url] ?? _retained[url]?.file.target;
           if (file != null &&
               !_closed &&
               identical(_pending[url], result) &&
-              !_resolved.containsKey(url)) {
-            _failedUntil.remove(url);
+              (_isSource(file) || previous == null)) {
+            if (_isSource(file)) _failedUntil.remove(url);
             _remember(url, file);
+            if (sourceOnly ||
+                (_isSource(file) && previous != null && !_isSource(previous))) {
+              _changes.value = PosterCacheChange(url, file);
+            }
           }
           return file;
         })
@@ -367,17 +469,23 @@ class PosterCache {
             _pending.remove(url);
             _priority.remove(url);
             _nearby.remove(url);
+            _upgrades.remove(url);
           }
           if (!_closed && _clearing == null) _capacity.value++;
+          _dispatchUpgrades();
         });
     _pending[url] = result;
     return _track(result);
   }
 
-  Future<File?> _load(String url, _PosterEpoch epoch) async {
-    final nearby = _nearby[url];
+  Future<File?> _load(
+    String url,
+    _PosterEpoch epoch, {
+    bool sourceOnly = false,
+  }) async {
+    final nearby = _nearby[url] ?? _upgrades[url];
     if (nearby?.allowed == false) return null;
-    final uri = Uri.tryParse(url);
+    final uri = Uri.tryParse(sourcePosterUrl(url));
     if (uri == null ||
         !['http', 'https'].contains(uri.scheme) ||
         uri.host.isEmpty ||
@@ -385,7 +493,7 @@ class PosterCache {
       _failed(url);
       return null;
     }
-    final file = _file(url);
+    final file = sourceFile(url);
     try {
       while (await _checkpoint(epoch)) {
         await _invalidating[url];
@@ -396,6 +504,16 @@ class PosterCache {
               return null;
             }
             return file;
+          }
+        }
+        if (!sourceOnly) {
+          final fallback = _file(url);
+          if (await _whenActive(epoch, fallback.exists) == true &&
+              (await _whenActive(epoch, fallback.length) ?? 0) > 0) {
+            if (!await _checkpoint(epoch) || nearby?.allowed == false) {
+              return null;
+            }
+            return fallback;
           }
         }
         if ((_failedUntil[url]?.isAfter(DateTime.now()) ?? false) ||
@@ -464,7 +582,10 @@ class PosterCache {
     if (!_current(epoch) || attempt.stopped) return null;
     if (!await _checkpoint(epoch) || nearby?.allowed == false) return null;
     bool canContinue() =>
-        _current(epoch) && _resume == null && !attempt.stopped;
+        _current(epoch) &&
+        _resume == null &&
+        !attempt.stopped &&
+        nearby?.allowed != false;
     if (!canContinue()) return null;
     // One pool reuses HTTP/TLS connections across covers. An individual
     // timeout aborts only its own request; lifecycle suspension closes all.
@@ -621,7 +742,8 @@ class PosterCache {
       _failed(url);
     }
     late final Future<void> result;
-    result = _delete(url).whenComplete(() {
+    _upgradeWaiting.remove(url);
+    result = _delete(url, failedFile: failedFile).whenComplete(() {
       if (identical(_invalidating[url], result)) _invalidating.remove(url);
     });
     _invalidating[url] = result;
@@ -630,11 +752,14 @@ class PosterCache {
     return result;
   }
 
-  Future<void> _delete(String url) async {
-    try {
-      await _file(url).delete();
-    } on FileSystemException {
-      // Already removed or unavailable.
+  Future<void> _delete(String url, {File? failedFile}) async {
+    for (final file
+        in failedFile == null ? [sourceFile(url), _file(url)] : [failedFile]) {
+      try {
+        await file.delete();
+      } on FileSystemException {
+        // Already removed or unavailable.
+      }
     }
   }
 
@@ -674,6 +799,8 @@ class PosterCache {
     _failedUntil.clear();
     _priority.clear();
     _nearby.clear();
+    _upgradeWaiting.clear();
+    _upgrades.clear();
     unawaited(_clear(completed));
     return completed.future;
   }
@@ -716,6 +843,8 @@ class PosterCache {
     _failedUntil.clear();
     _priority.clear();
     _nearby.clear();
+    _upgradeWaiting.clear();
+    _upgrades.clear();
     _cancelTransfers();
     for (final waiting in _waiting) {
       waiting.ready.complete(false);

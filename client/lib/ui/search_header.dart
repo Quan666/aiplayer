@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'glass.dart';
+import 'desktop_window_frame.dart';
 import 'theme/settings_styles.dart';
 
 /// Lets navigation dismiss this input and cancel focus queued for its entrance
@@ -138,27 +139,30 @@ class _SearchHeaderState extends State<SearchHeader>
                 key: const ValueKey('compact-search'),
                 children: [
                   Expanded(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          widget.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: SettingsStyles.of(
-                            context,
-                          ).searchTitle(widget.titleSize),
-                        ),
-                        if (widget.subtitle != null)
+                    child: DesktopWindowDragArea(
+                      enabled: DesktopWindowFrame.usesInlineTitlebar(context),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
                           Text(
-                            widget.subtitle!,
+                            widget.title,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: AppStyles.of(context).micro,
+                            style: SettingsStyles.of(
+                              context,
+                            ).searchTitle(widget.titleSize),
                           ),
-                      ],
+                          if (widget.subtitle != null)
+                            Text(
+                              widget.subtitle!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: AppStyles.of(context).micro,
+                            ),
+                        ],
+                      ),
                     ),
                   ),
                   IconButton(

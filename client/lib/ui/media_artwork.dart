@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -58,7 +60,7 @@ class MediaArtwork extends StatefulWidget {
     this.cache,
     this.placeholder,
     this.fit = BoxFit.cover,
-    this.maxDecodeEdge = 640,
+    this.maxDecodeEdge = 1280,
     this.decodeScale = 1,
     this.loadWhileScrolling = false,
     this.onRequestPreview,
@@ -99,7 +101,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
   Animation<double>? _routeEntrance;
   Animation<double>? _routeTransition;
   ArtworkDecodeRequest? _decodeRequest;
-  ResizeImage? _queuedImage, _failedImage;
+  ResizeImage? _queuedImage, _failedImage, _displayedPosterImage;
   bool _waitingForDecodeCapacity = false;
   bool _posterWasNearby = false;
   int _geometryGeneration = -1, _geometryPriority = -1;
@@ -158,6 +160,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
       _posterFailed = false;
       _posterWasNearby = false;
       _poster = change.file == null ? null : SynchronousFuture(change.file);
+      if (change.file == null) _displayedPosterImage = null;
       _posterRevision++;
     }
 
@@ -400,7 +403,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
 
   void _loadArtwork() {
     final needsPoster =
-        (_poster == null || _posterWasNearby) &&
+        (_poster == null ||
+            _posterWasNearby ||
+            widget.cache?.needsSourceUpgrade(widget.poster) == true) &&
         widget.cache != null &&
         widget.poster.isNotEmpty;
     if (!_enabled ||
@@ -439,12 +444,25 @@ class _MediaArtworkState extends State<MediaArtwork> {
           (_queuedImage != null && _decodeRequest?.isPending != true)) {
         setState(() => _imageLoadingAllowed = true);
       }
-      if ((_poster == null || (_posterWasNearby && priority == 0)) &&
+      if ((_poster == null ||
+              ((_posterWasNearby ||
+                      widget.cache?.needsSourceUpgrade(widget.poster) ==
+                          true) &&
+                  priority == 0)) &&
           widget.cache != null &&
           widget.poster.isNotEmpty) {
         final cache = widget.cache!;
+        final requestedPoster = widget.poster;
         final poster = priority == 0
-            ? cache.loadVisible(widget.poster)
+            ? cache.loadVisible(
+                requestedPoster,
+                canStart: () =>
+                    mounted &&
+                    widget.cache == cache &&
+                    widget.poster == requestedPoster &&
+                    _enabled &&
+                    _artworkPriority == 0,
+              )
             : cache.loadNearby(
                 widget.poster,
                 canStart: () => mounted && _artworkPriority >= 0,
@@ -457,10 +475,12 @@ class _MediaArtworkState extends State<MediaArtwork> {
         } else {
           _cacheCapacity?.removeListener(_loadArtwork);
           _cacheCapacity = null;
-          setState(() {
-            _poster = poster;
-            _posterWasNearby = priority > 0;
-          });
+          if (_poster == null || _posterWasNearby) {
+            setState(() {
+              _poster = poster;
+              _posterWasNearby = priority > 0;
+            });
+          }
           poster.then((file) {
             if (!mounted || !identical(_poster, poster)) return;
             // Null can also mean cancelled prefetch, a paused cache or a full
@@ -526,6 +546,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
       _cacheCapacity?.removeListener(_loadArtwork);
       _cacheCapacity = null;
       _poster = null;
+      _displayedPosterImage = null;
     }
     if (oldWidget.poster != widget.poster ||
         oldWidget.thumbnail != widget.thumbnail ||
@@ -611,11 +632,21 @@ class _MediaArtworkState extends State<MediaArtwork> {
     return false;
   }
 
-  ResizeImage _imageFor(File file, int edge) {
-    final requested = artworkImage(file, edge);
-    final warm = _warmArtworkImage(file, edge, widget.maxDecodeEdge);
+  ResizeImage _imageFor(File file, int edge, double? coverAspectRatio) {
+    final requested = artworkImage(
+      file,
+      edge,
+      coverAspectRatio: coverAspectRatio,
+      maxDecodeEdge: widget.maxDecodeEdge,
+    );
+    final warm = _warmArtworkImage(
+      file,
+      edge,
+      widget.maxDecodeEdge,
+      coverAspectRatio,
+    );
     if (warm == null) return requested;
-    if (warm.width! >= edge && warm.width! <= widget.maxDecodeEdge) {
+    if (_suitableArtwork(warm, edge, widget.maxDecodeEdge, coverAspectRatio)) {
       // A card's larger texture is already sharp enough for the detail header.
       // Sharing its exact provider avoids another disk read and decode.
       return warm;
@@ -711,14 +742,19 @@ class _MediaArtworkState extends State<MediaArtwork> {
           ),
         );
     final pixelRatio = MediaQuery.devicePixelRatioOf(context);
-    Widget frame(int decodeWidth, {bool load = true}) {
+    Widget frame(
+      int decodeWidth,
+      double? coverAspectRatio, {
+      bool load = true,
+    }) {
       if (thumbnail == null || thumbnail.isEmpty) return placeholder;
       final provider = load
-          ? _imageFor(File(thumbnail), decodeWidth)
+          ? _imageFor(File(thumbnail), decodeWidth, coverAspectRatio)
           : _warmArtworkImage(
               File(thumbnail),
               decodeWidth,
               widget.maxDecodeEdge,
+              coverAspectRatio,
             );
       if (provider == null) return placeholder;
       return !_canLoadImage(provider)
@@ -728,7 +764,7 @@ class _MediaArtworkState extends State<MediaArtwork> {
               fit: fit,
               width: double.infinity,
               height: double.infinity,
-              filterQuality: FilterQuality.low,
+              filterQuality: FilterQuality.medium,
               gaplessPlayback: true,
               frameBuilder: (_, child, frame, synchronous) =>
                   frame != null || synchronous
@@ -744,9 +780,9 @@ class _MediaArtworkState extends State<MediaArtwork> {
     return RepaintBoundary(
       child: LayoutBuilder(
         builder: (context, constraints) {
-          // Small source rows used to decode the same 640px texture as a large
-          // poster. Use the larger layout edge for cropped covers, with 64px
-          // buckets so nearby responsive sizes can share the image cache.
+          // Bucket physical dimensions so responsive layouts share textures.
+          // Cover decodes also need the box aspect ratio: fitting a landscape
+          // source into a square first would enlarge its cropped pixels later.
           final edge = constraints.hasBoundedWidth
               ? constraints.hasBoundedHeight
                     ? constraints.biggest.longestSide
@@ -757,6 +793,19 @@ class _MediaArtworkState extends State<MediaArtwork> {
                 64,
                 widget.maxDecodeEdge,
               );
+          final coverAspectRatio =
+              fit == BoxFit.cover &&
+                  constraints.hasBoundedWidth &&
+                  constraints.hasBoundedHeight &&
+                  !constraints.biggest.isEmpty
+              ? (constraints.maxWidth * pixelRatio * widget.decodeScale / 64)
+                        .ceil() /
+                    (constraints.maxHeight *
+                            pixelRatio *
+                            widget.decodeScale /
+                            64)
+                        .ceil()
+              : null;
           return poster.isNotEmpty
               ? FutureBuilder<File?>(
                   // The repaired file keeps its path. Replace the failed
@@ -766,37 +815,52 @@ class _MediaArtworkState extends State<MediaArtwork> {
                   future: _poster,
                   initialData: widget.cache?.resolvedFile(poster),
                   builder: (_, snapshot) {
-                    if (snapshot.data == null) return frame(decodeWidth);
-                    final provider = _imageFor(snapshot.data!, decodeWidth);
-                    return !_canLoadImage(provider)
-                        ? frame(
-                            decodeWidth,
-                            load:
-                                !widget.loadWhileScrolling ||
-                                _failedImage == provider,
-                          )
-                        : Image(
-                            image: provider,
-                            fit: fit,
-                            width: double.infinity,
-                            height: double.infinity,
-                            filterQuality: FilterQuality.low,
-                            gaplessPlayback: true,
-                            frameBuilder: (_, child, frame, synchronous) =>
-                                frame != null || synchronous
-                                ? child
-                                : Stack(
-                                    fit: StackFit.expand,
-                                    children: [placeholder, child],
-                                  ),
-                            errorBuilder: (_, error, _) {
-                              _repairPoster(poster, snapshot.data!);
-                              return frame(decodeWidth);
-                            },
-                          );
+                    if (snapshot.data == null) {
+                      return frame(decodeWidth, coverAspectRatio);
+                    }
+                    var provider = _imageFor(
+                      snapshot.data!,
+                      decodeWidth,
+                      coverAspectRatio,
+                    );
+                    if (!_canLoadImage(provider)) {
+                      final previous = _displayedPosterImage;
+                      if (previous == null || !_decodedArtwork(previous)) {
+                        return frame(
+                          decodeWidth,
+                          coverAspectRatio,
+                          load:
+                              !widget.loadWhileScrolling ||
+                              _failedImage == provider,
+                        );
+                      }
+                      // Source upgrades have a new file/key. Keep the already
+                      // decoded portable cover until its replacement is ready.
+                      provider = previous;
+                    }
+                    _displayedPosterImage = provider;
+                    return Image(
+                      image: provider,
+                      fit: fit,
+                      width: double.infinity,
+                      height: double.infinity,
+                      filterQuality: FilterQuality.medium,
+                      gaplessPlayback: true,
+                      frameBuilder: (_, child, frame, synchronous) =>
+                          frame != null || synchronous
+                          ? child
+                          : Stack(
+                              fit: StackFit.expand,
+                              children: [placeholder, child],
+                            ),
+                      errorBuilder: (_, error, _) {
+                        _repairPoster(poster, snapshot.data!);
+                        return frame(decodeWidth, coverAspectRatio);
+                      },
+                    );
                   },
                 )
-              : frame(decodeWidth);
+              : frame(decodeWidth, coverAspectRatio);
         },
       ),
     );
@@ -815,46 +879,89 @@ String mediaTime(double seconds) {
 // This bounded index owns only providers/keys, never decoded images or stream
 // listeners. Flutter's ImageCache remains responsible for texture residency
 // and eviction. Index lookup is O(1), with at most 32 size variants per file.
-final _artworkVariants = <(String, int), Map<int, ResizeImage>>{};
+final _artworkVariants =
+    <(String, int), Map<(int, double?, int?), ResizeImage>>{};
 
-/// Use the same SDK provider/key for lookup and display, bounding both axes.
-ResizeImage artworkImage(File file, int edge) {
+/// Native decoding with bounded dimensions, without upscaling small sources.
+/// [coverAspectRatio] sizes the visible crop; null fits inside an edge square.
+ResizeImage artworkImage(
+  File file,
+  int edge, {
+  double? coverAspectRatio,
+  int? maxDecodeEdge,
+}) {
   final revision = posterFileRevision(file);
   final identity = (file.path, revision);
-  final variants = _artworkVariants.remove(identity) ?? <int, ResizeImage>{};
+  final variants =
+      _artworkVariants.remove(identity) ??
+      <(int, double?, int?), ResizeImage>{};
+  final limit = coverAspectRatio == null ? null : maxDecodeEdge ?? edge;
+  final variant = (edge, coverAspectRatio, limit);
   _artworkVariants[identity] = variants;
   while (_artworkVariants.length > 512) {
     _artworkVariants.remove(_artworkVariants.keys.first);
   }
   final provider =
-      variants.remove(edge) ??
-      ResizeImage(
-        _VersionedFileImage(file, revision),
-        width: edge,
-        height: edge,
-        policy: ResizeImagePolicy.fit,
-      );
-  variants[edge] = provider;
+      variants.remove(variant) ??
+      (coverAspectRatio == null
+          ? ResizeImage(
+              _VersionedFileImage(file, revision),
+              width: edge,
+              height: edge,
+              policy: ResizeImagePolicy.fit,
+            )
+          : _CoverResizeImage(
+              _VersionedFileImage(
+                file,
+                revision,
+                coverAspectRatio: coverAspectRatio,
+                maxDecodeEdge: limit,
+              ),
+              edge,
+            ));
+  variants[variant] = provider;
   while (variants.length > 32) {
     variants.remove(variants.keys.first);
   }
   return provider;
 }
 
-ResizeImage? _warmArtworkImage(File file, int edge, int maxDecodeEdge) {
+bool _decodedArtwork(ResizeImage provider) {
+  var decoded = false;
+  // FileImage/ResizeImage keys resolve synchronously, without file access.
+  provider.obtainKey(ImageConfiguration.empty).then((key) {
+    final status = PaintingBinding.instance.imageCache.statusForKey(key);
+    decoded = !status.pending && (status.keepAlive || status.live);
+  });
+  return decoded;
+}
+
+bool _suitableArtwork(
+  ResizeImage provider,
+  int edge,
+  int maxDecodeEdge,
+  double? coverAspectRatio,
+) {
+  final source = provider.imageProvider as _VersionedFileImage;
+  return provider.width! >= edge &&
+      provider.width! <= maxDecodeEdge &&
+      source.coverAspectRatio == coverAspectRatio &&
+      (coverAspectRatio == null || source.maxDecodeEdge == maxDecodeEdge);
+}
+
+ResizeImage? _warmArtworkImage(
+  File file,
+  int edge,
+  int maxDecodeEdge,
+  double? coverAspectRatio,
+) {
   ResizeImage? suitable, fallback;
   final variants = _artworkVariants[(file.path, posterFileRevision(file))];
   if (variants == null) return null;
   for (final provider in variants.values) {
-    var decoded = false;
-    // FileImage/ResizeImage keys resolve synchronously, without file access.
-    provider.obtainKey(ImageConfiguration.empty).then((key) {
-      final status = PaintingBinding.instance.imageCache.statusForKey(key);
-      decoded = !status.pending && (status.keepAlive || status.live);
-    });
-    if (!decoded) continue;
+    if (!_decodedArtwork(provider)) continue;
     final size = provider.width!;
-    if (size >= edge && size <= maxDecodeEdge) {
+    if (_suitableArtwork(provider, edge, maxDecodeEdge, coverAspectRatio)) {
       if (suitable == null || size < suitable.width!) suitable = provider;
     } else if (fallback == null ||
         (size <= maxDecodeEdge &&
@@ -876,15 +983,62 @@ Future<void> _evictArtworkImages(File file) async {
 
 class _VersionedFileImage extends FileImage {
   final int revision;
+  final double? coverAspectRatio;
+  final int? maxDecodeEdge;
 
-  const _VersionedFileImage(super.file, this.revision);
+  const _VersionedFileImage(
+    super.file,
+    this.revision, {
+    this.coverAspectRatio,
+    this.maxDecodeEdge,
+  });
 
   @override
   bool operator ==(Object other) =>
       other is _VersionedFileImage &&
       other.revision == revision &&
+      other.coverAspectRatio == coverAspectRatio &&
+      other.maxDecodeEdge == maxDecodeEdge &&
       super == other;
 
   @override
-  int get hashCode => Object.hash(super.hashCode, revision);
+  int get hashCode =>
+      Object.hash(super.hashCode, revision, coverAspectRatio, maxDecodeEdge);
+}
+
+/// Reuses the SDK's asynchronous file loading, key and error eviction. Only
+/// target geometry changes; pixel work stays in the engine's native decoder.
+class _CoverResizeImage extends ResizeImage {
+  const _CoverResizeImage(super.imageProvider, int edge)
+    : super(width: edge, height: edge, policy: ResizeImagePolicy.fit);
+
+  @override
+  ImageStreamCompleter loadImage(
+    ResizeImageKey key,
+    ImageDecoderCallback decode,
+  ) {
+    final source = imageProvider as _VersionedFileImage;
+    final ratio = source.coverAspectRatio!;
+    final boxWidth = ratio >= 1 ? width!.toDouble() : width! * ratio;
+    final boxHeight = ratio >= 1 ? height! / ratio : height!.toDouble();
+    return super.loadImage(
+      key,
+      (buffer, {getTargetSize}) => decode(
+        buffer,
+        getTargetSize: (intrinsicWidth, intrinsicHeight) {
+          final scale = math.min(
+            1.0,
+            math.min(
+              source.maxDecodeEdge! / math.max(intrinsicWidth, intrinsicHeight),
+              math.max(boxWidth / intrinsicWidth, boxHeight / intrinsicHeight),
+            ),
+          );
+          return ui.TargetImageSize(
+            width: math.max(1, (intrinsicWidth * scale).ceil()),
+            height: math.max(1, (intrinsicHeight * scale).ceil()),
+          );
+        },
+      ),
+    );
+  }
 }

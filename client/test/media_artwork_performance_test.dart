@@ -73,7 +73,8 @@ class _FullPosterCache extends _RecordingPosterCache {
   Listenable get capacity => available;
 
   @override
-  Future<File?>? loadVisible(String url) => full ? null : load(url);
+  Future<File?>? loadVisible(String url, {bool Function()? canStart}) =>
+      full ? null : load(url);
 
   void release() {
     full = false;
@@ -304,10 +305,13 @@ void main() {
             throw StateError('The local poster must be reused');
           },
         );
-        await cache.restore(
-          poster,
-          await File('assets/branding/app_icon.png').readAsBytes(),
-        );
+        await cache.directory.create(recursive: true);
+        await cache
+            .sourceFile(poster)
+            .writeAsBytes(
+              await File('assets/branding/app_icon.png').readAsBytes(),
+            );
+        await cache.load(poster);
       });
       addTearDown(() async {
         cache.close();
@@ -915,8 +919,8 @@ void main() {
     expect(provider.width, 256);
     await mount(const Size(400, 600));
     provider = tester.widget<Image>(find.byType(Image)).image as ResizeImage;
-    expect(provider.width, 640);
-    expect(provider.height, 640);
+    expect(provider.width, 1280);
+    expect(provider.height, 1280);
     expect(provider.policy, ResizeImagePolicy.fit);
     await tester.pumpWidget(const SizedBox());
   });

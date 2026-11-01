@@ -23,7 +23,8 @@ class _ControlledPosterCache extends PosterCache {
   bool hasFailed(String url) => failures.contains(url);
 
   @override
-  Future<File?>? loadVisible(String url) => full ? null : load(url);
+  Future<File?>? loadVisible(String url, {bool Function()? canStart}) =>
+      full ? null : load(url);
 
   @override
   Future<File?> load(String url) =>

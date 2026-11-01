@@ -38,6 +38,7 @@ import 'media_source_selection.dart';
 import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
 import 'metadata_tasks_sheet.dart';
+import 'desktop_window_frame.dart';
 
 String _sourceLabel(String kind) => switch (kind) {
   'smb' => 'SMB',
@@ -2053,16 +2054,19 @@ class _FolderHeader extends StatelessWidget {
           const SizedBox(width: 2),
         ],
         Expanded(
-          child: !showTitle
-              ? const SizedBox.shrink()
-              : Text(
-                  title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: SettingsStyles.of(
-                    context,
-                  ).sourceTitle(nested: onBack != null),
-                ),
+          child: DesktopWindowDragArea(
+            enabled: DesktopWindowFrame.usesInlineTitlebar(context),
+            child: !showTitle
+                ? const SizedBox.shrink()
+                : Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: SettingsStyles.of(
+                      context,
+                    ).sourceTitle(nested: onBack != null),
+                  ),
+          ),
         ),
         ...actions,
       ],
