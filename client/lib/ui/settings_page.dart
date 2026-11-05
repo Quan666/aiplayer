@@ -897,7 +897,7 @@ class _SettingsPageState extends State<SettingsPage>
     const ListTile(
       leading: Icon(Icons.play_circle_outline_rounded),
       title: Text('映库 · AIPlayer'),
-      subtitle: Text('0.5.26 · 个人影视库'),
+      subtitle: Text('0.5.27 · 个人影视库'),
     ),
     ListTile(
       leading: const Icon(Icons.code_rounded),
@@ -906,7 +906,7 @@ class _SettingsPageState extends State<SettingsPage>
       onTap: () => showLicensePage(
         context: context,
         applicationName: '映库',
-        applicationVersion: '0.5.26',
+        applicationVersion: '0.5.27',
       ),
     ),
     ListTile(

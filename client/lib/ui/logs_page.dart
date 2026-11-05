@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
 import '../core/logger.dart';
 import 'glass.dart';
 import 'theme/settings_styles.dart';
 import 'search_header.dart';
+import 'television_scroll_region.dart';
 
 class LogsView extends StatefulWidget {
   final AppLog? log;
@@ -62,7 +64,11 @@ class _LogsViewState extends State<LogsView> {
                 ),
           )
           .toList();
-      Widget list({required bool bounded}) => ListView.separated(
+      Widget list({
+        required bool bounded,
+        ScrollController? controller,
+      }) => ListView.separated(
+        controller: controller,
         key: const ValueKey('diagnostic-log-list'),
         shrinkWrap: !bounded,
         physics: bounded ? null : const NeverScrollableScrollPhysics(),
@@ -164,7 +170,12 @@ class _LogsViewState extends State<LogsView> {
               ),
             if (entries.isNotEmpty)
               if (constraints.hasBoundedHeight)
-                Expanded(child: list(bounded: true))
+                Expanded(
+                  child: TelevisionScrollRegion(
+                    builder: (context, scroll) =>
+                        list(bounded: true, controller: scroll),
+                  ),
+                )
               else
                 list(bounded: false),
           ],

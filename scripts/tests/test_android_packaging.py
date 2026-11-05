@@ -77,7 +77,11 @@ class AndroidPackagingTest(unittest.TestCase):
                 argv = ["package.py", "android", "--android-legacy", "--output-dir", str(output)]
                 if skip_build:
                     argv.append("--skip-build")
-                with patch.object(packager, "CLIENT", client), patch.object(sys, "argv", argv), \
+                else:
+                    (root / ".aiplayer-android6-snapshot.json").write_text(json.dumps({
+                        "profile": "android6", "min_sdk": 23, "flutter": "3.32.8",
+                    }))
+                with patch.object(packager, "ROOT", root), patch.object(packager, "CLIENT", client), patch.object(sys, "argv", argv), \
                      patch.object(packager, "run", return_value=json.dumps({"frameworkVersion": "3.32.8"})) as run, \
                      patch.object(packager, "android_package", return_value=([artifact], {"minimum_android": "6.0 (API 23)"})) as package:
                     packager.main()
@@ -99,12 +103,38 @@ class AndroidPackagingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             client = Path(directory)
             (client / "pubspec.yaml").write_text("version: 1.0.0+1\n")
-            with patch.object(packager, "CLIENT", client), \
+            (client / ".aiplayer-android6-snapshot.json").write_text(json.dumps({
+                "profile": "android6", "min_sdk": 23, "flutter": "3.32.8",
+            }))
+            with patch.object(packager, "ROOT", client), patch.object(packager, "CLIENT", client), \
                  patch.object(sys, "argv", ["package.py", "android", "--android-legacy"]), \
                  patch.object(packager, "run", return_value=json.dumps({"frameworkVersion": "3.47.7"})) as run:
                 with self.assertRaisesRegex(RuntimeError, "pinned Flutter 3.32.8"):
                     packager.main()
             self.assertEqual(run.call_count, 1)
+
+    def test_legacy_rejects_unprepared_or_mismatched_snapshot_before_running_flutter(self):
+        valid = {"profile": "android6", "min_sdk": 23, "flutter": "3.32.8"}
+        markers = [None, "invalid JSON", "[]", "null", "{}"]
+        for key, bad_value in (("profile", "main"), ("min_sdk", 24), ("flutter", "3.47.7")):
+            markers.append(json.dumps({**valid, key: bad_value}))
+            markers.append(json.dumps({k: v for k, v in valid.items() if k != key}))
+        for contents in markers:
+            with self.subTest(marker=contents), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                client = root / "client"
+                client.mkdir()
+                (client / "pubspec.yaml").write_text("version: 1.0.0+1\n")
+                if contents is not None:
+                    (root / ".aiplayer-android6-snapshot.json").write_text(contents)
+                with patch.object(packager, "ROOT", root), patch.object(packager, "CLIENT", client), \
+                     patch.object(sys, "argv", ["package.py", "android", "--android-legacy"]), \
+                     patch.object(packager, "run") as run, patch.object(packager, "android_package") as package:
+                    with self.assertRaisesRegex(RuntimeError, "prepared compatibility checkout"):
+                        packager.main()
+                run.assert_not_called()
+                package.assert_not_called()
+                self.assertEqual((client / "pubspec.yaml").read_text(), "version: 1.0.0+1\n")
 
     def test_legacy_cannot_silently_omit_32_bit_arm(self):
         with self.assertRaisesRegex(ValueError, "both ARM32 and ARM64"):

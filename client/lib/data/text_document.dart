@@ -150,6 +150,8 @@ class TextDocumentService {
   final Map<String, dynamic> source;
   final String password, documentsPath;
   final int maxTextBytes, maxExternalBytes;
+  final Duration smbSlotWaitTimeout, requestIdleTimeout;
+  Timer? _requestDeadline;
   @visibleForTesting
   final DocumentSourceConnector? testConnector;
   ReceivePort? _replies;
@@ -170,6 +172,8 @@ class TextDocumentService {
     required this.documentsPath,
     this.maxTextBytes = 16 * 1024 * 1024,
     this.maxExternalBytes = 256 * 1024 * 1024,
+    this.smbSlotWaitTimeout = const Duration(seconds: 15),
+    this.requestIdleTimeout = const Duration(seconds: 45),
     this.testConnector,
   }) : source = Map.unmodifiable(source);
 
@@ -192,6 +196,7 @@ class TextDocumentService {
     SourceEntry entry, {
     required String cacheDirectory,
     int maxCacheBytes = 512 * 1024 * 1024,
+    void Function(int received, int total)? onProgress,
   }) async {
     if (maxCacheBytes <= 0) {
       throw ArgumentError.value(maxCacheBytes, 'maxCacheBytes');
@@ -202,17 +207,28 @@ class TextDocumentService {
             cacheDirectory,
             'open-${DateTime.now().microsecondsSinceEpoch}-${++_serial}',
           );
-    return await _submit('external', (
-      entry,
-      cacheDirectory,
-      staging,
-      maxCacheBytes,
-    ), staging: staging) as String;
+    return await _submit(
+      'external',
+      (entry, cacheDirectory, staging, maxCacheBytes),
+      staging: staging,
+      onProgress: onProgress,
+    ) as String;
   }
 
-  Future<Object> _submit(String operation, Object argument, {String? staging}) {
+  Future<Object> _submit(
+    String operation,
+    Object argument, {
+    String? staging,
+    void Function(int received, int total)? onProgress,
+  }) {
     if (_disposed) return Future.error(const Cancelled());
-    final request = _DocumentRequest(++_serial, operation, argument, staging);
+    final request = _DocumentRequest(
+      ++_serial,
+      operation,
+      argument,
+      staging,
+      onProgress,
+    );
     final pending = _pending;
     if (pending != null && !pending.result.isCompleted) {
       pending.result.completeError(const Cancelled());
@@ -257,9 +273,22 @@ class TextDocumentService {
       if (message is SendPort) {
         _commands = message;
         if (!starting.isCompleted) starting.complete();
+      } else if (message is _DocumentActivity) {
+        _requestActivity(message.id);
+      } else if (message is _DocumentProgress) {
+        final request = _active;
+        if (!_disposed &&
+            request != null &&
+            request.id == message.id &&
+            !request.result.isCompleted) {
+          _requestActivity(message.id);
+          request.onProgress?.call(message.received, message.total);
+        }
       } else if (message is _DocumentReply) {
         final request = _active;
         if (request == null || request.id != message.id) return;
+        _requestDeadline?.cancel();
+        _requestDeadline = null;
         if (message.error != null && source['kind'] == 'smb') {
           // A timed-out native connect can retain an abandoned channel until
           // its late result is closed. Retire this parent instead of spawning
@@ -322,8 +351,11 @@ class TextDocumentService {
       await _start();
       if (_disposed) return;
       final request = _active!;
+      _requestActivity(request.id);
       _commands!.send((request.id, request.operation, request.argument));
     } catch (error, stack) {
+      _requestDeadline?.cancel();
+      _requestDeadline = null;
       final request = _active;
       _active = null;
       if (request != null && !request.result.isCompleted) {
@@ -333,7 +365,22 @@ class TextDocumentService {
     }
   }
 
+  void _requestActivity(int id) {
+    if (_disposed || _active?.id != id) return;
+    _requestDeadline?.cancel();
+    // await-for waits for async* cancellation, which can itself be blocked on
+    // native IO. The parent must own this deadline so it can report failure
+    // without waiting for that subscription or terminating an active FFI call.
+    _requestDeadline = Timer(requestIdleTimeout, () {
+      if (!_disposed && _active?.id == id) {
+        _fail(const AppFailure('文件读取超时，请检查网络后重试。'));
+      }
+    });
+  }
+
   void _fail(Object error) {
+    _requestDeadline?.cancel();
+    _requestDeadline = null;
     final starting = _starting;
     if (starting != null && !starting.isCompleted) {
       starting.completeError(error);
@@ -415,7 +462,13 @@ class _SmbDocumentSlots {
     }
     final ready = Completer<void>();
     waiting.add((owner, ready));
-    return ready.future;
+    return ready.future.timeout(
+      owner.smbSlotWaitTimeout,
+      onTimeout: () {
+        waiting.removeWhere((entry) => identical(entry.$2, ready));
+        throw const AppFailure('SMB 文件任务等待超时，请稍后重试。');
+      },
+    );
   }
 
   static void cancel(TextDocumentService owner) {
@@ -437,8 +490,25 @@ class _DocumentRequest {
   final String operation;
   final Object argument;
   final String? staging;
+  final void Function(int received, int total)? onProgress;
   final result = Completer<Object>();
-  _DocumentRequest(this.id, this.operation, this.argument, this.staging);
+  _DocumentRequest(
+    this.id,
+    this.operation,
+    this.argument,
+    this.staging,
+    this.onProgress,
+  );
+}
+
+class _DocumentActivity {
+  final int id;
+  const _DocumentActivity(this.id);
+}
+
+class _DocumentProgress {
+  final int id, received, total;
+  const _DocumentProgress(this.id, this.received, this.total);
 }
 
 class _DocumentReply {
@@ -509,6 +579,11 @@ Future<void> _documentMain(_WorkerArguments arguments) async {
 
   Future<void> run(dynamic message) async {
     final (id, operation, argument) = message as (int, String, Object);
+    void activity() {
+      if (!cancel.cancelled) replies.send(_DocumentActivity(id));
+    }
+
+    activity();
     String? staging;
     try {
       Object result;
@@ -518,7 +593,14 @@ Future<void> _documentMain(_WorkerArguments arguments) async {
           final entry = argument as SourceEntry;
           final source = await open();
           cancel.check();
-          final bytes = await _readBounded(source, entry, maxText, cancel);
+          activity();
+          final bytes = await _readBounded(
+            source,
+            entry,
+            maxText,
+            cancel,
+            activity,
+          );
           cancel.check();
           final loaded = _decodeDocument(bytes);
           document = loaded;
@@ -540,10 +622,12 @@ Future<void> _documentMain(_WorkerArguments arguments) async {
             cancel.check();
             final source = await open();
             cancel.check();
+            activity();
             final stat = await source
                 .stat(entry.path)
                 .timeout(const Duration(seconds: 30));
             cancel.check();
+            activity();
             _checkSize(stat.size, maxExternal, external: true);
             final used = await _externalCacheSize(cacheDirectory);
             cancel.check();
@@ -570,6 +654,11 @@ Future<void> _documentMain(_WorkerArguments arguments) async {
             final partial = File(p.join(directory.path, '.download.part'));
             final sink = partial.openWrite();
             var received = 0;
+            final progressClock = Stopwatch()..start();
+            // Show the first completed block immediately, then coalesce by
+            // elapsed time without scheduling a periodic timer.
+            var lastProgress = -250;
+            replies.send(_DocumentProgress(id, 0, stat.size));
             try {
               if (stat.size > 0) {
                 await for (final bytes
@@ -583,6 +672,11 @@ Future<void> _documentMain(_WorkerArguments arguments) async {
                   // Await flush for bounded file IO backpressure.
                   await sink.flush();
                   cancel.check();
+                  final elapsed = progressClock.elapsedMilliseconds;
+                  if (received < stat.size && elapsed - lastProgress >= 250) {
+                    lastProgress = elapsed;
+                    replies.send(_DocumentProgress(id, received, stat.size));
+                  }
                 }
               }
             } finally {
@@ -596,6 +690,7 @@ Future<void> _documentMain(_WorkerArguments arguments) async {
             cancel.check();
             await File(p.join(directory.path, '.complete')).writeAsString('');
             cancel.check();
+            replies.send(_DocumentProgress(id, received, stat.size));
             result = target.path;
             staging = null;
           }
@@ -605,19 +700,26 @@ Future<void> _documentMain(_WorkerArguments arguments) async {
       cancel.check();
       replies.send(_DocumentReply(id, value: result));
     } catch (error) {
+      final reply = _DocumentReply(
+        id,
+        error: safeFailure(error, action: '读取文件失败').message,
+      );
+      final smb = configuration['kind'] == 'smb';
+      // Report the failure before native shutdown: close may wait behind the
+      // very FFI operation that timed out. The parent retires an SMB service on
+      // error but retains its slot until this worker and its child really exit.
+      if (smb && !cancel.cancelled) replies.send(reply);
       if (staging != null) {
         try {
           await Directory(staging).delete(recursive: true);
         } catch (_) {}
       }
-      await closeSource();
-      if (!cancel.cancelled) {
-        replies.send(
-          _DocumentReply(
-            id,
-            error: safeFailure(error, action: '读取文件失败').message,
-          ),
-        );
+      if (smb) {
+        closing ??= closeSource();
+        await closing;
+      } else {
+        await closeSource();
+        if (!cancel.cancelled) replies.send(reply);
       }
     } finally {
       busy = false;
@@ -654,15 +756,19 @@ Future<Uint8List> _readBounded(
   SourceEntry entry,
   int maximum,
   CancelToken cancel,
+  void Function() activity,
 ) async {
   cancel.check();
   final stat = await source
       .stat(entry.path)
       .timeout(const Duration(seconds: 30));
   cancel.check();
+  activity();
   if (stat.directory) throw const AppFailure('无法将文件夹作为文本读取。');
   _checkSize(stat.size, maximum);
   final builder = BytesBuilder(copy: false);
+  final activityClock = Stopwatch()..start();
+  var lastActivity = -250;
   if (stat.size > 0) {
     await for (final bytes
         in source
@@ -671,6 +777,11 @@ Future<Uint8List> _readBounded(
       cancel.check();
       _checkSize(builder.length + bytes.length, maximum);
       builder.add(bytes);
+      final elapsed = activityClock.elapsedMilliseconds;
+      if (elapsed - lastActivity >= 250) {
+        lastActivity = elapsed;
+        activity();
+      }
     }
   }
   cancel.check();

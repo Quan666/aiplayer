@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 
 import '../core/logger.dart';
@@ -38,6 +39,7 @@ import 'device_icon.dart';
 import 'continue_watching_content.dart';
 import 'artwork_scroll_scope.dart';
 import 'desktop_window_frame.dart';
+import 'television_input.dart';
 
 Object _mediaChoicesRevision(AppModel model) => (
   model.store.localKeyRevision('sources'),
@@ -68,7 +70,14 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   final _pages = PageController();
   final _sources = SourcesController();
   final _search = SearchHeaderController();
+  final _libraryHeaderFocus = FocusNode(debugLabel: 'library-toolbar');
+  final _historyHeaderFocus = FocusNode(debugLabel: 'history-toolbar');
   final _pointerSelectedTabs = <int>{};
+  final _contentFocus = FocusScopeNode(debugLabel: 'shell-content');
+  final _navigationFocus = FocusScopeNode(debugLabel: 'shell-navigation');
+  final _tabFocus = List.generate(3, (i) => FocusNode(debugLabel: 'tab-$i'));
+  final _lastContentFocus = <int, FocusNode>{};
+  bool _televisionNavigationOpen = false;
   late bool _navigationCollapsed;
   String query = '';
   bool importing = false;
@@ -339,7 +348,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
 
   Future<T?> _pushCoveringRoute<T>(TransitionRoute<T> route) async {
     _search.dismissFocus();
-    FocusManager.instance.primaryFocus?.unfocus();
+    if (!TelevisionMode.read(context)) {
+      FocusManager.instance.primaryFocus?.unfocus();
+    }
     _coveringRoutes++;
     _suspendLibrary();
     try {
@@ -387,6 +398,13 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     _sources.dispose();
     _search.dispose();
     _navigationHidden.dispose();
+    _libraryHeaderFocus.dispose();
+    _historyHeaderFocus.dispose();
+    _contentFocus.dispose();
+    _navigationFocus.dispose();
+    for (final focus in _tabFocus) {
+      focus.dispose();
+    }
     super.dispose();
   }
 
@@ -443,7 +461,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     // Dismiss before any async preparation or association sheet can take focus.
     // The search controller also cancels a pending expansion focus request.
     _search.dismissFocus();
-    FocusManager.instance.primaryFocus?.unfocus();
+    if (!TelevisionMode.read(context)) {
+      FocusManager.instance.primaryFocus?.unfocus();
+    }
     _openingPlayer = true;
     try {
       if (expectedBinding == null &&
@@ -492,7 +512,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
 
   Future<void> _associate(SyncRecord record) async {
     _search.dismissFocus();
-    FocusManager.instance.primaryFocus?.unfocus();
+    if (!TelevisionMode.read(context)) {
+      FocusManager.instance.primaryFocus?.unfocus();
+    }
     await showGlassBottomSheet(
       context: context,
       builder: (sheet) => SafeArea(
@@ -552,7 +574,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     // Clear the route's remembered search focus before the modal takes over,
     // otherwise touch navigation restores the keyboard when details close.
     _search.dismissFocus();
-    FocusManager.instance.primaryFocus?.unfocus();
+    if (!TelevisionMode.read(context)) {
+      FocusManager.instance.primaryFocus?.unfocus();
+    }
     final complete = snapshot.seriesFor(episodes.first);
     if (complete.isNotEmpty) episodes = complete;
     _detailsVisible = true;
@@ -787,25 +811,28 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
           ),
           sliver: SliverList.list(
             children: [
-              SearchHeader(
-                controller: _search,
-                title: '我的影视库',
-                hint: '搜索作品或文件名',
-                onChanged: (v) {
-                  setState(() {
-                    query = v;
-                    _libraryContent = null;
-                  });
-                  _loadLibrarySnapshot();
-                },
-                subtitle: mobile ? null : '${media.length} 个视频',
-                trailing: FilledButton.icon(
-                  onPressed: importing ? null : _files,
-                  icon: const Icon(
-                    Icons.add_rounded,
-                    size: LibraryStyles.iconHeading,
+              TelevisionHeader(
+                focusNode: _libraryHeaderFocus,
+                child: SearchHeader(
+                  controller: _search,
+                  title: '我的影视库',
+                  hint: '搜索作品或文件名',
+                  onChanged: (v) {
+                    setState(() {
+                      query = v;
+                      _libraryContent = null;
+                    });
+                    _loadLibrarySnapshot();
+                  },
+                  subtitle: mobile ? null : '${media.length} 个视频',
+                  trailing: FilledButton.icon(
+                    onPressed: importing ? null : _files,
+                    icon: const Icon(
+                      Icons.add_rounded,
+                      size: LibraryStyles.iconHeading,
+                    ),
+                    label: const Text('导入视频'),
                   ),
-                  label: const Text('导入视频'),
                 ),
               ),
               const SizedBox(height: 8),
@@ -847,7 +874,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                       icon: const Icon(Icons.sort_rounded),
                       onOpened: () {
                         _search.dismissFocus();
-                        FocusManager.instance.primaryFocus?.unfocus();
+                        if (!TelevisionMode.read(context)) {
+                          FocusManager.instance.primaryFocus?.unfocus();
+                        }
                       },
                       onSelected: _sortLibrary,
                       itemBuilder: (_) => [
@@ -1001,14 +1030,19 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
           ),
         SliverToBoxAdapter(
           // Keep scroll metrics stable while the floating navigation slides.
-          child: SizedBox(height: desktop ? 16 : 92),
+          child: SizedBox(
+            height: desktop && !TelevisionMode.of(context) ? 16 : 92,
+          ),
         ),
       ],
     );
-    return RefreshIndicator(
-      key: const ValueKey('library-refresh'),
-      onRefresh: _refreshLibrarySources,
-      child: scroll,
+    return TelevisionHeaderNavigation(
+      headerFocusNode: _libraryHeaderFocus,
+      child: RefreshIndicator(
+        key: const ValueKey('library-refresh'),
+        onRefresh: _refreshLibrarySources,
+        child: scroll,
+      ),
     );
   }
 
@@ -1037,66 +1071,80 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     await _pushCoveringRoute(
       MaterialPageRoute(
         builder: (_) => GlassBackground(
-          child: Scaffold(
-            appBar: AppBar(title: const Text('观看历史')),
-            body: _HistorySnapshotContent(
-              model: model,
-              query: historyQuery,
-              initialSnapshot: _snapshot,
-              builder: (context, snapshot) {
-                final items = snapshot?.searchRecent;
-                if (items == null) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                if (items.isEmpty) {
-                  return const Center(child: Text('暂无观看历史'));
-                }
-                return Align(
-                  alignment: Alignment.topCenter,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 1600),
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final scale = MediaQuery.textScalerOf(context).scale(1);
-                        final inset = constraints.maxWidth >= 700 ? 24.0 : 12.0;
-                        const gap = 16.0;
-                        final width = constraints.maxWidth - inset * 2;
-                        final minCardWidth = scale > 1.3 ? 360.0 : 300.0;
-                        final columns = ((width + gap) / (minCardWidth + gap))
-                            .floor()
-                            .clamp(1, 5);
-                        final cardWidth =
-                            (width - (columns - 1) * gap) / columns;
-                        return ContinueWatchingContent(
-                          model: model,
-                          items: items,
-                          builder: (_, views) => GridView.builder(
-                            key: const PageStorageKey('library-history-grid'),
-                            scrollCacheExtent: const ScrollCacheExtent.viewport(
-                              .75,
+          child: TelevisionHeaderNavigation(
+            headerFocusNode: _historyHeaderFocus,
+            child: Scaffold(
+              appBar: PreferredSize(
+                preferredSize: const Size.fromHeight(kToolbarHeight),
+                child: TelevisionHeader(
+                  focusNode: _historyHeaderFocus,
+                  child: AppBar(title: const Text('观看历史')),
+                ),
+              ),
+              body: _HistorySnapshotContent(
+                model: model,
+                query: historyQuery,
+                initialSnapshot: _snapshot,
+                builder: (context, snapshot) {
+                  final items = snapshot?.searchRecent;
+                  if (items == null) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  if (items.isEmpty) {
+                    return const Center(child: Text('暂无观看历史'));
+                  }
+                  return Align(
+                    alignment: Alignment.topCenter,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 1600),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final scale = MediaQuery.textScalerOf(context)
+                              .scale(1);
+                          final inset = constraints.maxWidth >= 700
+                              ? 24.0
+                              : 12.0;
+                          const gap = 16.0;
+                          final width = constraints.maxWidth - inset * 2;
+                          final minCardWidth = scale > 1.3 ? 360.0 : 300.0;
+                          final columns = ((width + gap) / (minCardWidth + gap))
+                              .floor()
+                              .clamp(1, 5);
+                          final cardWidth =
+                              (width - (columns - 1) * gap) / columns;
+                          return ContinueWatchingContent(
+                            model: model,
+                            items: items,
+                            builder: (_, views) => GridView.builder(
+                              key: const PageStorageKey('library-history-grid'),
+                              scrollCacheExtent:
+                                  const ScrollCacheExtent.viewport(.75),
+                              padding: EdgeInsets.all(inset),
+                              gridDelegate:
+                                  SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: columns,
+                                    mainAxisExtent:
+                                        (cardWidth * 9 / 16).clamp(
+                                          176.0,
+                                          250.0,
+                                        ) +
+                                        (scale - 1).clamp(0, 2) * 60,
+                                    crossAxisSpacing: gap,
+                                    mainAxisSpacing: gap,
+                                  ),
+                              itemCount: items.length,
+                              itemBuilder: (_, index) => _continueCard(
+                                items[index],
+                                views[items[index].id],
+                              ),
                             ),
-                            padding: EdgeInsets.all(inset),
-                            gridDelegate:
-                                SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: columns,
-                                  mainAxisExtent:
-                                      (cardWidth * 9 / 16).clamp(176.0, 250.0) +
-                                      (scale - 1).clamp(0, 2) * 60,
-                                  crossAxisSpacing: gap,
-                                  mainAxisSpacing: gap,
-                                ),
-                            itemCount: items.length,
-                            itemBuilder: (_, index) => _continueCard(
-                              items[index],
-                              views[items[index].id],
-                            ),
-                          ),
-                        );
-                      },
+                          );
+                        },
+                      ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
           ),
         ),
@@ -1106,7 +1154,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
 
   Future<void> _historyActions(SyncRecord media) async {
     _search.dismissFocus();
-    FocusManager.instance.primaryFocus?.unfocus();
+    if (!TelevisionMode.read(context)) {
+      FocusManager.instance.primaryFocus?.unfocus();
+    }
     final remove = await showGlassBottomSheet<bool>(
       context: context,
       builder: (sheet) => SafeArea(
@@ -1141,103 +1191,110 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         view?.title ??
         '${media.data['metadataTitle'] ?? media.data['series'] ?? media.data['title'] ?? ''}';
     final otherDevice = view?.remoteDeviceName ?? '';
-    return ClipRRect(
-      key: ValueKey('history:${media.id}'),
+    return TelevisionAction(
+      onActivate: () => _play(media),
+      onMenu: () => _historyActions(media),
       borderRadius: LibraryStyles.historyRadius,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          MediaArtwork(
-            thumbnail: view?.thumbnail,
-            thumbnailRevision: model.mediaPreviewImageRevision(media.id),
-            thumbnailChanges: model,
-            thumbnailRevisionOf: () =>
-                model.mediaPreviewImageRevision(media.id),
-            onThumbnailError: (path, error) =>
-                model.retryMissingMediaPreview(media.id, path, error),
-            onThumbnailReady: (path) => model.mediaPreviewReady(media.id, path),
-            loadWhileScrolling: true,
-            onRequestPreview: view == null
-                ? null
-                : () => _requestPreview(media),
-          ),
-          DecoratedBox(decoration: LibraryStyles.of(context).historyOverlay),
-          Material(
-            color: Colors.transparent,
-            child: InkWell(
-              onTap: () => _play(media),
-              onLongPress: () => _historyActions(media),
-              onSecondaryTap: () => _historyActions(media),
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    Text(
-                      title,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: LibraryStyles.of(context).continueTitle,
-                    ),
-                    if (episode.isNotEmpty)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 3),
+      builder: (context, focus) => ClipRRect(
+        key: ValueKey('history:${media.id}'),
+        borderRadius: LibraryStyles.historyRadius,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            MediaArtwork(
+              thumbnail: view?.thumbnail,
+              thumbnailRevision: model.mediaPreviewImageRevision(media.id),
+              thumbnailChanges: model,
+              thumbnailRevisionOf: () =>
+                  model.mediaPreviewImageRevision(media.id),
+              onThumbnailError: (path, error) =>
+                  model.retryMissingMediaPreview(media.id, path, error),
+              onThumbnailReady: (path) =>
+                  model.mediaPreviewReady(media.id, path),
+              loadWhileScrolling: true,
+              onRequestPreview: view == null
+                  ? null
+                  : () => _requestPreview(media),
+            ),
+            DecoratedBox(decoration: LibraryStyles.of(context).historyOverlay),
+            Material(
+              color: Colors.transparent,
+              child: InkWell(
+                focusNode: focus,
+                onTap: () => _play(media),
+                onLongPress: () => _historyActions(media),
+                onSecondaryTap: () => _historyActions(media),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: LibraryStyles.of(context).continueTitle,
+                      ),
+                      if (episode.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 3),
+                          child: Text(
+                            episode,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: LibraryStyles.of(context).mediaCaption,
+                          ),
+                        ),
+                      const SizedBox(height: 8),
+                      Text(
+                        '${mediaTime(position)} / ${duration > 0 ? mediaTime(duration) : '--:--'} · ${duration > 0 ? '${(fraction * 100).round()}%' : '--%'}',
+                        style: LibraryStyles.of(context).mediaCaption,
+                      ),
+                      const SizedBox(height: 6),
+                      LinearProgressIndicator(
+                        value: fraction,
+                        minHeight: LibraryStyles.progressHeight,
+                        color: GlassPalette.of(context).onMedia,
+                        backgroundColor: LibraryStyles.of(context)
+                            .mediaProgressTrack,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            if (otherDevice.isNotEmpty)
+              Positioned(
+                top: 10,
+                left: 12,
+                right: 12,
+                child: IgnorePointer(
+                  child: Row(
+                    children: [
+                      Icon(
+                        playbackDeviceIcon(
+                          platform: view?.originDevicePlatform ?? '',
+                          name: otherDevice,
+                        ),
+                        size: 14,
+                        color: GlassPalette.of(context).onMedia,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
                         child: Text(
-                          episode,
+                          otherDevice,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: LibraryStyles.of(context).mediaCaption,
                         ),
                       ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '${mediaTime(position)} / ${duration > 0 ? mediaTime(duration) : '--:--'} · ${duration > 0 ? '${(fraction * 100).round()}%' : '--%'}',
-                      style: LibraryStyles.of(context).mediaCaption,
-                    ),
-                    const SizedBox(height: 6),
-                    LinearProgressIndicator(
-                      value: fraction,
-                      minHeight: LibraryStyles.progressHeight,
-                      color: GlassPalette.of(context).onMedia,
-                      backgroundColor: LibraryStyles.of(context)
-                          .mediaProgressTrack,
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
-            ),
-          ),
-          if (otherDevice.isNotEmpty)
-            Positioned(
-              top: 10,
-              left: 12,
-              right: 12,
-              child: IgnorePointer(
-                child: Row(
-                  children: [
-                    Icon(
-                      playbackDeviceIcon(
-                        platform: view?.originDevicePlatform ?? '',
-                        name: otherDevice,
-                      ),
-                      size: 14,
-                      color: GlassPalette.of(context).onMedia,
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        otherDevice,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: LibraryStyles.of(context).mediaCaption,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -1303,12 +1360,88 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     if (mounted) _navigationHidden.value = false;
   }
 
+  void _openTelevisionNavigation() {
+    if (!mounted ||
+        !_foreground ||
+        !_routeCurrent ||
+        !TelevisionMode.read(context)) {
+      return;
+    }
+    if (!_televisionNavigationOpen) {
+      final focus = FocusManager.instance.primaryFocus;
+      if (focus != null && focus != _contentFocus) {
+        _lastContentFocus[page] = focus;
+      }
+      setState(() => _televisionNavigationOpen = true);
+    }
+    _revealNavigation();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          _foreground &&
+          _televisionNavigationOpen &&
+          _routeCurrent) {
+        _tabFocus[page].requestFocus();
+      }
+    });
+  }
+
+  void _returnToContent() {
+    if (!mounted) return;
+    setState(() => _televisionNavigationOpen = false);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          !_foreground ||
+          !_routeCurrent ||
+          _televisionNavigationOpen) {
+        return;
+      }
+      final previous = _lastContentFocus[page];
+      if (previous?.context != null && previous!.canRequestFocus) {
+        FocusTraversalGroup.of(previous.context!)
+            .requestFocusCallback(previous);
+      } else {
+        _contentFocus.requestFocus();
+        _contentFocus.nextFocus();
+      }
+    });
+  }
+
+  KeyEventResult _navigationKey(FocusNode node, KeyEvent event) {
+    if (!TelevisionMode.read(context) || !_televisionNavigationOpen) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.goBack) {
+      if (event is KeyDownEvent) _returnToContent();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Widget _navigationRegion(bool desktop) {
+    final television = TelevisionMode.of(context);
+    return ExcludeFocus(
+      excluding: television && !_televisionNavigationOpen,
+      child: FocusScope(
+        node: _navigationFocus,
+        onKeyEvent: _navigationKey,
+        child: _navigation(desktop),
+      ),
+    );
+  }
+
   void _selectPage(int value) {
     _revealNavigation();
-    if (page == value) return;
+    if (page == value) {
+      if (_televisionNavigationOpen) _returnToContent();
+      return;
+    }
     // Button selection is immediate on every platform; horizontal swipes still
     // use PageView's gesture-driven animation and retained tab state.
     _pages.jumpToPage(value);
+    if (_televisionNavigationOpen) _returnToContent();
   }
 
   bool _onScroll(ScrollNotification notification) {
@@ -1316,15 +1449,16 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         notification.metrics.axis != Axis.vertical) {
       return false;
     }
+    final television = TelevisionMode.read(context);
     if (notification is ScrollUpdateNotification &&
-        notification.dragDetails != null) {
+        (notification.dragDetails != null || television)) {
       final delta = notification.scrollDelta ?? 0;
       if (_scrollTravel.sign != delta.sign) _scrollTravel = 0;
       _scrollTravel += delta;
       final hide = _scrollTravel > 24 && notification.metrics.pixels > 24;
       final show = _scrollTravel < -12 || notification.metrics.pixels <= 0;
-      if (hide) _navigationHidden.value = true;
-      if (show) _navigationHidden.value = false;
+      if (hide && !_televisionNavigationOpen) _navigationHidden.value = true;
+      if (show && !television) _navigationHidden.value = false;
     }
     return false;
   }
@@ -1342,100 +1476,105 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     final radius = desktop
         ? GlassMetrics.control
         : GlassMetrics.navigationItemRadius;
-    Widget item(int i) => Semantics(
-      selected: page == i,
-      button: true,
-      child: Tooltip(
-        message: labels[i],
-        child: Listener(
-          onPointerDown: i < 2
-              ? (_) {
-                  _pointerSelectedTabs.add(i);
+    Widget item(int i) => TelevisionFocusIndicator(
+      focusNode: _tabFocus[i],
+      borderRadius: BorderRadius.circular(radius),
+      child: Semantics(
+        selected: page == i,
+        button: true,
+        child: Tooltip(
+          message: labels[i],
+          child: Listener(
+            onPointerDown: i < 2
+                ? (_) {
+                    _pointerSelectedTabs.add(i);
+                    _selectPage(i);
+                  }
+                : null,
+            onPointerCancel: (_) => _pointerSelectedTabs.remove(i),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                focusNode: _tabFocus[i],
+                borderRadius: BorderRadius.circular(radius),
+                onTap: () {
+                  // Tabs with double-tap actions select immediately on pointer
+                  // down. Their delayed tap must not undo a later selection.
+                  if (_pointerSelectedTabs.remove(i)) return;
                   _selectPage(i);
-                }
-              : null,
-          onPointerCancel: (_) => _pointerSelectedTabs.remove(i),
-          child: Material(
-            color: Colors.transparent,
-            child: InkWell(
-              borderRadius: BorderRadius.circular(radius),
-              onTap: () {
-                // Tabs with double-tap actions select immediately on pointer
-                // down. Their delayed tap must not undo a later selection.
-                if (_pointerSelectedTabs.remove(i)) return;
-                _selectPage(i);
-              },
-              onDoubleTap: i < 2
-                  ? () {
-                      _pointerSelectedTabs.remove(i);
-                      _selectPage(i);
-                      if (i == 0) {
-                        unawaited(_refreshLibrarySources());
-                      } else {
-                        _sources.showRoot();
+                },
+                onDoubleTap: i < 2
+                    ? () {
+                        _pointerSelectedTabs.remove(i);
+                        _selectPage(i);
+                        if (i == 0) {
+                          unawaited(_refreshLibrarySources());
+                        } else {
+                          _sources.showRoot();
+                        }
                       }
-                    }
-                  : null,
-              child: AnimatedContainer(
-                key: ValueKey('nav-item-$i'),
-                duration: itemDuration,
-                curve: Curves.easeOutCubic,
-                constraints: const BoxConstraints(minHeight: 48),
-                padding: EdgeInsets.symmetric(
-                  horizontal: desktop ? 12 : 8,
-                  vertical: desktop ? 12 : 7,
-                ),
-                decoration: styles.navigationDecoration(radius: radius),
-                child: desktop
-                    ? TweenAnimationBuilder<TextStyle>(
-                        tween: TextStyleTween(
-                          end: styles.navigationLabel(
-                            desktop: true,
-                            selected: page == i,
-                          ),
-                        ),
-                        duration: itemDuration,
-                        curve: Curves.easeOutCubic,
-                        builder: (context, style, child) => Row(
-                          children: [
-                            Icon(
-                              icons[i],
-                              size: LibraryStyles.iconNavigationDesktop,
-                              color: style.color,
-                            ),
-                            if (!_navigationCollapsed)
-                              const SizedBox(width: 10),
-                            if (!_navigationCollapsed)
-                              Flexible(
-                                child: Text(
-                                  labels[i],
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: style,
-                                ),
-                              ),
-                          ],
-                        ),
-                      )
-                    : Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            icons[i],
-                            size: LibraryStyles.iconNavigation,
-                            color: page == i ? c.accent : c.muted,
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            labels[i],
-                            maxLines: 1,
-                            style: LibraryStyles.of(context).navigationLabel(
-                              desktop: false,
+                    : null,
+                child: AnimatedContainer(
+                  key: ValueKey('nav-item-$i'),
+                  duration: itemDuration,
+                  curve: Curves.easeOutCubic,
+                  constraints: const BoxConstraints(minHeight: 48),
+                  padding: EdgeInsets.symmetric(
+                    horizontal: desktop ? 12 : 8,
+                    vertical: desktop ? 12 : 7,
+                  ),
+                  decoration: styles.navigationDecoration(radius: radius),
+                  child: desktop
+                      ? TweenAnimationBuilder<TextStyle>(
+                          tween: TextStyleTween(
+                            end: styles.navigationLabel(
+                              desktop: true,
                               selected: page == i,
                             ),
                           ),
-                        ],
-                      ),
+                          duration: itemDuration,
+                          curve: Curves.easeOutCubic,
+                          builder: (context, style, child) => Row(
+                            children: [
+                              Icon(
+                                icons[i],
+                                size: LibraryStyles.iconNavigationDesktop,
+                                color: style.color,
+                              ),
+                              if (!_navigationCollapsed)
+                                const SizedBox(width: 10),
+                              if (!_navigationCollapsed)
+                                Flexible(
+                                  child: Text(
+                                    labels[i],
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: style,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        )
+                      : Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              icons[i],
+                              size: LibraryStyles.iconNavigation,
+                              color: page == i ? c.accent : c.muted,
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              labels[i],
+                              maxLines: 1,
+                              style: LibraryStyles.of(context).navigationLabel(
+                                desktop: false,
+                                selected: page == i,
+                              ),
+                            ),
+                          ],
+                        ),
+                ),
               ),
             ),
           ),
@@ -1529,6 +1668,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     _chromeKey = _chromeVersion;
     final desktop = MediaQuery.sizeOf(context).width >= 1000;
+    final television = TelevisionMode.of(context);
+    final sideNavigation = desktop && !television;
     final inlineTitlebar = DesktopWindowFrame.usesInlineTitlebar(context);
     if (_libraryDesktop != desktop) {
       _libraryDesktop = desktop;
@@ -1559,157 +1700,180 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         child: SettingsPage(model: model, active: page == 2),
       );
     }
-    return GlassBackground(
-      onScrollActivityChanged: _onLibraryActivityChanged,
-      child: Scaffold(
-        extendBody: true,
-        floatingActionButton:
-            !_routeCurrent || MediaQuery.viewInsetsOf(context).bottom > 0
-            ? null
-            : Column(
-                key: const ValueKey('task-shortcuts'),
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (model.metadataTasks.isNotEmpty)
-                    FloatingActionButton.small(
-                      heroTag: null,
-                      tooltip: '识别任务',
-                      onPressed: () => showMetadataTasks(context, model),
-                      child: Badge(
-                        isLabelVisible: model.metadataTasks.any(
-                          (task) => task.running,
+    return TelevisionNavigationHost(
+      onNavigation: _openTelevisionNavigation,
+      navigationActive: _televisionNavigationOpen,
+      navigationBounds: () =>
+          sideNavigation ||
+              (_navigationHidden.value && _hideNavigationOnScroll) ||
+              _navigationFocus.context == null
+          ? null
+          : _navigationFocus.rect,
+      child: TelevisionFocusScope(
+        node: _contentFocus,
+        autofocus: !_televisionNavigationOpen,
+        child: PopScope(
+          canPop: !_televisionNavigationOpen,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop && _televisionNavigationOpen) _returnToContent();
+          },
+          child: GlassBackground(
+            onScrollActivityChanged: _onLibraryActivityChanged,
+            child: Scaffold(
+              extendBody: true,
+              floatingActionButton:
+                  !_routeCurrent || MediaQuery.viewInsetsOf(context).bottom > 0
+                  ? null
+                  : Column(
+                      key: const ValueKey('task-shortcuts'),
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (model.metadataTasks.isNotEmpty)
+                          FloatingActionButton.small(
+                            heroTag: null,
+                            tooltip: '识别任务',
+                            onPressed: () => showMetadataTasks(context, model),
+                            child: Badge(
+                              isLabelVisible: model.metadataTasks.any(
+                                (task) => task.running,
+                              ),
+                              label: Text(
+                                '${model.metadataTasks.where((task) => task.running).length}',
+                              ),
+                              child: const Icon(Icons.manage_search_rounded),
+                            ),
+                          ),
+                        DownloadTasksButton(
+                          model: model,
+                          padding: EdgeInsets.only(
+                            top: model.metadataTasks.isNotEmpty ? 8 : 0,
+                          ),
                         ),
-                        label: Text(
-                          '${model.metadataTasks.where((task) => task.running).length}',
+                      ],
+                    ),
+              body: SafeArea(
+                top: desktop && !inlineTitlebar,
+                bottom: false,
+                child: DropTarget(
+                  onDragDone: (details) =>
+                      _import(details.files.map((f) => f.path).toList()),
+                  child: Row(
+                    children: [
+                      if (sideNavigation)
+                        Padding(
+                          padding: EdgeInsets.fromLTRB(
+                            12,
+                            12 +
+                                (inlineTitlebar
+                                    ? MediaQuery.paddingOf(context).top
+                                    : 0),
+                            0,
+                            12,
+                          ),
+                          child: SizedBox(
+                            width: _navigationCollapsed ? 68 : 172,
+                            child: GlassSurface(
+                              borderRadius: GlassMetrics.sheet,
+                              blur: 0,
+                              padding: const EdgeInsets.all(8),
+                              child: _navigationRegion(true),
+                            ),
+                          ),
                         ),
-                        child: const Icon(Icons.manage_search_rounded),
-                      ),
-                    ),
-                  DownloadTasksButton(
-                    model: model,
-                    padding: EdgeInsets.only(
-                      top: model.metadataTasks.isNotEmpty ? 8 : 0,
-                    ),
-                  ),
-                ],
-              ),
-        body: SafeArea(
-          top: desktop && !inlineTitlebar,
-          bottom: false,
-          child: DropTarget(
-            onDragDone: (details) =>
-                _import(details.files.map((f) => f.path).toList()),
-            child: Row(
-              children: [
-                if (desktop)
-                  Padding(
-                    padding: EdgeInsets.fromLTRB(
-                      12,
-                      12 +
-                          (inlineTitlebar
-                              ? MediaQuery.paddingOf(context).top
-                              : 0),
-                      0,
-                      12,
-                    ),
-                    child: SizedBox(
-                      width: _navigationCollapsed ? 68 : 172,
-                      child: GlassSurface(
-                        borderRadius: GlassMetrics.sheet,
-                        blur: 0,
-                        padding: const EdgeInsets.all(8),
-                        child: _navigation(true),
-                      ),
-                    ),
-                  ),
-                Expanded(
-                  child: Builder(
-                    builder: (context) => MediaQuery.removePadding(
-                      context: context,
-                      removeTop: inlineTitlebar,
-                      child: NavigationRevealRegion(
-                        onReveal: _revealNavigation,
-                        child: NotificationListener<ScrollNotification>(
-                          onNotification: _onScroll,
-                          child: PageView(
-                            controller: _pages,
-                            onPageChanged: (value) {
-                              setState(() {
-                                page = value;
-                                _navigationHidden.value = false;
-                                _scrollTravel = 0;
-                              });
-                              if (value == 0) {
-                                _refreshUncoveredLibrary();
-                              } else {
-                                _suspendLibrary();
-                              }
-                            },
-                            children: [
-                              _RetainedTab(
-                                active: page == 0,
-                                child: _libraryContent ??= Builder(
-                                  builder: (context) =>
-                                      _library(context, desktop),
+                      Expanded(
+                        child: Builder(
+                          builder: (context) => MediaQuery.removePadding(
+                            context: context,
+                            removeTop: inlineTitlebar,
+                            child: NavigationRevealRegion(
+                              onReveal: _revealNavigation,
+                              child: NotificationListener<ScrollNotification>(
+                                onNotification: _onScroll,
+                                child: PageView(
+                                  controller: _pages,
+                                  onPageChanged: (value) {
+                                    setState(() {
+                                      page = value;
+                                      _navigationHidden.value = false;
+                                      _scrollTravel = 0;
+                                    });
+                                    if (value == 0) {
+                                      _refreshUncoveredLibrary();
+                                    } else {
+                                      _suspendLibrary();
+                                    }
+                                  },
+                                  children: [
+                                    _RetainedTab(
+                                      active: page == 0,
+                                      child: _libraryContent ??= Builder(
+                                        builder: (context) =>
+                                            _library(context, desktop),
+                                      ),
+                                    ),
+                                    _RetainedTab(
+                                      active: page == 1,
+                                      child: _sourcesContent!,
+                                    ),
+                                    _RetainedTab(
+                                      active: page == 2,
+                                      child: _settingsContent!,
+                                    ),
+                                  ],
                                 ),
                               ),
-                              _RetainedTab(
-                                active: page == 1,
-                                child: _sourcesContent!,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              bottomNavigationBar: sideNavigation
+                  ? null
+                  : ValueListenableBuilder<bool>(
+                      valueListenable: _navigationHidden,
+                      builder: (context, hidden, child) => ExcludeFocus(
+                        excluding: hidden && _hideNavigationOnScroll,
+                        child: IgnorePointer(
+                          ignoring: hidden && _hideNavigationOnScroll,
+                          child: AnimatedSlide(
+                            key: const ValueKey('navigation-slide'),
+                            offset: hidden && _hideNavigationOnScroll
+                                ? const Offset(0, 1.3)
+                                : Offset.zero,
+                            duration: MotionScope.duration(context, 220),
+                            curve: Curves.easeOutCubic,
+                            child: child,
+                          ),
+                        ),
+                      ),
+                      child: SafeArea(
+                        top: false,
+                        minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+                        child: Center(
+                          heightFactor: 1,
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 440),
+                            child: GlassSurface(
+                              key: const ValueKey('bottom-navigation'),
+                              elevated: true,
+                              borderRadius: GlassMetrics.navigationRadius,
+                              blur: 12,
+                              tint: GlassPalette.of(context).navigationSurface,
+                              padding: const EdgeInsets.all(
+                                GlassMetrics.navigationInset,
                               ),
-                              _RetainedTab(
-                                active: page == 2,
-                                child: _settingsContent!,
-                              ),
-                            ],
+                              child: _navigationRegion(false),
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  ),
-                ),
-              ],
             ),
           ),
         ),
-        bottomNavigationBar: desktop
-            ? null
-            : ValueListenableBuilder<bool>(
-                valueListenable: _navigationHidden,
-                builder: (context, hidden, child) => IgnorePointer(
-                  ignoring: hidden && _hideNavigationOnScroll,
-                  child: AnimatedSlide(
-                    key: const ValueKey('navigation-slide'),
-                    offset: hidden && _hideNavigationOnScroll
-                        ? const Offset(0, 1.3)
-                        : Offset.zero,
-                    duration: MotionScope.duration(context, 220),
-                    curve: Curves.easeOutCubic,
-                    child: child,
-                  ),
-                ),
-                child: SafeArea(
-                  top: false,
-                  minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
-                  child: Center(
-                    heightFactor: 1,
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 440),
-                      child: GlassSurface(
-                        key: const ValueKey('bottom-navigation'),
-                        elevated: true,
-                        borderRadius: GlassMetrics.navigationRadius,
-                        blur: 12,
-                        tint: GlassPalette.of(context).navigationSurface,
-                        padding: const EdgeInsets.all(
-                          GlassMetrics.navigationInset,
-                        ),
-                        child: _navigation(false),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
       ),
     );
   }
@@ -2041,144 +2205,153 @@ class _PosterTileState extends State<_PosterTile> {
   @override
   Widget build(BuildContext context) {
     final c = GlassPalette.of(context);
-    return ValueListenableBuilder<double>(
-      valueListenable: _scale,
-      builder: (context, scale, child) => AnimatedScale(
-        scale: scale,
-        duration: MotionScope.duration(context, 140),
-        curve: Curves.easeOutCubic,
-        child: child,
-      ),
-      child: RepaintBoundary(
-        child: MouseRegion(
-          cursor: SystemMouseCursors.click,
-          child: Material(
-            color: Colors.transparent,
-            child: InkWell(
-              key: ValueKey('play:${widget.mediaId}'),
-              onTap: widget.enabled ? widget.onTap : null,
-              onLongPress: widget.enabled ? _showActions : null,
-              onSecondaryTapUp: widget.enabled
-                  ? (details) => _showActions(details.globalPosition)
-                  : null,
-              onTapDown: (_) => _press(true),
-              onTapUp: (_) => _press(false),
-              onTapCancel: () => _press(false),
-              borderRadius: LibraryStyles.posterRadius,
-              hoverColor: Colors.transparent,
-              highlightColor: Colors.transparent,
-              splashColor: Colors.transparent,
-              splashFactory: NoSplash.splashFactory,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: ClipRRect(
-                      borderRadius: LibraryStyles.posterRadius,
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          MediaArtwork(
-                            cache: widget.cache,
-                            poster: widget.poster,
-                            thumbnail: widget.thumbnail,
-                            thumbnailRevision: widget.thumbnailRevision,
-                            thumbnailChanges: widget.thumbnailChanges,
-                            thumbnailRevisionOf: widget.thumbnailRevisionOf,
-                            onThumbnailError: widget.onThumbnailError,
-                            onThumbnailReady: widget.onThumbnailReady,
-                            loadWhileScrolling: true,
-                            onRequestPreview: widget.onRequestPreview,
-                          ),
-                          if (widget.selecting && widget.selected)
-                            ColoredBox(
-                              color: Theme.of(context).colorScheme.primary
-                                  .withValues(alpha: .2),
+    return TelevisionAction(
+      onActivate: () {
+        if (widget.enabled) widget.onTap();
+      },
+      onMenu: widget.enabled ? _showActions : null,
+      borderRadius: LibraryStyles.posterRadius,
+      builder: (context, focus) => ValueListenableBuilder<double>(
+        valueListenable: _scale,
+        builder: (context, scale, child) => AnimatedScale(
+          scale: scale,
+          duration: MotionScope.duration(context, 140),
+          curve: Curves.easeOutCubic,
+          child: child,
+        ),
+        child: RepaintBoundary(
+          child: MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                key: ValueKey('play:${widget.mediaId}'),
+                focusNode: focus,
+                onTap: widget.enabled ? widget.onTap : null,
+                onLongPress: widget.enabled ? _showActions : null,
+                onSecondaryTapUp: widget.enabled
+                    ? (details) => _showActions(details.globalPosition)
+                    : null,
+                onTapDown: (_) => _press(true),
+                onTapUp: (_) => _press(false),
+                onTapCancel: () => _press(false),
+                borderRadius: LibraryStyles.posterRadius,
+                hoverColor: Colors.transparent,
+                highlightColor: Colors.transparent,
+                splashColor: Colors.transparent,
+                splashFactory: NoSplash.splashFactory,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: ClipRRect(
+                        borderRadius: LibraryStyles.posterRadius,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            MediaArtwork(
+                              cache: widget.cache,
+                              poster: widget.poster,
+                              thumbnail: widget.thumbnail,
+                              thumbnailRevision: widget.thumbnailRevision,
+                              thumbnailChanges: widget.thumbnailChanges,
+                              thumbnailRevisionOf: widget.thumbnailRevisionOf,
+                              onThumbnailError: widget.onThumbnailError,
+                              onThumbnailReady: widget.onThumbnailReady,
+                              loadWhileScrolling: true,
+                              onRequestPreview: widget.onRequestPreview,
                             ),
-                          Positioned(
-                            top: 4,
-                            right: 4,
-                            child: widget.selecting
-                                ? Checkbox(
-                                    key: ValueKey('select:${widget.mediaId}'),
-                                    semanticLabel: widget.title,
-                                    value: widget.selected,
-                                    onChanged: widget.enabled
-                                        ? (_) => widget.onTap()
-                                        : null,
-                                  )
-                                : SizedBox(
-                                    width: 36,
-                                    height: 36,
-                                    child: Material(
-                                      color: Colors.transparent,
-                                      child: IconButton(
-                                        key: ValueKey(
-                                          'details:${widget.mediaId}',
-                                        ),
-                                        tooltip: '查看详情',
-                                        onPressed: widget.onDetails,
-                                        padding: EdgeInsets.zero,
-                                        icon: Icon(
-                                          Icons.info_outline_rounded,
-                                          color: c.onMedia,
-                                          shadows: LibraryStyles.of(context)
-                                              .posterIconShadows,
-                                          size: LibraryStyles.iconButton,
+                            if (widget.selecting && widget.selected)
+                              ColoredBox(
+                                color: Theme.of(context).colorScheme.primary
+                                    .withValues(alpha: .2),
+                              ),
+                            Positioned(
+                              top: 4,
+                              right: 4,
+                              child: widget.selecting
+                                  ? Checkbox(
+                                      key: ValueKey('select:${widget.mediaId}'),
+                                      semanticLabel: widget.title,
+                                      value: widget.selected,
+                                      onChanged: widget.enabled
+                                          ? (_) => widget.onTap()
+                                          : null,
+                                    )
+                                  : SizedBox(
+                                      width: 36,
+                                      height: 36,
+                                      child: Material(
+                                        color: Colors.transparent,
+                                        child: IconButton(
+                                          key: ValueKey(
+                                            'details:${widget.mediaId}',
+                                          ),
+                                          tooltip: '查看详情',
+                                          onPressed: widget.onDetails,
+                                          padding: EdgeInsets.zero,
+                                          icon: Icon(
+                                            Icons.info_outline_rounded,
+                                            color: c.onMedia,
+                                            shadows: LibraryStyles.of(context)
+                                                .posterIconShadows,
+                                            size: LibraryStyles.iconButton,
+                                          ),
                                         ),
                                       ),
                                     ),
+                            ),
+                            if (widget.onRemove != null)
+                              Positioned(
+                                top: 4,
+                                left: 4,
+                                child: PopupMenuButton<_PosterAction>(
+                                  key: ValueKey(
+                                    'media-actions:${widget.mediaId}',
                                   ),
-                          ),
-                          if (widget.onRemove != null)
-                            Positioned(
-                              top: 4,
-                              left: 4,
-                              child: PopupMenuButton<_PosterAction>(
-                                key: ValueKey(
-                                  'media-actions:${widget.mediaId}',
+                                  tooltip: '视频操作',
+                                  enabled: widget.enabled,
+                                  padding: EdgeInsets.zero,
+                                  icon: Icon(
+                                    Icons.more_horiz_rounded,
+                                    color: c.onMedia,
+                                    shadows: LibraryStyles.of(context)
+                                        .posterIconShadows,
+                                  ),
+                                  onSelected: _runAction,
+                                  itemBuilder: (_) => _posterActions,
                                 ),
-                                tooltip: '视频操作',
-                                enabled: widget.enabled,
-                                padding: EdgeInsets.zero,
-                                icon: Icon(
-                                  Icons.more_horiz_rounded,
-                                  color: c.onMedia,
-                                  shadows: LibraryStyles.of(context)
-                                      .posterIconShadows,
+                              ),
+                            if (widget.episodeCount > 1 ||
+                                widget.videoCount > 1)
+                              Positioned(
+                                bottom: 7,
+                                right: 8,
+                                child: Text(
+                                  widget.episodeCount > 0
+                                      ? '${widget.episodeCount} 集'
+                                      : '${widget.videoCount} 个视频',
+                                  style: LibraryStyles.of(context).posterCount,
                                 ),
-                                onSelected: _runAction,
-                                itemBuilder: (_) => _posterActions,
                               ),
-                            ),
-                          if (widget.episodeCount > 1 || widget.videoCount > 1)
-                            Positioned(
-                              bottom: 7,
-                              right: 8,
-                              child: Text(
-                                widget.episodeCount > 0
-                                    ? '${widget.episodeCount} 集'
-                                    : '${widget.videoCount} 个视频',
-                                style: LibraryStyles.of(context).posterCount,
-                              ),
-                            ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 7),
-                  Text(
-                    widget.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: LibraryStyles.of(context).posterTitle,
-                  ),
-                  if (widget.duration > 0 && widget.videoCount == 1)
+                    const SizedBox(height: 7),
                     Text(
-                      mediaTime(widget.duration),
-                      style: AppStyles.of(context).micro,
+                      widget.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: LibraryStyles.of(context).posterTitle,
                     ),
-                ],
+                    if (widget.duration > 0 && widget.videoCount == 1)
+                      Text(
+                        mediaTime(widget.duration),
+                        style: AppStyles.of(context).micro,
+                      ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -2928,7 +3101,10 @@ class _RetainedTabState extends State<_RetainedTab>
       enabled: widget.active,
       child: NotificationListener<ScrollNotification>(
         onNotification: _onScrollActivity,
-        child: RepaintBoundary(child: widget.child),
+        child: ExcludeFocus(
+          excluding: !widget.active,
+          child: RepaintBoundary(child: widget.child),
+        ),
       ),
     );
   }

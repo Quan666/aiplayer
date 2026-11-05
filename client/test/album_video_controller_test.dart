@@ -309,6 +309,37 @@ void main() {
   );
 
   test(
+    'retirement wait includes another decoder closed while already waiting',
+    () async {
+      final first = _Fixture(), second = _Fixture();
+      first.controller.select(_entry('one.mp4'));
+      second.controller.select(_entry('two.mp4'));
+      await first.controller.toggle();
+      await second.controller.toggle();
+      final firstGate = first.sessions.single.closeGate = Completer<void>();
+      final secondGate = second.sessions.single.closeGate = Completer<void>();
+      first.controller.select(null);
+      var finished = false;
+      final waiting = AlbumVideoController.waitForDisposals().then((_) {
+        finished = true;
+      });
+      second.controller.select(null);
+      firstGate.complete();
+      await Future<void>.delayed(Duration.zero);
+      expect(finished, isFalse);
+      expect(first.sessions.single.player.state.playing, isFalse);
+      expect(second.sessions.single.player.state.playing, isFalse);
+      secondGate.complete();
+      await waiting;
+      expect(finished, isTrue);
+      // Completed retirements leave no retained future in the global queue.
+      await AlbumVideoController.waitForDisposals();
+      await first.close();
+      await second.close();
+    },
+  );
+
+  test(
     'background cancels a tap waiting for another player to dispose',
     () async {
       final gate = Completer<void>();

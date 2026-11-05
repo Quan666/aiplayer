@@ -35,12 +35,13 @@ class RemoteCommandResult {
 }
 
 class RemoteControlStatus {
-  final bool playing, active, editing;
+  final bool playing, active, editing, obscured;
   final int editSession, positionMs, durationMs;
   const RemoteControlStatus({
     this.playing = false,
     this.active = false,
     this.editing = false,
+    this.obscured = false,
     this.editSession = 0,
     this.positionMs = 0,
     this.durationMs = 0,
@@ -50,6 +51,7 @@ class RemoteControlStatus {
     'playing': playing,
     'active': active,
     'editing': editing,
+    'obscured': obscured,
     'editSession': editSession,
     'positionMs': positionMs,
     'durationMs': durationMs,

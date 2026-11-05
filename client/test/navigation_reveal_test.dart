@@ -5,11 +5,130 @@ import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/main.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/ui/navigation_reveal.dart';
+import 'package:aiplayer/ui/library_page.dart';
+import 'package:aiplayer/ui/television_input.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets(
+    'TV navigation opens by menu or lower content edge and restores focus',
+    (tester) async {
+      final fixture = _Fixture(tester);
+      tester.view.physicalSize = const Size(1280, 720);
+      fixture.store.setLocal('sources', [
+        {'id': 'nas', 'kind': 'webdav', 'label': 'NAS'},
+      ]);
+      await fixture.mount(television: true);
+      expect(find.byKey(const ValueKey('bottom-navigation')), findsOneWidget);
+      FocusNode navFocus(int index) => tester
+          .widget<InkWell>(
+            find
+                .ancestor(
+                  of: find.byKey(ValueKey('nav-item-$index')),
+                  matching: find.byType(InkWell),
+                )
+                .first,
+          )
+          .focusNode!;
+      Future<void> navigation() async {
+        await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+        await tester.pump(const Duration(milliseconds: 100));
+        await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+        await tester.pumpAndSettle();
+      }
+
+      for (var i = 0; i < 4; i++) {
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+        await tester.pump();
+      }
+      expect(navFocus(0).hasFocus, isFalse);
+      await navigation();
+      expect(navFocus(0).hasFocus, isTrue);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump();
+      expect(navFocus(1).hasFocus, isTrue);
+      await tester.sendKeyEvent(LogicalKeyboardKey.select);
+      await tester.pumpAndSettle();
+      expect(find.text('NAS'), findsOneWidget);
+      expect(navFocus(1).hasFocus, isFalse);
+      await tester.tap(find.text('NAS'));
+      await tester.pumpAndSettle();
+      final first = tester.widget<ListTile>(
+        find.widgetWithText(ListTile, '文件夹 00'),
+      );
+      first.focusNode!.requestFocus();
+      await tester.pump();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.select);
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.pumpAndSettle();
+      expect(find.text('收藏文件夹'), findsOneWidget);
+      final menuFocus = FocusManager.instance.primaryFocus;
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.select);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump();
+      expect(FocusManager.instance.primaryFocus, isNot(menuFocus));
+      await tester.sendKeyEvent(
+        LogicalKeyboardKey.goBack,
+        physicalKey: PhysicalKeyboardKey.escape,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('收藏文件夹'), findsNothing);
+      expect(first.focusNode!.hasFocus, isTrue);
+      await navigation();
+      expect(navFocus(1).hasFocus, isTrue);
+      // Native Back closes only navigation, leaving the same folder open.
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.text('文件夹 00'), findsOneWidget);
+      expect(first.focusNode!.hasFocus, isTrue);
+      await navigation();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pumpAndSettle();
+      expect(first.focusNode!.hasFocus, isTrue);
+      // Traverse beyond the first viewport without eagerly building the list.
+      for (var i = 0; i < 26; i++) {
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pumpAndSettle();
+      }
+      expect(fixture.hidden, isTrue);
+      expect(navFocus(1).hasFocus, isFalse);
+      final scroll = tester.state<ScrollableState>(
+        find
+            .descendant(
+              of: find.byType(ListView).first,
+              matching: find.byType(Scrollable),
+            )
+            .first,
+      );
+      expect(scroll.position.pixels, greaterThan(500));
+      await navigation();
+      expect(fixture.hidden, isFalse);
+      expect(navFocus(1).hasFocus, isTrue);
+      await tester.sendKeyEvent(
+        LogicalKeyboardKey.goBack,
+        physicalKey: PhysicalKeyboardKey.escape,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('本地视频'), findsNothing);
+      expect(navFocus(1).hasFocus, isFalse);
+      for (var i = 0; i < 80 && !navFocus(1).hasFocus; i++) {
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pumpAndSettle();
+      }
+      expect(navFocus(1).hasFocus, isTrue);
+      expect(fixture.hidden, isFalse);
+      expect(find.text('本地视频'), findsNothing);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pumpAndSettle();
+      expect(navFocus(1).hasFocus, isFalse);
+      expect(tester.takeException(), isNull);
+      await fixture.close();
+    },
+  );
+
   testWidgets(
     'a downward pull on an unscrollable page reveals without stealing taps',
     (tester) async {
@@ -272,8 +391,16 @@ class _Fixture {
           .dy >
       1;
 
-  Future<void> mount() async {
-    await tester.pumpWidget(AIPlayerApp(model: model));
+  Future<void> mount({bool television = false}) async {
+    await tester.pumpWidget(
+      television
+          ? MaterialApp(
+              builder: (context, child) =>
+                  TelevisionInputScope(overrideTelevision: true, child: child!),
+              home: LibraryPage(model: model),
+            )
+          : AIPlayerApp(model: model),
+    );
     await tester.pumpAndSettle();
   }
 

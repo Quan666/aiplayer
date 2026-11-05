@@ -19,7 +19,8 @@ const remoteControlHtml = '''<!doctype html>
 <div class="row"><button data-command="zoomOut">缩小</button>
 <button data-command="zoomIn">放大</button><button data-command="rotate">旋转</button></div>
 <section class="typing"><label for="text">输入到当前输入框</label>
-<textarea id="text" rows="3" maxlength="4096" placeholder="先在电视上选中输入框"></textarea>
+<textarea id="text" rows="3" maxlength="4096" autocomplete="off" placeholder="先在电视上选中输入框"></textarea>
+<input id="password" type="password" maxlength="4096" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="输入密码" placeholder="输入密码后发送" hidden>
 <div class="row"><button id="send">发送文字</button><button id="submit">确认输入</button></div></section>
 <p id="feedback" role="status"></p><button id="retry" hidden>重新连接</button>
 </main><script src="/app.js" defer></script></body></html>''';
@@ -28,15 +29,15 @@ const remoteControlCss = '''
 :root{color-scheme:light dark;font-family:system-ui,-apple-system,sans-serif;color:#172133;background:#f2f4f8}
 *{box-sizing:border-box}body{margin:0;padding:20px max(16px,env(safe-area-inset-right)) 28px max(16px,env(safe-area-inset-left))}
 main{max-width:420px;margin:auto}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
-h1{font-size:22px;margin:0}#status{font-size:14px;color:#5d6a7d}button,textarea{font:inherit;color:inherit}
+h1{font-size:22px;margin:0}#status{font-size:14px;color:#5d6a7d}button,textarea,input{font:inherit;color:inherit}
 button{border:0;background:white;border-radius:12px;min-height:54px;padding:12px;touch-action:manipulation}
-button:active{background:#d9e7ff}button:disabled{opacity:.42}button:focus-visible,textarea:focus{outline:3px solid #176be8;outline-offset:2px}
+button:active{background:#d9e7ff}button:disabled{opacity:.42}button:focus-visible,textarea:focus,input:focus{outline:3px solid #176be8;outline-offset:2px}
 .pad{display:grid;grid-template:repeat(3,64px)/repeat(3,1fr);gap:6px;margin-bottom:12px}
 .up{grid-area:1/2}.left{grid-area:2/1}.ok{grid-area:2/2;background:#176be8;color:white}.right{grid-area:2/3}.down{grid-area:3/2}
 .row{display:flex;gap:6px;margin:6px 0}.row button{flex:1}.typing{margin-top:24px}label{display:block;font-size:14px;margin-bottom:8px}
-textarea{width:100%;resize:vertical;border:1px solid #cbd3df;border-radius:10px;padding:12px;background:white}
+textarea,input{width:100%;resize:vertical;border:1px solid #cbd3df;border-radius:10px;padding:12px;background:white}
 #feedback{min-height:24px;color:#5d6a7d;font-size:14px}#retry{width:100%}
-@media(prefers-color-scheme:dark){:root{background:#111822;color:#edf2f9}button,textarea{background:#253043}#status,#feedback{color:#b1bfd1}button:active{background:#344b6a}.ok{background:#176be8}}
+@media(prefers-color-scheme:dark){:root{background:#111822;color:#edf2f9}button,textarea,input{background:#253043}#status,#feedback{color:#b1bfd1}button:active{background:#344b6a}.ok{background:#176be8}}
 ''';
 
 const remoteControlJs = r'''
@@ -44,18 +45,25 @@ const remoteControlJs = r'''
   'use strict';
   const status=document.getElementById('status'), feedback=document.getElementById('feedback');
   const text=document.getElementById('text'), send=document.getElementById('send');
+  const password=document.getElementById('password');
   const submit=document.getElementById('submit'), retry=document.getElementById('retry');
-  let socket=null, sequence=0, editing=false, editSession=0, attempts=0, reconnect=null;
+  let socket=null, sequence=0, editing=false, obscured=false, editSession=0, attempts=0, reconnect=null;
   const pending=new Set();
   const token=location.hash.slice(1); history.replaceState(null,'',location.pathname);
   function controls(connected){document.querySelectorAll('[data-command]').forEach(b=>b.disabled=!connected);
-    send.disabled=!connected||!editing;submit.disabled=send.disabled;}
+    send.disabled=!connected||!editing;submit.disabled=send.disabled;
+    text.disabled=send.disabled;password.disabled=send.disabled;}
+  function clearDraft(){text.value='';password.value='';}
   function command(action,extra={}){
-    if(!socket||socket.readyState!==WebSocket.OPEN||pending.size>=8)return;
+    if(!socket||socket.readyState!==WebSocket.OPEN||pending.size>=8)return false;
     const id=++sequence;pending.add(id);socket.send(JSON.stringify({id,action,...extra}));
+    return true;
   }
   document.querySelectorAll('[data-command]').forEach(b=>b.addEventListener('click',()=>command(b.dataset.command)));
-  send.addEventListener('click',()=>{if(!text.matches(':disabled'))command('text',{text:text.value,editSession});});
+  send.addEventListener('click',()=>{
+    const input=obscured?password:text;
+    if(!input.disabled&&command('text',{text:input.value,editSession})&&obscured)password.value='';
+  });
   submit.addEventListener('click',()=>command('submit',{editSession}));
   retry.addEventListener('click',()=>{attempts=0;connect();});
   function connect(){
@@ -66,26 +74,30 @@ const remoteControlJs = r'''
       if(socket!==current)return;
       let value;try{value=JSON.parse(event.data);}catch(_){return;}
       if(value.type==='status'){
-        editing=value.editing===true;editSession=value.editSession||0;
+        const nextSession=value.editSession||0, nextObscured=value.obscured===true;
+        if(nextSession!==editSession||nextObscured!==obscured||!value.editing)clearDraft();
+        editing=value.editing===true;editSession=nextSession;obscured=nextObscured;
+        text.hidden=obscured;password.hidden=!obscured;
         status.textContent=value.playing?'正在播放':'已连接';
         document.getElementById('play').textContent=value.playing?'暂停':'播放';
-        text.placeholder=editing?'在手机输入文字后发送':'先在电视上选中输入框';controls(true);
+        text.placeholder=editing?'在手机输入文字后发送':'先在电视上选中输入框';
+        send.textContent=obscured?'发送密码':'发送文字';controls(true);
       }else if(value.type==='result'){
         pending.delete(value.id);feedback.textContent=value.ok?'':(value.message||'当前操作不可用');
       }
     };
     current.onclose=()=>{
-      if(socket!==current)return;pending.clear();controls(false);status.textContent='连接已断开';
+      if(socket!==current)return;pending.clear();clearDraft();controls(false);status.textContent='连接已断开';
       if(!document.hidden&&attempts<3){const delay=800*Math.pow(2,attempts++);reconnect=setTimeout(connect,delay);}
       else retry.hidden=false;
     };
     current.onerror=()=>{};
   }
   document.addEventListener('visibilitychange',()=>{
-    if(document.hidden){clearTimeout(reconnect);reconnect=null;}
+    if(document.hidden){clearTimeout(reconnect);reconnect=null;password.value='';}
     else if(!socket||socket.readyState===WebSocket.CLOSED){attempts=0;connect();}
   });
-  window.addEventListener('pagehide',()=>{clearTimeout(reconnect);const old=socket;socket=null;old?.close();});
+  window.addEventListener('pagehide',()=>{clearTimeout(reconnect);clearDraft();const old=socket;socket=null;old?.close();});
   controls(false);
   (async()=>{
     if(token){try{

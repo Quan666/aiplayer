@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:aiplayer/core/file_open.dart';
@@ -96,4 +97,37 @@ void main() {
     await const ExternalFileOpener(operatingSystem: 'android').cancelPending();
     expect(methods, ['cancel']);
   });
+
+  test(
+    'unresponsive native handoff is cancelled and reports a retryable error',
+    () async {
+      final pending = Completer<void>();
+      final methods = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(ExternalFileOpener.channel, (call) async {
+            methods.add(call.method);
+            if (call.method == 'open') await pending.future;
+            return null;
+          });
+      addTearDown(() {
+        pending.complete();
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(ExternalFileOpener.channel, null);
+      });
+      await expectLater(
+        const ExternalFileOpener(
+          operatingSystem: 'android',
+          handoffTimeout: Duration(milliseconds: 20),
+        ).open('/tmp/any-file.unknown'),
+        throwsA(
+          isA<AppFailure>().having(
+            (error) => error.message,
+            'message',
+            contains('系统未响应'),
+          ),
+        ),
+      );
+      expect(methods, ['open', 'cancel']);
+    },
+  );
 }

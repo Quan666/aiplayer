@@ -288,6 +288,17 @@ def main() -> None:
     version = version_match.group(1)
     if not arguments.skip_build:
         if arguments.android_legacy:
+            marker = ROOT / ".aiplayer-android6-snapshot.json"
+            prepared_error = "Android 6 builds require a prepared compatibility checkout; use scripts/package_android_legacy.sh instead of downgrading the main client"
+            try:
+                snapshot = json.loads(marker.read_text())
+            except (OSError, ValueError) as error:
+                raise RuntimeError(prepared_error) from error
+            if not isinstance(snapshot, dict) or any(
+                snapshot.get(key) != value
+                for key, value in {"profile": "android6", "min_sdk": 23, "flutter": "3.32.8"}.items()
+            ):
+                raise RuntimeError(prepared_error)
             flutter_version = json.loads(run([arguments.flutter, "--version", "--machine"], cwd=CLIENT, capture=True))
             if flutter_version.get("frameworkVersion") != "3.32.8":
                 raise RuntimeError("Android 6 builds require the pinned Flutter 3.32.8 SDK and prepared compatibility checkout; use scripts/package_android_legacy.sh")

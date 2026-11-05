@@ -410,6 +410,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   String? initialPath, initialName;
   SourceFavorites get favorites => SourceFavorites(model.store);
   final _rootScroll = ScrollController();
+  final _rootHeaderFocus = FocusNode(debugLabel: 'sources-toolbar');
+  final _localHeaderFocus = FocusNode(debugLabel: 'local-toolbar');
   final _localScroll = ScrollController(keepScrollOffset: false);
   final _localOffsets = <String, double>{};
   bool _localPendingScroll = false, _localScrollScheduled = false;
@@ -437,6 +439,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   Object? _renderedRevision;
   Object? _sourcesSnapshotKey;
   List<Map<String, dynamic>> _sourcesSnapshot = const [];
+  String? _reorderedSourceId;
+  int _sourceFocusRevision = 0;
 
   List<Map<String, dynamic>> get _currentSources {
     final key = (model, model.store.localKeyRevision('sources'));
@@ -538,6 +542,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _localSearch.television = TelevisionMode.of(context);
     _visible =
         TickerMode.valuesOf(context).enabled &&
         (ModalRoute.isCurrentOf(context) ?? true);
@@ -831,6 +836,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     _localFolderDeleteCancel?.cancel();
     _localSearch.dispose();
     _localSorter.close();
+    _rootHeaderFocus.dispose();
+    _localHeaderFocus.dispose();
     _rootScroll.dispose();
     _localScroll.dispose();
     scan?.cancel();
@@ -949,13 +956,37 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     }
   }
 
-  Widget _menu(Map<String, dynamic> source) => PopupMenuButton<String>(
-    tooltip: '来源选项',
-    icon: const Icon(Icons.more_horiz_rounded, size: 21),
+  Widget _menu(
+    Map<String, dynamic> source, {
+    Widget Function(Widget menu, VoidCallback openMenu)? builder,
+  }) => _SourceMenuButton(
+    builder: builder,
+    restoreFocus: _reorderedSourceId == source['id'] ? _sourceFocusRevision : 0,
+    onFocusRestored: (revision) {
+      if (_sourceFocusRevision == revision &&
+          _reorderedSourceId == source['id']) {
+        _reorderedSourceId = null;
+      }
+    },
     onSelected: (action) {
       if (action == 'edit') _configure(existing: source);
       if (action == 'remove') _remove(source);
       if (action == 'favorite') _toggleFavorite(source);
+      if (action == 'move-up' || action == 'move-down') {
+        // Re-read the current order: another edit may have completed while
+        // this menu was open. Keep identity and focus on the moved source.
+        final order = _currentSources
+            .map((item) => item['id'] as String)
+            .toList();
+        final from = order.indexOf(source['id'] as String);
+        final to = from + (action == 'move-up' ? -1 : 1);
+        if (from < 0 || to < 0 || to >= order.length) return;
+        order.insert(to, order.removeAt(from));
+        _reorderedSourceId = source['id'] as String;
+        _sourceFocusRevision++;
+        model.reorderSources(order);
+        if (mounted) setState(() {});
+      }
     },
     itemBuilder: (_) => [
       const PopupMenuItem(
@@ -973,6 +1004,23 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
             favorites.contains(source['id'] as String, '') ? '取消收藏' : '收藏文件夹',
           ),
         ),
+      if (TelevisionMode.of(context)) ...[
+        const PopupMenuDivider(height: GlassMetrics.menuDividerHeight),
+        _SourceOrderMenuItem(
+          value: 'move-up',
+          enabled:
+              _currentSources.indexWhere((item) => item['id'] == source['id']) >
+              0,
+          child: const Text('上移'),
+        ),
+        _SourceOrderMenuItem(
+          value: 'move-down',
+          enabled:
+              _currentSources.indexWhere((item) => item['id'] == source['id']) <
+              _currentSources.length - 1,
+          child: const Text('下移'),
+        ),
+      ],
       const PopupMenuDivider(height: GlassMetrics.menuDividerHeight),
       const PopupMenuItem(
         height: GlassMetrics.menuItemHeight,
@@ -990,173 +1038,188 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     final saved = favorites.available(
       sources.map((source) => source['id'] as String),
     );
-    return Padding(
-      padding: EdgeInsets.symmetric(
-        horizontal: desktop ? GlassMetrics.desktopPageInset : 12,
-      ),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: desktop ? double.infinity : 960,
-          ),
-          child: RefreshIndicator(
-            onRefresh: _refreshSources,
-            child: CustomScrollView(
-              physics: const AlwaysScrollableScrollPhysics(),
-              key: const PageStorageKey('sources-scroll'),
-              controller: _rootScroll,
-              scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
-              slivers: [
-                SliverPadding(
-                  padding: EdgeInsets.only(
-                    top:
-                        GlassMetrics.pageTopPadding(context) +
-                        MediaQuery.paddingOf(context).top,
-                  ),
-                  sliver: SliverToBoxAdapter(
-                    child: Column(
-                      children: [
-                        _FolderHeader(
-                          title: '来源',
-                          actions: [
-                            IconButton(
-                              tooltip: '手机控制',
-                              onPressed: () => showRemoteControlDialog(context),
-                              icon: const Icon(Icons.phonelink),
-                            ),
-                            IconButton(
-                              tooltip: '打开本地相册',
-                              onPressed: _openLocalAlbum,
-                              icon: const Icon(Icons.photo_library_outlined),
-                            ),
-                            IconButton(
-                              tooltip: '添加来源',
-                              onPressed: () => _configure(),
-                              icon: const Icon(Icons.add_rounded),
-                            ),
-                          ],
-                        ),
-                        _FolderRow(
-                          title: '本地视频',
-                          subtitle: '$_localCount 个视频',
-                          leading: Icon(
-                            _protocolIcon('local'),
-                            size: 27,
-                            color: GlassPalette.of(context).accent,
+    return TelevisionHeaderNavigation(
+      headerFocusNode: _rootHeaderFocus,
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: desktop ? GlassMetrics.desktopPageInset : 12,
+        ),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: desktop ? double.infinity : 960,
+            ),
+            child: RefreshIndicator(
+              onRefresh: _refreshSources,
+              child: CustomScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                key: const PageStorageKey('sources-scroll'),
+                controller: _rootScroll,
+                scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
+                slivers: [
+                  SliverPadding(
+                    padding: EdgeInsets.only(
+                      top:
+                          GlassMetrics.pageTopPadding(context) +
+                          MediaQuery.paddingOf(context).top,
+                    ),
+                    sliver: SliverToBoxAdapter(
+                      child: Column(
+                        children: [
+                          _FolderHeader(
+                            focusNode: _rootHeaderFocus,
+                            title: '来源',
+                            actions: [
+                              IconButton(
+                                tooltip: '手机控制',
+                                onPressed: () =>
+                                    showRemoteControlDialog(context),
+                                icon: const Icon(Icons.phonelink),
+                              ),
+                              IconButton(
+                                tooltip: '打开本地相册',
+                                onPressed: _openLocalAlbum,
+                                icon: const Icon(Icons.photo_library_outlined),
+                              ),
+                              IconButton(
+                                tooltip: '添加来源',
+                                onPressed: () => _configure(),
+                                icon: const Icon(Icons.add_rounded),
+                              ),
+                            ],
                           ),
-                          onTap: () => _showLocal(true),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                SliverReorderableList(
-                  itemCount: sources.length,
-                  proxyDecorator: (child, index, animation) => AnimatedBuilder(
-                    animation: animation,
-                    child: child,
-                    builder: (context, child) => Material(
-                      elevation:
-                          6 * Curves.easeInOut.transform(animation.value),
-                      child: child,
-                    ),
-                  ),
-                  onReorderItem: (oldIndex, newIndex) {
-                    if (oldIndex == newIndex) return;
-                    final order = sources
-                        .map((source) => source['id'] as String)
-                        .toList();
-                    order.insert(newIndex, order.removeAt(oldIndex));
-                    model.reorderSources(order);
-                    setState(() {});
-                  },
-                  itemBuilder: (context, index) {
-                    final source = sources[index];
-                    return ReorderableDelayedDragStartListener(
-                      key: ValueKey(source['id']),
-                      index: index,
-                      child: _FolderRow(
-                        title:
-                            source['label'] as String? ??
-                            _sourceLabel(source['kind']),
-                        subtitle: _sourceLabel(source['kind']),
-                        leading: Icon(
-                          _protocolIcon(source['kind']),
-                          size: 27,
-                          color: GlassPalette.of(context).accent,
-                        ),
-                        trailing: _menu(source),
-                        onTap: () => _openSource(source),
-                      ),
-                    );
-                  },
-                ),
-                if (saved.isNotEmpty) ...[
-                  SliverToBoxAdapter(
-                    child: Padding(
-                      key: const ValueKey('favorites-heading'),
-                      padding: const EdgeInsets.fromLTRB(2, 16, 2, 6),
-                      child: Text(
-                        '我的收藏',
-                        style: AppStyles.of(context).sectionTitle,
-                      ),
-                    ),
-                  ),
-                  SliverList.builder(
-                    itemCount: saved.length,
-                    itemBuilder: (context, index) {
-                      final item = saved[index];
-                      final source = sourcesById[item.sourceId]!;
-                      final collection = _knownCollection(
-                        model,
-                        item.sourceId,
-                        item.path,
-                        _knownFolderIndex.read(),
-                        preview: model.catalog
-                            .directoryPreview(
-                              item.sourceId,
-                              item.path,
-                              allowStale: true,
-                            )
-                            ?.collection,
-                      );
-                      return _FolderRow(
-                        key: ValueKey('favorite:${item.key}'),
-                        title: item.name,
-                        subtitle:
-                            source['label'] as String? ??
-                            _sourceLabel(source['kind']),
-                        leading: _FolderArtwork(
-                          model: model,
-                          poster: collection?.poster ?? '',
-                          favorite: true,
-                        ),
-                        onTap: () => _openSource(source, favorite: item),
-                        onLongPress: () => _favoriteOptions(source, item),
-                        trailing: PopupMenuButton<String>(
-                          tooltip: '收藏选项',
-                          icon: const Icon(Icons.more_horiz_rounded, size: 20),
-                          onSelected: (_) =>
-                              _toggleFavorite(source, favorite: item),
-                          itemBuilder: (_) => const [
-                            PopupMenuItem(
-                              height: GlassMetrics.menuItemHeight,
-                              padding: GlassMetrics.menuItemPadding,
-                              value: 'remove',
-                              child: Text('取消收藏'),
+                          _FolderRow(
+                            title: '本地视频',
+                            subtitle: '$_localCount 个视频',
+                            leading: Icon(
+                              _protocolIcon('local'),
+                              size: 27,
+                              color: GlassPalette.of(context).accent,
                             ),
-                          ],
+                            onTap: () => _showLocal(true),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  SliverReorderableList(
+                    itemCount: sources.length,
+                    proxyDecorator: (child, index, animation) =>
+                        AnimatedBuilder(
+                          animation: animation,
+                          child: child,
+                          builder: (context, child) => Material(
+                            elevation:
+                                6 * Curves.easeInOut.transform(animation.value),
+                            child: child,
+                          ),
+                        ),
+                    onReorderItem: (oldIndex, newIndex) {
+                      if (oldIndex == newIndex) return;
+                      final order = sources
+                          .map((source) => source['id'] as String)
+                          .toList();
+                      order.insert(newIndex, order.removeAt(oldIndex));
+                      model.reorderSources(order);
+                      setState(() {});
+                    },
+                    itemBuilder: (context, index) {
+                      final source = sources[index];
+                      return ReorderableDelayedDragStartListener(
+                        key: ValueKey(source['id']),
+                        index: index,
+                        child: _menu(
+                          source,
+                          builder: (menu, openMenu) => _FolderRow(
+                            title:
+                                source['label'] as String? ??
+                                _sourceLabel(source['kind']),
+                            subtitle: _sourceLabel(source['kind']),
+                            leading: Icon(
+                              _protocolIcon(source['kind']),
+                              size: 27,
+                              color: GlassPalette.of(context).accent,
+                            ),
+                            trailing: menu,
+                            onLongPress: TelevisionMode.of(context)
+                                ? openMenu
+                                : null,
+                            onTap: () => _openSource(source),
+                          ),
                         ),
                       );
                     },
                   ),
-                ],
-                SliverToBoxAdapter(
-                  child: SizedBox(
-                    height: 20 + MediaQuery.paddingOf(context).bottom,
+                  if (saved.isNotEmpty) ...[
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        key: const ValueKey('favorites-heading'),
+                        padding: const EdgeInsets.fromLTRB(2, 16, 2, 6),
+                        child: Text(
+                          '我的收藏',
+                          style: AppStyles.of(context).sectionTitle,
+                        ),
+                      ),
+                    ),
+                    SliverList.builder(
+                      itemCount: saved.length,
+                      itemBuilder: (context, index) {
+                        final item = saved[index];
+                        final source = sourcesById[item.sourceId]!;
+                        final collection = _knownCollection(
+                          model,
+                          item.sourceId,
+                          item.path,
+                          _knownFolderIndex.read(),
+                          preview: model.catalog
+                              .directoryPreview(
+                                item.sourceId,
+                                item.path,
+                                allowStale: true,
+                              )
+                              ?.collection,
+                        );
+                        return _FolderRow(
+                          key: ValueKey('favorite:${item.key}'),
+                          title: item.name,
+                          subtitle:
+                              source['label'] as String? ??
+                              _sourceLabel(source['kind']),
+                          leading: _FolderArtwork(
+                            model: model,
+                            poster: collection?.poster ?? '',
+                            favorite: true,
+                          ),
+                          onTap: () => _openSource(source, favorite: item),
+                          onLongPress: () => _favoriteOptions(source, item),
+                          trailing: PopupMenuButton<String>(
+                            tooltip: '收藏选项',
+                            icon: const Icon(
+                              Icons.more_horiz_rounded,
+                              size: 20,
+                            ),
+                            onSelected: (_) =>
+                                _toggleFavorite(source, favorite: item),
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(
+                                height: GlassMetrics.menuItemHeight,
+                                padding: GlassMetrics.menuItemPadding,
+                                value: 'remove',
+                                child: Text('取消收藏'),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                  SliverToBoxAdapter(
+                    child: SizedBox(
+                      height: 20 + MediaQuery.paddingOf(context).bottom,
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -1599,200 +1662,204 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     final directory = _localDirectories[_localPath];
     final details = directory?.details;
     final latest = _knownFolderIndex.snapshot?.localDirectoryLatest[_localPath];
-    return RefreshIndicator(
-      onRefresh: _refreshSources,
-      child: _ContentList(
-        scrollKey: PageStorageKey(('local-videos', _localPath)),
-        controller: _localScroll,
-        physics: const AlwaysScrollableScrollPhysics(),
-        itemCount: media.length,
-        itemBuilder: (context, index) {
-          final entry = media[index];
-          if (entry.directory) {
-            final folder = _localDirectories[entry.path];
-            if (folder == null) return const SizedBox.shrink();
+    return TelevisionHeaderNavigation(
+      headerFocusNode: _localHeaderFocus,
+      child: RefreshIndicator(
+        onRefresh: _refreshSources,
+        child: _ContentList(
+          scrollKey: PageStorageKey(('local-videos', _localPath)),
+          controller: _localScroll,
+          physics: const AlwaysScrollableScrollPhysics(),
+          itemCount: media.length,
+          itemBuilder: (context, index) {
+            final entry = media[index];
+            if (entry.directory) {
+              final folder = _localDirectories[entry.path];
+              if (folder == null) return const SizedBox.shrink();
+              return _FolderRow(
+                key: ValueKey('local-folder:${entry.path}'),
+                title: _localDirectoryName(folder),
+                subtitle: '',
+                leading: folder.anchor == null
+                    ? null
+                    : _localArtwork(
+                        folder.anchor!,
+                        poster: folder.details?.poster,
+                        directory: true,
+                      ),
+                onTap: () => _openLocalDirectory(entry.path),
+                trailing: trailingMenus ? _localDirectoryMenu(folder) : null,
+                onLongPress: () => _deleteLocalDirectory(folder),
+              );
+            }
+            final item = _localSearch.resultRecords[entry.path];
+            if (item == null) return const SizedBox.shrink();
+            if (details != null && isVideo(entry.name)) {
+              return MediaDetailsEpisodeTile(
+                key: ValueKey('local-video:${item.id}'),
+                model: model,
+                item: item,
+                title: details.availableEpisodes == 0 && details.videoCount > 1
+                    ? entry.name
+                    : _localEpisodeTitle(item),
+                showTechnical: directory!.episodes.length != 1,
+                showTrailing: trailingMenus,
+                onPlay: () {
+                  _localSearch.dismiss();
+                  widget.onPlay(item);
+                },
+                onLongPress: () => _localMetadataOptions(item),
+                trailing: trailingMenus ? _localVideoMenu(item) : null,
+              );
+            }
+            final progress = playbackProgressLabel(model.progressFor(item));
+            final technical = MediaTechnicalInfo.forRecord(
+              model.store,
+              item,
+              dimensions: model.mediaDimensions(item),
+              duration: model.mediaDuration(item),
+            ).label;
             return _FolderRow(
-              key: ValueKey('local-folder:${entry.path}'),
-              title: _localDirectoryName(folder),
-              subtitle: '',
-              leading: folder.anchor == null
-                  ? null
-                  : _localArtwork(
-                      folder.anchor!,
-                      poster: folder.details?.poster,
-                      directory: true,
-                    ),
-              onTap: () => _openLocalDirectory(entry.path),
-              trailing: trailingMenus ? _localDirectoryMenu(folder) : null,
-              onLongPress: () => _deleteLocalDirectory(folder),
-            );
-          }
-          final item = _localSearch.resultRecords[entry.path];
-          if (item == null) return const SizedBox.shrink();
-          if (details != null && isVideo(entry.name)) {
-            return MediaDetailsEpisodeTile(
               key: ValueKey('local-video:${item.id}'),
-              model: model,
-              item: item,
-              title: details.availableEpisodes == 0 && details.videoCount > 1
-                  ? entry.name
-                  : _localEpisodeTitle(item),
-              showTechnical: directory!.episodes.length != 1,
-              showTrailing: trailingMenus,
-              onPlay: () {
+              title: model.displayTitle(item),
+              subtitle: [
+                technical,
+                progress,
+              ].where((line) => line.isNotEmpty).join('\n'),
+              video: true,
+              leading: _localArtwork(item),
+              trailing: trailingMenus ? _localVideoMenu(item) : null,
+              onTap: () {
                 _localSearch.dismiss();
                 widget.onPlay(item);
               },
-              onLongPress: () => _localMetadataOptions(item),
-              trailing: trailingMenus ? _localVideoMenu(item) : null,
+              onLongPress: () {
+                _localSearch.dismiss();
+                _localMetadataOptions(item);
+              },
             );
-          }
-          final progress = playbackProgressLabel(model.progressFor(item));
-          final technical = MediaTechnicalInfo.forRecord(
-            model.store,
-            item,
-            dimensions: model.mediaDimensions(item),
-            duration: model.mediaDuration(item),
-          ).label;
-          return _FolderRow(
-            key: ValueKey('local-video:${item.id}'),
-            title: model.displayTitle(item),
-            subtitle: [
-              technical,
-              progress,
-            ].where((line) => line.isNotEmpty).join('\n'),
-            video: true,
-            leading: _localArtwork(item),
-            trailing: trailingMenus ? _localVideoMenu(item) : null,
-            onTap: () {
-              _localSearch.dismiss();
-              widget.onPlay(item);
-            },
-            onLongPress: () {
-              _localSearch.dismiss();
-              _localMetadataOptions(item);
-            },
-          );
-        },
-        children: [
-          _FolderHeader(
-            title: directory == null || _localPath.isEmpty
-                ? '本地视频'
-                : _localDirectoryName(directory),
-            onBack: _backLocal,
-            actions: [
-              IconButton(
-                tooltip: '相册模式',
-                onPressed: _openLocalAlbum,
-                icon: const Icon(Icons.photo_library_outlined),
-              ),
-              IconButton(
-                tooltip: '排序与显示',
-                onPressed: _sortLocal,
-                icon: const Icon(Icons.sort_rounded, size: 21),
-              ),
-              PopupMenuButton<String>(
-                key: const ValueKey('local-folder-menu'),
-                tooltip: '本地视频选项',
-                icon: const Icon(Icons.more_horiz_rounded),
-                onSelected: (action) {
-                  switch (action) {
-                    case 'search':
-                      _localSearch.toggle();
-                    case 'import':
-                      widget.onImport();
-                    case 'delete':
-                      if (directory != null) {
-                        unawaited(_deleteLocalDirectory(directory));
-                      }
-                    case 'scan':
-                      _scanFolder();
-                  }
-                },
-                itemBuilder: (_) => [
-                  const PopupMenuItem(
-                    height: GlassMetrics.menuItemHeight,
-                    padding: GlassMetrics.menuItemPadding,
-                    value: 'search',
-                    child: Text('搜索'),
-                  ),
-                  const PopupMenuItem(
-                    height: GlassMetrics.menuItemHeight,
-                    padding: GlassMetrics.menuItemPadding,
-                    value: 'import',
-                    child: Text('导入视频'),
-                  ),
-                  if (_localPath.isNotEmpty && directory != null)
-                    PopupMenuItem(
-                      height: GlassMetrics.menuItemHeight,
-                      padding: GlassMetrics.menuItemPadding,
-                      enabled: _localFolderDeleting == null,
-                      value: 'delete',
-                      child: const Text('删除文件夹'),
-                    ),
-                  if (!Platform.isAndroid && !Platform.isIOS)
-                    PopupMenuItem(
-                      height: GlassMetrics.menuItemHeight,
-                      padding: GlassMetrics.menuItemPadding,
-                      enabled: !model.scanning,
-                      value: 'scan',
-                      child: const Text('扫描文件夹'),
-                    ),
-                ],
-              ),
-            ],
-          ),
-          if (_localSearch.shown) _FolderSearchField(_localSearch),
-          if (model.scanning) ...[
-            const SizedBox(height: 8),
-            const LinearProgressIndicator(minHeight: 2),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    model.status,
-                    style: AppStyles.of(context).bodySmall,
-                  ),
+          },
+          children: [
+            _FolderHeader(
+              focusNode: _localHeaderFocus,
+              title: directory == null || _localPath.isEmpty
+                  ? '本地视频'
+                  : _localDirectoryName(directory),
+              onBack: _backLocal,
+              actions: [
+                IconButton(
+                  tooltip: '相册模式',
+                  onPressed: _openLocalAlbum,
+                  icon: const Icon(Icons.photo_library_outlined),
                 ),
-                TextButton(
-                  onPressed: () => scan?.cancel(),
-                  child: const Text('停止'),
+                IconButton(
+                  tooltip: '排序与显示',
+                  onPressed: _sortLocal,
+                  icon: const Icon(Icons.sort_rounded, size: 21),
+                ),
+                PopupMenuButton<String>(
+                  key: const ValueKey('local-folder-menu'),
+                  tooltip: '本地视频选项',
+                  icon: const Icon(Icons.more_horiz_rounded),
+                  onSelected: (action) {
+                    switch (action) {
+                      case 'search':
+                        _localSearch.toggle();
+                      case 'import':
+                        widget.onImport();
+                      case 'delete':
+                        if (directory != null) {
+                          unawaited(_deleteLocalDirectory(directory));
+                        }
+                      case 'scan':
+                        _scanFolder();
+                    }
+                  },
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(
+                      height: GlassMetrics.menuItemHeight,
+                      padding: GlassMetrics.menuItemPadding,
+                      value: 'search',
+                      child: Text('搜索'),
+                    ),
+                    const PopupMenuItem(
+                      height: GlassMetrics.menuItemHeight,
+                      padding: GlassMetrics.menuItemPadding,
+                      value: 'import',
+                      child: Text('导入视频'),
+                    ),
+                    if (_localPath.isNotEmpty && directory != null)
+                      PopupMenuItem(
+                        height: GlassMetrics.menuItemHeight,
+                        padding: GlassMetrics.menuItemPadding,
+                        enabled: _localFolderDeleting == null,
+                        value: 'delete',
+                        child: const Text('删除文件夹'),
+                      ),
+                    if (!Platform.isAndroid && !Platform.isIOS)
+                      PopupMenuItem(
+                        height: GlassMetrics.menuItemHeight,
+                        padding: GlassMetrics.menuItemPadding,
+                        enabled: !model.scanning,
+                        value: 'scan',
+                        child: const Text('扫描文件夹'),
+                      ),
+                  ],
                 ),
               ],
             ),
-          ],
-          const SizedBox(height: 8),
-          if (details != null)
-            MediaDetailsOverview(
-              key: ValueKey('local-collection:$_localPath'),
-              model: model,
-              details: details,
-              records: directory!.collectionRecords,
-              latest: latest,
-              latestLabel: latest == null ? null : _localEpisodeLabel(latest),
-              onPlay: (item) {
-                _localSearch.dismiss();
-                widget.onPlay(item);
-              },
-              onMatch: () => _matchSourceRecords(
-                context,
-                model,
-                directory.collectionRecords,
-                automatic: false,
-              ),
-            ),
-          if (media.isEmpty)
-            _EmptyFolder(
-              text: _localSearch.query.isEmpty ? '还没有本地视频' : '没有匹配的视频',
-              action: _localSearch.query.isNotEmpty
-                  ? null
-                  : TextButton.icon(
-                      onPressed: widget.onImport,
-                      icon: const Icon(Icons.add_rounded, size: 18),
-                      label: const Text('导入视频'),
+            if (_localSearch.shown) _FolderSearchField(_localSearch),
+            if (model.scanning) ...[
+              const SizedBox(height: 8),
+              const LinearProgressIndicator(minHeight: 2),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      model.status,
+                      style: AppStyles.of(context).bodySmall,
                     ),
-            ),
-        ],
+                  ),
+                  TextButton(
+                    onPressed: () => scan?.cancel(),
+                    child: const Text('停止'),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 8),
+            if (details != null)
+              MediaDetailsOverview(
+                key: ValueKey('local-collection:$_localPath'),
+                model: model,
+                details: details,
+                records: directory!.collectionRecords,
+                latest: latest,
+                latestLabel: latest == null ? null : _localEpisodeLabel(latest),
+                onPlay: (item) {
+                  _localSearch.dismiss();
+                  widget.onPlay(item);
+                },
+                onMatch: () => _matchSourceRecords(
+                  context,
+                  model,
+                  directory.collectionRecords,
+                  automatic: false,
+                ),
+              ),
+            if (media.isEmpty)
+              _EmptyFolder(
+                text: _localSearch.query.isEmpty ? '还没有本地视频' : '没有匹配的视频',
+                action: _localSearch.query.isNotEmpty
+                    ? null
+                    : TextButton.icon(
+                        onPressed: widget.onImport,
+                        icon: const Icon(Icons.add_rounded, size: 18),
+                        label: const Text('导入视频'),
+                      ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1854,9 +1921,14 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       );
     }
     return PopScope(
-      canPop: !localOpen,
+      canPop: !widget.active || !localOpen,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && localOpen) _backLocal();
+        if (!didPop &&
+            widget.active &&
+            localOpen &&
+            !TelevisionMenuRegion.navigationOwnsBack(context)) {
+          _backLocal();
+        }
       },
       child: AnimatedSwitcher(
         duration: MotionScope.duration(context, 180),
@@ -1889,6 +1961,7 @@ class _FolderSearchController extends ChangeNotifier {
   int _revision = 0, _focusRevision = 0;
   int _settledRevision = -1;
   bool active = true, shown = false, _disposed = false;
+  bool television = false;
   String get query => text.text.trim();
   bool get settled => _settledRevision == _revision;
 
@@ -1963,7 +2036,7 @@ class _FolderSearchController extends ChangeNotifier {
     // Clear the field's remembered focus even when a tapped button already
     // owns primary focus. Route restoration must not reopen the keyboard.
     focus.unfocus();
-    FocusManager.instance.primaryFocus?.unfocus();
+    if (!television && active) FocusManager.instance.primaryFocus?.unfocus();
   }
 
   void setActive(bool value) {
@@ -2109,55 +2182,62 @@ class _FolderSearchField extends StatelessWidget {
 }
 
 class _FolderHeader extends StatelessWidget {
+  final FocusNode? focusNode;
   final String title;
   final bool showTitle;
   final VoidCallback? onBack;
   final List<Widget> actions;
   const _FolderHeader({
     required this.title,
+    this.focusNode,
     this.showTitle = true,
     this.onBack,
     this.actions = const [],
   });
   @override
-  Widget build(BuildContext context) => SizedBox(
-    height: 48,
-    child: Row(
-      children: [
-        if (onBack != null) ...[
-          IconButton(
-            tooltip: '返回',
-            onPressed: onBack,
-            icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 20),
-          ),
-          const SizedBox(width: 2),
-        ],
-        Expanded(
-          child: DesktopWindowDragArea(
-            enabled: DesktopWindowFrame.usesInlineTitlebar(context),
-            child: !showTitle
-                ? const SizedBox.shrink()
-                : Text(
-                    title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: SettingsStyles.of(context)
-                        .sourceTitle(nested: onBack != null),
-                  ),
-          ),
-        ),
-        IconButtonTheme(
-          data: IconButtonThemeData(
-            style: IconButton.styleFrom(
-              minimumSize: const Size(36, 36),
-              maximumSize: const Size(36, 36),
-              padding: const EdgeInsets.all(6),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+  Widget build(BuildContext context) => Focus(
+    focusNode: focusNode,
+    canRequestFocus: false,
+    skipTraversal: true,
+    child: SizedBox(
+      height: 48,
+      child: Row(
+        children: [
+          if (onBack != null) ...[
+            IconButton(
+              tooltip: '返回',
+              onPressed: onBack,
+              icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 20),
+            ),
+            const SizedBox(width: 2),
+          ],
+          Expanded(
+            child: DesktopWindowDragArea(
+              enabled: DesktopWindowFrame.usesInlineTitlebar(context),
+              child: !showTitle
+                  ? const SizedBox.shrink()
+                  : Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: SettingsStyles.of(context)
+                          .sourceTitle(nested: onBack != null),
+                    ),
             ),
           ),
-          child: Row(mainAxisSize: MainAxisSize.min, children: actions),
-        ),
-      ],
+          IconButtonTheme(
+            data: IconButtonThemeData(
+              style: IconButton.styleFrom(
+                minimumSize: const Size(36, 36),
+                maximumSize: const Size(36, 36),
+                padding: const EdgeInsets.all(6),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: actions),
+          ),
+        ],
+      ),
     ),
   );
 }
@@ -2215,6 +2295,115 @@ class _ContentList extends StatelessWidget {
   );
 }
 
+class _SourceMenuButton extends StatefulWidget {
+  final ValueChanged<String> onSelected;
+  final PopupMenuItemBuilder<String> itemBuilder;
+  final Widget Function(Widget menu, VoidCallback openMenu)? builder;
+  final int restoreFocus;
+  final ValueChanged<int> onFocusRestored;
+  const _SourceMenuButton({
+    required this.onSelected,
+    required this.itemBuilder,
+    required this.restoreFocus,
+    required this.onFocusRestored,
+    this.builder,
+  });
+
+  @override
+  State<_SourceMenuButton> createState() => _SourceMenuButtonState();
+}
+
+class _SourceMenuButtonState extends State<_SourceMenuButton> {
+  final _focus = FocusNode(debugLabel: 'source-options');
+  final _menu = GlobalKey<PopupMenuButtonState<String>>();
+  int _restoredRevision = 0;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _restoreFocus();
+  }
+
+  @override
+  void didUpdateWidget(_SourceMenuButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _restoreFocus();
+  }
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _restoreFocus() {
+    if (widget.restoreFocus == 0 ||
+        widget.restoreFocus == _restoredRevision ||
+        !TelevisionMode.read(context)) {
+      return;
+    }
+    final revision = _restoredRevision = widget.restoreFocus;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || widget.restoreFocus != revision) return;
+      widget.onFocusRestored(revision);
+      if (!TickerMode.valuesOf(context).enabled ||
+          !(ModalRoute.isCurrentOf(context) ?? true) ||
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.hidden ||
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.paused) {
+        return;
+      }
+      final target = _focus.traversalDescendants.firstOrNull;
+      target?.requestFocus();
+      final targetContext = target?.context;
+      if (targetContext != null) Scrollable.ensureVisible(targetContext);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final menu = Focus(
+      focusNode: _focus,
+      canRequestFocus: false,
+      child: PopupMenuButton<String>(
+        key: _menu,
+        tooltip: '来源选项',
+        icon: const Icon(Icons.more_horiz_rounded, size: 21),
+        onSelected: widget.onSelected,
+        itemBuilder: widget.itemBuilder,
+      ),
+    );
+    return widget.builder?.call(
+          menu,
+          () => _menu.currentState?.showButtonMenu(),
+        ) ??
+        menu;
+  }
+}
+
+// Directional navigation normally keeps disabled Material controls focusable.
+// A reorder boundary is informational: skip it rather than consuming a stop.
+class _SourceOrderMenuItem extends PopupMenuItem<String> {
+  const _SourceOrderMenuItem({
+    required super.value,
+    required super.enabled,
+    required super.child,
+  }) : super(
+         height: GlassMetrics.menuItemHeight,
+         padding: GlassMetrics.menuItemPadding,
+       );
+
+  @override
+  PopupMenuItemState<String, _SourceOrderMenuItem> createState() =>
+      _SourceOrderMenuItemState();
+}
+
+class _SourceOrderMenuItemState
+    extends PopupMenuItemState<String, _SourceOrderMenuItem> {
+  @override
+  Widget build(BuildContext context) =>
+      ExcludeFocus(excluding: !widget.enabled, child: super.build(context));
+}
+
 bool _showFileRowMenus(BuildContext context) =>
     TelevisionMode.of(context) ||
     switch (Theme.of(context).platform) {
@@ -2243,38 +2432,44 @@ class _FolderRow extends StatelessWidget {
     this.contentPadding,
   });
   @override
-  Widget build(BuildContext context) => Material(
-    type: MaterialType.transparency,
-    child: GestureDetector(
-      onSecondaryTap: onLongPress,
-      child: ListTile(
-        dense: true,
-        visualDensity: SettingsStyles.folderRowDensity,
-        contentPadding: contentPadding,
-        horizontalTitleGap: 10,
-        minLeadingWidth: LibraryStyles.listArtworkSize.width,
-        shape: SettingsStyles.folderRowShape,
-        leading: SizedBox.fromSize(
-          size: LibraryStyles.listArtworkSize,
-          child: Center(child: leading ?? _FolderIcon(video: video)),
+  Widget build(BuildContext context) => TelevisionAction(
+    onActivate: onTap,
+    onMenu: onLongPress,
+    borderRadius: BorderRadius.circular(GlassMetrics.control),
+    builder: (context, focus) => Material(
+      type: MaterialType.transparency,
+      child: GestureDetector(
+        onSecondaryTap: onLongPress,
+        child: ListTile(
+          focusNode: focus,
+          dense: true,
+          visualDensity: SettingsStyles.folderRowDensity,
+          contentPadding: contentPadding,
+          horizontalTitleGap: 10,
+          minLeadingWidth: LibraryStyles.listArtworkSize.width,
+          shape: SettingsStyles.folderRowShape,
+          leading: SizedBox.fromSize(
+            size: LibraryStyles.listArtworkSize,
+            child: Center(child: leading ?? _FolderIcon(video: video)),
+          ),
+          title: Text(
+            title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: AppStyles.of(context).title14,
+          ),
+          subtitle: subtitle.isEmpty
+              ? null
+              : Text(
+                  subtitle,
+                  maxLines: video ? 3 : 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: AppStyles.of(context).caption,
+                ),
+          trailing: trailing,
+          onTap: onTap,
+          onLongPress: onLongPress,
         ),
-        title: Text(
-          title,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: AppStyles.of(context).title14,
-        ),
-        subtitle: subtitle.isEmpty
-            ? null
-            : Text(
-                subtitle,
-                maxLines: video ? 3 : 1,
-                overflow: TextOverflow.ellipsis,
-                style: AppStyles.of(context).caption,
-              ),
-        trailing: trailing,
-        onTap: onTap,
-        onLongPress: onLongPress,
       ),
     ),
   );
@@ -2538,7 +2733,10 @@ class _SourceEditorPageState extends State<SourceEditorPage> {
           ),
   );
   @override
-  Widget build(BuildContext context) => Scaffold(
+  Widget build(BuildContext context) =>
+      TelevisionFocusScope(child: _buildPage(context));
+
+  Widget _buildPage(BuildContext context) => Scaffold(
     backgroundColor: GlassPalette.of(context).canvas,
     appBar: AppBar(
       title: Text(widget.editing ? '编辑来源' : '添加来源'),
@@ -2846,6 +3044,7 @@ class SourceBrowser extends StatefulWidget {
 
 class _SourceBrowserState extends State<SourceBrowser>
     with WidgetsBindingObserver {
+  final _headerFocus = FocusNode(debugLabel: 'source-folder-toolbar');
   final _albumSettings = AlbumCatalogWorker();
   AlbumImageService? _localDirectoryWorker;
   AlbumImageService? _fileImages;
@@ -3288,6 +3487,7 @@ class _SourceBrowserState extends State<SourceBrowser>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _search.television = TelevisionMode.of(context);
     final wasCurrent = _routeCurrent;
     _routeCurrent =
         _toolbarMenuOpen || (ModalRoute.isCurrentOf(context) ?? true);
@@ -5102,6 +5302,7 @@ class _SourceBrowserState extends State<SourceBrowser>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _modeGeneration++;
+    _headerFocus.dispose();
     _localDirectoryWorker?.dispose();
     _fileImagesRevision++;
     _fileImages?.dispose();
@@ -5155,494 +5356,512 @@ class _SourceBrowserState extends State<SourceBrowser>
     final inset = desktop
         ? GlassMetrics.desktopPageInset
         : (width < 600 ? 12.0 : 24.0);
-    final body = Padding(
-      padding: EdgeInsets.fromLTRB(
-        inset,
-        GlassMetrics.pageTopPadding(context),
-        inset,
-        0,
-      ),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: desktop ? double.infinity : 960,
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _FolderHeader(
-                showTitle: !hasCollectionHeader,
-                title:
-                    paths.lastOrNull?.name ??
-                    widget.source['label'] as String? ??
-                    '来源',
-                onBack: _back,
-                actions: [
-                  if (widget.associateId == null &&
-                      widget.source['kind'] != 'http')
+    final body = TelevisionHeaderNavigation(
+      headerFocusNode: _headerFocus,
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          inset,
+          GlassMetrics.pageTopPadding(context),
+          inset,
+          0,
+        ),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: desktop ? double.infinity : 960,
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _FolderHeader(
+                  focusNode: _headerFocus,
+                  showTitle: !hasCollectionHeader,
+                  title:
+                      paths.lastOrNull?.name ??
+                      widget.source['label'] as String? ??
+                      '来源',
+                  onBack: _back,
+                  actions: [
+                    if (widget.associateId == null &&
+                        widget.source['kind'] != 'http')
+                      IconButton(
+                        tooltip: '相册模式',
+                        onPressed: () => unawaited(_setAlbumMode(true)),
+                        icon: const Icon(Icons.photo_library_outlined),
+                      ),
                     IconButton(
-                      tooltip: '相册模式',
-                      onPressed: () => unawaited(_setAlbumMode(true)),
-                      icon: const Icon(Icons.photo_library_outlined),
+                      tooltip: '排序与显示',
+                      onPressed: _sortMenu,
+                      icon: const Icon(Icons.sort_rounded, size: 21),
                     ),
-                  IconButton(
-                    tooltip: '排序与显示',
-                    onPressed: _sortMenu,
-                    icon: const Icon(Icons.sort_rounded, size: 21),
-                  ),
-                  PopupMenuButton<String>(
-                    key: const ValueKey('source-folder-menu'),
-                    tooltip: '文件夹选项',
-                    onOpened: () => _toolbarMenuOpen = true,
-                    onCanceled: () => _toolbarMenuOpen = false,
-                    icon: const Icon(Icons.more_horiz_rounded),
-                    onSelected: (action) {
-                      _toolbarMenuOpen = false;
-                      if (action == 'search') _search.toggle();
-                      if (action == 'download') unawaited(_selectDownloads());
-                      if (action == 'refresh') unawaited(_refreshManually());
-                      if (action == 'scan') _scan();
-                      if (action == 'download-folder') {
-                        unawaited(_downloadCurrentFolder());
-                      }
-                      if (action == 'recognize') _recognizeDirectory();
-                      if (action == 'cancelRecognition') {
-                        widget.model.cancelDirectoryRecognition();
-                      }
-                      if (action == 'edit') widget.onEdit?.call();
-                      if (action == 'remove') widget.onRemove?.call();
-                      if (action == 'favorite') {
-                        _toggleFavorite(
-                          current,
-                          paths.lastOrNull?.name ??
-                              widget.source['label'] ??
-                              '来源',
-                        );
-                      }
-                    },
-                    itemBuilder: (_) => [
-                      const PopupMenuItem(
-                        height: GlassMetrics.menuItemHeight,
-                        padding: GlassMetrics.menuItemPadding,
-                        value: 'search',
-                        child: Text('搜索'),
-                      ),
-                      if (_canDownloadFromSource)
+                    PopupMenuButton<String>(
+                      key: const ValueKey('source-folder-menu'),
+                      tooltip: '文件夹选项',
+                      onOpened: () => _toolbarMenuOpen = true,
+                      onCanceled: () => _toolbarMenuOpen = false,
+                      icon: const Icon(Icons.more_horiz_rounded),
+                      onSelected: (action) {
+                        _toolbarMenuOpen = false;
+                        if (action == 'search') _search.toggle();
+                        if (action == 'download') unawaited(_selectDownloads());
+                        if (action == 'refresh') unawaited(_refreshManually());
+                        if (action == 'scan') _scan();
+                        if (action == 'download-folder') {
+                          unawaited(_downloadCurrentFolder());
+                        }
+                        if (action == 'recognize') _recognizeDirectory();
+                        if (action == 'cancelRecognition') {
+                          widget.model.cancelDirectoryRecognition();
+                        }
+                        if (action == 'edit') widget.onEdit?.call();
+                        if (action == 'remove') widget.onRemove?.call();
+                        if (action == 'favorite') {
+                          _toggleFavorite(
+                            current,
+                            paths.lastOrNull?.name ??
+                                widget.source['label'] ??
+                                '来源',
+                          );
+                        }
+                      },
+                      itemBuilder: (_) => [
                         const PopupMenuItem(
                           height: GlassMetrics.menuItemHeight,
                           padding: GlassMetrics.menuItemPadding,
-                          value: 'download',
-                          child: Text('选择下载'),
+                          value: 'search',
+                          child: Text('搜索'),
                         ),
-                      if (hasCollectionHeader) ...[
-                        PopupMenuItem<String>(
+                        if (_canDownloadFromSource)
+                          const PopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: 'download',
+                            child: Text('选择下载'),
+                          ),
+                        if (hasCollectionHeader) ...[
+                          PopupMenuItem<String>(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            enabled: false,
+                            child: Text(
+                              '当前目录：${current.isEmpty ? widget.source['label'] ?? '来源' : current}',
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const PopupMenuDivider(
+                            height: GlassMetrics.menuDividerHeight,
+                          ),
+                        ],
+                        PopupMenuItem(
                           height: GlassMetrics.menuItemHeight,
                           padding: GlassMetrics.menuItemPadding,
-                          enabled: false,
-                          child: Text(
-                            '当前目录：${current.isEmpty ? widget.source['label'] ?? '来源' : current}',
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
+                          value: 'refresh',
+                          enabled: !busy,
+                          child: const Text('刷新目录'),
+                        ),
+                        if (_canDownloadFromSource &&
+                            widget.source['kind'] != 'http')
+                          const PopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: 'download-folder',
+                            child: Text('下载当前文件夹（含子目录）'),
                           ),
-                        ),
-                        const PopupMenuDivider(
-                          height: GlassMetrics.menuDividerHeight,
-                        ),
+                        if (widget.associateId == null &&
+                            widget.source['kind'] != 'http')
+                          PopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: 'favorite',
+                            child: Text(
+                              favorites.contains(widget.source['id'], current)
+                                  ? '取消收藏'
+                                  : '收藏文件夹',
+                            ),
+                          ),
+                        if (widget.associateId == null &&
+                            widget.source['kind'] != 'http')
+                          PopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: widget.model.recognizingDirectory
+                                ? 'cancelRecognition'
+                                : 'recognize',
+                            enabled:
+                                widget.model.recognizingDirectory ||
+                                (!busy &&
+                                    error.isEmpty &&
+                                    !widget.model.scanning),
+                            child: Text(
+                              widget.model.recognizingDirectory
+                                  ? '取消文件夹识别'
+                                  : hasCollectionHeader
+                                  ? '重新识别信息'
+                                  : '识别信息',
+                            ),
+                          ),
+                        if (widget.associateId == null &&
+                            widget.source['kind'] != 'http')
+                          PopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: 'scan',
+                            enabled:
+                                !busy &&
+                                error.isEmpty &&
+                                !widget.model.scanning,
+                            child: const Text('添加到影视库'),
+                          ),
+                        if (widget.onEdit != null)
+                          const PopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: 'edit',
+                            child: Text('编辑来源'),
+                          ),
+                        if (widget.onRemove != null) ...[
+                          const PopupMenuDivider(
+                            height: GlassMetrics.menuDividerHeight,
+                          ),
+                          const PopupMenuItem(
+                            height: GlassMetrics.menuItemHeight,
+                            padding: GlassMetrics.menuItemPadding,
+                            value: 'remove',
+                            child: Text('移除来源…'),
+                          ),
+                        ],
                       ],
-                      PopupMenuItem(
-                        height: GlassMetrics.menuItemHeight,
-                        padding: GlassMetrics.menuItemPadding,
-                        value: 'refresh',
-                        enabled: !busy,
-                        child: const Text('刷新目录'),
-                      ),
-                      if (_canDownloadFromSource &&
-                          widget.source['kind'] != 'http')
-                        const PopupMenuItem(
-                          height: GlassMetrics.menuItemHeight,
-                          padding: GlassMetrics.menuItemPadding,
-                          value: 'download-folder',
-                          child: Text('下载当前文件夹（含子目录）'),
-                        ),
-                      if (widget.associateId == null &&
-                          widget.source['kind'] != 'http')
-                        PopupMenuItem(
-                          height: GlassMetrics.menuItemHeight,
-                          padding: GlassMetrics.menuItemPadding,
-                          value: 'favorite',
-                          child: Text(
-                            favorites.contains(widget.source['id'], current)
-                                ? '取消收藏'
-                                : '收藏文件夹',
-                          ),
-                        ),
-                      if (widget.associateId == null &&
-                          widget.source['kind'] != 'http')
-                        PopupMenuItem(
-                          height: GlassMetrics.menuItemHeight,
-                          padding: GlassMetrics.menuItemPadding,
-                          value: widget.model.recognizingDirectory
-                              ? 'cancelRecognition'
-                              : 'recognize',
-                          enabled:
-                              widget.model.recognizingDirectory ||
-                              (!busy &&
-                                  error.isEmpty &&
-                                  !widget.model.scanning),
-                          child: Text(
-                            widget.model.recognizingDirectory
-                                ? '取消文件夹识别'
-                                : hasCollectionHeader
-                                ? '重新识别信息'
-                                : '识别信息',
-                          ),
-                        ),
-                      if (widget.associateId == null &&
-                          widget.source['kind'] != 'http')
-                        PopupMenuItem(
-                          height: GlassMetrics.menuItemHeight,
-                          padding: GlassMetrics.menuItemPadding,
-                          value: 'scan',
-                          enabled:
-                              !busy && error.isEmpty && !widget.model.scanning,
-                          child: const Text('添加到影视库'),
-                        ),
-                      if (widget.onEdit != null)
-                        const PopupMenuItem(
-                          height: GlassMetrics.menuItemHeight,
-                          padding: GlassMetrics.menuItemPadding,
-                          value: 'edit',
-                          child: Text('编辑来源'),
-                        ),
-                      if (widget.onRemove != null) ...[
-                        const PopupMenuDivider(
-                          height: GlassMetrics.menuDividerHeight,
-                        ),
-                        const PopupMenuItem(
-                          height: GlassMetrics.menuItemHeight,
-                          padding: GlassMetrics.menuItemPadding,
-                          value: 'remove',
-                          child: Text('移除来源…'),
-                        ),
-                      ],
-                    ],
-                  ),
-                ],
-              ),
-              if (_search.shown) _FolderSearchField(_search),
-              if (widget.associateId != null)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 8),
-                  child: Text(
-                    '选择此设备上的视频',
-                    style: AppStyles.of(context).bodySmall,
-                  ),
+                    ),
+                  ],
                 ),
-              const SizedBox(height: 2),
-              if (busy) const LinearProgressIndicator(minHeight: 2),
-              Expanded(
-                child: RefreshIndicator(
-                  onRefresh: _refreshManually,
-                  child: error.isNotEmpty
-                      ? SingleChildScrollView(
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              vertical: 44,
-                              horizontal: 16,
-                            ),
-                            child: Column(
-                              children: [
-                                Icon(
-                                  Icons.wifi_off_rounded,
-                                  color: GlassPalette.of(context).muted,
-                                  size: 32,
-                                ),
-                                const SizedBox(height: 14),
-                                SelectableText(
-                                  error,
-                                  textAlign: TextAlign.center,
-                                  style: SettingsStyles.of(context)
-                                      .sourceErrorMessage,
-                                ),
-                                const SizedBox(height: 12),
-                                Wrap(
-                                  spacing: 12,
-                                  children: [
-                                    TextButton(
-                                      onPressed: _open,
-                                      child: const Text('重试'),
-                                    ),
-                                    if (widget.onEdit != null)
+                if (_search.shown) _FolderSearchField(_search),
+                if (widget.associateId != null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                      '选择此设备上的视频',
+                      style: AppStyles.of(context).bodySmall,
+                    ),
+                  ),
+                const SizedBox(height: 2),
+                if (busy) const LinearProgressIndicator(minHeight: 2),
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: _refreshManually,
+                    child: error.isNotEmpty
+                        ? SingleChildScrollView(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                vertical: 44,
+                                horizontal: 16,
+                              ),
+                              child: Column(
+                                children: [
+                                  Icon(
+                                    Icons.wifi_off_rounded,
+                                    color: GlassPalette.of(context).muted,
+                                    size: 32,
+                                  ),
+                                  const SizedBox(height: 14),
+                                  SelectableText(
+                                    error,
+                                    textAlign: TextAlign.center,
+                                    style: SettingsStyles.of(context)
+                                        .sourceErrorMessage,
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Wrap(
+                                    spacing: 12,
+                                    children: [
                                       TextButton(
-                                        onPressed: widget.onEdit,
-                                        child: const Text('编辑来源'),
+                                        onPressed: _open,
+                                        child: const Text('重试'),
                                       ),
-                                  ],
-                                ),
-                              ],
+                                      if (widget.onEdit != null)
+                                        TextButton(
+                                          onPressed: widget.onEdit,
+                                          child: const Text('编辑来源'),
+                                        ),
+                                    ],
+                                  ),
+                                ],
+                              ),
                             ),
-                          ),
-                        )
-                      : displayed.isEmpty && !busy
-                      ? SingleChildScrollView(
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          child: _EmptyFolder(
-                            text: _search.query.isEmpty ? '这里还没有文件' : '没有匹配的文件',
-                          ),
-                        )
-                      : ListView.builder(
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          controller: scroll,
-                          scrollCacheExtent: const ScrollCacheExtent.viewport(
-                            .75,
-                          ),
-                          padding: EdgeInsets.only(
-                            bottom: 20 + MediaQuery.paddingOf(context).bottom,
-                          ),
-                          itemCount:
-                              displayed.length + (hasCollectionHeader ? 1 : 0),
-                          itemBuilder: (context, index) {
-                            if (hasCollectionHeader && index == 0) {
-                              return _collectionHeader(collection!, records);
-                            }
-                            final entry =
-                                displayed[index -
-                                    (hasCollectionHeader ? 1 : 0)];
-                            final group = entry.directory
-                                ? _folderCollection(entry)
-                                : null;
-                            final playable =
-                                entry.directory ||
-                                isVideo(entry.name) ||
-                                widget.associateId == null ||
-                                widget.source['kind'] == 'http';
-                            final media = entry.directory
-                                ? null
-                                : _mediaByPath[entry.path.replaceAll(
-                                    '\\',
-                                    '/',
-                                  )];
-                            if (hasCollectionHeader && isVideo(entry.name)) {
-                              final savedEpisode = media == null
+                          )
+                        : displayed.isEmpty && !busy
+                        ? SingleChildScrollView(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            child: _EmptyFolder(
+                              text: _search.query.isEmpty
+                                  ? '这里还没有文件'
+                                  : '没有匹配的文件',
+                            ),
+                          )
+                        : ListView.builder(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            controller: scroll,
+                            scrollCacheExtent: const ScrollCacheExtent.viewport(
+                              .75,
+                            ),
+                            padding: EdgeInsets.only(
+                              bottom: 20 + MediaQuery.paddingOf(context).bottom,
+                            ),
+                            itemCount:
+                                displayed.length +
+                                (hasCollectionHeader ? 1 : 0),
+                            itemBuilder: (context, index) {
+                              if (hasCollectionHeader && index == 0) {
+                                return _collectionHeader(collection!, records);
+                              }
+                              final entry =
+                                  displayed[index -
+                                      (hasCollectionHeader ? 1 : 0)];
+                              final group = entry.directory
+                                  ? _folderCollection(entry)
+                                  : null;
+                              final playable =
+                                  entry.directory ||
+                                  isVideo(entry.name) ||
+                                  widget.associateId == null ||
+                                  widget.source['kind'] == 'http';
+                              final media = entry.directory
+                                  ? null
+                                  : _mediaByPath[entry.path.replaceAll(
+                                      '\\',
+                                      '/',
+                                    )];
+                              if (hasCollectionHeader && isVideo(entry.name)) {
+                                final savedEpisode = media == null
+                                    ? ''
+                                    : widget.model.episodeLabel(media);
+                                final episode = savedEpisode.isNotEmpty
+                                    ? savedEpisode
+                                    : collection?.episodeLabel(entry.path) ??
+                                          '';
+                                final sourceId = widget.source['id'] as String;
+                                return GestureDetector(
+                                  onSecondaryTap: widget.associateId == null
+                                      ? () => _entryOptions(entry)
+                                      : null,
+                                  child: MediaDetailsEpisodeTile(
+                                    key: ValueKey(entry.path),
+                                    model: widget.model,
+                                    item:
+                                        media ??
+                                        SyncRecord(
+                                          kind: 'media',
+                                          id: widget.model.sourcePreviewId(
+                                            sourceId,
+                                            entry.path,
+                                          ),
+                                          data: {
+                                            'title': entry.name,
+                                            'fileName': entry.name,
+                                            'size': entry.size,
+                                          },
+                                        ),
+                                    title:
+                                        collection!.episodeCount == 0 &&
+                                            collection!.videos.length > 1
+                                        ? entry.name
+                                        : episode.isEmpty
+                                        ? null
+                                        : episode,
+                                    sourceId: sourceId,
+                                    sourceEntry: entry,
+                                    showTechnical:
+                                        _headerSeriesRecords?.length != 1,
+                                    showTrailing: desktopMenus,
+                                    onPlay: () => _select(entry),
+                                    onLongPress: widget.associateId == null
+                                        ? () => _entryOptions(entry)
+                                        : null,
+                                    trailing:
+                                        widget.associateId == null &&
+                                            desktopMenus
+                                        ? IconButton(
+                                            key: ValueKey(
+                                              'video-options:${entry.path}',
+                                            ),
+                                            tooltip: '视频选项',
+                                            icon: const Icon(Icons.more_vert),
+                                            onPressed: () =>
+                                                _entryOptions(entry),
+                                          )
+                                        : null,
+                                  ),
+                                );
+                              }
+                              final recognized =
+                                  media != null &&
+                                  hasRecognizedMediaMetadata(media);
+                              final savedEpisode = !recognized
                                   ? ''
                                   : widget.model.episodeLabel(media);
                               final episode = savedEpisode.isNotEmpty
                                   ? savedEpisode
-                                  : collection?.episodeLabel(entry.path) ?? '';
-                              final sourceId = widget.source['id'] as String;
-                              return GestureDetector(
-                                onSecondaryTap: widget.associateId == null
-                                    ? () => _entryOptions(entry)
-                                    : null,
-                                child: MediaDetailsEpisodeTile(
-                                  key: ValueKey(entry.path),
-                                  model: widget.model,
-                                  item:
-                                      media ??
-                                      SyncRecord(
-                                        kind: 'media',
-                                        id: widget.model.sourcePreviewId(
-                                          sourceId,
-                                          entry.path,
-                                        ),
-                                        data: {
-                                          'title': entry.name,
-                                          'fileName': entry.name,
-                                          'size': entry.size,
-                                        },
+                                  : collection?.recognized == true
+                                  ? collection!.episodeLabel(entry.path)
+                                  : '';
+                              final progress = media == null
+                                  ? ''
+                                  : playbackProgressLabel(
+                                      widget.model.progressFor(media),
+                                    );
+                              final specRecord =
+                                  media ??
+                                  SyncRecord(
+                                    kind: 'media',
+                                    id: widget.model.sourcePreviewId(
+                                      widget.source['id'],
+                                      entry.path,
+                                    ),
+                                    data: {
+                                      'title': entry.name,
+                                      'fileName': entry.name,
+                                      'size': entry.size,
+                                    },
+                                  );
+                              final technical =
+                                  !entry.directory && isVideo(entry.name)
+                                  ? MediaTechnicalInfo.forRecord(
+                                      widget.model.store,
+                                      specRecord,
+                                      dimensions: widget.model.mediaDimensions(
+                                        specRecord,
                                       ),
+                                      fileName: entry.name,
+                                      fileSize: entry.size,
+                                    ).label
+                                  : _fileSize(entry.size);
+                              return Opacity(
+                                key: ValueKey(entry.path),
+                                opacity: playable || widget.associateId == null
+                                    ? 1
+                                    : .45,
+                                child: _FolderRow(
+                                  contentPadding: EdgeInsets.zero,
                                   title:
-                                      collection!.episodeCount == 0 &&
-                                          collection!.videos.length > 1
-                                      ? entry.name
-                                      : episode.isEmpty
-                                      ? null
-                                      : episode,
-                                  sourceId: sourceId,
-                                  sourceEntry: entry,
-                                  showTechnical:
-                                      _headerSeriesRecords?.length != 1,
-                                  showTrailing: desktopMenus,
-                                  onPlay: () => _select(entry),
+                                      group?.displayName ??
+                                      (hasCollectionHeader && episode.isNotEmpty
+                                          ? episode
+                                          : recognized
+                                          ? widget.model.displayTitle(media)
+                                          : entry.name),
+                                  subtitle: group != null
+                                      ? [
+                                          if (group.seasonLabel.isNotEmpty)
+                                            group.seasonLabel,
+                                          group.membershipComplete &&
+                                                  group.episodeCount > 0
+                                              ? '${group.episodeCount} 集'
+                                              : '${group.listedVideoCount} 个视频',
+                                          if (group.membershipComplete &&
+                                              group.episodeCount > 0 &&
+                                              group.listedVideoCount >
+                                                  group.episodeCount)
+                                            '${group.listedVideoCount} 个视频',
+                                        ].join(' · ')
+                                      : entry.directory
+                                      ? ''
+                                      : [technical, progress]
+                                            .where((line) => line.isNotEmpty)
+                                            .join('\n'),
+                                  leading: _entryArtwork(entry),
+                                  video: !entry.directory,
+                                  onTap: () {
+                                    if (playable) _select(entry);
+                                  },
                                   onLongPress: widget.associateId == null
                                       ? () => _entryOptions(entry)
                                       : null,
                                   trailing:
-                                      widget.associateId == null && desktopMenus
+                                      !entry.directory &&
+                                          !isVideo(entry.name) &&
+                                          widget.associateId == null &&
+                                          desktopMenus
+                                      ? IconButton(
+                                          key: ValueKey(
+                                            'file-options:${entry.path}',
+                                          ),
+                                          tooltip: '文件选项',
+                                          icon: const Icon(
+                                            Icons.more_horiz_rounded,
+                                            size: 20,
+                                          ),
+                                          onPressed: () => _entryOptions(entry),
+                                        )
+                                      : !playable
+                                      ? null
+                                      : entry.directory &&
+                                            widget.associateId == null &&
+                                            desktopMenus
+                                      ? Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            if (favorites.contains(
+                                              widget.source['id'],
+                                              entry.path,
+                                            ))
+                                              Icon(
+                                                Icons.star_rounded,
+                                                size: 18,
+                                                color: GlassPalette.of(context)
+                                                    .accent,
+                                              ),
+                                            _folderEntryMenu(entry),
+                                          ],
+                                        )
+                                      : !entry.directory &&
+                                            widget.associateId == null &&
+                                            desktopMenus &&
+                                            isVideo(entry.name)
                                       ? IconButton(
                                           key: ValueKey(
                                             'video-options:${entry.path}',
                                           ),
                                           tooltip: '视频选项',
-                                          icon: const Icon(Icons.more_vert),
+                                          icon: const Icon(
+                                            Icons.more_horiz_rounded,
+                                            size: 20,
+                                          ),
                                           onPressed: () => _entryOptions(entry),
+                                        )
+                                      : entry.directory &&
+                                            favorites.contains(
+                                              widget.source['id'],
+                                              entry.path,
+                                            )
+                                      ? Icon(
+                                          Icons.star_rounded,
+                                          size: 18,
+                                          color: GlassPalette.of(context)
+                                              .accent,
                                         )
                                       : null,
                                 ),
                               );
-                            }
-                            final recognized =
-                                media != null &&
-                                hasRecognizedMediaMetadata(media);
-                            final savedEpisode = !recognized
-                                ? ''
-                                : widget.model.episodeLabel(media);
-                            final episode = savedEpisode.isNotEmpty
-                                ? savedEpisode
-                                : collection?.recognized == true
-                                ? collection!.episodeLabel(entry.path)
-                                : '';
-                            final progress = media == null
-                                ? ''
-                                : playbackProgressLabel(
-                                    widget.model.progressFor(media),
-                                  );
-                            final specRecord =
-                                media ??
-                                SyncRecord(
-                                  kind: 'media',
-                                  id: widget.model.sourcePreviewId(
-                                    widget.source['id'],
-                                    entry.path,
-                                  ),
-                                  data: {
-                                    'title': entry.name,
-                                    'fileName': entry.name,
-                                    'size': entry.size,
-                                  },
-                                );
-                            final technical =
-                                !entry.directory && isVideo(entry.name)
-                                ? MediaTechnicalInfo.forRecord(
-                                    widget.model.store,
-                                    specRecord,
-                                    dimensions: widget.model.mediaDimensions(
-                                      specRecord,
-                                    ),
-                                    fileName: entry.name,
-                                    fileSize: entry.size,
-                                  ).label
-                                : _fileSize(entry.size);
-                            return Opacity(
-                              key: ValueKey(entry.path),
-                              opacity: playable || widget.associateId == null
-                                  ? 1
-                                  : .45,
-                              child: _FolderRow(
-                                contentPadding: EdgeInsets.zero,
-                                title:
-                                    group?.displayName ??
-                                    (hasCollectionHeader && episode.isNotEmpty
-                                        ? episode
-                                        : recognized
-                                        ? widget.model.displayTitle(media)
-                                        : entry.name),
-                                subtitle: group != null
-                                    ? [
-                                        if (group.seasonLabel.isNotEmpty)
-                                          group.seasonLabel,
-                                        group.membershipComplete &&
-                                                group.episodeCount > 0
-                                            ? '${group.episodeCount} 集'
-                                            : '${group.listedVideoCount} 个视频',
-                                        if (group.membershipComplete &&
-                                            group.episodeCount > 0 &&
-                                            group.listedVideoCount >
-                                                group.episodeCount)
-                                          '${group.listedVideoCount} 个视频',
-                                      ].join(' · ')
-                                    : entry.directory
-                                    ? ''
-                                    : [technical, progress]
-                                          .where((line) => line.isNotEmpty)
-                                          .join('\n'),
-                                leading: _entryArtwork(entry),
-                                video: !entry.directory,
-                                onTap: () {
-                                  if (playable) _select(entry);
-                                },
-                                onLongPress: widget.associateId == null
-                                    ? () => _entryOptions(entry)
-                                    : null,
-                                trailing:
-                                    !entry.directory &&
-                                        !isVideo(entry.name) &&
-                                        widget.associateId == null &&
-                                        desktopMenus
-                                    ? IconButton(
-                                        key: ValueKey(
-                                          'file-options:${entry.path}',
-                                        ),
-                                        tooltip: '文件选项',
-                                        icon: const Icon(
-                                          Icons.more_horiz_rounded,
-                                          size: 20,
-                                        ),
-                                        onPressed: () => _entryOptions(entry),
-                                      )
-                                    : !playable
-                                    ? null
-                                    : entry.directory &&
-                                          widget.associateId == null &&
-                                          desktopMenus
-                                    ? Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          if (favorites.contains(
-                                            widget.source['id'],
-                                            entry.path,
-                                          ))
-                                            Icon(
-                                              Icons.star_rounded,
-                                              size: 18,
-                                              color: GlassPalette.of(context)
-                                                  .accent,
-                                            ),
-                                          _folderEntryMenu(entry),
-                                        ],
-                                      )
-                                    : !entry.directory &&
-                                          widget.associateId == null &&
-                                          desktopMenus &&
-                                          isVideo(entry.name)
-                                    ? IconButton(
-                                        key: ValueKey(
-                                          'video-options:${entry.path}',
-                                        ),
-                                        tooltip: '视频选项',
-                                        icon: const Icon(
-                                          Icons.more_horiz_rounded,
-                                          size: 20,
-                                        ),
-                                        onPressed: () => _entryOptions(entry),
-                                      )
-                                    : entry.directory &&
-                                          favorites.contains(
-                                            widget.source['id'],
-                                            entry.path,
-                                          )
-                                    ? Icon(
-                                        Icons.star_rounded,
-                                        size: 18,
-                                        color: GlassPalette.of(context).accent,
-                                      )
-                                    : null,
-                              ),
-                            );
-                          },
-                        ),
+                            },
+                          ),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
     );
     final contents = PopScope(
-      canPop: !widget.embedded && paths.length <= _rootDepth,
+      canPop:
+          !widget.active || (!widget.embedded && paths.length <= _rootDepth),
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _back();
+        if (!didPop &&
+            widget.active &&
+            !TelevisionMenuRegion.navigationOwnsBack(context)) {
+          _back();
+        }
       },
       child: ArtworkScrollScope(
         onActivityChanged: (scrolling) => _fileImages?.setScrolling(scrolling),

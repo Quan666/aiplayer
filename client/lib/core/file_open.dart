@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -20,12 +21,23 @@ Future<void> openExternalFile(String localPath) =>
 Future<void> cancelPendingExternalFileOpen() =>
     const ExternalFileOpener().cancelPending();
 
+/// The system may already have accepted the file without acknowledging it.
+/// Retain remote cache copies until their normal lease expires in this case.
+class ExternalFileHandoffTimeout extends AppFailure {
+  const ExternalFileHandoffTimeout() : super('系统未响应文件打开请求，请重试。');
+}
+
 class ExternalFileOpener {
   static const channel = MethodChannel('app.aiplayer/file_open');
   final String? operatingSystem;
   final ExternalFileProcess? process;
+  final Duration handoffTimeout;
 
-  const ExternalFileOpener({this.operatingSystem, this.process});
+  const ExternalFileOpener({
+    this.operatingSystem,
+    this.process,
+    this.handoffTimeout = const Duration(seconds: 15),
+  });
 
   Future<void> cancelPending() async {
     final platform = operatingSystem ?? Platform.operatingSystem;
@@ -49,7 +61,15 @@ class ExternalFileOpener {
     final platform = operatingSystem ?? Platform.operatingSystem;
     try {
       if (platform == 'android' || platform == 'ios' || platform == 'macos') {
-        await channel.invokeMethod<void>('open', path);
+        await channel
+            .invokeMethod<void>('open', path)
+            .timeout(
+              handoffTimeout,
+              onTimeout: () {
+                unawaited(cancelPending());
+                throw const ExternalFileHandoffTimeout();
+              },
+            );
         return;
       }
       final run = process ?? _run;

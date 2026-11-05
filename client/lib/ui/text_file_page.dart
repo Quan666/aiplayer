@@ -14,6 +14,8 @@ import '../data/app_model.dart';
 import '../data/text_document.dart';
 import '../sources/source.dart';
 import 'glass.dart';
+import 'television_input.dart';
+import 'television_scroll_region.dart';
 
 /// Resolve credentials only for the selected file, never while building rows.
 Future<void> openSourceDocument(
@@ -63,6 +65,10 @@ Future<void> openSourceDocument(
         !(ModalRoute.of(context)?.isCurrent ?? true) ||
         !TickerMode.valuesOf(context).enabled ||
         !mapEquals(selected, configuration())) {
+      return;
+    }
+    if (external && resolved['kind'] == 'local') {
+      await openExternalFile(entry.path);
       return;
     }
     route = Navigator.push<void>(
@@ -320,18 +326,32 @@ class _TextFilePageState extends State<TextFilePage>
     }
   }
 
-  Future<void> _openExternally() => Navigator.push<void>(
-    context,
-    MaterialPageRoute(
-      builder: (_) => ExternalFilePage(
-        source: widget.source,
-        password: widget.password,
-        documentsPath: widget.documentsPath,
-        entry: widget.entry,
-        externalCacheBytes: widget.externalCacheBytes,
+  Future<void> _openExternally() async {
+    if (widget.source['kind'] == 'local' || widget.source['id'] == 'local') {
+      try {
+        await openExternalFile(widget.entry.path);
+      } catch (error) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(safeFailure(error).message)));
+        }
+      }
+      return;
+    }
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ExternalFilePage(
+          source: widget.source,
+          password: widget.password,
+          documentsPath: widget.documentsPath,
+          entry: widget.entry,
+          externalCacheBytes: widget.externalCacheBytes,
+        ),
       ),
-    ),
-  );
+    );
+  }
 
   @override
   void dispose() {
@@ -362,12 +382,14 @@ class _TextFilePageState extends State<TextFilePage>
           if (!_searchVisible) _toggleSearch();
           _searchFocus.requestFocus();
         },
-        const SingleActivator(LogicalKeyboardKey.escape): () {
-          if (_searchVisible) _toggleSearch();
-        },
+        if (_searchVisible)
+          const SingleActivator(LogicalKeyboardKey.escape): _toggleSearch,
+        if (_searchVisible && TelevisionMode.of(context))
+          const SingleActivator(LogicalKeyboardKey.goBack): _toggleSearch,
       },
       child: Focus(
-        autofocus: true,
+        autofocus: !TelevisionMode.of(context),
+        skipTraversal: TelevisionMode.of(context),
         child: Scaffold(
           appBar: AppBar(
             toolbarHeight: 48,
@@ -469,88 +491,101 @@ class _TextFilePageState extends State<TextFilePage>
                     : document == null
                     ? const Center(child: _FileLoading())
                     : LayoutBuilder(
-                        builder: (context, constraints) => Scrollbar(
-                          controller: _horizontal,
-                          notificationPredicate: (notification) =>
-                              notification.metrics.axis == Axis.horizontal,
-                          child: SingleChildScrollView(
+                        builder: (context, constraints) => TelevisionScrollRegion(
+                          controller: _scroll,
+                          horizontalController: _horizontal,
+                          autofocus: true,
+                          builder: (context, _) => Scrollbar(
                             controller: _horizontal,
-                            scrollDirection: Axis.horizontal,
-                            child: SizedBox(
-                              width: math.max(
-                                constraints.maxWidth,
-                                document.maxColumns * 14.0 * scale + 32,
-                              ),
-                              child: SelectionArea(
-                                child: Scrollbar(
-                                  controller: _scroll,
-                                  child: ListView.builder(
-                                    key: const ValueKey('text-document-lines'),
-                                    controller: _scroll,
-                                    itemExtent: _rowHeight,
-                                    padding: EdgeInsets.fromLTRB(
-                                      12,
-                                      0,
-                                      12,
-                                      MediaQuery.paddingOf(context).bottom + 20,
-                                    ),
-                                    itemCount: document.lines.length,
-                                    itemBuilder: (context, row) {
-                                      final text = document.lines[row];
-                                      final matches =
-                                          _matchesByRow[row] ??
-                                          const <TextMatch>[];
-                                      final spans = <InlineSpan>[];
-                                      var position = 0;
-                                      for (final match in matches) {
-                                        if (match.start < position) continue;
-                                        spans.add(
-                                          TextSpan(
-                                            text: text.substring(
-                                              position,
-                                              match.start,
+                            notificationPredicate: (notification) =>
+                                notification.metrics.axis == Axis.horizontal,
+                            child: SingleChildScrollView(
+                              controller: _horizontal,
+                              scrollDirection: Axis.horizontal,
+                              child: SizedBox(
+                                width: math.max(
+                                  constraints.maxWidth,
+                                  document.maxColumns * 14.0 * scale + 32,
+                                ),
+                                child: ExcludeFocus(
+                                  excluding: TelevisionMode.of(context),
+                                  child: SelectionArea(
+                                    child: Scrollbar(
+                                      controller: _scroll,
+                                      child: ListView.builder(
+                                        key: const ValueKey(
+                                          'text-document-lines',
+                                        ),
+                                        controller: _scroll,
+                                        itemExtent: _rowHeight,
+                                        padding: EdgeInsets.fromLTRB(
+                                          12,
+                                          0,
+                                          12,
+                                          MediaQuery.paddingOf(context).bottom +
+                                              20,
+                                        ),
+                                        itemCount: document.lines.length,
+                                        itemBuilder: (context, row) {
+                                          final text = document.lines[row];
+                                          final matches =
+                                              _matchesByRow[row] ??
+                                              const <TextMatch>[];
+                                          final spans = <InlineSpan>[];
+                                          var position = 0;
+                                          for (final match in matches) {
+                                            if (match.start < position) {
+                                              continue;
+                                            }
+                                            spans.add(
+                                              TextSpan(
+                                                text: text.substring(
+                                                  position,
+                                                  match.start,
+                                                ),
+                                              ),
+                                            );
+                                            spans.add(
+                                              TextSpan(
+                                                text: text.substring(
+                                                  match.start,
+                                                  match.end,
+                                                ),
+                                                style: TextStyle(
+                                                  backgroundColor: colors.accent
+                                                      .withValues(
+                                                        alpha:
+                                                            match.id ==
+                                                                _matches[_currentMatch]
+                                                                    .id
+                                                            ? .45
+                                                            : .2,
+                                                      ),
+                                                ),
+                                              ),
+                                            );
+                                            position = match.end;
+                                          }
+                                          spans.add(
+                                            TextSpan(
+                                              text: text.substring(position),
                                             ),
-                                          ),
-                                        );
-                                        spans.add(
-                                          TextSpan(
-                                            text: text.substring(
-                                              match.start,
-                                              match.end,
-                                            ),
+                                          );
+                                          return Text.rich(
+                                            TextSpan(children: spans),
+                                            key: ValueKey('text-line:$row'),
+                                            softWrap: false,
+                                            maxLines: 1,
                                             style: TextStyle(
-                                              backgroundColor: colors.accent
-                                                  .withValues(
-                                                    alpha:
-                                                        match.id ==
-                                                            _matches[_currentMatch]
-                                                                .id
-                                                        ? .45
-                                                        : .2,
-                                                  ),
+                                              fontFamily: 'monospace',
+                                              fontSize: 14,
+                                              height: 1.4,
+                                              color: colors.text,
                                             ),
-                                          ),
-                                        );
-                                        position = match.end;
-                                      }
-                                      spans.add(
-                                        TextSpan(
-                                          text: text.substring(position),
-                                        ),
-                                      );
-                                      return Text.rich(
-                                        TextSpan(children: spans),
-                                        key: ValueKey('text-line:$row'),
-                                        softWrap: false,
-                                        maxLines: 1,
-                                        style: TextStyle(
-                                          fontFamily: 'monospace',
-                                          fontSize: 14,
-                                          height: 1.4,
-                                          color: colors.text,
-                                        ),
-                                      );
-                                    },
+                                          );
+                                        },
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -593,6 +628,7 @@ class _ExternalFilePageState extends State<ExternalFilePage>
     with WidgetsBindingObserver {
   TextDocumentService? _service;
   String? _prepared, _error;
+  ({int received, int total})? _transfer;
   int _revision = 0;
   bool _handedOff = false, _opening = false, _paused = false, _visible = true;
 
@@ -628,6 +664,7 @@ class _ExternalFilePageState extends State<ExternalFilePage>
     _service?.dispose();
     _service = null;
     _opening = false;
+    _transfer = null;
     final path = _prepared;
     _prepared = null;
     if (!_handedOff && path != null) unawaited(discardExternalFile(path));
@@ -651,6 +688,7 @@ class _ExternalFilePageState extends State<ExternalFilePage>
   Future<void> _open() async {
     if (_opening || _paused || !_visible) return;
     _opening = true;
+    _transfer = null;
     final revision = ++_revision;
     final service = _service = TextDocumentService(
       source: widget.source,
@@ -667,6 +705,17 @@ class _ExternalFilePageState extends State<ExternalFilePage>
           widget.entry,
           cacheDirectory: p.join(temporary.path, 'aiplayer-external-files-v1'),
           maxCacheBytes: widget.externalCacheBytes?.call() ?? 512 * 1024 * 1024,
+          onProgress: (received, total) {
+            if (!mounted ||
+                _paused ||
+                !_visible ||
+                revision != _revision ||
+                _handedOff) {
+              return;
+            }
+            final transfer = (received: received, total: total);
+            if (_transfer != transfer) setState(() => _transfer = transfer);
+          },
         );
         prepared = path;
       }
@@ -678,6 +727,7 @@ class _ExternalFilePageState extends State<ExternalFilePage>
       // The receiving application may read after this future completes. Keep
       // its lease in the bounded cache; failures/cancellations release at once.
       _handedOff = true;
+      if (_transfer != null) setState(() => _transfer = null);
       await (widget.opener ?? openExternalFile)(path);
       if (mounted && revision == _revision) {
         final route = ModalRoute.of(context);
@@ -692,8 +742,10 @@ class _ExternalFilePageState extends State<ExternalFilePage>
         _handedOff = false;
         _prepared = null;
       }
-      if (prepared != null) await discardExternalFile(prepared);
-      if (mounted && !_paused && revision == _revision) {
+      if (prepared != null && error is! ExternalFileHandoffTimeout) {
+        await discardExternalFile(prepared);
+      }
+      if (mounted && revision == _revision) {
         setState(() => _error = safeFailure(error).message);
       }
     } finally {
@@ -714,11 +766,64 @@ class _ExternalFilePageState extends State<ExternalFilePage>
     appBar: AppBar(toolbarHeight: 48, title: Text(widget.entry.name)),
     body: Center(
       child: _error == null
-          ? const _FileLoading()
+          ? _transfer == null
+                ? const _FileLoading()
+                : _ExternalTransferProgress(
+                    received: _transfer!.received,
+                    total: _transfer!.total,
+                  )
           : Padding(
               padding: const EdgeInsets.all(20),
-              child: Text(_error!, textAlign: TextAlign.center),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(_error!, textAlign: TextAlign.center),
+                  const SizedBox(height: 12),
+                  TextButton(
+                    autofocus: TelevisionMode.of(context),
+                    onPressed: () {
+                      setState(() => _error = null);
+                      unawaited(_open());
+                    },
+                    child: const Text('重试'),
+                  ),
+                ],
+              ),
             ),
+    ),
+  );
+}
+
+class _ExternalTransferProgress extends StatelessWidget {
+  final int received, total;
+  const _ExternalTransferProgress({
+    required this.received,
+    required this.total,
+  });
+
+  static String _size(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 200,
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        LinearProgressIndicator(
+          key: const ValueKey('external-file-transfer'),
+          value: total == 0 ? 1 : (received / total).clamp(0.0, 1.0),
+          semanticsLabel: '正在准备文件',
+        ),
+        const SizedBox(height: 8),
+        Text(
+          '${_size(received)} / ${_size(total)}',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ],
     ),
   );
 }

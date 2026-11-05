@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:aiplayer/core/file_open.dart';
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/ui/text_file_page.dart';
@@ -10,14 +11,18 @@ import 'package:flutter_test/flutter_test.dart';
 
 const _paths = MethodChannel('plugins.flutter.io/path_provider');
 
-Future<void> _until(WidgetTester tester, bool Function() ready) async {
+Future<void> _until(
+  WidgetTester tester,
+  bool Function() ready, {
+  String Function()? diagnostics,
+}) async {
   for (var count = 0; count < 200 && !ready(); count++) {
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 10)),
     );
     await tester.pump(const Duration(milliseconds: 20));
   }
-  expect(ready(), isTrue);
+  expect(ready(), isTrue, reason: diagnostics?.call());
 }
 
 class _RemoteFile {
@@ -36,7 +41,11 @@ class _RemoteFile {
     this.requests,
   );
 
-  static Future<_RemoteFile> create({bool stall = false}) async {
+  static Future<_RemoteFile> create({
+    bool stall = false,
+    int length = 1024,
+    int firstChunkBytes = 64,
+  }) async {
     final root = await Directory.systemTemp.createTemp('external-file-page-');
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final started = Completer<void>(), release = Completer<void>();
@@ -45,14 +54,14 @@ class _RemoteFile {
     final subscription = server.listen((request) async {
       requests.add(request.method);
       request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-      request.response.contentLength = 1024;
+      request.response.contentLength = length;
       try {
         if (request.method != 'HEAD') {
-          request.response.add(List.filled(64, 65));
+          request.response.add(List.filled(firstChunkBytes, 65));
           await request.response.flush();
           if (!started.isCompleted) started.complete();
           await release.future;
-          request.response.add(List.filled(960, 65));
+          request.response.add(List.filled(length - firstChunkBytes, 65));
         }
         await request.response.close();
       } catch (_) {
@@ -84,8 +93,9 @@ class _RemoteFile {
 Future<GlobalKey<NavigatorState>> _show(
   WidgetTester tester,
   _RemoteFile remote,
-  Future<void> Function(String) opener,
-) async {
+  Future<void> Function(String) opener, {
+  String name = 'report.pdf',
+}) async {
   tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(_paths, (_) async => remote.root.path);
@@ -102,7 +112,7 @@ Future<GlobalKey<NavigatorState>> _show(
         builder: (_) => ExternalFilePage(
           source: remote.source,
           documentsPath: remote.root.path,
-          entry: const SourceEntry(name: 'report.pdf', path: 'report.pdf'),
+          entry: SourceEntry(name: name, path: name),
           opener: opener,
         ),
       ),
@@ -123,6 +133,122 @@ Future<void> _close(WidgetTester tester, _RemoteFile remote) async {
 }
 
 void main() {
+  testWidgets('remote file shows real transfer progress before system handoff', (
+    tester,
+  ) async {
+    final remote = (await tester.runAsync(
+      () => _RemoteFile.create(
+        stall: true,
+        length: 128 * 1024,
+        firstChunkBytes: 64 * 1024,
+      ),
+    ))!;
+    var opens = 0;
+    try {
+      await _show(tester, remote, (_) async => opens++);
+      final progress = find.byKey(const ValueKey('external-file-transfer'));
+      await _until(
+        tester,
+        () =>
+            progress.evaluate().isNotEmpty &&
+            tester.widget<LinearProgressIndicator>(progress).value! > 0,
+        diagnostics: () =>
+            'requests=${remote.requests}, '
+            'texts=${tester.widgetList<Text>(find.byType(Text)).map((text) => text.data).toList()}',
+      );
+      expect(
+        tester.widget<LinearProgressIndicator>(progress).value,
+        inExclusiveRange(0, 1),
+      );
+      expect(find.textContaining(' / 128.0 KB'), findsOneWidget);
+      expect(opens, 0);
+      remote.release.complete();
+      await _until(tester, () => opens == 1);
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(find.byType(ExternalFilePage), findsNothing);
+    } finally {
+      await _close(tester, remote);
+    }
+  });
+
+  testWidgets('unacknowledged handoff retains its copy for a late receiver', (
+    tester,
+  ) async {
+    final remote = (await tester.runAsync(_RemoteFile.create))!;
+    String? opened;
+    try {
+      await _show(tester, remote, (path) async {
+        opened = path;
+        throw const ExternalFileHandoffTimeout();
+      });
+      await _until(tester, () => find.text('重试').evaluate().isNotEmpty);
+      expect(find.text('系统未响应文件打开请求，请重试。'), findsOneWidget);
+      expect(await tester.runAsync(() => File(opened!).length()), 1024);
+      await tester.pumpWidget(const SizedBox());
+      expect(await tester.runAsync(() => File(opened!).exists()), isTrue);
+    } finally {
+      await _close(tester, remote);
+    }
+  });
+
+  for (final name in [
+    'installer.apk',
+    'archive.zip',
+    'data.unknown',
+    'README',
+  ]) {
+    testWidgets('remote $name uses the same complete-file handoff', (
+      tester,
+    ) async {
+      final remote = (await tester.runAsync(_RemoteFile.create))!;
+      String? opened;
+      try {
+        await _show(tester, remote, (path) async => opened = path, name: name);
+        await _until(tester, () => opened != null);
+        await tester.pump(const Duration(milliseconds: 400));
+        expect(find.byType(ExternalFilePage), findsNothing);
+        expect(opened, endsWith('/payload/$name'));
+        expect(await tester.runAsync(() => File(opened!).length()), 1024);
+      } finally {
+        await _close(tester, remote);
+      }
+    });
+  }
+
+  testWidgets('handoff error while paused survives resume and can be retried', (
+    tester,
+  ) async {
+    final remote = (await tester.runAsync(_RemoteFile.create))!;
+    final handoff = Completer<void>();
+    var opens = 0;
+    try {
+      await _show(tester, remote, (_) {
+        opens++;
+        return opens == 1 ? handoff.future : Future.value();
+      });
+      await _until(tester, () => opens == 1);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      handoff.completeError(const AppFailure('没有可打开此文件的应用。'));
+      // Complete disposal/cleanup while no frame is produced.
+      for (var count = 0; count < 20; count++) {
+        await tester.idle();
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)),
+        );
+      }
+      expect(opens, 1);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      expect(find.text('没有可打开此文件的应用。'), findsOneWidget);
+      expect(opens, 1);
+      await tester.tap(find.text('重试'));
+      await _until(tester, () => opens == 2);
+    } finally {
+      if (!handoff.isCompleted) handoff.complete();
+      await _close(tester, remote);
+    }
+  });
+
   testWidgets('successful handoff retains the copy after the page closes', (
     tester,
   ) async {

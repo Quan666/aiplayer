@@ -1,7 +1,7 @@
 name: aiplayer
 description: 四端动漫播放器与个人影视库
 publish_to: none
-version: 0.5.26+32
+version: 0.5.27+33
 environment:
   sdk: '>=3.13.0 <4.0.0'
 dependencies:
@@ -49,6 +49,7 @@ flutter:
     - family: NotoSansSC
       fonts:
         - asset: assets/fonts/NotoSansSC-Regular.ttf
+          weight: 400
   assets:
     - assets/branding/app_icon.png
     - assets/branding/tmdb.png

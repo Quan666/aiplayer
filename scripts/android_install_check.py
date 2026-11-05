@@ -27,9 +27,10 @@ def main() -> None:
     parser.add_argument("--launch", action="store_true")
     parser.add_argument("--archive-probe", action="store_true", help="Call the device's getPackageArchiveInfo before installation; requires javac and SDK platforms")
     parser.add_argument("--allow-legacy-signing", action="store_true")
+    parser.add_argument("--android-legacy", action="store_true", help="Check and install the Android 6 compatibility APK")
     parser.add_argument("--output", type=Path, default=Path("artifacts/android-install-check.json"))
     arguments = parser.parse_args()
-    report = {"apk": validate_apk(arguments.apk, require_all_signatures=not arguments.allow_legacy_signing)}
+    report = {"apk": validate_apk(arguments.apk, require_all_signatures=not arguments.allow_legacy_signing, android_legacy=arguments.android_legacy)}
     adb = [str(sdk_root() / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb"))]
     if arguments.serial:
         adb += ["-s", arguments.serial]
@@ -63,7 +64,7 @@ def main() -> None:
             temporary = Path(directory)
             source = Path(__file__).resolve().parent / "android/PackageArchiveProbe.java"
             subprocess.run(["javac", "-source", "8", "-target", "8", "-classpath", str(platforms[0]), "-d", str(temporary), str(source)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            subprocess.run([str(sdk_tool("d8")), "--min-api", "24", "--lib", str(platforms[0]), "--output", str(temporary), str(temporary / "PackageArchiveProbe.class")], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run([str(sdk_tool("d8")), "--min-api", str(report["apk"]["min_sdk"]), "--lib", str(platforms[0]), "--output", str(temporary), str(temporary / "PackageArchiveProbe.class")], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             jar = temporary / "archive-probe.jar"
             with zipfile.ZipFile(jar, "w") as archive:
                 archive.write(temporary / "classes.dex", "classes.dex")

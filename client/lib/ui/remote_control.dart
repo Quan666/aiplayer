@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../playback/media_controls.dart';
 import '../remote/remote_control_service.dart';
@@ -25,7 +26,12 @@ class RemoteControlTarget extends InheritedWidget {
 
 class RemoteControlScope extends StatefulWidget {
   final Widget child;
-  const RemoteControlScope({super.key, required this.child});
+  final bool television;
+  const RemoteControlScope({
+    super.key,
+    required this.child,
+    this.television = false,
+  });
   static RemoteControlScopeState? maybeOf(BuildContext context) =>
       context.findAncestorStateOfType<RemoteControlScopeState>();
   @override
@@ -39,12 +45,31 @@ class RemoteControlScopeState extends State<RemoteControlScope>
   EditableTextState? _editor;
   int _editSession = 0;
   bool _dialogOpen = false;
+  EditableTextState? _televisionEditor, _navigationOrigin;
+  bool _hideNextKeyboard = false;
+
+  /// Traversal selects an input without entering editing. The selection must
+  /// be valid before focus: EditableText otherwise fixes it and opens the IME
+  /// even after its keyboard token was consumed.
+  void prepareTelevisionTraversal(FocusNode node) {
+    if (!widget.television || node.hasFocus) return;
+    final editor = node.context?.findAncestorStateOfType<EditableTextState>();
+    if (editor == null) return;
+    final controller = editor.widget.controller;
+    if (!controller.selection.isValid) {
+      controller.selection = TextSelection.collapsed(
+        offset: controller.text.length,
+      );
+    }
+    _hideNextKeyboard = true;
+  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     FocusManager.instance.addListener(_focusChanged);
+    FocusManager.instance.addEarlyKeyEventHandler(_televisionKey);
     PlayerMediaControls.remoteStatus.addListener(_publish);
     service.addListener(_focusChanged);
   }
@@ -58,15 +83,9 @@ class RemoteControlScopeState extends State<RemoteControlScope>
 
   bool _permittedEditor(EditableTextState editor) {
     final field = editor.widget;
-    if (field.readOnly ||
-        field.obscureText ||
-        field.keyboardType == TextInputType.visiblePassword) {
-      return false;
-    }
+    if (field.readOnly) return false;
     return !(field.autofillHints?.any(
           (hint) => const {
-            AutofillHints.password,
-            AutofillHints.newPassword,
             AutofillHints.creditCardNumber,
             AutofillHints.creditCardSecurityCode,
             AutofillHints.oneTimeCode,
@@ -75,7 +94,137 @@ class RemoteControlScopeState extends State<RemoteControlScope>
         false);
   }
 
+  bool _obscuredEditor(EditableTextState editor) =>
+      editor.widget.obscureText ||
+      editor.widget.keyboardType == TextInputType.visiblePassword ||
+      (editor.widget.autofillHints?.any(
+            (hint) =>
+                hint == AutofillHints.password ||
+                hint == AutofillHints.newPassword,
+          ) ??
+          false);
+
+  EditableTextState? get _focusedEditor => FocusManager
+      .instance
+      .primaryFocus
+      ?.context
+      ?.findAncestorStateOfType<EditableTextState>();
+
+  EditableTextState? get _televisionNavigationEditor {
+    final current = _focusedEditor;
+    if (current != null) return current;
+    final previous = _navigationOrigin;
+    // Android can close the text connection and unfocus EditableText when its
+    // IME is dismissed. Preserve only a navigation origin, never reopen it.
+    if (previous == null ||
+        !previous.mounted ||
+        ModalRoute.isCurrentOf(previous.context) == false ||
+        !identical(
+          FocusManager.instance.primaryFocus,
+          previous.widget.focusNode.enclosingScope,
+        )) {
+      return null;
+    }
+    return previous;
+  }
+
+  void _hideKeyboard() {
+    _televisionEditor = null;
+    _focusedEditor?.hideToolbar();
+    unawaited(SystemChannels.textInput.invokeMethod<void>('TextInput.hide'));
+  }
+
+  bool _closeTelevisionEditor() {
+    if (!widget.television || _televisionEditor == null) return false;
+    _hideKeyboard();
+    return true;
+  }
+
+  bool _moveFromEditor(EditableTextState editor, TraversalDirection direction) {
+    _navigationOrigin = editor;
+    _hideKeyboard();
+    _hideNextKeyboard = true;
+    final node = editor.widget.focusNode;
+    final restoring = !node.hasFocus;
+    // The policy reads its scope's focused child. Both requests are synchronous
+    // and coalesce before focus notifications, so the old editor never opens.
+    if (restoring) node.requestFocus();
+    final moved = node.focusInDirection(direction);
+    node.nearestScope?.focusedChild?.consumeKeyboardToken();
+    if (!moved && !restoring) _hideNextKeyboard = false;
+    return moved;
+  }
+
+  KeyEventResult _televisionKey(KeyEvent event) {
+    if (!widget.television || _backgrounded) return KeyEventResult.ignored;
+    final editor = _televisionNavigationEditor;
+    if (editor == null) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final direction = switch (key) {
+      LogicalKeyboardKey.arrowUp => TraversalDirection.up,
+      LogicalKeyboardKey.arrowDown => TraversalDirection.down,
+      LogicalKeyboardKey.arrowLeft => TraversalDirection.left,
+      LogicalKeyboardKey.arrowRight => TraversalDirection.right,
+      _ => null,
+    };
+    final select =
+        key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter ||
+        key == LogicalKeyboardKey.gameButtonA;
+    final back =
+        key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.goBack ||
+        key == LogicalKeyboardKey.browserBack;
+    if (direction != null) {
+      if (event is KeyDownEvent || event is KeyRepeatEvent) {
+        _moveFromEditor(editor, direction);
+      }
+      // EditableText's default arrows edit the caret and trap a TV remote.
+      // The platform IME owns editing keys while it is visible; keys reaching
+      // Flutter belong to form traversal, including at a form's edge.
+      return KeyEventResult.handled;
+    }
+    if (select && !editor.widget.readOnly) {
+      if (event is KeyDownEvent) {
+        _televisionEditor = editor;
+        editor.requestKeyboard();
+      }
+      return KeyEventResult.handled;
+    }
+    if (back && event is KeyDownEvent && _closeTelevisionEditor()) {
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
+  Future<bool> didPopRoute() async => _closeTelevisionEditor();
+
+  @override
+  void didChangeMetrics() {
+    final editor = _televisionEditor;
+    if (editor != null &&
+        editor.mounted &&
+        View.of(editor.context).viewInsets.bottom == 0) {
+      _televisionEditor = null;
+    }
+  }
+
   void _focusChanged() {
+    if (widget.television) {
+      final current = _focusedEditor;
+      if (current != null) {
+        _navigationOrigin = current;
+      } else if (FocusManager.instance.primaryFocus is! FocusScopeNode) {
+        _navigationOrigin = null;
+      }
+      if (!identical(current, _televisionEditor)) _televisionEditor = null;
+      if (_hideNextKeyboard) {
+        _hideNextKeyboard = false;
+        _hideKeyboard();
+      }
+    }
     final focus = FocusManager.instance.primaryFocus?.context;
     final editor = service.value.running && !_backgrounded
         ? focus?.findAncestorStateOfType<EditableTextState>()
@@ -108,6 +257,7 @@ class RemoteControlScopeState extends State<RemoteControlScope>
         positionMs: media.positionMs,
         durationMs: media.durationMs,
         editing: _editing != null,
+        obscured: _editor != null && _obscuredEditor(_editor!),
         editSession: _editSession,
       ),
     );
@@ -132,9 +282,12 @@ class RemoteControlScopeState extends State<RemoteControlScope>
       }
       if (command.action == 'text') {
         final text = command.text!;
-        controller.value = TextEditingValue(
-          text: text,
-          selection: TextSelection.collapsed(offset: text.length),
+        editor.userUpdateTextEditingValue(
+          TextEditingValue(
+            text: text,
+            selection: TextSelection.collapsed(offset: text.length),
+          ),
+          SelectionChangedCause.keyboard,
         );
       } else {
         editor.performAction(
@@ -164,10 +317,19 @@ class RemoteControlScopeState extends State<RemoteControlScope>
       _ => null,
     };
     if (direction != null) {
-      final moved = focus?.focusInDirection(direction) ?? false;
+      final editor = widget.television ? _televisionNavigationEditor : null;
+      final moved = editor != null
+          ? _moveFromEditor(editor, direction)
+          : focus?.focusInDirection(direction) ?? false;
       return RemoteCommandResult(moved, moved ? '' : '已到边缘');
     }
     if (command.action == 'select') {
+      final editor = widget.television ? _televisionNavigationEditor : null;
+      if (editor != null && !editor.widget.readOnly) {
+        _televisionEditor = editor;
+        editor.requestKeyboard();
+        return const RemoteCommandResult(true);
+      }
       if (context == null) return RemoteCommandResult.unavailable;
       final intent = const ActivateIntent();
       final action = Actions.maybeFind<ActivateIntent>(context);
@@ -183,6 +345,7 @@ class RemoteControlScopeState extends State<RemoteControlScope>
       return const RemoteCommandResult(true);
     }
     if (command.action == 'back') {
+      if (_closeTelevisionEditor()) return const RemoteCommandResult(true);
       final navigator = context == null ? null : Navigator.maybeOf(context);
       final popped = await navigator?.maybePop() ?? false;
       return RemoteCommandResult(popped, popped ? '' : '已在首页');
@@ -217,6 +380,8 @@ class RemoteControlScopeState extends State<RemoteControlScope>
     if (state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
+      _televisionEditor = null;
+      _hideNextKeyboard = false;
       unawaited(service.stop());
       _focusChanged();
     }
@@ -226,6 +391,7 @@ class RemoteControlScopeState extends State<RemoteControlScope>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     FocusManager.instance.removeListener(_focusChanged);
+    FocusManager.instance.removeEarlyKeyEventHandler(_televisionKey);
     PlayerMediaControls.remoteStatus.removeListener(_publish);
     _editing?.removeListener(_textChanged);
     service.removeListener(_focusChanged);

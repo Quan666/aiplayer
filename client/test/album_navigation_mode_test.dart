@@ -82,6 +82,62 @@ void main() {
     });
   }
 
+  testWidgets('TV album cells separate short OK, held OK and menu presses', (
+    tester,
+  ) async {
+    final scroll = ScrollController();
+    final snapshot = AlbumIndex(
+      const [SourceEntry(name: 'photo.jpg', path: '/photo.jpg')],
+      sourceId: 'local',
+      directory: '/',
+    ).filter(AlbumOptions());
+    var opened = 0, menus = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        builder: (_, child) =>
+            TelevisionInputScope(overrideTelevision: true, child: child!),
+        home: Scaffold(
+          body: AlbumWall(
+            snapshot: snapshot,
+            controller: scroll,
+            onOpen: (_) => opened++,
+            onMenu: (_) => menus++,
+            thumbnail: (_, _, _) => const ColoredBox(color: Colors.white),
+          ),
+        ),
+      ),
+    );
+    tester
+        .widget<InkWell>(
+          find.descendant(
+            of: find.byType(AlbumWall),
+            matching: find.byType(InkWell),
+          ),
+        )
+        .focusNode!
+        .requestFocus();
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.select);
+    expect(opened, 1);
+    expect(menus, 0);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.select);
+    await tester.pump(const Duration(milliseconds: 650));
+    expect(menus, 1);
+    expect(opened, 1);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.select);
+    expect(opened, 1);
+    await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+    await tester.pump(TelevisionInputScope.menuDoublePressInterval);
+    expect(menus, 1);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.contextMenu);
+    await tester.pump(const Duration(milliseconds: 550));
+    expect(menus, 2);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.contextMenu);
+    expect(opened, 1);
+    await tester.pumpWidget(const SizedBox());
+    scroll.dispose();
+  });
+
   for (final mode in ['files', 'album', 'album-menu']) {
     final startAlbum = mode != 'files';
     testWidgets(

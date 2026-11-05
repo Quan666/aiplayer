@@ -9,6 +9,7 @@ import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/sources_page.dart';
 import 'package:aiplayer/ui/text_file_page.dart';
+import 'package:aiplayer/ui/television_input.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -36,7 +37,15 @@ Future<File> _file(
 SourceEntry _entry(File file, String name) =>
     SourceEntry(name: name, path: file.path);
 
-Widget _page(Directory root, File file, String name) => MaterialApp(
+Widget _page(
+  Directory root,
+  File file,
+  String name, {
+  bool television = false,
+}) => MaterialApp(
+  builder: (context, child) => television
+      ? TelevisionInputScope(overrideTelevision: true, child: child!)
+      : child!,
   theme: GlassPalette.theme(),
   home: TextFilePage(
     source: const {'id': 'local', 'kind': 'local'},
@@ -115,6 +124,60 @@ void main() {
   tearDown(() async {
     overrideSystemProxyPlatformForTesting(Platform.operatingSystem);
     await root.delete(recursive: true);
+  });
+
+  testWidgets('TV reads long wide text and returns to toolbar with arrows', (
+    tester,
+  ) async {
+    final file = await _file(
+      tester,
+      root,
+      'remote.txt',
+      List.generate(1000, (row) => '$row ${'wide content ' * 40}').join('\n'),
+    );
+    try {
+      await tester.pumpWidget(
+        _page(root, file, 'remote.txt', television: true),
+      );
+      await _until(
+        tester,
+        () => find.byKey(const ValueKey('text-line:0')).evaluate().isNotEmpty,
+      );
+      await tester.pump();
+      expect(
+        FocusManager.instance.primaryFocus?.debugLabel,
+        'television-scroll-region',
+      );
+      final vertical = _linesController(tester);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump();
+      expect(vertical.offset, greaterThan(0));
+      final horizontal = tester
+          .widget<SingleChildScrollView>(find.byType(SingleChildScrollView))
+          .controller!;
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump();
+      expect(horizontal.offset, greaterThan(0));
+      _pause(tester);
+      final before = vertical.offset;
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      expect(vertical.offset, before);
+      _resume(tester);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pump();
+      expect(vertical.offset, 0);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pump();
+      expect(
+        FocusManager.instance.primaryFocus?.debugLabel,
+        isNot('television-scroll-region'),
+      );
+      expect(tester.takeException(), isNull);
+    } finally {
+      _resume(tester);
+      await tester.pumpWidget(const SizedBox());
+    }
   });
 
   for (final fixture in [

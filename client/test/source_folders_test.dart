@@ -173,6 +173,21 @@ void main() {
         await tester.tap(find.text('手动搜索影视资料'));
         await tester.pumpAndSettle();
         expect(find.text('匹配影视资料'), findsOneWidget);
+        // Snapshot preparation runs on a real worker. A settled animation does
+        // not mean the recognition action is enabled yet.
+        final recognize = find.widgetWithText(OutlinedButton, 'AI 自动识别');
+        for (
+          var attempt = 0;
+          attempt < 250 &&
+              tester.widget<OutlinedButton>(recognize).onPressed == null;
+          attempt++
+        ) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(tester.widget<OutlinedButton>(recognize).onPressed, isNotNull);
         await tester.tap(find.text('AI 自动识别'));
         await tester.pumpAndSettle();
         // Folder preparation may still be running outside the widget test's
@@ -188,7 +203,7 @@ void main() {
           await tester.pump();
         }
         expect(find.text('匹配影视资料'), findsOneWidget);
-        expect(find.text('请先在设置 → AI 翻译中配置模型。'), findsOneWidget);
+        expect(find.text('请先填写 AI 服务 API Key。'), findsOneWidget);
         expect(tester.takeException(), isNull);
       } finally {
         await tester.pumpWidget(const SizedBox());

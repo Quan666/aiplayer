@@ -9,7 +9,9 @@ import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/ui/album_page.dart';
 import 'package:aiplayer/ui/album_wall.dart';
+import 'package:aiplayer/ui/television_input.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as images;
 
@@ -28,6 +30,161 @@ Future<void> flushPages(WidgetTester tester) async {
 }
 
 void main() {
+  testWidgets(
+    'TV album return and reopen preserve focus and viewport; menu returns to the same cell',
+    (tester) async {
+      final root = (await tester.runAsync(() async {
+        final root = await Directory.systemTemp.createTemp('album-tv-return-');
+        for (var i = 0; i < 40; i++) {
+          await Directory('${root.path}/album${i.toString().padLeft(2, '0')}')
+              .create();
+          await Directory(
+            '${root.path}/album08/child${i.toString().padLeft(2, '0')}',
+          ).create(recursive: true);
+        }
+        return root;
+      }))!;
+      final store = AppStore(':memory:');
+      final model = AppModel(store, root, backgroundWork: false);
+      AlbumWall wall() => tester.widget<AlbumWall>(find.byType(AlbumWall));
+      AlbumWallState state() =>
+          tester.state<AlbumWallState>(find.byType(AlbumWall));
+      FocusNode focus(String id) => tester
+          .widget<InkWell>(
+            find.descendant(
+              of: find.byKey(ValueKey(id)),
+              matching: find.byType(InkWell),
+            ),
+          )
+          .focusNode!;
+      Future<void> loaded(String firstName) => until(
+        tester,
+        () =>
+            find.byType(AlbumWall).evaluate().isNotEmpty &&
+            wall().snapshot.items.length == 40 &&
+            wall().snapshot.items.first.name == firstName &&
+            tester
+                    .widget<IconButton>(
+                      find.widgetWithIcon(IconButton, Icons.sort),
+                    )
+                    .onPressed !=
+                null &&
+            find.byType(LinearProgressIndicator).evaluate().isEmpty,
+      );
+      Future<void> menu() async {
+        await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+        await tester.pump(TelevisionInputScope.menuDoublePressInterval);
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+
+      try {
+        await tester.pumpWidget(
+          MaterialApp(
+            builder: (_, child) =>
+                TelevisionInputScope(overrideTelevision: true, child: child!),
+            home: AlbumPage(
+              model: model,
+              source: const {'id': 'local', 'kind': 'local'},
+              initialPath: root.path,
+              initialEntries: [
+                for (var i = 0; i < 40; i++)
+                  SourceEntry(
+                    name: 'album${i.toString().padLeft(2, '0')}',
+                    path: '${root.path}/album${i.toString().padLeft(2, '0')}',
+                    directory: true,
+                  ),
+              ],
+            ),
+          ),
+        );
+        await loaded('album00');
+        wall().controller.jumpTo(327.25);
+        await tester.pump();
+        final parentId = wall().snapshot.items[8].id;
+        focus(parentId).requestFocus();
+        await tester.pump();
+        final parentOffset = wall().controller.offset;
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await loaded('child00');
+        await tester.pump();
+        await until(
+          tester,
+          () => focus(wall().snapshot.items.first.id).hasFocus,
+        );
+        wall().controller.jumpTo(450.25);
+        await tester.pump();
+        final childId = wall().snapshot.items[9].id;
+        focus(childId).requestFocus();
+        await tester.pump();
+        final childOffset = wall().controller.offset;
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(
+          tester.getRect(find.byType(AppBar)).bottom,
+          lessThanOrEqualTo(0),
+        );
+        await menu();
+        expect(tester.getRect(find.byType(AppBar)).top, closeTo(0, .01));
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        expect(focus(childId).hasFocus, isTrue);
+        expect(wall().controller.offset, closeTo(childOffset, .01));
+
+        await menu();
+        await tester.tap(find.byType(BackButton));
+        await loaded('album00');
+        await tester.pump();
+        expect(state().focusedId, parentId);
+        expect(focus(parentId).hasFocus, isTrue);
+        expect(wall().controller.offset, closeTo(parentOffset, .01));
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await loaded('child00');
+        await tester.pump();
+        expect(state().focusedId, childId);
+        expect(focus(childId).hasFocus, isTrue);
+        expect(wall().controller.offset, closeTo(childOffset, .01));
+        await tester.pump(const Duration(seconds: 10));
+        expect(wall().controller.offset, closeTo(childOffset, .01));
+        expect(focus(childId).hasFocus, isTrue);
+        await tester.pumpWidget(const SizedBox());
+        await flushPages(tester);
+        await tester.pumpWidget(
+          MaterialApp(
+            builder: (_, child) =>
+                TelevisionInputScope(overrideTelevision: true, child: child!),
+            home: AlbumPage(
+              model: model,
+              source: const {'id': 'local', 'kind': 'local'},
+              initialPath: '${root.path}/album08',
+            ),
+          ),
+        );
+        await loaded('child00');
+        await tester.pump();
+        expect(focus(childId).hasFocus, isTrue);
+        expect(wall().controller.offset, closeTo(childOffset, .01));
+        wall().controller.jumpTo(0);
+        await tester.pump();
+        final firstRowId = wall().snapshot.items[2].id;
+        focus(firstRowId).requestFocus();
+        await tester.pump();
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        expect(focus(firstRowId).hasFocus, isTrue);
+        expect(wall().controller.offset, 0);
+        expect(tester.takeException(), isNull);
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        await flushPages(tester);
+        model.dispose();
+        store.dispose();
+        await tester.runAsync(() => root.delete(recursive: true));
+      }
+    },
+  );
+
   for (final preset in ['default', 'legacy', 'explicit', 'custom']) {
     testWidgets('album name default and saved sort migration: $preset', (
       tester,
@@ -358,9 +515,15 @@ void main() {
         final scroll = wall().controller;
         scroll.jumpTo(327.25);
         await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(
+          tester.getRect(find.byType(AppBar)).bottom,
+          lessThanOrEqualTo(0),
+        );
         // Navigation uses the same callback as a wall tap, after a free scroll.
         wall().onOpen(snapshot.items.firstWhere((item) => item.isDirectory));
         await until(tester, () => find.text('没有符合条件的项目').evaluate().isNotEmpty);
+        await tester.pump(const Duration(milliseconds: 200));
         await tester.tap(find.byType(BackButton));
         await tester.pump();
         expect(wall().snapshot, same(snapshot));

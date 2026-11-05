@@ -12,6 +12,7 @@ import 'package:aiplayer/ui/album_viewer.dart';
 import 'package:aiplayer/ui/artwork_decode_queue.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/remote_control.dart';
+import 'package:aiplayer/ui/television_input.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -90,7 +91,9 @@ void main() {
         return;
       }
     }
-    fail('Viewer image did not finish loading');
+    fail(
+      'Viewer image did not finish loading: loading=${find.byKey(const ValueKey("album-image-loading")).evaluate().length}, frames=${tester.binding.hasScheduledFrame}, tickers=${tester.binding.transientCallbackCount}, services=${tester.widgetList<AlbumThumbnail>(find.byType(AlbumThumbnail)).map((thumbnail) => thumbnail.service.pendingCount).toList()}, decode=${ArtworkDecodeQueue.instance.activeCount}/${ArtworkDecodeQueue.instance.pendingCount}',
+    );
   }
 
   Future<void> mount(
@@ -99,11 +102,13 @@ void main() {
     AlbumImageResult? initialPreview,
     bool motionEnabled = true,
     bool disableAnimations = false,
+    bool television = false,
   }) async {
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pumpWidget(
       MaterialApp(
-        builder: (_, child) => RemoteControlScope(child: child!),
+        builder: (_, child) =>
+            TelevisionInputScope(overrideTelevision: television, child: child!),
         home: Builder(
           builder: (context) => Scaffold(
             body: TextButton(
@@ -162,6 +167,272 @@ void main() {
   TransformationController transform(WidgetTester tester) => tester
       .widget<InteractiveViewer>(find.byType(InteractiveViewer))
       .transformationController!;
+
+  testWidgets(
+    'TV OK toggles photo canvas once per press and Menu reaches zoomed toolbar',
+    (tester) async {
+      await mount(tester, television: true);
+      final viewerFocus = tester
+          .widgetList<Focus>(find.byType(Focus))
+          .singleWhere((focus) => focus.focusNode?.debugLabel == 'album-viewer')
+          .focusNode!;
+      Color? canvasColor() =>
+          tester.widget<Scaffold>(find.byType(Scaffold).last).backgroundColor;
+      expect(canvasColor(), Colors.white);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.select);
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.select);
+      await tester.pump();
+      expect(canvasColor(), Colors.white);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.select);
+      await tester.pump();
+      expect(canvasColor(), Colors.black);
+      expect(viewerFocus.hasPrimaryFocus, isTrue);
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeUp);
+      await tester.pump();
+      final zoom = transform(tester).value.clone();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+      expect(canvasColor(), Colors.white);
+      expect(transform(tester).value, zoom);
+      expect(find.byKey(const ValueKey('album-viewer-toolbar')), findsNothing);
+      await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+      await tester.pump(TelevisionInputScope.menuDoublePressInterval);
+      await tester.pump();
+      final infoFocus = tester
+          .widget<IconButton>(
+            find.byWidgetPredicate(
+              (widget) => widget is IconButton && widget.tooltip == '照片信息',
+            ),
+          )
+          .focusNode!;
+      expect(infoFocus.hasPrimaryFocus, isTrue);
+      expect(transform(tester).value, zoom);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump();
+      expect(viewerFocus.hasPrimaryFocus, isTrue);
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+      await tester.pump(const Duration(milliseconds: 200));
+      await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+      await tester.pump();
+      expect(infoFocus.hasPrimaryFocus, isTrue);
+      expect(find.byType(AlbumViewer), findsOneWidget);
+      await unmount(tester);
+    },
+  );
+
+  testWidgets(
+    'viewer keeps system navigation hidden with toolbar and restores without a frame',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final calls = <MethodCall>[];
+      final orientationReply = Completer<void>();
+      var delayOrientation = false;
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (call) async {
+          calls.add(call);
+          if (delayOrientation &&
+              call.method == 'SystemChrome.setPreferredOrientations') {
+            await orientationReply.future;
+          }
+          return null;
+        },
+      );
+      await mount(tester, television: true);
+      expect(
+        find.byKey(const ValueKey('album-viewer-toolbar')),
+        findsOneWidget,
+      );
+      expect(
+        calls
+            .lastWhere(
+              (call) => call.method == 'SystemChrome.setEnabledSystemUIMode',
+            )
+            .arguments,
+        'SystemUiMode.immersiveSticky',
+      );
+      calls.clear();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pump();
+      expect(
+        calls.where(
+          (call) => call.method == 'SystemChrome.setEnabledSystemUIOverlays',
+        ),
+        isEmpty,
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeUp);
+      await tester.pump();
+      expect(find.byKey(const ValueKey('album-viewer-toolbar')), findsNothing);
+      delayOrientation = true;
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      // Pause also reveals chrome, superseding the pending orientation request.
+      // Its delayed reply must still restore system bars without another frame.
+      delayOrientation = false;
+      orientationReply.complete();
+      await tester.idle();
+      expect(
+        calls.any(
+          (call) =>
+              call.method == 'SystemChrome.setEnabledSystemUIOverlays' &&
+              (call.arguments as List).contains('SystemUiOverlay.bottom'),
+        ),
+        isTrue,
+      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.idle();
+      expect(
+        calls
+            .lastWhere(
+              (call) => call.method == 'SystemChrome.setEnabledSystemUIMode',
+            )
+            .arguments,
+        'SystemUiMode.immersiveSticky',
+      );
+      await unmount(tester);
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
+
+  testWidgets(
+    'TV photos navigate toolbar, zoom with volume and pan with arrows',
+    (tester) async {
+      await mount(tester, television: true);
+      final viewerFocus = tester
+          .widgetList<Focus>(find.byType(Focus))
+          .singleWhere((focus) => focus.focusNode?.debugLabel == 'album-viewer')
+          .focusNode!;
+      final infoFocus = tester
+          .widget<IconButton>(
+            find.byWidgetPredicate(
+              (widget) => widget is IconButton && widget.tooltip == '照片信息',
+            ),
+          )
+          .focusNode!;
+      expect(viewerFocus.hasPrimaryFocus, isTrue);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pump();
+      expect(infoFocus.hasPrimaryFocus, isTrue);
+      expect(transform(tester).value.getMaxScaleOnAxis(), 1);
+      final iconTheme = IconButtonTheme.of(
+        tester.element(find.byTooltip('照片信息')),
+      );
+      expect(iconTheme.style!.side!.resolve({WidgetState.focused})!.width, 2);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump();
+      expect(viewerFocus.hasPrimaryFocus, isTrue);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeUp);
+      await tester.pump();
+      expect(transform(tester).value.getMaxScaleOnAxis(), closeTo(1.25, .001));
+      expect(viewerFocus.hasPrimaryFocus, isTrue);
+      expect(find.byKey(const ValueKey('album-viewer-toolbar')), findsNothing);
+      final matrix = transform(tester).value.clone();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pump();
+      expect(transform(tester).value.getMaxScaleOnAxis(), closeTo(1.25, .001));
+      expect(transform(tester).value.storage[13], lessThan(matrix.storage[13]));
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump();
+      expect(transform(tester).value.storage[12], lessThan(matrix.storage[12]));
+      await tester.binding.handlePopRoute();
+      await tester.pump();
+      expect(find.byType(AlbumViewer), findsOneWidget);
+      expect(transform(tester).value.getMaxScaleOnAxis(), 1);
+      expect(
+        find.byKey(const ValueKey('album-viewer-toolbar')),
+        findsOneWidget,
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeUp);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeDown);
+      await tester.pump();
+      expect(transform(tester).value.getMaxScaleOnAxis(), 1);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await settle(tester);
+      expect(find.text('001.png'), findsOneWidget);
+      await tester.binding.handlePopRoute();
+      await settle(tester);
+      expect(find.byType(AlbumViewer), findsNothing);
+      await unmount(tester);
+    },
+  );
+
+  testWidgets('TV slideshow toolbar stays visible while remotely focused', (
+    tester,
+  ) async {
+    await tester.runAsync(
+      () => model.updatePreferences({
+        'controlsHideSeconds': 1,
+        'albumSlideshowSeconds': 60,
+      }),
+    );
+    await mount(tester, television: true);
+    final target = tester.widget<RemoteControlTarget>(
+      find.byType(RemoteControlTarget).last,
+    );
+    await target.onCommand(
+      RemoteCommand(1, 'play', null, null, null, () => true),
+    );
+    await tester.pump();
+    expect(find.byKey(const ValueKey('album-viewer-toolbar')), findsNothing);
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+    await tester.pump();
+    await tester.pump();
+    final focus = tester
+        .widget<IconButton>(
+          find.byWidgetPredicate(
+            (widget) => widget is IconButton && widget.tooltip == '照片信息',
+          ),
+        )
+        .focusNode!;
+    expect(focus.hasPrimaryFocus, isTrue);
+    await tester.pump(const Duration(seconds: 3));
+    expect(find.byKey(const ValueKey('album-viewer-toolbar')), findsOneWidget);
+    expect(focus.hasPrimaryFocus, isTrue);
+    await unmount(tester);
+  });
+
+  for (final television in [false, true]) {
+    testWidgets(
+      'photo toolbar auto-hides and reveals with television=$television',
+      (tester) async {
+        await tester.runAsync(
+          () => model.updatePreferences({'controlsHideSeconds': 1}),
+        );
+        await mount(tester, television: television);
+        final toolbar = find.byKey(const ValueKey('album-viewer-toolbar'));
+        expect(toolbar, findsOneWidget);
+        await tester.pump(const Duration(seconds: 2));
+        expect(toolbar, findsNothing);
+        if (television) {
+          await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+          await tester.pump(TelevisionInputScope.menuDoublePressInterval);
+          await tester.pump();
+        } else {
+          await tester.drag(
+            find.byKey(const ValueKey('album-photo-canvas')),
+            const Offset(0, 180),
+          );
+          await tester.pump();
+        }
+        expect(toolbar, findsOneWidget);
+        await tester.pump(const Duration(seconds: 2));
+        expect(toolbar, television ? findsOneWidget : findsNothing);
+        if (television) {
+          await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+          await tester.pump();
+          await tester.pump(const Duration(seconds: 2));
+          expect(toolbar, findsNothing);
+        }
+        await unmount(tester);
+      },
+    );
+  }
 
   testWidgets(
     'painted photo stays centered across aspect, zoom, rotation and resize',
@@ -1259,9 +1530,15 @@ void main() {
       await tester.tap(find.text('无').last);
       await tester.pumpAndSettle();
       expect(model.preferences.albumSlideshowTransition, 'none');
+      final resumedAt = tester.binding.clock.now();
       await tester.tap(find.byTooltip('关闭幻灯片设置'));
       await settle(tester);
-      await tester.pump(const Duration(seconds: 9));
+      // Worker I/O in settle may advance the fake clock. Assert the interval
+      // from the close event, rather than adding that I/O time to nine seconds.
+      await tester.pump(
+        const Duration(seconds: 9) -
+            tester.binding.clock.now().difference(resumedAt),
+      );
       expect(
         tester.widget<AlbumThumbnail>(find.byType(AlbumThumbnail)).entry.name,
         '000.png',
@@ -1306,7 +1583,11 @@ void main() {
         findsOneWidget,
       );
       await tester.pump(const Duration(seconds: 11));
-      expect(find.text('001.png'), findsOneWidget);
+      expect(
+        tester.widget<AlbumThumbnail>(find.byType(AlbumThumbnail)).entry.name,
+        '001.png',
+      );
+      expect(find.byKey(const ValueKey('album-viewer-toolbar')), findsNothing);
       await unmount(tester);
     },
   );
@@ -1334,9 +1615,13 @@ void main() {
       await tester.tap(find.text('10 秒').last);
       await tester.pumpAndSettle();
       expect(model.preferences.albumSlideshowSeconds, 5);
+      final resumedAt = tester.binding.clock.now();
       await tester.tap(find.byTooltip('关闭幻灯片设置'));
       await settle(tester);
-      await tester.pump(const Duration(seconds: 4));
+      await tester.pump(
+        const Duration(seconds: 4) -
+            tester.binding.clock.now().difference(resumedAt),
+      );
       delayed.save.complete();
       await tester.pump();
       await tester.idle();
@@ -1381,7 +1666,10 @@ void main() {
     await settle(tester);
     expect(find.byTooltip('幻灯片'), findsNothing);
     await tester.pump(const Duration(seconds: 7));
-    expect(find.text('000.png'), findsOneWidget);
+    expect(
+      tester.widget<AlbumThumbnail>(find.byType(AlbumThumbnail)).entry.name,
+      '000.png',
+    );
     await unmount(tester);
   });
 
@@ -1477,11 +1765,11 @@ void main() {
       );
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pump(const Duration(seconds: 4));
-      expect(find.text('000.png'), findsOneWidget);
       expect(
-        find.byKey(const ValueKey('album-viewer-toolbar')),
-        findsOneWidget,
+        tester.widget<AlbumThumbnail>(find.byType(AlbumThumbnail)).entry.name,
+        '000.png',
       );
+      expect(find.byKey(const ValueKey('album-viewer-toolbar')), findsNothing);
       await unmount(tester);
     },
   );
@@ -1567,6 +1855,9 @@ void main() {
               (call.arguments as List).contains('SystemUiOverlay.top'),
         ),
         isTrue,
+        reason: calls
+            .map((call) => '${call.method}: ${call.arguments}')
+            .join('\n'),
       );
       await tester.pump(const Duration(seconds: 6));
       expect(

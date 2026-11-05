@@ -27,8 +27,10 @@ import 'artwork_lifecycle.dart';
 import 'artwork_scroll_scope.dart';
 import 'player_page.dart';
 import 'music_page.dart';
+import 'navigation_reveal.dart';
 import 'remote_control.dart';
 import 'glass.dart';
+import 'television_input.dart';
 import 'offline_download_controls.dart';
 import 'text_file_page.dart';
 
@@ -88,6 +90,10 @@ class _AlbumPageState extends State<AlbumPage> {
   final _worker = AlbumCatalogWorker();
   final _scroll = AlbumScrollController();
   final _wall = GlobalKey<AlbumWallState>();
+  final _headerFocus = FocusNode(debugLabel: 'album toolbar');
+  final _headerHidden = ValueNotifier(false);
+  double _headerScrollTravel = 0;
+  final _focusedItems = <String, String>{};
   final _stack = <({String path, String name, int anchor, double? offset})>[];
   final _listings = <String, List<SourceEntry>>{};
   final _settings = <String, Map<String, dynamic>>{};
@@ -219,6 +225,7 @@ class _AlbumPageState extends State<AlbumPage> {
       _videoCovers.clear();
       _videoCoverRevision = _videoContentRevision();
       _viewportAnchors.clear();
+      _focusedItems.clear();
       _orderingRevisions.clear();
       _restoredViewport = null;
       _views.clear();
@@ -358,6 +365,7 @@ class _AlbumPageState extends State<AlbumPage> {
     }
     refresh = _pendingRefresh;
     _pendingRefresh = false;
+    _revealHeader();
     if (refresh) _resetOrdering();
     final restoreIdentity =
         _stack.last.offset == null &&
@@ -365,6 +373,7 @@ class _AlbumPageState extends State<AlbumPage> {
         !_views.containsKey(_path);
     _restoredViewport = null;
     final ticket = ++_generation;
+    _filterPending = false;
     _indexing = false;
     _metadataHandle?.cancel();
     _metadata = refresh ? {} : _views[_path]?.metadata ?? {};
@@ -403,6 +412,9 @@ class _AlbumPageState extends State<AlbumPage> {
       cancel.check();
       _settings[_path] = settings;
       final viewport = settings['viewport'];
+      if (viewport is Map && viewport['focusedId'] is String) {
+        _focusedItems.putIfAbsent(_path, () => viewport['focusedId'] as String);
+      }
       if (restoreIdentity && viewport is Map) {
         final id = viewport['id'], relative = viewport['relativeOffset'];
         if (id is String &&
@@ -489,29 +501,50 @@ class _AlbumPageState extends State<AlbumPage> {
         _listings.remove(oldest);
         _settings.remove(oldest);
         _viewportAnchors.remove(oldest);
+        _focusedItems.remove(oldest);
         _orderingRevisions.remove(oldest);
         _views.remove(oldest);
       }
       _listings[_path] = entries;
       _entries = entries;
-      await _filter();
+      // Navigation ends the previous directory's scroll, but artwork keeps a
+      // short idle grace period. Publish the destination before restoring its
+      // viewport and focus instead of deferring it past that restoration.
+      await _filter(initialLoad: true);
       cancel.check();
       if (!mounted || ticket != _generation) return;
       final restored = _restoredViewport;
       final restoredIndex = restored?.path == _path
           ? _snapshot.indexById[restored?.id]
           : null;
+      final initialFocusIndex = restoredIndex ?? _stack.last.anchor;
+      final focusedId =
+          _focusedItems[_path] ??
+          (TelevisionMode.read(context) && _snapshot.items.isNotEmpty
+              ? _snapshot
+                    .items[initialFocusIndex.clamp(
+                      0,
+                      _snapshot.items.length - 1,
+                    )]
+                    .id
+              : null);
       if (restoredIndex != null) {
         _wall.currentState?.restoreIndex(
           restoredIndex,
           relativeOffset: restored!.relativeOffset,
+          focusedId: focusedId,
         );
       } else if (_stack.last.offset case final double offset) {
-        _restoredViewport = null;
-        _wall.currentState?.restoreViewport(offset);
+        _wall.currentState?.restoreViewport(offset, focusedId: focusedId);
       } else {
-        _wall.currentState?.restoreIndex(_stack.last.anchor);
+        _wall.currentState?.restoreIndex(
+          _stack.last.anchor,
+          focusedId: focusedId,
+        );
       }
+      // The saved identity only owns the initial layout. Later metadata
+      // publications must preserve the live viewport, including remote moves.
+      _restoredViewport = null;
       _save();
     } on Cancelled {
       if (mounted && ticket == _generation) _pendingLoad = true;
@@ -537,8 +570,11 @@ class _AlbumPageState extends State<AlbumPage> {
     }
   }
 
-  Future<void> _filter({bool retainAnchor = false}) async {
-    if (!_active || _scrolling) {
+  Future<void> _filter({
+    bool retainAnchor = false,
+    bool initialLoad = false,
+  }) async {
+    if (!_active || (_scrolling && !initialLoad)) {
       _filterPending = true;
       return;
     }
@@ -569,7 +605,7 @@ class _AlbumPageState extends State<AlbumPage> {
           directory != _path) {
         return;
       }
-      if (!_active || _scrolling) {
+      if (!_active || (_scrolling && !initialLoad)) {
         _filterPending = true;
         return;
       }
@@ -778,6 +814,7 @@ class _AlbumPageState extends State<AlbumPage> {
       if (_stack.last.offset != null)
         'viewport': {
           'offset': _stack.last.offset,
+          if (_focusedItems[_path] case final String id) 'focusedId': id,
           if (anchor != null) ...{
             'id': anchor.id,
             'relativeOffset': anchor.relativeOffset,
@@ -824,6 +861,10 @@ class _AlbumPageState extends State<AlbumPage> {
 
   void _rememberAnchor() {
     final wall = _wall.currentState;
+    final focusedId = wall?.focusedId;
+    if (focusedId != null && _snapshot.indexById.containsKey(focusedId)) {
+      _focusedItems[_path] = focusedId;
+    }
     final restored = _restoredViewport?.path == _path
         ? _restoredViewport
         : null;
@@ -857,9 +898,11 @@ class _AlbumPageState extends State<AlbumPage> {
     }
     final previous = _stack.last.offset;
     final previousAnchor = _viewportAnchors[_path];
+    final previousFocus = _focusedItems[_path];
     _rememberAnchor();
     if (previous != _stack.last.offset ||
-        previousAnchor != _viewportAnchors[_path]) {
+        previousAnchor != _viewportAnchors[_path] ||
+        previousFocus != _focusedItems[_path]) {
       unawaited(_save());
     }
   }
@@ -1237,6 +1280,49 @@ class _AlbumPageState extends State<AlbumPage> {
     await _save();
   }
 
+  void _revealHeader() {
+    _headerScrollTravel = 0;
+    _headerHidden.value = false;
+  }
+
+  void _focusHeader() {
+    final wallContext = _wall.currentContext;
+    if (wallContext != null && TelevisionMode.read(context)) {
+      TelevisionHeaderNavigation.focusHeader(wallContext);
+      return;
+    }
+    _revealHeader();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_active) return;
+      final targets = _headerFocus.traversalDescendants;
+      if (targets.isNotEmpty) targets.first.requestFocus();
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  bool _onScroll(ScrollNotification notification) {
+    if (!_active ||
+        _busy ||
+        !widget.model.preferences.hideNavigationOnScroll ||
+        _scroll.restoring ||
+        notification.depth != 0 ||
+        notification.metrics.axis != Axis.vertical ||
+        notification is! ScrollUpdateNotification) {
+      return false;
+    }
+    final delta = notification.scrollDelta ?? 0;
+    if (_headerScrollTravel.sign != delta.sign) _headerScrollTravel = 0;
+    _headerScrollTravel += delta;
+    if (_headerScrollTravel > 24 &&
+        notification.metrics.pixels > 24 &&
+        !_headerFocus.hasFocus) {
+      _headerHidden.value = true;
+    } else if (_headerScrollTravel < -12 || notification.metrics.pixels <= 0) {
+      _headerHidden.value = false;
+    }
+    return false;
+  }
+
   @override
   void dispose() {
     _rememberViewport();
@@ -1252,6 +1338,8 @@ class _AlbumPageState extends State<AlbumPage> {
     AlbumPage._finishWrites(_worker);
     _metadataRefresh?.cancel();
     _scroll.dispose();
+    _headerFocus.dispose();
+    _headerHidden.dispose();
     super.dispose();
   }
 
@@ -1269,292 +1357,343 @@ class _AlbumPageState extends State<AlbumPage> {
       child: GlassMenuTheme(
         child: PopScope(
           canPop:
-              _stack.length <= 1 && !_choosingCover && widget.onExit == null,
+              !widget.active ||
+              (_stack.length <= 1 && !_choosingCover && widget.onExit == null),
           onPopInvokedWithResult: (didPop, _) {
-            if (!didPop) _back();
+            if (!didPop &&
+                widget.active &&
+                !TelevisionMenuRegion.navigationOwnsBack(context)) {
+              _back();
+            }
           },
-          child: Scaffold(
-            backgroundColor: Colors.white,
-            extendBodyBehindAppBar: true,
-            appBar: AppBar(
-              toolbarHeight: 48,
-              backgroundColor: Colors.white.withValues(alpha: .82),
-              surfaceTintColor: Colors.transparent,
-              elevation: 0,
-              actionsPadding: EdgeInsets.zero,
-              leading: BackButton(onPressed: _back),
-              title: Text(
-                _choosingCover
-                    ? '选择相册封面'
-                    : _stack.last.name.isEmpty
-                    ? '相册'
-                    : _stack.last.name,
-              ),
-              actions: [
-                if (widget.onFileView != null)
-                  IconButton(
-                    constraints: const BoxConstraints.tightFor(
-                      width: 36,
-                      height: 40,
-                    ),
-                    padding: EdgeInsets.zero,
-                    tooltip: '文件视图',
-                    onPressed: _busy ? null : _switchToFiles,
-                    icon: const Icon(Icons.view_list_outlined),
-                  ),
-                IconButton(
-                  constraints: const BoxConstraints.tightFor(
-                    width: 36,
-                    height: 40,
-                  ),
-                  padding: EdgeInsets.zero,
-                  tooltip: '排序',
-                  onPressed: _busy ? null : _filters,
-                  icon: const Icon(Icons.sort),
-                ),
-                PopupMenuButton<String>(
-                  padding: EdgeInsets.zero,
-                  tooltip: '相册选项',
-                  child: const SizedBox(
-                    width: 36,
-                    height: 40,
-                    child: Icon(Icons.more_vert),
-                  ),
-                  onSelected: (value) async {
-                    if (!mounted || generation != _generation) return;
-                    if (value == 'remote') {
-                      await showRemoteControlDialog(context);
-                    }
-                    if (value == 'refresh') {
-                      unawaited(_load(refresh: true));
-                    }
-                    if (value == 'choose-cover') {
-                      setState(() => _choosingCover = true);
-                    }
-                    if (value == 'files') {
-                      await _switchToFiles();
-                    }
-                    if (value == 'cover') {
-                      await _setCover();
-                    }
-                    if (value == 'hide-cover') {
-                      await _setCover(hidden: true);
-                    }
-                  },
-                  itemBuilder: (_) => [
-                    const PopupMenuItem(
-                      height: GlassMetrics.menuItemHeight,
-                      padding: GlassMetrics.menuItemPadding,
-                      value: 'remote',
-                      child: Text('手机控制'),
-                    ),
-                    const PopupMenuItem(
-                      height: GlassMetrics.menuItemHeight,
-                      padding: GlassMetrics.menuItemPadding,
-                      value: 'refresh',
-                      child: Text('刷新'),
-                    ),
-                    PopupMenuItem(
-                      height: GlassMetrics.menuItemHeight,
-                      padding: GlassMetrics.menuItemPadding,
-                      value: 'choose-cover',
-                      enabled: !_busy,
-                      child: const Text('选择相册封面'),
-                    ),
-                    if (!_hideCover)
-                      PopupMenuItem(
-                        height: GlassMetrics.menuItemHeight,
-                        padding: GlassMetrics.menuItemPadding,
-                        value: 'hide-cover',
-                        enabled: !_busy,
-                        child: const Text('不显示相册封面'),
-                      ),
-                    if (_cover != null || _hideCover)
-                      PopupMenuItem(
-                        height: GlassMetrics.menuItemHeight,
-                        padding: GlassMetrics.menuItemPadding,
-                        value: 'cover',
-                        enabled: !_busy,
-                        child: const Text('恢复自动封面'),
-                      ),
-                    if (widget.onFileView != null)
-                      const PopupMenuItem(
-                        height: GlassMetrics.menuItemHeight,
-                        padding: GlassMetrics.menuItemPadding,
-                        value: 'files',
-                        child: Text('文件视图'),
-                      ),
-                  ],
-                ),
-              ],
-            ),
-            body: Stack(
-              children: [
-                Positioned.fill(
-                  child: ArtworkScrollScope(
-                    onActivityChanged: (value) {
-                      _scrolling = value;
-                      images?.setScrolling(_scrolling);
-                      if (_scrolling) {
-                        _restoredViewport = null;
-                        _metadataRefresh?.cancel();
-                        _metadataHandle?.cancel();
-                      } else {
-                        _rememberViewport();
-                        if (_filterPending) {
-                          _filterPending = false;
-                          _metadataDirty = false;
-                          unawaited(_filter(retainAnchor: true));
-                        }
-                        _scheduleMetadataRefresh();
-                        if (_indexing) {
-                          if (_indexRunning) {
-                            _resumeIndex = true;
-                          } else {
-                            unawaited(_indexMetadata());
-                          }
-                        }
-                      }
-                    },
-                    child: TickerMode(
-                      enabled: _active,
-                      child: AlbumWall(
-                        key: _wall,
-                        snapshot: _snapshot,
-                        controller: _scroll,
-                        active: _active,
-                        padding: EdgeInsets.only(
-                          top: MediaQuery.paddingOf(context).top + 48,
-                          bottom: MediaQuery.paddingOf(context).bottom,
+          child: TelevisionHeaderNavigation(
+            headerFocusNode: _headerFocus,
+            onHeaderRequested: _revealHeader,
+            child: NavigationRevealRegion(
+              onReveal: _revealHeader,
+              child: NotificationListener<ScrollNotification>(
+                onNotification: _onScroll,
+                child: Scaffold(
+                  backgroundColor: Colors.white,
+                  extendBodyBehindAppBar: true,
+                  appBar: PreferredSize(
+                    preferredSize: const Size.fromHeight(48),
+                    child: ValueListenableBuilder<bool>(
+                      valueListenable: _headerHidden,
+                      builder: (context, hidden, child) => ExcludeFocus(
+                        excluding: hidden,
+                        child: IgnorePointer(
+                          ignoring: hidden,
+                          child: FractionalTranslation(
+                            translation: hidden
+                                ? const Offset(0, -1)
+                                : Offset.zero,
+                            child: child,
+                          ),
                         ),
-                        onOpen: (item) => unawaited(_open(item)),
-                        onMenu: (item) => unawaited(_itemMenu(item)),
-                        thumbnail: (context, item, edge) {
-                          if (item.isVideo) {
-                            final entry = item.preferred;
-                            return AlbumVideoThumbnail(
-                              model: widget.model,
-                              sourceId: _sourceId,
-                              entry: item.preferred,
-                              edge: edge,
-                              active: _active,
-                              initialThumbnail: _preparedVideoCover(entry),
-                              onThumbnailChanged: (path) {
+                      ),
+                      child: Focus(
+                        focusNode: _headerFocus,
+                        skipTraversal: true,
+                        canRequestFocus: false,
+                        onFocusChange: (focused) {
+                          if (focused) _revealHeader();
+                        },
+                        child: AppBar(
+                          toolbarHeight: 48,
+                          backgroundColor: Colors.white.withValues(alpha: .82),
+                          surfaceTintColor: Colors.transparent,
+                          elevation: 0,
+                          actionsPadding: EdgeInsets.zero,
+                          leading: BackButton(onPressed: _back),
+                          title: Text(
+                            _choosingCover
+                                ? '选择相册封面'
+                                : _stack.last.name.isEmpty
+                                ? '相册'
+                                : _stack.last.name,
+                          ),
+                          actions: [
+                            if (widget.onFileView != null)
+                              IconButton(
+                                constraints: const BoxConstraints.tightFor(
+                                  width: 36,
+                                  height: 40,
+                                ),
+                                padding: EdgeInsets.zero,
+                                tooltip: '文件视图',
+                                onPressed: _busy ? null : _switchToFiles,
+                                icon: const Icon(Icons.view_list_outlined),
+                              ),
+                            IconButton(
+                              constraints: const BoxConstraints.tightFor(
+                                width: 36,
+                                height: 40,
+                              ),
+                              padding: EdgeInsets.zero,
+                              tooltip: '排序',
+                              onPressed: _busy ? null : _filters,
+                              icon: const Icon(Icons.sort),
+                            ),
+                            PopupMenuButton<String>(
+                              padding: EdgeInsets.zero,
+                              tooltip: '相册选项',
+                              child: const SizedBox(
+                                width: 36,
+                                height: 40,
+                                child: Icon(Icons.more_vert),
+                              ),
+                              onSelected: (value) async {
                                 if (!mounted || generation != _generation) {
                                   return;
                                 }
-                                _rememberVideoCover(entry, path);
-                              },
-                            );
-                          }
-                          final placeholder = Center(
-                            child: Icon(
-                              item.isDirectory
-                                  ? Icons.folder_outlined
-                                  : item.isVideo
-                                  ? Icons.play_circle_outline
-                                  : item.isAudio
-                                  ? Icons.music_note
-                                  : item.isPhoto
-                                  ? Icons.image_outlined
-                                  : Icons.insert_drive_file_outlined,
-                              color: Colors.black38,
-                              size: 36,
-                            ),
-                          );
-                          // A folder cover must not leak a member excluded by a filter
-                          // that the shallow preview provider cannot evaluate.
-                          if (images == null ||
-                              item.isAudio ||
-                              (!item.isPhoto && !item.isDirectory) ||
-                              (item.isDirectory &&
-                                  (_options.query.isNotEmpty ||
-                                      _options.kinds.isNotEmpty ||
-                                      _options.minSize != null ||
-                                      _options.maxSize != null ||
-                                      _options.dateFrom != null ||
-                                      _options.dateTo != null ||
-                                      _options.orientation != 'any' ||
-                                      _options.unknownDatesOnly ||
-                                      _options.minWidth != null ||
-                                      _options.maxWidth != null ||
-                                      _options.minHeight != null ||
-                                      _options.maxHeight != null ||
-                                      _options.minDurationMilliseconds !=
-                                          null ||
-                                      _options.maxDurationMilliseconds !=
-                                          null))) {
-                            return placeholder;
-                          }
-                          if (item.isDirectory) {
-                            return AlbumFolderThumbnail(
-                              model: widget.model,
-                              service: images,
-                              sourceId: _sourceId,
-                              entry: item.preferred,
-                              edge: edge,
-                              active: _active,
-                              placeholder: placeholder,
-                              extensions: _coverExtensions,
-                              excludedExtensions: _options.excludeExtensions,
-                              hideHidden: _options.hideHiddenFiles,
-                              preparedVideoCover: _preparedVideoCover,
-                              onVideoCoverChanged: (entry, path) {
-                                if (mounted && generation == _generation) {
-                                  _rememberVideoCover(entry, path);
+                                if (value == 'remote') {
+                                  await showRemoteControlDialog(context);
+                                }
+                                if (value == 'refresh') {
+                                  unawaited(_load(refresh: true));
+                                }
+                                if (value == 'choose-cover') {
+                                  setState(() => _choosingCover = true);
+                                }
+                                if (value == 'files') {
+                                  await _switchToFiles();
+                                }
+                                if (value == 'cover') {
+                                  await _setCover();
+                                }
+                                if (value == 'hide-cover') {
+                                  await _setCover(hidden: true);
                                 }
                               },
-                            );
-                          }
-                          return AlbumThumbnail(
-                            service: images,
-                            entry: item.preferred,
-                            edge: edge,
-                            placeholder: placeholder,
-                            extensions: _coverExtensions,
-                            excludedExtensions: _options.excludeExtensions,
-                            hideHidden: _options.hideHiddenFiles,
-                            onLoaded: (result) {
-                              if (generation == _generation) {
-                                _metadataLoaded(item.preferred, result);
-                              }
-                            },
-                          );
-                        },
+                              itemBuilder: (_) => [
+                                const PopupMenuItem(
+                                  height: GlassMetrics.menuItemHeight,
+                                  padding: GlassMetrics.menuItemPadding,
+                                  value: 'remote',
+                                  child: Text('手机控制'),
+                                ),
+                                const PopupMenuItem(
+                                  height: GlassMetrics.menuItemHeight,
+                                  padding: GlassMetrics.menuItemPadding,
+                                  value: 'refresh',
+                                  child: Text('刷新'),
+                                ),
+                                PopupMenuItem(
+                                  height: GlassMetrics.menuItemHeight,
+                                  padding: GlassMetrics.menuItemPadding,
+                                  value: 'choose-cover',
+                                  enabled: !_busy,
+                                  child: const Text('选择相册封面'),
+                                ),
+                                if (!_hideCover)
+                                  PopupMenuItem(
+                                    height: GlassMetrics.menuItemHeight,
+                                    padding: GlassMetrics.menuItemPadding,
+                                    value: 'hide-cover',
+                                    enabled: !_busy,
+                                    child: const Text('不显示相册封面'),
+                                  ),
+                                if (_cover != null || _hideCover)
+                                  PopupMenuItem(
+                                    height: GlassMetrics.menuItemHeight,
+                                    padding: GlassMetrics.menuItemPadding,
+                                    value: 'cover',
+                                    enabled: !_busy,
+                                    child: const Text('恢复自动封面'),
+                                  ),
+                                if (widget.onFileView != null)
+                                  const PopupMenuItem(
+                                    height: GlassMetrics.menuItemHeight,
+                                    padding: GlassMetrics.menuItemPadding,
+                                    value: 'files',
+                                    child: Text('文件视图'),
+                                  ),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
-                if (_busy && _snapshot.items.isEmpty)
-                  Positioned(
-                    top: MediaQuery.paddingOf(context).top + 48,
-                    left: 0,
-                    right: 0,
-                    child: const LinearProgressIndicator(minHeight: 2),
-                  ),
-                if (!_busy && (_error.isNotEmpty || _snapshot.items.isEmpty))
-                  Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Text(
-                            _error.isNotEmpty ? _error : '没有符合条件的项目',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(color: Colors.black54),
+                  body: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: ArtworkScrollScope(
+                          onActivityChanged: (value) {
+                            _scrolling = value;
+                            images?.setScrolling(_scrolling);
+                            if (_scrolling) {
+                              _restoredViewport = null;
+                              _metadataRefresh?.cancel();
+                              _metadataHandle?.cancel();
+                            } else {
+                              _rememberViewport();
+                              if (_filterPending) {
+                                _filterPending = false;
+                                _metadataDirty = false;
+                                unawaited(_filter(retainAnchor: true));
+                              }
+                              _scheduleMetadataRefresh();
+                              if (_indexing) {
+                                if (_indexRunning) {
+                                  _resumeIndex = true;
+                                } else {
+                                  unawaited(_indexMetadata());
+                                }
+                              }
+                            }
+                          },
+                          child: TickerMode(
+                            enabled: _active,
+                            child: AlbumWall(
+                              key: _wall,
+                              snapshot: _snapshot,
+                              controller: _scroll,
+                              active: _active,
+                              onExitUp: _focusHeader,
+                              padding: EdgeInsets.only(
+                                top: MediaQuery.paddingOf(context).top + 48,
+                                bottom: MediaQuery.paddingOf(context).bottom,
+                              ),
+                              onOpen: (item) => unawaited(_open(item)),
+                              onMenu: (item) => unawaited(_itemMenu(item)),
+                              thumbnail: (context, item, edge) {
+                                if (item.isVideo) {
+                                  final entry = item.preferred;
+                                  return AlbumVideoThumbnail(
+                                    model: widget.model,
+                                    sourceId: _sourceId,
+                                    entry: item.preferred,
+                                    edge: edge,
+                                    active: _active,
+                                    initialThumbnail: _preparedVideoCover(
+                                      entry,
+                                    ),
+                                    onThumbnailChanged: (path) {
+                                      if (!mounted ||
+                                          generation != _generation) {
+                                        return;
+                                      }
+                                      _rememberVideoCover(entry, path);
+                                    },
+                                  );
+                                }
+                                final placeholder = Center(
+                                  child: Icon(
+                                    item.isDirectory
+                                        ? Icons.folder_outlined
+                                        : item.isVideo
+                                        ? Icons.play_circle_outline
+                                        : item.isAudio
+                                        ? Icons.music_note
+                                        : item.isPhoto
+                                        ? Icons.image_outlined
+                                        : Icons.insert_drive_file_outlined,
+                                    color: Colors.black38,
+                                    size: 36,
+                                  ),
+                                );
+                                // A folder cover must not leak a member excluded by a filter
+                                // that the shallow preview provider cannot evaluate.
+                                if (images == null ||
+                                    item.isAudio ||
+                                    (!item.isPhoto && !item.isDirectory) ||
+                                    (item.isDirectory &&
+                                        (_options.query.isNotEmpty ||
+                                            _options.kinds.isNotEmpty ||
+                                            _options.minSize != null ||
+                                            _options.maxSize != null ||
+                                            _options.dateFrom != null ||
+                                            _options.dateTo != null ||
+                                            _options.orientation != 'any' ||
+                                            _options.unknownDatesOnly ||
+                                            _options.minWidth != null ||
+                                            _options.maxWidth != null ||
+                                            _options.minHeight != null ||
+                                            _options.maxHeight != null ||
+                                            _options.minDurationMilliseconds !=
+                                                null ||
+                                            _options.maxDurationMilliseconds !=
+                                                null))) {
+                                  return placeholder;
+                                }
+                                if (item.isDirectory) {
+                                  return AlbumFolderThumbnail(
+                                    model: widget.model,
+                                    service: images,
+                                    sourceId: _sourceId,
+                                    entry: item.preferred,
+                                    edge: edge,
+                                    active: _active,
+                                    placeholder: placeholder,
+                                    extensions: _coverExtensions,
+                                    excludedExtensions:
+                                        _options.excludeExtensions,
+                                    hideHidden: _options.hideHiddenFiles,
+                                    preparedVideoCover: _preparedVideoCover,
+                                    onVideoCoverChanged: (entry, path) {
+                                      if (mounted &&
+                                          generation == _generation) {
+                                        _rememberVideoCover(entry, path);
+                                      }
+                                    },
+                                  );
+                                }
+                                return AlbumThumbnail(
+                                  service: images,
+                                  entry: item.preferred,
+                                  edge: edge,
+                                  placeholder: placeholder,
+                                  extensions: _coverExtensions,
+                                  excludedExtensions:
+                                      _options.excludeExtensions,
+                                  hideHidden: _options.hideHiddenFiles,
+                                  onLoaded: (result) {
+                                    if (generation == _generation) {
+                                      _metadataLoaded(item.preferred, result);
+                                    }
+                                  },
+                                );
+                              },
+                            ),
                           ),
                         ),
-                        TextButton(
-                          onPressed: _error.isNotEmpty
-                              ? () => unawaited(_load(refresh: true))
-                              : _filters,
-                          child: Text(_error.isNotEmpty ? '重试' : '调整筛选'),
+                      ),
+                      if (_busy && _snapshot.items.isEmpty)
+                        Positioned(
+                          top: MediaQuery.paddingOf(context).top + 48,
+                          left: 0,
+                          right: 0,
+                          child: const LinearProgressIndicator(minHeight: 2),
                         ),
-                      ],
-                    ),
+                      if (!_busy &&
+                          (_error.isNotEmpty || _snapshot.items.isEmpty))
+                        Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Padding(
+                                padding: const EdgeInsets.all(24),
+                                child: Text(
+                                  _error.isNotEmpty ? _error : '没有符合条件的项目',
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(color: Colors.black54),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: _error.isNotEmpty
+                                    ? () => unawaited(_load(refresh: true))
+                                    : _filters,
+                                child: Text(_error.isNotEmpty ? '重试' : '调整筛选'),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
                   ),
-              ],
+                ),
+              ),
             ),
           ),
         ),

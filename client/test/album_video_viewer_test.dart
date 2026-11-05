@@ -18,6 +18,8 @@ import 'package:aiplayer/ui/media_file_details.dart';
 import 'package:aiplayer/ui/media_artwork.dart';
 import 'package:aiplayer/ui/player_page.dart';
 import 'package:aiplayer/ui/sources_page.dart';
+import 'package:aiplayer/ui/television_input.dart';
+import 'package:aiplayer/ui/remote_control.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -164,11 +166,14 @@ void main() {
     int index = 0,
     AppModel? owner,
     bool albumMode = true,
+    bool television = false,
     String? initialVideoThumbnail,
   }) async {
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pumpWidget(
       MaterialApp(
+        builder: (_, child) =>
+            TelevisionInputScope(overrideTelevision: television, child: child!),
         home: MediaQuery(
           data: MediaQueryData.fromView(tester.view).copyWith(
             padding: const EdgeInsets.only(top: 24, bottom: 30),
@@ -326,6 +331,34 @@ void main() {
       await unmount(tester);
     },
   );
+
+  testWidgets('TV video keeps volume for audio and disables gallery zoom', (
+    tester,
+  ) async {
+    await mount(tester, index: 1, television: true);
+    final viewer = tester.widget<InteractiveViewer>(
+      find.byType(InteractiveViewer),
+    );
+    expect(viewer.scaleEnabled, isFalse);
+    expect(viewer.panEnabled, isFalse);
+    await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeUp);
+    await tester.sendKeyEvent(LogicalKeyboardKey.audioVolumeDown);
+    await tester.pump();
+    expect(transform(tester).value.getMaxScaleOnAxis(), 1);
+    final target = tester.widget<RemoteControlTarget>(
+      find.byType(RemoteControlTarget).last,
+    );
+    final result = await target.onCommand(
+      RemoteCommand(1, 'zoomIn', null, null, null, () => true),
+    );
+    expect(result!.ok, isFalse);
+    await tester.tapAt(const Offset(240, 230));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tapAt(const Offset(240, 230));
+    await tester.pump();
+    expect(transform(tester).value.getMaxScaleOnAxis(), 1);
+    await unmount(tester);
+  });
 
   testWidgets('video zoom uses gallery gestures and suppresses page swipes', (
     tester,
@@ -540,7 +573,7 @@ void main() {
   testWidgets('TV arrows reach video information and transport controls', (
     tester,
   ) async {
-    await mount(tester, index: 1);
+    await mount(tester, index: 1, television: true);
     await until(tester, () => coverDecoded(tester));
     final viewerFocus = tester
         .widgetList<Focus>(find.byType(Focus))
@@ -595,6 +628,31 @@ void main() {
     );
     expect(transform(tester).value.getMaxScaleOnAxis(), 1);
     expect(model.playbackPreparations, 0);
+    await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
+    await tester.pump(TelevisionInputScope.menuDoublePressInterval);
+    await tester.pump();
+    expect(focusedWithin(info), isTrue);
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+    await tester.pump();
+    expect(
+      focusedWithin(find.byKey(const ValueKey('album-video-toggle'))),
+      isTrue,
+    );
+    // Exercise actual OK dispatch without creating a native player in widgets.
+    model.failPlaybackPreparation = true;
+    await tester.sendKeyEvent(LogicalKeyboardKey.select);
+    await until(
+      tester,
+      () => model.playbackPreparations == 1,
+      diagnostics: () {
+        final controller = tester
+            .widget<AlbumVideoControls>(find.byType(AlbumVideoControls))
+            .controller;
+        return 'focus=${FocusManager.instance.primaryFocus}, prepares=${model.playbackPreparations}, active=${controller.presentationActive}, loading=${controller.loading}, error=${controller.error}';
+      },
+    );
+    await settle(tester);
+    expect(find.text('测试播放准备失败'), findsOneWidget);
     expect(tester.takeException(), isNull);
     await unmount(tester);
   });

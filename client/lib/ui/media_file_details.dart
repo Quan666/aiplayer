@@ -11,6 +11,8 @@ import '../data/media_technical_info.dart';
 import '../data/store.dart';
 import '../sources/source.dart';
 import 'glass.dart';
+import 'television_input.dart';
+import 'television_scroll_region.dart';
 import 'artwork_lifecycle.dart';
 
 typedef MediaFileDetailsLoader = Future<MediaFileDetails> Function(CancelToken);
@@ -592,96 +594,105 @@ class _MediaFileParameterListState extends State<MediaFileParameterList> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = GlassPalette.of(context);
-    return ListView.builder(
-      shrinkWrap: true,
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      itemCount: _itemCount,
-      itemBuilder: (context, index) {
-        if (index == _loadingIndex) {
-          return Align(
-            alignment: AlignmentDirectional.centerStart,
-            child: _indexError
-                ? TextButton(
-                    onPressed: () => setState(() {
-                      _indexError = false;
-                      _prepare();
-                    }),
-                    child: const Text('重新读取参数'),
-                  )
-                : const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text(
-                      '读取参数…',
-                      key: ValueKey('media-parameters-indexing'),
+    return TelevisionScrollRegion(
+      builder: (context, scroll) => ListView.builder(
+        controller: scroll,
+        shrinkWrap: true,
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        itemCount: _itemCount,
+        itemBuilder: (context, index) {
+          if (index == _loadingIndex) {
+            return Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: _indexError
+                  ? TextButton(
+                      onPressed: () => setState(() {
+                        _indexError = false;
+                        _prepare();
+                      }),
+                      child: const Text('重新读取参数'),
+                    )
+                  : const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
+                      child: Text(
+                        '读取参数…',
+                        key: ValueKey('media-parameters-indexing'),
+                      ),
+                    ),
+            );
+          }
+          if (index == _moreIndex) {
+            return Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: TextButton.icon(
+                key: const ValueKey('media-parameters-more'),
+                onPressed: () => setState(() {
+                  _expanded = !_expanded;
+                  _prepare();
+                }),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 0,
+                    vertical: 4,
+                  ),
+                  visualDensity: VisualDensity.compact,
+                  minimumSize: const Size(48, 32),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                icon: Icon(
+                  _expanded
+                      ? Icons.expand_less_rounded
+                      : Icons.expand_more_rounded,
+                  size: 18,
+                ),
+                label: Text(_expanded ? '收起更多' : '更多'),
+              ),
+            );
+          }
+          final row = _row(index);
+          if (row.value == null) {
+            return Padding(
+              padding: const EdgeInsets.only(top: 12, bottom: 5),
+              child: Text(
+                row.label,
+                style: theme.textTheme.labelLarge?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            );
+          }
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 5),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  width: 84,
+                  child: Text(
+                    row.label,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: colors.muted,
                     ),
                   ),
-          );
-        }
-        if (index == _moreIndex) {
-          return Align(
-            alignment: AlignmentDirectional.centerStart,
-            child: TextButton.icon(
-              key: const ValueKey('media-parameters-more'),
-              onPressed: () => setState(() {
-                _expanded = !_expanded;
-                _prepare();
-              }),
-              style: TextButton.styleFrom(
-                padding: const EdgeInsets.symmetric(horizontal: 0, vertical: 4),
-                visualDensity: VisualDensity.compact,
-                minimumSize: const Size(48, 32),
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-              icon: Icon(
-                _expanded
-                    ? Icons.expand_less_rounded
-                    : Icons.expand_more_rounded,
-                size: 18,
-              ),
-              label: Text(_expanded ? '收起更多' : '更多'),
-            ),
-          );
-        }
-        final row = _row(index);
-        if (row.value == null) {
-          return Padding(
-            padding: const EdgeInsets.only(top: 12, bottom: 5),
-            child: Text(
-              row.label,
-              style: theme.textTheme.labelLarge?.copyWith(
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          );
-        }
-        return Padding(
-          padding: const EdgeInsets.symmetric(vertical: 5),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(
-                width: 84,
-                child: Text(
-                  row.label,
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: colors.muted,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ExcludeFocus(
+                    excluding: TelevisionMode.of(context),
+                    child: SelectableText(
+                      row.value!,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w500,
+                        height: 1.4,
+                      ),
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: SelectableText(
-                  row.value!,
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    fontWeight: FontWeight.w500,
-                    height: 1.4,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        );
-      },
+              ],
+            ),
+          );
+        },
+      ),
     );
   }
 }

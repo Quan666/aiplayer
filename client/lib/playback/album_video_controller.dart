@@ -16,14 +16,12 @@ import 'session.dart';
 /// Browsing only selects a file. Explicit playback owns at most one decoder,
 /// with one latest pending request behind cancellation and native retirement.
 class AlbumVideoController extends ChangeNotifier with WidgetsBindingObserver {
-  static Future<void> _disposals = Future.value();
+  static final _disposals = <Future<void>>{};
 
   /// A route may be reopened before its predecessor finishes native teardown.
   static Future<void> waitForDisposals() async {
-    while (true) {
-      final current = _disposals;
-      await current;
-      if (identical(current, _disposals)) return;
+    while (_disposals.isNotEmpty) {
+      await Future.wait(_disposals.toList());
     }
   }
 
@@ -182,7 +180,8 @@ class AlbumVideoController extends ChangeNotifier with WidgetsBindingObserver {
       AppLog.instance.warning('关闭相册视频', safeFailure(failure).message);
     });
     _retiring = Future.wait([_retiring, closing]).then((_) {});
-    _disposals = Future.wait([_disposals, closing]).then((_) {});
+    _disposals.add(closing);
+    unawaited(closing.then((_) => _disposals.remove(closing)));
     _wakelock.disable();
   }
 

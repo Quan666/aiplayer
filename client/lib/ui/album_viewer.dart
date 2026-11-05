@@ -32,6 +32,7 @@ import 'glass.dart';
 import 'music_page.dart';
 import 'player_page.dart';
 import 'remote_control.dart';
+import 'television_input.dart';
 
 class AlbumViewer extends StatefulWidget {
   final AppModel model;
@@ -107,6 +108,8 @@ class _AlbumViewerState extends State<AlbumViewer>
   final _viewerFocus = FocusNode(debugLabel: 'album-viewer');
   final _infoFocus = FocusNode(debugLabel: 'album-info');
   final _videoControlsFocus = FocusNode(debugLabel: 'album-video-controls');
+  final _toolbarFocus = FocusNode(debugLabel: 'album-toolbar');
+  bool _toolbarFocused = false, _transportFocused = false;
   late AlbumImageService _images = _createImages();
   AlbumImageService _createImages() => AlbumImageService(
     cacheDirectory: p.join(widget.model.documents.path, 'album-images-v1'),
@@ -141,6 +144,7 @@ class _AlbumViewerState extends State<AlbumViewer>
   int? _swipePointer;
   bool _swipeAllowed = false;
   bool _horizontalSwipe = false;
+  bool _pointerControlsHeld = false;
   VelocityTracker? _swipeVelocity;
   final _pointers = <int>{};
   final _systemUi = _ViewerSystemUi();
@@ -601,6 +605,7 @@ class _AlbumViewerState extends State<AlbumViewer>
   void _setSlides(bool enabled) {
     if (!_canInteract || !_item.isPhoto) return;
     _slideshow?.cancel();
+    if (enabled && TelevisionMode.read(context)) _viewerFocus.requestFocus();
     setState(() {
       _slides = enabled;
       _slideshowLandscape = null;
@@ -625,14 +630,17 @@ class _AlbumViewerState extends State<AlbumViewer>
       playing:
           active &&
           _canInteract &&
-          (_slides || _video.playing && !_video.buffering) &&
-          _controlsVisible,
+          (_item.isPhoto || _video.playing && !_video.buffering) &&
+          _controlsVisible &&
+          !(TelevisionMode.read(context) &&
+              (_toolbarFocused || _transportFocused)),
       seconds: widget.model.preferences.controlsHideSeconds,
     );
   }
 
   void _setControlsVisible(bool visible) {
     if (!_canInteract) return;
+    if (!visible && TelevisionMode.read(context)) _viewerFocus.requestFocus();
     if (_controlsVisible != visible) {
       setState(() => _controlsVisible = visible);
     }
@@ -835,6 +843,7 @@ class _AlbumViewerState extends State<AlbumViewer>
     _dragOffset = 0;
     _settleOffset = null;
     _pointers.clear();
+    _releasePointerControls();
     if (synchronizeArtwork) _syncVideoArtwork();
   }
 
@@ -862,6 +871,10 @@ class _AlbumViewerState extends State<AlbumViewer>
   }
 
   void _pointerDown(PointerDownEvent event) {
+    if (!_pointerControlsHeld) {
+      _pointerControlsHeld = true;
+      _controlsTimer.hold();
+    }
     _pointers.add(event.pointer);
     if (_pointers.length != 1) {
       _swipeAllowed = false;
@@ -937,6 +950,7 @@ class _AlbumViewerState extends State<AlbumViewer>
         start != null &&
         end != null;
     _pointers.remove(event.pointer);
+    if (_pointers.isEmpty) _releasePointerControls();
     if (!swiped) {
       if (_pointers.isEmpty && _slides) _scheduleSlide();
       return;
@@ -970,8 +984,14 @@ class _AlbumViewerState extends State<AlbumViewer>
     _syncVideoArtwork();
   }
 
+  void _releasePointerControls() {
+    if (!_pointerControlsHeld) return;
+    _pointerControlsHeld = false;
+    _controlsTimer.release();
+  }
+
   void _doubleTap() {
-    if (!_canInteract || !(_item.isPhoto || _item.isVideo)) return;
+    if (!_canInteract || !_canZoom) return;
     final point = _doubleTapPosition ?? Offset.zero;
     _transform.value = _transform.value.getMaxScaleOnAxis() > 1.01
         ? Matrix4.identity()
@@ -980,8 +1000,12 @@ class _AlbumViewerState extends State<AlbumViewer>
             ..scaleByDouble(2, 2, 1, 1));
   }
 
+  bool get _canZoom =>
+      _item.isPhoto || _item.isVideo && !TelevisionMode.read(context);
+
   void _zoom(double factor) {
-    if (!(_item.isPhoto || _item.isVideo)) return;
+    if (!_canInteract || !_canZoom) return;
+    if (TelevisionMode.read(context)) _viewerFocus.requestFocus();
     final current = _transform.value.getMaxScaleOnAxis();
     final next = (current * factor).clamp(1.0, 8.0);
     setState(() {
@@ -1017,7 +1041,10 @@ class _AlbumViewerState extends State<AlbumViewer>
   }
 
   void _activateViewer() {
-    if (_item.isPhoto) {
+    if (!_canInteract) return;
+    if (_item.isPhoto && TelevisionMode.read(context)) {
+      setState(() => _whiteCanvas = !_whiteCanvas);
+    } else if (_item.isPhoto) {
       if (!_controlsVisible) {
         _setControlsVisible(true);
       } else {
@@ -1041,8 +1068,10 @@ class _AlbumViewerState extends State<AlbumViewer>
       case 'next':
         _next(1);
       case 'zoomIn':
+        if (!_canZoom) return RemoteCommandResult.unavailable;
         _zoom(2);
       case 'zoomOut':
+        if (!_canZoom) return RemoteCommandResult.unavailable;
         _zoom(.5);
       case 'rotate':
         if (!_item.isPhoto) return RemoteCommandResult.unavailable;
@@ -1068,6 +1097,12 @@ class _AlbumViewerState extends State<AlbumViewer>
         if (FocusManager.instance.primaryFocus != _viewerFocus) return null;
         _activateViewer();
       case 'up' || 'down' || 'left' || 'right':
+        if (TelevisionMode.read(context) &&
+            command.action == 'down' &&
+            _toolbarFocus.hasFocus) {
+          _focusControls(_item.isVideo ? _videoControlsFocus : _viewerFocus);
+          break;
+        }
         if (!_viewerFocus.hasFocus) return null;
         final key = switch (command.action) {
           'up' => LogicalKeyboardKey.arrowUp,
@@ -1082,6 +1117,58 @@ class _AlbumViewerState extends State<AlbumViewer>
     return const RemoteCommandResult(true);
   }
 
+  void _focusControls(FocusNode focus) {
+    if (_controlsVisible) {
+      focus.requestFocus();
+      return;
+    }
+    final item = _item;
+    _setControlsVisible(true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_canInteract && identical(item, _item)) focus.requestFocus();
+    });
+  }
+
+  void _focusToolbar() {
+    if (_canInteract) _focusControls(_infoFocus);
+  }
+
+  // This ancestor receives volume even while a toolbar button is focused.
+  // Consume release as well, so a photo zoom never changes system volume.
+  KeyEventResult _televisionKey(FocusNode _, KeyEvent event) {
+    if (!TelevisionMode.read(context) || !_canInteract) {
+      return KeyEventResult.ignored;
+    }
+    final key = event.logicalKey;
+    if (_item.isPhoto &&
+        (key == LogicalKeyboardKey.audioVolumeUp ||
+            key == LogicalKeyboardKey.audioVolumeDown)) {
+      if (event is! KeyUpEvent) {
+        _zoom(key == LogicalKeyboardKey.audioVolumeUp ? 1.25 : .8);
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.escape || key == LogicalKeyboardKey.goBack) {
+      if (event is KeyDownEvent) _back();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  KeyEventResult _toolbarKey(FocusNode _, KeyEvent event) {
+    if (!TelevisionMode.read(context) || event is KeyUpEvent || !_canInteract) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+      _focusControls(_item.isVideo ? _videoControlsFocus : _viewerFocus);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   KeyEventResult _key(FocusNode _, KeyEvent event) {
     if (event is KeyUpEvent) return KeyEventResult.ignored;
     return _direction(event.logicalKey);
@@ -1089,35 +1176,11 @@ class _AlbumViewerState extends State<AlbumViewer>
 
   KeyEventResult _direction(LogicalKeyboardKey key) {
     if (!_canInteract) return KeyEventResult.ignored;
+    final television = TelevisionMode.read(context);
     if (_item.isVideo &&
         (key == LogicalKeyboardKey.space ||
             key == LogicalKeyboardKey.mediaPlayPause)) {
       unawaited(_play());
-      return KeyEventResult.handled;
-    }
-    if (_item.isVideo &&
-        (key == LogicalKeyboardKey.arrowUp ||
-            key == LogicalKeyboardKey.arrowDown)) {
-      final focus = key == LogicalKeyboardKey.arrowUp
-          ? _infoFocus
-          : _videoControlsFocus;
-      if (_controlsVisible) {
-        focus.requestFocus();
-      } else {
-        final item = _item;
-        _setControlsVisible(true);
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_canInteract && identical(item, _item)) {
-            focus.requestFocus();
-          }
-        });
-      }
-      return KeyEventResult.handled;
-    }
-    if (_item.isPhoto &&
-        (key == LogicalKeyboardKey.arrowUp ||
-            key == LogicalKeyboardKey.arrowDown)) {
-      _zoom(key == LogicalKeyboardKey.arrowUp ? 2 : .5);
       return KeyEventResult.handled;
     }
     final direction = switch (key) {
@@ -1128,7 +1191,42 @@ class _AlbumViewerState extends State<AlbumViewer>
       _ => Offset.zero,
     };
     if (direction == Offset.zero) return KeyEventResult.ignored;
-    if (_transform.value.getMaxScaleOnAxis() > 1.01) {
+    final scale = _transform.value.getMaxScaleOnAxis();
+    if (television && _item.isPhoto && scale > 1.01) {
+      // Pan in screen pixels and keep the image inside the canvas bounds.
+      final matrix = _transform.value.clone();
+      matrix.setTranslationRaw(
+        (matrix.storage[12] + direction.dx).clamp(
+          _viewportSize.width * (1 - scale),
+          0.0,
+        ),
+        (matrix.storage[13] + direction.dy).clamp(
+          _viewportSize.height * (1 - scale),
+          0.0,
+        ),
+        0,
+      );
+      _transform.value = matrix;
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown) {
+      if (_item.isVideo) {
+        _focusControls(
+          key == LogicalKeyboardKey.arrowUp ? _infoFocus : _videoControlsFocus,
+        );
+        return KeyEventResult.handled;
+      }
+      if (_item.isPhoto) {
+        if (television) {
+          if (key == LogicalKeyboardKey.arrowUp) _focusControls(_infoFocus);
+        } else {
+          _zoom(key == LogicalKeyboardKey.arrowUp ? 2 : .5);
+        }
+        return KeyEventResult.handled;
+      }
+    }
+    if (scale > 1.01) {
       _transform.value = _transform.value.clone()
         ..translateByDouble(direction.dx, direction.dy, 0, 1);
     } else if (key == LogicalKeyboardKey.arrowLeft ||
@@ -1163,6 +1261,7 @@ class _AlbumViewerState extends State<AlbumViewer>
     _viewerFocus.dispose();
     _infoFocus.dispose();
     _videoControlsFocus.dispose();
+    _toolbarFocus.dispose();
     super.dispose();
   }
 
@@ -1414,7 +1513,9 @@ class _AlbumViewerState extends State<AlbumViewer>
                 entry: entry,
                 edge: edge,
                 fit: BoxFit.contain,
-                showLoading: !_infoOpen,
+                // A modal owns interaction while the viewer is paused. Keep
+                // its prepared backdrop without a loading indicator behind it.
+                showLoading: _routeCurrent && !_infoOpen,
                 loadingPlaceholder: _imageResult?.path == null
                     ? null
                     : _preparedPhoto(_imageResult, 0, edge),
@@ -1706,152 +1807,219 @@ class _AlbumViewerState extends State<AlbumViewer>
     ),
   );
 
+  Widget _focusChrome(Widget child, {bool toolbar = false}) {
+    if (!TelevisionMode.of(context)) return child;
+    return Focus(
+      focusNode: toolbar ? _toolbarFocus : null,
+      canRequestFocus: false,
+      onKeyEvent: toolbar ? _toolbarKey : null,
+      onFocusChange: (focused) {
+        if (toolbar) {
+          _toolbarFocused = focused;
+        } else {
+          _transportFocused = focused;
+        }
+        _syncPresentation();
+      },
+      child: _remoteChrome(child),
+    );
+  }
+
+  Widget _remoteChrome(Widget child) {
+    return IconButtonTheme(
+      data: IconButtonThemeData(
+        style: (IconButtonTheme.of(context).style ?? const ButtonStyle())
+            .copyWith(
+              side: WidgetStateProperty.resolveWith(
+                (states) =>
+                    states.contains(WidgetState.focused) &&
+                        !states.contains(WidgetState.disabled)
+                    ? const BorderSide(color: Colors.white, width: 2)
+                    : BorderSide.none,
+              ),
+              backgroundColor: WidgetStateProperty.resolveWith(
+                (states) =>
+                    states.contains(WidgetState.focused) &&
+                        !states.contains(WidgetState.disabled)
+                    ? Colors.white.withAlpha(40)
+                    : Colors.transparent,
+              ),
+            ),
+      ),
+      child: child,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final item = _item;
     final entry = item.members[_member.clamp(0, item.members.length - 1)];
     final edge = _imageEdge;
-    return GlassMenuTheme(
-      child: RemoteControlTarget(
-        onCommand: _remote,
-        child: PopScope(
-          canPop: false,
-          onPopInvokedWithResult: (didPop, _) {
-            if (!didPop) _back();
-          },
-          child: AnnotatedRegion<SystemUiOverlayStyle>(
-            value: SystemUiOverlayStyle.light.copyWith(
-              statusBarColor: Colors.transparent,
-              systemNavigationBarIconBrightness: _whiteCanvas
-                  ? Brightness.dark
-                  : Brightness.light,
-              systemNavigationBarColor: Colors.transparent,
-              systemNavigationBarDividerColor: Colors.transparent,
-              systemNavigationBarContrastEnforced: false,
-              systemStatusBarContrastEnforced: false,
-            ),
-            child: Scaffold(
-              backgroundColor: _whiteCanvas ? Colors.white : Colors.black,
-              body: Stack(
-                fit: StackFit.expand,
-                children: [
-                  Positioned.fill(
-                    child: Actions(
-                      actions: {
-                        ActivateIntent: CallbackAction<ActivateIntent>(
-                          onInvoke: (_) {
-                            _activateViewer();
-                            return null;
-                          },
-                        ),
-                      },
-                      child: Focus(
-                        focusNode: _viewerFocus,
-                        autofocus: true,
-                        onKeyEvent: _key,
-                        child: item.isPhoto || item.isVideo
-                            ? Listener(
-                                onPointerDown: _pointerDown,
-                                onPointerMove: _pointerMove,
-                                onPointerUp: _pointerUp,
-                                onPointerCancel: (_) => _cancelSwipe(),
-                                child: GestureDetector(
-                                  key: const ValueKey('album-photo-canvas'),
-                                  behavior: HitTestBehavior.opaque,
-                                  onTap: () {
-                                    if (_canInteract) {
-                                      if (!item.isVideo || widget.albumMode) {
-                                        setState(
-                                          () => _whiteCanvas = !_whiteCanvas,
-                                        );
-                                      }
-                                      if (item.isVideo) {
-                                        _setControlsVisible(!_controlsVisible);
-                                      }
-                                    }
-                                  },
-                                  onDoubleTapDown: (details) =>
-                                      _doubleTapPosition =
-                                          details.localPosition,
-                                  onDoubleTap: _doubleTap,
-                                  child: InteractiveViewer(
-                                    transformationController: _transform,
-                                    minScale: 1,
-                                    maxScale: 8,
-                                    child: _animatedPhoto(entry, edge),
-                                  ),
-                                ),
-                              )
-                            : Center(
-                                child: IconButton.filled(
-                                  tooltip: '播放',
-                                  onPressed: _playing ? null : _play,
-                                  iconSize: 60,
-                                  icon: Icon(
-                                    item.isAudio
-                                        ? Icons.music_note
-                                        : Icons.play_arrow,
-                                  ),
-                                ),
+    return TelevisionMenuRegion(
+      onMenu: _focusToolbar,
+      // The immersive viewer owns menu gestures, including a second press.
+      // Never move focus into the shell underneath this route.
+      onNavigation: _focusToolbar,
+      child: GlassMenuTheme(
+        child: RemoteControlTarget(
+          onCommand: _remote,
+          child: Focus(
+            canRequestFocus: false,
+            onKeyEvent: _televisionKey,
+            child: PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (didPop, _) {
+                if (!didPop) _back();
+              },
+              child: AnnotatedRegion<SystemUiOverlayStyle>(
+                value: SystemUiOverlayStyle.light.copyWith(
+                  statusBarColor: Colors.transparent,
+                  systemNavigationBarIconBrightness: _whiteCanvas
+                      ? Brightness.dark
+                      : Brightness.light,
+                  systemNavigationBarColor: Colors.transparent,
+                  systemNavigationBarDividerColor: Colors.transparent,
+                  systemNavigationBarContrastEnforced: false,
+                  systemStatusBarContrastEnforced: false,
+                ),
+                child: Scaffold(
+                  backgroundColor: _whiteCanvas ? Colors.white : Colors.black,
+                  body: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Positioned.fill(
+                        child: TelevisionAction(
+                          focusNode: _viewerFocus,
+                          onActivate: _activateViewer,
+                          builder: (_, focus) => Actions(
+                            actions: {
+                              ActivateIntent: CallbackAction<ActivateIntent>(
+                                onInvoke: (_) {
+                                  _activateViewer();
+                                  return null;
+                                },
                               ),
-                      ),
-                    ),
-                  ),
-                  if (item.isVideo && (_controlsVisible || _zoomed))
-                    Align(
-                      alignment: Alignment.bottomCenter,
-                      child: DecoratedBox(
-                        decoration: const BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: [Color(0x00000000), Color(0xBB000000)],
+                            },
+                            child: Focus(
+                              focusNode: focus,
+                              autofocus: true,
+                              onKeyEvent: _key,
+                              child: item.isPhoto || item.isVideo
+                                  ? Listener(
+                                      onPointerDown: _pointerDown,
+                                      onPointerMove: _pointerMove,
+                                      onPointerUp: _pointerUp,
+                                      onPointerCancel: (_) => _cancelSwipe(),
+                                      child: GestureDetector(
+                                        key: const ValueKey(
+                                          'album-photo-canvas',
+                                        ),
+                                        behavior: HitTestBehavior.opaque,
+                                        onTap: () {
+                                          if (_canInteract) {
+                                            if (!item.isVideo ||
+                                                widget.albumMode) {
+                                              setState(
+                                                () => _whiteCanvas =
+                                                    !_whiteCanvas,
+                                              );
+                                            }
+                                            if (item.isVideo) {
+                                              _setControlsVisible(
+                                                !_controlsVisible,
+                                              );
+                                            }
+                                          }
+                                        },
+                                        onDoubleTapDown: (details) =>
+                                            _doubleTapPosition =
+                                                details.localPosition,
+                                        onDoubleTap: _doubleTap,
+                                        child: InteractiveViewer(
+                                          transformationController: _transform,
+                                          minScale: 1,
+                                          maxScale: _canZoom ? 8 : 1,
+                                          scaleEnabled: _canZoom,
+                                          panEnabled: _canZoom,
+                                          child: _animatedPhoto(entry, edge),
+                                        ),
+                                      ),
+                                    )
+                                  : Center(
+                                      child: IconButton.filled(
+                                        tooltip: '播放',
+                                        onPressed: _playing ? null : _play,
+                                        iconSize: 60,
+                                        icon: Icon(
+                                          item.isAudio
+                                              ? Icons.music_note
+                                              : Icons.play_arrow,
+                                        ),
+                                      ),
+                                    ),
+                            ),
                           ),
                         ),
-                        child: SafeArea(
-                          top: false,
-                          minimum: const EdgeInsets.fromLTRB(8, 16, 8, 8),
-                          child: AlbumVideoControls(
-                            controller: _video,
-                            playPauseFocusNode: _videoControlsFocus,
-                            onInteractionStart: _controlsTimer.hold,
-                            onInteractionEnd: _controlsTimer.release,
-                          ),
-                        ),
                       ),
-                    ),
-                  if (_controlsVisible)
-                    Align(
-                      key: const ValueKey('album-viewer-toolbar'),
-                      alignment: Alignment.topCenter,
-                      child: _toolbar(entry),
-                    ),
-                  SafeArea(
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        if (_imageResult?.error != null ||
-                            _imageResult?.previewOnly == true)
-                          Positioned(
-                            bottom: 16,
-                            left: 24,
-                            right: 24,
-                            child: IgnorePointer(
-                              child: Text(
-                                _imageResult?.error ?? 'RAW 内嵌预览',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: _whiteCanvas
-                                      ? Colors.black54
-                                      : Colors.white70,
+                      if (item.isVideo && (_controlsVisible || _zoomed))
+                        Align(
+                          alignment: Alignment.bottomCenter,
+                          child: DecoratedBox(
+                            decoration: const BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [Color(0x00000000), Color(0xBB000000)],
+                              ),
+                            ),
+                            child: SafeArea(
+                              top: false,
+                              minimum: const EdgeInsets.fromLTRB(8, 16, 8, 8),
+                              child: _focusChrome(
+                                AlbumVideoControls(
+                                  controller: _video,
+                                  playPauseFocusNode: _videoControlsFocus,
+                                  onInteractionStart: _controlsTimer.hold,
+                                  onInteractionEnd: _controlsTimer.release,
                                 ),
                               ),
                             ),
                           ),
-                      ],
-                    ),
+                        ),
+                      if (_controlsVisible)
+                        Align(
+                          key: const ValueKey('album-viewer-toolbar'),
+                          alignment: Alignment.topCenter,
+                          child: _focusChrome(_toolbar(entry), toolbar: true),
+                        ),
+                      SafeArea(
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            if (_imageResult?.error != null ||
+                                _imageResult?.previewOnly == true)
+                              Positioned(
+                                bottom: 16,
+                                left: 24,
+                                right: 24,
+                                child: IgnorePointer(
+                                  child: Text(
+                                    _imageResult?.error ?? 'RAW 内嵌预览',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: _whiteCanvas
+                                          ? Colors.black54
+                                          : Colors.white70,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                ],
+                ),
               ),
             ),
           ),
@@ -2179,6 +2347,7 @@ class _ViewerSystemUi {
   );
   Future<void>? _pending;
   bool _ownsDesktopFullscreen = false;
+  bool? _mobileActive = false;
 
   Future<void> setActive(bool active) => setPresentation(
     active: active,
@@ -2240,8 +2409,13 @@ class _ViewerSystemUi {
                     ],
             );
           }
-          if (current()) {
-            if (requested.active && !requested.controlsVisible) {
+          if (current() && requested.active != _mobileActive) {
+            // Showing a toolbar must not restore the system navigation bar
+            // over an immersive photo or video. Restore only on leaving.
+            // Track completed platform writes separately: an orientation reply
+            // can be superseded while lifecycle updates also change chrome.
+            _mobileActive = null;
+            if (requested.active) {
               await SystemChrome.setEnabledSystemUIMode(
                 SystemUiMode.immersiveSticky,
               );
@@ -2258,6 +2432,7 @@ class _ViewerSystemUi {
               }
               if (current()) await PlayerDisplay.setImmersive(false);
             }
+            if (current()) _mobileActive = requested.active;
           }
         } else {
           final enter = requested.active && requested.fullscreen;

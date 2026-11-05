@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import 'theme/app_theme.dart';
 import 'artwork_scroll_scope.dart';
+import 'television_input.dart';
 
 export 'theme/app_theme.dart';
 
@@ -64,6 +65,7 @@ Future<T?> showGlassBottomSheet<T>({
   context: context,
   isScrollControlled: isScrollControlled,
   useSafeArea: true,
+  requestFocus: true,
   backgroundColor: AppTheme.transparent,
   barrierColor: GlassPalette.of(context).mediaScrim,
   sheetAnimationStyle: MotionScope.enabledOf(context)
@@ -79,7 +81,9 @@ Future<T?> showGlassBottomSheet<T>({
       child: GlassBlurScope(
         enabled: false,
         child: GlassMenuTheme(
-          child: ArtworkScrollScope(child: builder(context)),
+          child: TelevisionFocusScope(
+            child: ArtworkScrollScope(child: builder(context)),
+          ),
         ),
       ),
     ),
@@ -379,6 +383,8 @@ Future<T?> showGlassChoice<T>({
                 final option = options[index];
                 return ListTile(
                   selected: option.value == value,
+                  autofocus:
+                      TelevisionMode.of(context) && option.value == value,
                   leading: option.icon == null
                       ? null
                       : Icon(option.icon, size: 20),
@@ -401,7 +407,8 @@ Future<T?> showGlassChoice<T>({
   if (MediaQuery.sizeOf(context).width >= 600) {
     return showDialog<T>(
       context: context,
-      builder: (sheet) => Dialog(child: contents(sheet)),
+      builder: (sheet) =>
+          Dialog(child: TelevisionFocusScope(child: contents(sheet))),
     );
   }
   return showGlassBottomSheet<T>(
@@ -432,6 +439,7 @@ class GlassSelect<T> extends StatefulWidget {
 
 class _GlassSelectState<T> extends State<GlassSelect<T>> {
   bool opened = false;
+  bool focused = false;
   Future<void> choose() async {
     if (!widget.enabled || opened) return;
     setState(() => opened = true);
@@ -456,12 +464,13 @@ class _GlassSelectState<T> extends State<GlassSelect<T>> {
       enabled: widget.enabled,
       child: InkWell(
         onTap: widget.enabled ? choose : null,
+        onFocusChange: (value) => setState(() => focused = value),
         borderRadius: BorderRadius.circular(GlassMetrics.control),
         child: GlassControlBackground(
-          focused: opened,
+          focused: opened || focused,
           disabled: !widget.enabled,
           child: InputDecorator(
-            isFocused: opened,
+            isFocused: opened || focused,
             decoration: InputDecoration(
               labelText: widget.label,
               isDense: true,

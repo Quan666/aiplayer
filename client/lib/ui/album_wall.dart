@@ -79,6 +79,7 @@ class AlbumWall extends StatefulWidget {
   final Widget Function(BuildContext, AlbumItem, int) thumbnail;
   final ValueChanged<AlbumItem> onOpen;
   final ValueChanged<AlbumItem>? onMenu;
+  final VoidCallback? onExitUp;
   final bool active;
 
   const AlbumWall({
@@ -88,6 +89,7 @@ class AlbumWall extends StatefulWidget {
     required this.thumbnail,
     required this.onOpen,
     this.onMenu,
+    this.onExitUp,
     this.columns = 4,
     this.padding = EdgeInsets.zero,
     this.active = true,
@@ -125,6 +127,7 @@ class AlbumWallState extends State<AlbumWall> {
   void restoreIndex(
     int index, {
     bool focus = false,
+    String? focusedId,
     double relativeOffset = 0,
     bool onlyWhenIdle = false,
   }) {
@@ -146,7 +149,9 @@ class AlbumWallState extends State<AlbumWall> {
         return itemScrollOffset(index) + relativeOffset;
       });
       setState(() => _restoreRevision++);
-      if (focus) _focusAfterLayout(index, ticket);
+      if (focus || focusedId != null) {
+        _focusAfterLayout(index, ticket, focusedId: focusedId);
+      }
       return;
     }
     if (widget.snapshot.items.isEmpty) return;
@@ -164,7 +169,9 @@ class AlbumWallState extends State<AlbumWall> {
           ),
         );
       }
-      if (focus) _focusAfterLayout(target, ticket);
+      if (focus || focusedId != null) {
+        _focusAfterLayout(target, ticket, focusedId: focusedId);
+      }
     });
     // Phone commands can arrive while the app has no scheduled frame. A
     // post-frame callback alone would leave the old cell focused indefinitely.
@@ -178,9 +185,10 @@ class AlbumWallState extends State<AlbumWall> {
     if (controller.hasClients &&
         (controller.offset - offset).abs() <= .01 &&
         !(controller is AlbumScrollController && controller.restoring)) {
-      final index = widget.snapshot.indexById[focusedId];
-      if (index != null && _nodes[index]?.hasFocus == false) {
-        _focusAfterLayout(index, ticket);
+      if (focusedId != null) {
+        // A directory snapshot may have been published but not rebuilt yet.
+        // Resolve its identity after layout instead of against the old cells.
+        _focusAfterLayout(0, ticket, focusedId: focusedId);
       }
       return;
     }
@@ -210,10 +218,13 @@ class AlbumWallState extends State<AlbumWall> {
     WidgetsBinding.instance.ensureVisualUpdate();
   }
 
-  void _focusAfterLayout(int index, int ticket) {
+  void _focusAfterLayout(int index, int ticket, {String? focusedId}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && ticket == _focusRevision && widget.active) {
-        _nodes[index]?.requestFocus();
+        final target = focusedId == null
+            ? index
+            : widget.snapshot.indexById[focusedId];
+        if (target != null) _nodes[target]?.requestFocus();
       }
     });
     WidgetsBinding.instance.ensureVisualUpdate();
@@ -259,6 +270,10 @@ class AlbumWallState extends State<AlbumWall> {
         : _focused + delta;
     // Allow up from the first row to reach the toolbar.
     if (next < 0 || next >= widget.snapshot.items.length) {
+      if (vertical && next < 0 && widget.onExitUp != null) {
+        widget.onExitUp!();
+        return true;
+      }
       return false;
     }
     _focused = next;
@@ -645,79 +660,86 @@ class _AlbumCellState extends State<_AlbumCell> {
           SingleActivator(LogicalKeyboardKey.select, includeRepeats: false):
               ActivateIntent(),
         },
-        child: Material(
-          color: Colors.white,
-          child: InkWell(
-            focusNode: _focus,
-            focusColor: TelevisionMode.of(context) ? null : Colors.transparent,
-            onTap: widget.onOpen,
-            onLongPress: widget.onMenu,
-            onSecondaryTap: widget.onMenu,
-            onFocusChange: (value) {
-              if (value) widget.onFocus();
-              if (_focused != value) setState(() => _focused = value);
-            },
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                widget.child,
-                if (item.isDirectory)
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    child: Container(
-                      color: Colors.black54,
-                      padding: const EdgeInsets.all(8),
-                      child: Text(
-                        item.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(color: Colors.white),
+        child: TelevisionAction(
+          focusNode: _focus,
+          onActivate: widget.onOpen,
+          onMenu: widget.onMenu,
+          builder: (context, focusNode) => Material(
+            color: Colors.white,
+            child: InkWell(
+              focusNode: focusNode,
+              focusColor: TelevisionMode.of(context)
+                  ? null
+                  : Colors.transparent,
+              onTap: widget.onOpen,
+              onLongPress: widget.onMenu,
+              onSecondaryTap: widget.onMenu,
+              onFocusChange: (value) {
+                if (value) widget.onFocus();
+                if (_focused != value) setState(() => _focused = value);
+              },
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  widget.child,
+                  if (item.isDirectory)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: Container(
+                        color: Colors.black54,
+                        padding: const EdgeInsets.all(8),
+                        child: Text(
+                          item.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: Colors.white),
+                        ),
                       ),
                     ),
-                  ),
-                if (item.isVideo || item.isAudio || item.members.length > 1)
-                  Positioned(
-                    right: 4,
-                    top: 4,
-                    child: DecoratedBox(
-                      decoration: const BoxDecoration(color: Colors.black54),
-                      child: SizedBox.square(
-                        dimension: 18,
-                        child: Center(
-                          child: item.members.length > 1
-                              ? Text(
-                                  '${item.members.length}',
-                                  style: const TextStyle(
+                  if (item.isVideo || item.isAudio || item.members.length > 1)
+                    Positioned(
+                      right: 4,
+                      top: 4,
+                      child: DecoratedBox(
+                        decoration: const BoxDecoration(color: Colors.black54),
+                        child: SizedBox.square(
+                          dimension: 18,
+                          child: Center(
+                            child: item.members.length > 1
+                                ? Text(
+                                    '${item.members.length}',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11,
+                                      height: 1,
+                                    ),
+                                  )
+                                : Icon(
+                                    item.isAudio
+                                        ? Icons.music_note
+                                        : Icons.play_arrow,
                                     color: Colors.white,
-                                    fontSize: 11,
-                                    height: 1,
+                                    size: 14,
                                   ),
-                                )
-                              : Icon(
-                                  item.isAudio
-                                      ? Icons.music_note
-                                      : Icons.play_arrow,
-                                  color: Colors.white,
-                                  size: 14,
-                                ),
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                if (_focused && TelevisionMode.of(context))
-                  IgnorePointer(
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        border: Border.all(
-                          color: Theme.of(context).colorScheme.primary,
-                          width: 4,
+                  if (_focused && TelevisionMode.of(context))
+                    IgnorePointer(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: Theme.of(context).colorScheme.primary,
+                            width: 4,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-              ],
+                ],
+              ),
             ),
           ),
         ),

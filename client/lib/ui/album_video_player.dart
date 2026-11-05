@@ -6,6 +6,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import '../playback/album_video_controller.dart';
 import '../playback/input.dart';
 import '../playback/session.dart';
+import 'television_input.dart';
 
 /// The surrounding album owns zoom, swipes, chrome and orientation. This
 /// surface keeps its cover until the decoder confirms an actual video frame.
@@ -267,30 +268,34 @@ class _AlbumVideoControlsState extends State<AlbumVideoControls> {
                   children: [
                     Row(
                       children: [
-                        IconButton(
-                          key: const ValueKey('album-video-toggle'),
+                        TelevisionAction(
                           focusNode: widget.playPauseFocusNode,
-                          tooltip: controller.playing || controller.loading
-                              ? '暂停'
-                              : controller.error.isEmpty
-                              ? '播放'
-                              : '重试播放',
-                          color: Colors.white,
-                          iconSize: 32,
-                          constraints: const BoxConstraints(
-                            minWidth: 52,
-                            minHeight: 52,
-                          ),
-                          visualDensity: VisualDensity.standard,
-                          style: IconButton.styleFrom(
-                            backgroundColor: Colors.transparent,
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
-                          onPressed: () => unawaited(controller.toggle()),
-                          icon: _AlbumTransportIcon(
-                            controller.playing || controller.loading
-                                ? _AlbumTransportSymbol.pause
-                                : _AlbumTransportSymbol.play,
+                          onActivate: () => unawaited(controller.toggle()),
+                          builder: (_, focus) => IconButton(
+                            key: const ValueKey('album-video-toggle'),
+                            focusNode: focus,
+                            tooltip: controller.playing || controller.loading
+                                ? '暂停'
+                                : controller.error.isEmpty
+                                ? '播放'
+                                : '重试播放',
+                            color: Colors.white,
+                            iconSize: 32,
+                            constraints: const BoxConstraints(
+                              minWidth: 52,
+                              minHeight: 52,
+                            ),
+                            visualDensity: VisualDensity.standard,
+                            style: IconButton.styleFrom(
+                              backgroundColor: Colors.transparent,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: () => unawaited(controller.toggle()),
+                            icon: _AlbumTransportIcon(
+                              controller.playing || controller.loading
+                                  ? _AlbumTransportSymbol.pause
+                                  : _AlbumTransportSymbol.play,
+                            ),
                           ),
                         ),
                         const SizedBox(width: 4),

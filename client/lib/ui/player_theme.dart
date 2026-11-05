@@ -1,8 +1,12 @@
 import 'dart:async';
 import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
 import 'glass.dart';
+import 'television_input.dart';
+import 'television_scroll_region.dart';
 import 'theme/player_style.dart';
 export 'theme/player_style.dart';
 
@@ -37,7 +41,9 @@ class _PlayerPopupDismissState extends State<_PlayerPopupDismiss> {
     if (!mounted ||
         route is! PopupRoute<dynamic> ||
         !route.isCurrent ||
-        event.logicalKey != LogicalKeyboardKey.escape ||
+        (event.logicalKey != LogicalKeyboardKey.escape &&
+            !(TelevisionMode.read(context) &&
+                event.logicalKey == LogicalKeyboardKey.goBack)) ||
         (event is! KeyDownEvent && event is! KeyRepeatEvent)) {
       return KeyEventResult.ignored;
     }
@@ -57,7 +63,8 @@ class _PlayerPopupDismissState extends State<_PlayerPopupDismiss> {
   }
 
   @override
-  Widget build(BuildContext context) => widget.child;
+  Widget build(BuildContext context) =>
+      TelevisionFocusScope(child: widget.child);
 }
 
 class PlayerGlass extends StatelessWidget {
@@ -152,7 +159,7 @@ class PlayerChoiceTile extends StatelessWidget {
     final radius = BorderRadius.circular(style.controlRadius);
     final marker =
         trailing ?? (selected ? const Icon(Icons.check_rounded) : null);
-    return Semantics(
+    final tile = Semantics(
       selected: selected,
       child: Material(
         color: selected ? style.selectedColor : Colors.transparent,
@@ -161,6 +168,10 @@ class PlayerChoiceTile extends StatelessWidget {
         child: InkWell(
           borderRadius: radius,
           onTap: onTap,
+          autofocus: selected && TelevisionMode.of(context),
+          focusColor: TelevisionMode.of(context)
+              ? style.foreground.withAlpha(64)
+              : null,
           child: ConstrainedBox(
             constraints: BoxConstraints(
               minHeight: subtitle == null
@@ -230,6 +241,7 @@ class PlayerChoiceTile extends StatelessWidget {
         ),
       ),
     );
+    return ExcludeFocus(excluding: onTap == null, child: tile);
   }
 }
 
@@ -237,11 +249,13 @@ class PlayerChoiceTile extends StatelessWidget {
 class PlayerDialog extends StatelessWidget {
   final Widget title, content;
   final List<Widget> actions;
+  final bool remoteScroll;
   const PlayerDialog({
     super.key,
     required this.title,
     required this.content,
     this.actions = const [],
+    this.remoteScroll = false,
   });
 
   @override
@@ -259,33 +273,41 @@ class PlayerDialog extends StatelessWidget {
       child: PlayerGlass(
         radius: PlayerTheme.of(context).panelRadius,
         blur: false,
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              DefaultTextStyle.merge(
-                style: PlayerTheme.of(context).dialogTitleStyle,
-                child: title,
-              ),
-              const SizedBox(height: 18),
-              content,
-              if (actions.isNotEmpty) ...[
-                const SizedBox(height: 20),
-                OverflowBar(
-                  alignment: MainAxisAlignment.end,
-                  spacing: 8,
-                  overflowSpacing: 8,
-                  children: actions,
-                ),
-              ],
-            ],
-          ),
-        ),
+        child: remoteScroll
+            ? TelevisionScrollRegion(
+                focusColor: PlayerTheme.of(context).foreground,
+                builder: (context, controller) => _body(context, controller),
+              )
+            : _body(context, null),
       ),
     ),
   );
+  Widget _body(BuildContext context, ScrollController? controller) =>
+      SingleChildScrollView(
+        controller: controller,
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            DefaultTextStyle.merge(
+              style: PlayerTheme.of(context).dialogTitleStyle,
+              child: title,
+            ),
+            const SizedBox(height: 18),
+            content,
+            if (actions.isNotEmpty) ...[
+              const SizedBox(height: 20),
+              OverflowBar(
+                alignment: MainAxisAlignment.end,
+                spacing: 8,
+                overflowSpacing: 8,
+                children: actions,
+              ),
+            ],
+          ],
+        ),
+      );
 }
 
 /// A player selector keeps nested choices on the player's glass surface.
@@ -485,9 +507,8 @@ double playerMenuWidth(BuildContext context, Iterable<String> labels) {
   for (final label in labels) {
     painter.text = TextSpan(
       text: label,
-      style: Theme.of(
-        context,
-      ).textTheme.bodyMedium?.merge(PlayerTheme.of(context).optionLabelStyle),
+      style: Theme.of(context).textTheme.bodyMedium
+          ?.merge(PlayerTheme.of(context).optionLabelStyle),
     );
     painter.layout();
     width = (painter.width + PlayerTheme.menuLabelPadding).clamp(
@@ -541,9 +562,8 @@ class PlayerSheet extends StatelessWidget {
                           child: Container(
                             width: 34,
                             height: 4,
-                            decoration: PlayerTheme.of(
-                              context,
-                            ).sheetHandleDecoration,
+                            decoration: PlayerTheme.of(context)
+                                .sheetHandleDecoration,
                           ),
                         ),
                       Flexible(child: child),

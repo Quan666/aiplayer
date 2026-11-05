@@ -2,7 +2,7 @@
 
 面向个人动漫收藏的 Flutter 播放器与可选 Go 同步服务。包含 Android、iOS/iPadOS、Windows、macOS 工程；Linux 工程用于本次环境的实际播放验证。界面默认中文、浅色，可在「设置 → 常规 → 外观与文件」切换深色，选择保存在本机。
 
-**当前源码版本为 0.5.26+32，尚未完成四端实机验收。** 本次改进海报下载、缓存升级、显示解码和同步缩图，精简桌面导航并整合 macOS 标题栏，完善仅标题版本与电影多版本的资料识别。完整更新内容见 [0.5.26 更新说明](docs/releases/v0.5.26.md)，验证范围见 [验证记录](docs/VALIDATION.md)。
+**当前源码版本为 0.5.27+33，尚未完成四端实机验收。** 本版完善电视遥控、相册浏览位置恢复与播放器操作，修复 SMB 文件打开等待和兼容版默认字重，并加入 Android 6.0 / 6.0.1 双 ARM 兼容构建入口。Android 6.0.1 设备安装失败原因仍待错误码确认。更新内容见 [0.5.27 更新说明](docs/releases/v0.5.27.md)，验证范围见 [验证记录](docs/VALIDATION.md)。
 
 历史本地构建提供 [0.5.14 Android 通用 release APK](artifacts/performance-0514/aiplayer-0.5.14-android.apk)，支持 Android 7.0+ 的 ARM32、ARM64 与 x86_64，版本号 `0.5.14+20`，大小 135,301,586 字节。沿用现有签名，0.5.4 至 0.5.13 可覆盖升级；密钥仍保存在 `.local-build/signing/debug.keystore`。[构建与 APK 校验](artifacts/performance-0514/build-android.json)、[校验和](artifacts/performance-0514/SHA256SUMS-android)。配套进度同步仍兼容现有 [0.5.3 服务包](artifacts/aiplayer-sync-0.5.3-linux-amd64.tar.gz)；服务端源码已移除同步播放接口，本轮未部署或替换运行中的服务。
 
@@ -101,14 +101,14 @@ flutter run -d <设备ID>
 
 CI 不上传 DMG、`build-*.json`、`SHA256SUMS-*` 或截图产物；验证工作流的测试仍保留。Actions Artifacts 保留 30 天。相关源码变更及 `v*` 标签触发自动构建；PR 只构建 macOS，**不向 PR 代码提供 Android 签名密钥，也不生成正式 Android 包**。自动构建和手动构建都由 `packages.yml` 内的对应任务执行，不另设 macOS 工作流。
 
-推送版本标签会在 Android、macOS 全部打包成功后自动创建 GitHub Release，上传上述三个原始文件，并优先使用 `docs/releases/<tag>.md` 中的更新说明；没有对应文件时自动生成。标签必须与 `client/pubspec.yaml` 中去掉构建号的版本一致，例如 `0.5.26+32` 对应 `v0.5.26`；不一致时在打包前失败。将本次版本修改提交并推送后执行：
+推送版本标签会在 Android、macOS 全部打包成功后自动创建 GitHub Release，上传上述三个原始文件，并优先使用 `docs/releases/<tag>.md` 中的更新说明；没有对应文件时自动生成。标签必须与 `client/pubspec.yaml` 中去掉构建号的版本一致，例如 `0.5.27+33` 对应 `v0.5.27`；不一致时在打包前失败。将本次版本修改提交并推送后执行：
 
 ```bash
-git tag -a v0.5.26 -F docs/releases/v0.5.26.md
-git push origin v0.5.26
+git tag -a v0.5.27 -F docs/releases/v0.5.27.md
+git push origin v0.5.27
 ```
 
-普通分支和 PR 不发布 Release。手动补发已有标签可运行 `gh workflow run packages.yml --ref v0.5.26 -f target=all`，也可选 `android` 或 `macos` 仅构建并上传对应平台。所选平台任一构建失败或取消时不发布。新 Release 先创建草稿，文件上传成功后公开；上传失败可重跑，已存在的 Release 更新同名附件并保留其他附件和发布说明。预发布版本（如 `0.5.26-rc.1+32`）对应的标签会创建 Pre-release。只有发布任务获得 `contents: write`，使用内置 `GITHUB_TOKEN`，无需另配发布 Token；Release 附件不受 Artifacts 的 30 天保留期限制。
+普通分支和 PR 不发布 Release。手动补发已有标签可运行 `gh workflow run packages.yml --ref v0.5.27 -f target=all`，也可选 `android` 或 `macos` 仅构建并上传对应平台。所选平台任一构建失败或取消时不发布。新 Release 先创建草稿，文件上传成功后公开；上传失败可重跑，已存在的 Release 更新同名附件并保留其他附件和发布说明。预发布版本（如 `0.5.27-rc.1+33`）对应的标签会创建 Pre-release。只有发布任务获得 `contents: write`，使用内置 `GITHUB_TOKEN`，无需另配发布 Token；Release 附件不受 Artifacts 的 30 天保留期限制。
 
 Android 首次运行前，在仓库 **Settings → Secrets and variables → Actions** 配置 `ANDROID_KEYSTORE_BASE64`，内容为现有 `.local-build/signing/debug.keystore` 的 Base64。已登录 GitHub CLI 时，可在本机 Linux 项目根目录运行以下命令，将值通过标准输入上传，不打印密钥：
 
@@ -134,6 +134,8 @@ Actions Artifacts 保留 30 天，版本标签构建还会将应用包上传到�
 
 ### 本地打包
 
+日常交付只保留安卓通用、安卓 ARM64、Android 6.0 / 6.0.1 兼容通用（ARM32＋ARM64）和 macOS 四类。统一入口为 `bash scripts/build_release.sh <android|android-arm64|android-legacy|macos>`；安装包命名、环境、校验和整理规则见 [构建与产物约定](docs/BUILDING.md)。该入口关闭重复 APK 别名，macOS 只生成 ZIP；下列底层命令保留供其他平台维护使用。
+
 本地或 CI 完成 `flutter pub get` 后，可用统一打包脚本构建并生成校验文件：
 
 ```bash
@@ -148,6 +150,8 @@ python3 scripts/package.py ios      # 未签名 IPA 和 .app 压缩包，不可�
 ```
 
 Android 打包先校验清单、ZIP CRC、重复条目、v1/v2/v3 签名、每个 ABI 的核心原生库与 16KB 对齐；生成带版本名的 APK、文件大小、SHA256 与验证记录。更新继续使用原证书，避免丢失本机数据。
+
+Android 6.0 / 6.0.1 电视使用独立的 [Android 6 兼容构建](compat/android6/README.md)，支持 ARM32 / ARM64，并提供 **Actions → Build Android 6 compatibility** 手动打包入口。
 
 本地默认同时保留固定文件名的 APK 别名；传入 `--no-android-alias` 可与 CI 一样只生成带版本名的一份，校验文件和构建记录也只列这一份。
 

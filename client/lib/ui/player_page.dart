@@ -151,6 +151,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   Object? _mediaNeighborsRevision;
   String? _configuredMediaId;
   Future<void>? _mediaNeighborsWork;
+  GlobalObjectKey<_PlayerControlsState> get _controlsKey =>
+      GlobalObjectKey<_PlayerControlsState>(session);
   final _settingsAnchor = GlobalKey();
   final _speedAnchor = GlobalKey();
   final _modelChanges = PlayerModelChanges();
@@ -1164,6 +1166,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       builder: (c) => _playerSurface(
         StatefulBuilder(
           builder: (c, set) => PlayerDialog(
+            remoteScroll: true,
             title: const Text('播放诊断'),
             content: Column(
               mainAxisSize: MainAxisSize.min,
@@ -1206,7 +1209,12 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     PopScope(
       canPop: _readyToLeave,
       onPopInvokedWithResult: (didPop, result) {
-        if (!didPop) leave();
+        if (!didPop &&
+            !(TelevisionMode.read(context) &&
+                (_controlsKey.currentState?.consumeTelevisionBack() ??
+                    false))) {
+          leave();
+        }
       },
       child: Scaffold(
         backgroundColor: PlayerTheme.of(context).videoBackground,
@@ -1269,31 +1277,35 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
               ),
             Positioned.fill(
               key: const ValueKey('player-controls-layer'),
-              child: RepaintBoundary(
-                child: _PlayerControls(
-                  key: ValueKey(session),
-                  session: session,
-                  fullscreen: _nativeFullscreen,
-                  onEnterNativeFullscreen: _enterFullscreen,
-                  onOrientFullscreen: _orientFullscreen,
-                  title: widget.model.displayTitle(
-                    widget.model.store.get('media', session.media.id) ??
-                        session.media,
+              child: TelevisionMenuRegion(
+                onMenu: () =>
+                    _controlsKey.currentState?._revealTelevisionControls(),
+                child: RepaintBoundary(
+                  child: _PlayerControls(
+                    key: _controlsKey,
+                    session: session,
+                    fullscreen: _nativeFullscreen,
+                    onEnterNativeFullscreen: _enterFullscreen,
+                    onOrientFullscreen: _orientFullscreen,
+                    title: widget.model.displayTitle(
+                      widget.model.store.get('media', session.media.id) ??
+                          session.media,
+                    ),
+                    onBack: leave,
+                    onAudio: () => tracks(true),
+                    onSubtitle: () => tracks(false),
+                    onDanmaku: danmakuPanel,
+                    onDiagnostics: diagnostics,
+                    onSettings: quickSettings,
+                    settingsAnchor: _settingsAnchor,
+                    onSpeed: playbackSpeed,
+                    speedAnchor: _speedAnchor,
+                    onSelectMedia: selectMedia,
+                    onExitNativeFullscreen: _exitFullscreen,
+                    display: display,
+                    windowMode: windowMode,
+                    model: widget.model,
                   ),
-                  onBack: leave,
-                  onAudio: () => tracks(true),
-                  onSubtitle: () => tracks(false),
-                  onDanmaku: danmakuPanel,
-                  onDiagnostics: diagnostics,
-                  onSettings: quickSettings,
-                  settingsAnchor: _settingsAnchor,
-                  onSpeed: playbackSpeed,
-                  speedAnchor: _speedAnchor,
-                  onSelectMedia: selectMedia,
-                  onExitNativeFullscreen: _exitFullscreen,
-                  display: display,
-                  windowMode: windowMode,
-                  model: widget.model,
                 ),
               ),
             ),
@@ -1390,6 +1402,10 @@ class _PlayerControlsState extends State<_PlayerControls>
   bool _closing = false, _rotating = false, _preparingPip = false;
   final _playlistAnchor = GlobalKey();
   final _televisionPlayFocus = FocusNode(debugLabel: 'television-play-pause');
+  final _televisionLockFocus = FocusNode(debugLabel: 'television-player-lock');
+  final _surfaceFocus = FocusNode(debugLabel: 'player-surface');
+  final _timelineFocus = FocusNode(debugLabel: 'player-timeline');
+  bool _television = false;
   final Map<int, Offset> _touches = {};
   int? _mousePointer;
   double? _pinchDistance;
@@ -1416,6 +1432,7 @@ class _PlayerControlsState extends State<_PlayerControls>
   bool get mobile => Platform.isAndroid || Platform.isIOS;
   PlaybackSession get s => widget.session;
   bool get _controlsCanAutoHide =>
+      !_television &&
       s.ready &&
       s.firstFrameRendered &&
       s.player.state.playing &&
@@ -1450,6 +1467,16 @@ class _PlayerControlsState extends State<_PlayerControls>
     reveal();
     _controlsState = _visibleSessionState;
     _maybeAutoFullscreen();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final television = TelevisionMode.of(context);
+    if (_television != television) {
+      _television = television;
+      if (television) _revealTelevisionControls();
+    }
   }
 
   Future<void> _prepareSeekPreview() async {
@@ -1555,6 +1582,26 @@ class _PlayerControlsState extends State<_PlayerControls>
       locked = !locked;
       reveal();
     });
+    if (_television) _revealTelevisionControls();
+  }
+
+  /// Back removes the innermost remote interaction before leaving playback.
+  /// The page calls this for Android system Back as well as keyboard remotes.
+  bool consumeTelevisionBack() {
+    if (!_television || _closing || s.closed) return false;
+    if (locked) {
+      _lock();
+      return true;
+    }
+    if (seekTimeline.dragging) {
+      _finishSeek(commit: false);
+      return true;
+    }
+    if (show) {
+      setState(_hideControls);
+      return true;
+    }
+    return false;
   }
 
   Future<void> _pip() async {
@@ -1987,35 +2034,90 @@ class _PlayerControlsState extends State<_PlayerControls>
         ModalRoute.of(context)?.isCurrent != true) {
       return KeyEventResult.ignored;
     }
+    if (_television &&
+        playbackIsBackgrounded(WidgetsBinding.instance.lifecycleState)) {
+      // A late remote event must not reach a still-focused play button after
+      // Android has stopped drawing the route.
+      return const [
+            LogicalKeyboardKey.arrowUp,
+            LogicalKeyboardKey.arrowDown,
+            LogicalKeyboardKey.arrowLeft,
+            LogicalKeyboardKey.arrowRight,
+            LogicalKeyboardKey.select,
+            LogicalKeyboardKey.enter,
+            LogicalKeyboardKey.numpadEnter,
+            LogicalKeyboardKey.gameButtonA,
+            LogicalKeyboardKey.contextMenu,
+            LogicalKeyboardKey.escape,
+            LogicalKeyboardKey.goBack,
+          ].contains(event.logicalKey)
+          ? KeyEventResult.handled
+          : KeyEventResult.ignored;
+    }
     final focus = FocusManager.instance.primaryFocus?.context;
     if (focus?.widget is EditableText ||
         focus?.findAncestorWidgetOfExactType<EditableText>() != null) {
       return KeyEventResult.ignored;
     }
-    if (TelevisionMode.read(context) && !locked) {
-      final remote = televisionPlaybackAction(event, controlsVisible: show);
-      if (remote == 'traverse') {
-        hideTimer.arm();
-        return KeyEventResult.ignored;
+    if (_television) {
+      if ((event.logicalKey == LogicalKeyboardKey.escape ||
+              event.logicalKey == LogicalKeyboardKey.goBack) &&
+          (event is KeyDownEvent || event is KeyRepeatEvent)) {
+        if (event is KeyDownEvent && !consumeTelevisionBack()) {
+          unawaited(_back());
+        }
+        return KeyEventResult.handled;
       }
+      final remote = televisionPlaybackAction(event, controlsVisible: show);
       if (remote == 'consume') return KeyEventResult.handled;
       if (remote == 'showControls') {
         _revealTelevisionControls();
         return KeyEventResult.handled;
       }
+      if (remote == 'traverse') {
+        hideTimer.arm();
+        if (_surfaceFocus.hasPrimaryFocus ||
+            focus?.findAncestorStateOfType<_PlayerControlsState>() != this) {
+          _revealTelevisionControls();
+          return KeyEventResult.handled;
+        }
+        // The timeline uses the configured seek step, independent of duration.
+        // Volume and settings sliders keep Flutter's directional slider actions.
+        if (_timelineFocus.hasFocus &&
+            (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
+                event.logicalKey == LogicalKeyboardKey.arrowRight)) {
+          _action(
+            event.logicalKey == LogicalKeyboardKey.arrowLeft
+                ? 'seekBackward'
+                : 'seekForward',
+          );
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      }
       if (remote != null) {
-        _action(remote, revealControls: false);
+        if (locked) {
+          _revealTelevisionControls();
+        } else {
+          _action(remote, revealControls: false);
+        }
         return KeyEventResult.handled;
       }
       if (event is KeyDownEvent &&
           (event.logicalKey == LogicalKeyboardKey.select ||
               event.logicalKey == LogicalKeyboardKey.enter ||
               event.logicalKey == LogicalKeyboardKey.numpadEnter ||
-              event.logicalKey == LogicalKeyboardKey.gameButtonA) &&
-          focus?.findAncestorStateOfType<_PlayerControlsState>() != this) {
-        _revealTelevisionControls();
-        return KeyEventResult.handled;
+              event.logicalKey == LogicalKeyboardKey.gameButtonA)) {
+        hideTimer.arm();
+        if (_surfaceFocus.hasPrimaryFocus ||
+            focus?.findAncestorStateOfType<_PlayerControlsState>() != this) {
+          _revealTelevisionControls();
+          return KeyEventResult.handled;
+        }
       }
+      // TV navigation and hardware volume must never fall through to custom
+      // desktop arrow shortcuts (volume, zoom, or other reassigned actions).
+      return KeyEventResult.ignored;
     }
     // Handle player keys before a focused slider or button consumes arrows
     // and Space. Modal routes and text fields retain their own keyboard input.
@@ -2057,7 +2159,7 @@ class _PlayerControlsState extends State<_PlayerControls>
           ModalRoute.of(context)?.isCurrent != true) {
         return;
       }
-      _televisionPlayFocus.requestFocus();
+      (locked ? _televisionLockFocus : _televisionPlayFocus).requestFocus();
     });
   }
 
@@ -2067,6 +2169,9 @@ class _PlayerControlsState extends State<_PlayerControls>
   }
 
   void _hideControls() {
+    if (_television && ModalRoute.of(context)?.isCurrent == true) {
+      _surfaceFocus.requestFocus();
+    }
     _setControlsVisible(false);
     hideTimer.configure(
       playing: false,
@@ -2153,6 +2258,9 @@ class _PlayerControlsState extends State<_PlayerControls>
   void dispose() {
     _cancelSurfaceTaps(rebuild: false);
     _televisionPlayFocus.dispose();
+    _televisionLockFocus.dispose();
+    _surfaceFocus.dispose();
+    _timelineFocus.dispose();
     FocusManager.instance.removeEarlyKeyEventHandler(_keyEvent);
     if (!mobile) {
       GestureBinding.instance.pointerRouter.removeGlobalRoute(_desktopPointer);
@@ -2272,6 +2380,7 @@ class _PlayerControlsState extends State<_PlayerControls>
                 height: 28,
                 child: Slider(
                   key: const ValueKey('player-timeline'),
+                  focusNode: _timelineFocus,
                   semanticFormatterCallback: (v) =>
                       clockText(Duration(milliseconds: v.round())),
                   value: milliseconds,
@@ -2546,12 +2655,11 @@ class _PlayerControlsState extends State<_PlayerControls>
     final verticalGestures =
         gestures &&
         (p.verticalVolume || (p.verticalBrightness && PlayerDisplay.supported));
-    return PopScope(
-      canPop: true,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _back();
-      },
+    return TelevisionFocusScope(
+      autofocus: false,
       child: Focus(
+        focusNode: _surfaceFocus,
+        skipTraversal: _television,
         autofocus: true,
         child: MouseRegion(
           cursor: !mobile && widget.fullscreen && !show
@@ -2756,6 +2864,7 @@ class _PlayerControlsState extends State<_PlayerControls>
                     PlayerGlass(
                       radius: PlayerTheme.of(context).panelRadius,
                       child: _PlayerButton(
+                        focusNode: _televisionLockFocus,
                         icon: locked
                             ? Icons.lock_open_rounded
                             : Icons.lock_outline_rounded,
@@ -3146,19 +3255,40 @@ class _PlayerButton extends StatelessWidget {
     this.size = 44,
   });
   @override
-  Widget build(BuildContext context) => IconButton(
-    focusNode: focusNode,
-    tooltip: tooltip,
-    onPressed: onPressed,
-    style: PlayerTheme.of(context).controlButtonStyle(size),
-    icon: icon == null
-        ? SizedBox.square(dimension: iconSize)
-        : Icon(
-            icon,
-            size: iconSize,
-            shadows: PlayerTheme.of(context).iconShadows,
-          ),
-  );
+  Widget build(BuildContext context) {
+    final button = IconButton(
+      focusNode: focusNode,
+      tooltip: tooltip,
+      onPressed: onPressed,
+      style: TelevisionMode.of(context)
+          ? PlayerTheme.of(context)
+                .controlButtonStyle(size)
+                .copyWith(
+                  side: WidgetStateProperty.resolveWith(
+                    (states) => states.contains(WidgetState.focused)
+                        ? BorderSide(
+                            color: PlayerTheme.of(context).foreground,
+                            width: 2,
+                          )
+                        : BorderSide.none,
+                  ),
+                  backgroundColor: WidgetStateProperty.resolveWith(
+                    (states) => states.contains(WidgetState.focused)
+                        ? PlayerTheme.of(context).foreground.withAlpha(40)
+                        : Colors.transparent,
+                  ),
+                )
+          : PlayerTheme.of(context).controlButtonStyle(size),
+      icon: icon == null
+          ? SizedBox.square(dimension: iconSize)
+          : Icon(
+              icon,
+              size: iconSize,
+              shadows: PlayerTheme.of(context).iconShadows,
+            ),
+    );
+    return ExcludeFocus(excluding: onPressed == null, child: button);
+  }
 }
 
 class _OptionRow extends StatelessWidget {
