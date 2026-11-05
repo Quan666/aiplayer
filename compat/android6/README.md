@@ -40,11 +40,13 @@ bash scripts/package_android_legacy.sh --no-android-alias
 
 ## GitHub Actions
 
-手动运行 **Actions → Build Android 6 compatibility → Run workflow**。
-工作流分别执行两种 ARM 原生编译、无密钥 APK 构建、独立 runner 签名校验，
-最后提供带 `android-legacy` 的 APK 下载。签名仍使用已有
-`ANDROID_KEYSTORE_BASE64` secret。该工作流不会阻塞现代版自动构建，也不会
-自动发布 Release。
+统一运行 **Actions → Build packages → Run workflow**。默认 `all` 或
+`android` 都包含兼容包；只需要兼容包时选择 `android-legacy`。
+两种 ARM 原生库和无密钥 APK 在同一 runner 构建，原生缓存与 API 24 隔离，
+独立签名 runner 使用已有 `ANDROID_KEYSTORE_BASE64` secret 校验并上传。
+匹配版本的标签发布包含兼容包，缺失时拒绝发布。旧的独立手动工作流已合并。
+下载区只保留成品，临时传递会被清理，版本、大小、SHA-256、系统与架构说明
+在运行摘要中。缓存、重跑与签名边界见 [构建文档](../../docs/BUILDING.md)。
 
 ## 维护与验证
 
@@ -55,7 +57,8 @@ TickerMode 和二维码 API。保留惰性列表、有界缓存、向下排序�
 原生播放器继续使用当前固定源码版本，API 23 / API 24 的构建目录、指纹和
 产物 metadata 独立；插件验证 API、源码锁、构建脚本和 JAR 摘要。
 SQLite 继续使用项目维护的源码。兼容包仍检查双 ARM、API 23、原证书、
-v1/v2/v3 签名、必要播放库、PGS 和 16 KB 对齐。
+v1/v2/v3 签名、必要播放库、PGS 和 16 KB 对齐；额外要求所有 DEX 使用 Android 6
+支持的 035 格式，并单独按 API 23 验证 v1 签名及证书。
 
 修改共享源码后，应重新准备副本、执行旧 SDK 静态分析和相关 Flutter 回归，
 再严格构建 APK。更新依赖时，维护者可使用 `prepare_android_legacy.py --bootstrap`

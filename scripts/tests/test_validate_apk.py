@@ -97,11 +97,13 @@ class ApkCompatibilityTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.apk = Path(temporary.name) / "fixture.apk"
 
-    def create(self, abis=validation.LEGACY_ABIS, *, omit=(), modern=False):
+    def create(self, abis=validation.LEGACY_ABIS, *, omit=(), modern=False, dex=b"dex\n035\0", extra_dex=None):
         libraries = validation.CORE_LIBRARIES if modern else validation.LEGACY_CORE_LIBRARIES
         with zipfile.ZipFile(self.apk, "w") as archive:
             for name in ("AndroidManifest.xml", "resources.arsc", "classes.dex"):
-                archive.writestr(name, b"fixture")
+                archive.writestr(name, dex if name == "classes.dex" else b"fixture")
+            if extra_dex is not None:
+                archive.writestr("classes2.dex", extra_dex)
             for abi in abis:
                 for library in sorted(libraries - set(omit)):
                     archive.writestr(f"lib/{abi}/{library}", native_library(abi))
@@ -117,7 +119,7 @@ class ApkCompatibilityTest(unittest.TestCase):
             for scheme in ("v1", "v2", "v3")
         ) + "\nSigner #1 certificate SHA-256 digest: " + "a1" * 32
         with patch.object(validation, "sdk_tool", side_effect=lambda name: Path("/sdk") / name), \
-             patch.object(validation, "run", side_effect=[badging, signature_output, "Verified"]):
+             patch.object(validation, "run", side_effect=[badging, signature_output, signature_output, "Verified"]):
             return validation.validate_apk(self.apk, **kwargs)
 
     def test_legacy_requires_both_arm_abis_and_api23_without_unused_jni(self):
@@ -126,6 +128,31 @@ class ApkCompatibilityTest(unittest.TestCase):
         self.assertEqual(report["min_sdk"], 23)
         self.assertEqual(report["abis"], list(validation.LEGACY_ABIS))
         self.assertTrue(all(report["signature_schemes"].values()))
+        self.assertTrue(report["api23_signature_verified"])
+        self.assertEqual(report["dex_versions"], {"classes.dex": "035"})
+
+    def test_legacy_rejects_new_dex_even_when_only_in_secondary_file(self):
+        for options in ({"dex": b"dex\n037\0"}, {"extra_dex": b"dex\n039\0"}):
+            with self.subTest(options=options):
+                self.create(**options)
+                with self.assertRaisesRegex(RuntimeError, "Android 6 requires DEX 035"):
+                    self.validate(android_legacy=True)
+
+    def test_api23_verification_is_required_even_if_all_modern_schemes_pass(self):
+        self.create()
+        with patch.object(validation, "signing_certificate_sha256", return_value="a1" * 32), \
+             patch.object(validation, "sdk_tool", side_effect=lambda name: Path("/sdk") / name), \
+             patch.object(validation, "run", side_effect=[
+                 "package: name='app.aiplayer.aiplayer' versionCode='32' versionName='0.5.26'\n"
+                 "sdkVersion:'23'\ntargetSdkVersion:'36'\n"
+                 "launchable-activity: name='app.aiplayer.aiplayer.MainActivity'\n",
+                 "\n".join(f"Verified using {scheme} scheme (fixture): true" for scheme in ("v1", "v2", "v3")),
+                 RuntimeError("Android 6 installer rejects signature"),
+             ]) as execute:
+            with self.assertRaisesRegex(RuntimeError, "Android 6 installer rejects signature"):
+                validation.validate_apk(self.apk, android_legacy=True)
+            command = execute.call_args.args[0]
+            self.assertEqual(command[command.index("--max-sdk-version") + 1], "23")
 
     def test_release_minimum_is_strict_for_each_variant(self):
         for legacy, minimum in ((True, 24), (True, 22), (False, 23)):

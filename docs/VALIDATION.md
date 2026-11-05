@@ -1,5 +1,36 @@
 # 验证记录
 
+## 2026-11-05：统一安装包 CI 与 Android 6 安装检查
+
+- 主打包工作流默认交付 Android 通用、ARM64、API 23 双 ARM legacy 和 macOS ZIP。
+  合并独立 legacy 工作流；现代 / 兼容 / macOS 并行，每路 Android 在同一 runner
+  完成自己的原生依赖和 APK，签名保留独立环境。只传递两个临时未签名集合，
+  消费后清理；正常运行结束仅留四类成品，说明、大小、链接、SHA-256、
+  APK 校验记录和 CocoaPods 锁写入任务摘要。清理后重试需要 Re-run all jobs。
+- 原生缓存按 OS / CPU / API / 锁 / 补丁 / 编译及校验脚本 / 工作流隔离，
+  命中仍逐 ABI 验证；验证后即保存，不因后续 Flutter 失败而重编。
+  现代通用与 ARM64 共用工作区和依赖解析，取消无用 x86 原生编译，
+  新增 Gradle 下载 / CocoaPods 缓存及 Verify 过期运行取消。
+- 本地 Python 共 **121 项：115 通过、6 跳过、0 失败**；受本地监听权限限制
+  跳过的下载测试随后在允许本地端口的环境独立执行，**10 项全部通过**。
+  唯一剩余未验证测试为原生 Windows batch。日志分别为
+  `/tmp/aiplayer-ci-regressions.log`、`/tmp/aiplayer-ci-native-download-tests.log`。
+  新增回归覆盖四种构建计划、legacy-only 矩阵、旧引擎预检、API 23 / 24 隔离、
+  无密钥构建、同目录现代双包、单次严格依赖解析、签名传递边界、清理密钥、
+  下载说明、缺包拒发、DEX 035 和 API 23 v1 签名失败路径。
+- 本次修改的 `packages.yml`、`verify.yml` 通过 actionlint 1.7.12；shell 语法、
+  供应链固定版本 / 摘要和差异检查通过。全仓 actionlint 另有现存 `server.yml`
+  的 `ubuntu-26.04` / `ubuntu-26.04-arm` 标签不被该工具版本识别，本轮未修改服务器工作流。
+- 对本地既有 `aiplayer-0.5.27-android-legacy.apk` 重新检查，最低 API 23、
+  双 ARM、DEX 035、v1/v2/v3、单独 API 23 v1 验证、原证书、PGS、CRC 和 16 KB
+  对齐通过；SHA-256 为 `b6f1e592199b6582bdf0287d8e950b2f405d387cb5fb0dbf6572c8a42f2915dc`。
+  报告 `/tmp/aiplayer-legacy-ci-review.json`。这只是旧包复检，本轮未重新构建安装包。
+- **用户报告的 CI 兼容包无法安装尚未定位。** 尚缺失败 APK / 运行链接及设备
+  PackageManager 错误码；本地旧包通过静态检查不能证明该 CI 包可安装。
+  GitHub 公开 API 查询遇到限流，连接工具也未返回所查运行的产物；没有获取到失败包。
+  本轮未推送或触发真实 GitHub Actions、未连接 Android 6.0.1 / TV 真机、未在
+  macOS 构建机运行，也没有 CI 冷 / 热耗时实测；不宣称安装问题已修复或具体加速比例。
+
 ## 2026-11-05：0.5.27 发布前检查
 
 - 源码版本为 `0.5.27+33`，对应标签 `v0.5.27`；同步启动日志、关于信息、请求 User-Agent 与 README 示例，补充[更新说明](releases/v0.5.27.md)。纳入已有本地提交以及电视遥控、相册、SMB 文件打开、字体与 Android 6 独立构建改动。

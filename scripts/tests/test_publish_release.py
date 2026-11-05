@@ -21,6 +21,7 @@ TAG = "v0.5.15"
 ANDROID_ASSETS = (
     "aiplayer-0.5.15-android.apk",
     "aiplayer-0.5.15-android-arm64.apk",
+    "aiplayer-0.5.15-android-legacy.apk",
 )
 MACOS_ASSET = "aiplayer-macos-unsigned.zip"
 
@@ -79,6 +80,7 @@ class ReleaseAssetsTest(unittest.TestCase):
         for target, names in (
             ("all", (*ANDROID_ASSETS, MACOS_ASSET)),
             ("android", ANDROID_ASSETS),
+            ("android-legacy", (ANDROID_ASSETS[2],)),
             ("macos", (MACOS_ASSET,)),
         ):
             with self.subTest(target=target):
@@ -90,7 +92,7 @@ class ReleaseAssetsTest(unittest.TestCase):
     def test_single_platform_does_not_require_other_platform_packages(self):
         self.write_assets(ANDROID_ASSETS)
         self.assertEqual(
-            len(release.release_assets(self.directory, VERSION, "android")), 2
+            len(release.release_assets(self.directory, VERSION, "android")), 3
         )
         for name in ANDROID_ASSETS:
             (self.directory / name).unlink()
@@ -104,6 +106,7 @@ class ReleaseAssetsTest(unittest.TestCase):
         for target, names in (
             ("all", (*ANDROID_ASSETS, MACOS_ASSET)),
             ("android", ANDROID_ASSETS),
+            ("android-legacy", (ANDROID_ASSETS[2],)),
             ("macos", (MACOS_ASSET,)),
         ):
             for invalid_name in names:

@@ -6,6 +6,9 @@ if [[ "$#" -ne 1 ]]; then
   echo 'Usage: bash scripts/build_release.sh {android|android-arm64|android-legacy|macos}' >&2
   exit 2
 fi
+if [[ "${AIPLAYER_ANDROID_UNSIGNED:-}" == true && "$1" == android* ]]; then
+  exec bash "$release_root/scripts/ci_android_build.sh" "$1"
+fi
 case "$1" in
   android)
     source "$release_root/scripts/local_build_env.sh"

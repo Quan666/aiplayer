@@ -151,7 +151,7 @@ python3 scripts/package.py ios      # 未签名 IPA 和 .app 压缩包，不可�
 
 Android 打包先校验清单、ZIP CRC、重复条目、v1/v2/v3 签名、每个 ABI 的核心原生库与 16KB 对齐；生成带版本名的 APK、文件大小、SHA256 与验证记录。更新继续使用原证书，避免丢失本机数据。
 
-Android 6.0 / 6.0.1 电视使用独立的 [Android 6 兼容构建](compat/android6/README.md)，支持 ARM32 / ARM64，并提供 **Actions → Build Android 6 compatibility** 手动打包入口。
+Android 6.0 / 6.0.1 电视使用独立工具链的 [Android 6 兼容构建](compat/android6/README.md)，支持 ARM32 / ARM64。**Actions → Build packages** 默认包含兼容包，单独构建可选择 `android-legacy`；四类成品的系统、架构、大小、下载链接和校验记录见运行摘要。
 
 本地默认同时保留固定文件名的 APK 别名；传入 `--no-android-alias` 可与 CI 一样只生成带版本名的一份，校验文件和构建记录也只列这一份。
 

@@ -31,12 +31,14 @@ def validate_tag(tag: str, version: str) -> None:
 
 
 def release_assets(directory: Path, version: str, target: str) -> list[Path]:
-    if target not in ("all", "android", "macos"):
+    if target not in ("all", "android", "android-legacy", "macos"):
         raise ValueError(f"Unsupported release target: {target}")
     name = version.split("+")[0]
     names = []
     if target in ("all", "android"):
         names.extend((f"aiplayer-{name}-android.apk", f"aiplayer-{name}-android-arm64.apk"))
+    if target in ("all", "android", "android-legacy"):
+        names.append(f"aiplayer-{name}-android-legacy.apk")
     if target in ("all", "macos"):
         names.append("aiplayer-macos-unsigned.zip")
     assets = [directory / name for name in names]
@@ -72,7 +74,7 @@ def publish(tag: str, assets: list[Path], *, notes: Path | None = None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True)
-    parser.add_argument("--target", choices=("all", "android", "macos"), default="all")
+    parser.add_argument("--target", choices=("all", "android", "android-legacy", "macos"), default="all")
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()

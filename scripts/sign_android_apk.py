@@ -9,6 +9,7 @@ Gradle or APK-provided code in this job.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ import tempfile
 import zipfile
 
 from restore_android_signing import restore
-from validate_apk import sdk_tool, validate_apk
+from validate_apk import digest, sdk_tool, validate_apk
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +93,13 @@ def sign(directory: Path, output: Path, abi: str, *, android_legacy: bool = Fals
             raise ValueError("APK signing certificate changed; refusing an incompatible update")
         output.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(signed, target)
+    # Keep validation records in the job summary without extra download artifacts.
+    metadata_target = "android" + suffix
+    checksum = digest(target)
+    (output / f"SHA256SUMS-{metadata_target}").write_text(f"{checksum}  {target.name}\n")
+    (output / f"build-{metadata_target}.json").write_text(json.dumps({
+        "version": version, "artifacts": [target.name], "apk_validation": validation,
+    }, ensure_ascii=False, indent=2) + "\n")
     print(f"Signed and validated {target.name}")
     return target
 

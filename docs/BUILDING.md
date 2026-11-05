@@ -44,9 +44,49 @@ Android 使用项目持久环境 `.local-build/`：Flutter / Android SDK 在 `sd
 
 macOS 使用现有 macOS 脚本和 CI 工具链，保留双架构、包权限、符号链接与签名检查。`unsigned` 表示没有开发者证书和公证，不表示完全没有签名。
 
+## GitHub Actions
+
+统一使用 **Actions → Build packages**；默认 `all` 生成上表四个安装包。
+`android` 生成三个 Android 包，`android-legacy` 只生成 Android 6 兼容包，
+`macos` 只生成 macOS ZIP。兼容配置 `compat/android6/**` 的变更也触发主流程。
+PR 运行构建计划、打包回归和 macOS 构建，不接触 Android 签名密钥；完整 Android
+构建在 push / 手动运行执行。标签必须匹配源码版本；发布 Android 时缺少 legacy
+会阻止 Release，不能静默漏发。
+
+现代 Android、兼容 Android、macOS 并行。每个 Android runner 在同一环境内
+完成自己的原生依赖和 APK 构建；现代通用、ARM64 顺序共用 Flutter / Gradle
+工作区，避免竞争构建目录。CI 仍调用 `bash scripts/build_release.sh <目标>`：
+设置 `AIPLAYER_ANDROID_UNSIGNED=true` 时进入专用 CI 暂存分支，使用 runner
+上的 Flutter / Android SDK，不加载本地密钥或改写本机构建环境。
+构建阶段拒绝接收签名密钥；原证书仅在独立、无依赖构建的签名 runner 中恢复，
+用完删除，再做校验及上传。
+
+原生 JAR 仅从 GitHub Actions 分支隔离缓存恢复，不接收 PR 构建缓存作为发布输入。
+缓存键包含 OS、CPU、API、源码及补丁锁、编译 / 校验脚本和工作流，
+不使用宽泛 fallback；命中后仍逐 ABI 核对源码锁、补丁、recipe、API 和 JAR 摘要。
+原生编译验证后立即保存缓存，后续 Flutter 构建失败不必在下次重编原生依赖。
+冷缓存只编译需要的 ABI，现代版不编译 x86；兼容版的 API 23 缓存独立。
+源压缩包每次使用前重新哈希；Gradle 只缓存依赖下载及 wrapper，保留严格依赖校验。
+macOS 缓存 CocoaPods 下载和同依赖版本的锁文件，实际依赖锁写入任务摘要。
+首次构建或缓存失效仍须完整原生编译，提速效果需以真实 Actions 冷 / 热运行测量。
+
+签名前临时传递最多两个 `internal-unsigned-*` 压缩产物，原生库不上传。
+签名消费结束后清理当前运行的中间产物（包括构建 / 签名失败路径），正常结束只留下
+三个 APK 和一个 macOS ZIP；不上传依赖锁、日志和重复 APK。
+如果任务被强制终止导致清理未完成，中间产物最多保留一天。
+清理后需要重新构建时使用 **Re-run all jobs**，仅重跑签名会缺少已清理的输入。
+每个成品直接下载原 APK / ZIP，任务摘要提供下载链接、系统、架构、大小、
+SHA-256 和校验记录，不再新增说明文件下载项。
+
 ## 校验与整理
 
 Android 打包脚本必须通过最低 API、准确 ABI 集合、核心原生库、PGS、ZIP CRC、16 KB 对齐、v1/v2/v3 签名与固定证书检查后才复制到 `artifacts/`。三个 Android 目标分别保留 `build-android.json` / `build-android-arm64.json` / `build-android-legacy.json`，以及对应的 `SHA256SUMS-*`；它们是校验记录，不是额外安装包。macOS `--app-only` 只生成 ZIP，由脚本检查签名和双架构。
+
+兼容包额外拒绝 Android 6 不支持的 DEX 版本（含多 DEX），并以
+`apksigner --min-sdk-version 23 --max-sdk-version 23` 单独验证旧系统使用的 v1
+签名及证书。它仍不能替代目标电视的真实 PackageManager 安装结果；出现无法安装
+时需获取具体 APK、系统 ABI、`adb install -r` 返回码及已有安装的版本 / 签名，
+不能把通过静态校验直接写成“已修复安装”。
 
 整理已有产物时先校验，再恢复上述标准名称及配套记录；这不等同于重新编译当前源码。只有用户要求复用旧构建时才使用底层 `--skip-build`，报告中说明复用范围。兼容 shell 入口不接受 `--skip-build`，确需恢复现有兼容产物时使用兼容副本内的 `scripts/package.py android --android-legacy --skip-build --no-android-alias --output-dir <根仓库>/artifacts`。
 

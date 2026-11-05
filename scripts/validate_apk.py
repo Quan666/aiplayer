@@ -182,6 +182,7 @@ def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None 
         raise ValueError("Android 6 compatibility APKs must include both ARM32 and ARM64")
     path = path.resolve()
     native = {}
+    dex_versions = {}
     with zipfile.ZipFile(path) as archive:
         entries = archive.namelist()
         duplicates = [name for name, count in Counter(entries).items() if count > 1]
@@ -194,6 +195,13 @@ def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None 
             if required not in entries:
                 raise RuntimeError(f"APK is missing {required}")
         for name in entries:
+            if android_legacy and re.fullmatch(r"classes(?:[2-9]|[1-9][0-9]+)?\.dex", name):
+                with archive.open(name) as source:
+                    magic = source.read(8)
+                # Android 6 ART accepts DEX 035. DEX 037 requires Android 7.
+                if magic != b"dex\n035\0":
+                    raise RuntimeError(f"Android 6 requires DEX 035: {name} has {magic!r}")
+                dex_versions[name] = "035"
             if name.startswith("lib/") and name.endswith(".so"):
                 parts = Path(name).parts
                 if len(parts) != 3 or parts[1] not in ABI_MACHINES:
@@ -249,6 +257,17 @@ def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None 
     if not signatures["v2"]:
         raise RuntimeError("APK must have a valid v2 signature for Android 7+")
     certificate = signing_certificate_sha256(signature_output)
+    if android_legacy:
+        # Limit the verifier to Android 6 itself so newer signature schemes
+        # cannot substitute for the JAR signature used by its installer.
+        legacy_signature = run([
+            str(sdk_tool("apksigner")), "verify", "--verbose", "--print-certs",
+            "--min-sdk-version", "23", "--max-sdk-version", "23", str(path),
+        ])
+        if not re.search(r"Verified using v1 scheme .*: true", legacy_signature):
+            raise RuntimeError("Android 6 API 23 signature verification failed")
+        if signing_certificate_sha256(legacy_signature) != certificate:
+            raise RuntimeError("Android 6 v1 signing certificate differs from the modern signature")
     run([str(sdk_tool("zipalign")), "-c", "-P", "16", "4", str(path)])
     return {
         "file_name": path.name, "size_bytes": path.stat().st_size, "sha256": digest(path),
@@ -257,6 +276,7 @@ def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None 
         "signature_schemes": signatures,
         "certificate_sha256": certificate,
         "zip_crc_valid": True, "zip_alignment_16kb": True, "native_libraries": native,
+        **({"dex_versions": dex_versions, "api23_signature_verified": True} if android_legacy else {}),
     }
 
 
