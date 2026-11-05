@@ -33,13 +33,23 @@ PY
 esac
 export AIPLAYER_ANDROID_MIN_SDK="$api"
 cd "$client"
-# Resolve once per checkout; Flutter builds below must not resolve again.
+# Resolve with the reviewed lock before generating release-mode tooling.
 if [[ "$target" != android-arm64 || ! -f .dart_tool/package_config.json ]]; then
   "$flutter" pub get --enforce-lockfile
 fi
 args=(build apk --release --no-pub --target-platform "$platforms")
 if [[ "$target" == android-arm64 ]]; then
   args+=(--split-per-abi --android-project-arg=force-version-code-ignoring-abi=true)
+fi
+# --no-pub skips release plugin regeneration in both pinned Flutter SDKs.
+# pub get registers dev plugins (including integration_test), while Gradle
+# excludes them from the release classpath. Regenerate through Flutter first.
+# https://github.com/flutter/flutter/issues/169336
+lock_checksum="$(sha256sum pubspec.lock)"
+"$flutter" "${args[@]/--no-pub/--pub}" --config-only
+if ! printf '%s\n' "$lock_checksum" | sha256sum --check --status; then
+  echo 'Release configuration changed pubspec.lock; review dependencies before building.' >&2
+  exit 1
 fi
 "$flutter" "${args[@]}"
 mkdir -p "$RUNNER_TEMP/unsigned-apks/$target"
