@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -113,6 +114,7 @@ class UnsignedBuildTest(unittest.TestCase):
         for name in ("build_release.sh", "ci_android_build.sh"):
             shutil.copyfile(ROOT / "scripts" / name, self.root / "scripts" / name)
         (self.root / "client").mkdir()
+        (self.root / "client/pubspec.lock").write_text("reviewed-lock")
         (self.root / "compat/android6").mkdir(parents=True)
         shutil.copyfile(ROOT / "compat/android6/toolchain.json", self.root / "compat/android6/toolchain.json")
         self.trace = self.root / "trace"
@@ -124,10 +126,24 @@ with Path(os.environ['CI_TEST_TRACE']).open('a') as output:
     output.write(json.dumps({'args':sys.argv[1:], 'cwd':str(Path.cwd()), 'api':os.environ.get('AIPLAYER_ANDROID_MIN_SDK')})+'\\n')
 if sys.argv[1:] == ['--version', '--machine']:
     print(json.dumps({'frameworkVersion':os.environ.get('CI_TEST_SDK', '3.32.8'), 'dartSdkVersion':'3.8.1'}))
-elif sys.argv[1:3] == ['pub', 'get']:
+registrant = Path('android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java')
+if sys.argv[1:3] == ['pub', 'get']:
     Path('.dart_tool').mkdir(exist_ok=True)
     Path('.dart_tool/package_config.json').write_text('{}')
+    registrant.parent.mkdir(parents=True, exist_ok=True)
+    registrant.write_text('dev.flutter.plugins.integration_test.IntegrationTestPlugin')
+elif sys.argv[1:3] == ['build', 'apk'] and '--config-only' in sys.argv:
+    assert '--pub' in sys.argv and '--no-pub' not in sys.argv
+    assert '--release' in sys.argv
+    if os.environ.get('CI_TEST_CONFIG_FAIL'):
+        raise SystemExit('configuration failed')
+    registrant.parent.mkdir(parents=True, exist_ok=True)
+    registrant.write_text('release plugins')
+    if os.environ.get('CI_TEST_LOCK_DRIFT'):
+        Path('pubspec.lock').write_text('changed-lock')
 elif sys.argv[1:3] == ['build', 'apk']:
+    if not registrant.is_file() or 'integration_test' in registrant.read_text():
+        raise SystemExit('release references a dev plugin')
     target = Path('build/app/outputs/flutter-apk')
     target.mkdir(parents=True, exist_ok=True)
     name = 'app-arm64-v8a-release.apk' if '--split-per-abi' in sys.argv else 'app-release.apk'
@@ -138,6 +154,7 @@ elif sys.argv[1:3] == ['build', 'apk']:
 from pathlib import Path
 output = Path(sys.argv[sys.argv.index('--output')+1])
 (output/'client').mkdir(parents=True, exist_ok=True)
+(output/'client/pubspec.lock').write_text('reviewed-legacy-lock')
 ''')
         self.environment = {**os.environ, "GITHUB_ACTIONS": "true", "AIPLAYER_ANDROID_UNSIGNED": "true",
                             "RUNNER_TEMP": str(self.root / "temp"), "AIPLAYER_FLUTTER": str(flutter),
@@ -158,7 +175,12 @@ output = Path(sys.argv[sys.argv.index('--output')+1])
             self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         self.assertEqual(sum(c['args'][:2] == ['pub', 'get'] for c in calls), 1)
-        builds = [c for c in calls if c['args'][:2] == ['build', 'apk']]
+        configurations = [c for c in calls if '--config-only' in c['args']]
+        self.assertEqual(len(configurations), 2)
+        builds = [c for c in calls if c['args'][:2] == ['build', 'apk'] and '--config-only' not in c['args']]
+        for configure, build in zip(configurations, builds):
+            self.assertEqual(configure['args'], [a if a != '--no-pub' else '--pub' for a in build['args']] + ['--config-only'])
+            self.assertLess(calls.index(configure), calls.index(build))
         self.assertEqual(len(builds), 2)
         self.assertEqual(builds[0]['cwd'], builds[1]['cwd'])
         self.assertTrue(all('--no-pub' in c['args'] and c['api'] == '24' for c in builds))
@@ -172,10 +194,39 @@ output = Path(sys.argv[sys.argv.index('--output')+1])
         calls = self.calls()
         self.assertEqual(calls[0]['args'], ['--version', '--machine'])
         self.assertIn('--enforce-lockfile', calls[1]['args'])
+        self.assertIn('--config-only', calls[-2]['args'])
+        self.assertIn('--pub', calls[-2]['args'])
+        self.assertIn('--no-pub', calls[-1]['args'])
         self.assertEqual(calls[-1]['api'], '23')
         self.assertIn('android-arm,android-arm64', calls[-1]['args'])
         self.assertEqual(calls[-1]['cwd'], str(self.root / 'temp/android6-source/client'))
         self.assertEqual((self.root / 'temp/unsigned-apks/android-legacy/app-release.apk').read_text(), '23')
+
+    def test_standalone_arm64_regenerates_after_locked_resolution(self):
+        result = self.run_build('android-arm64')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls()[0]['args'], ['pub', 'get', '--enforce-lockfile'])
+        self.assertIn('--config-only', self.calls()[1]['args'])
+        self.assertIn('--split-per-abi', self.calls()[-1]['args'])
+
+    def test_configuration_failure_or_lock_drift_stops_before_compile_and_transfer(self):
+        for target in ('android', 'android-arm64', 'android-legacy'):
+            for flag in ('CI_TEST_CONFIG_FAIL', 'CI_TEST_LOCK_DRIFT'):
+                with self.subTest(target=target, flag=flag):
+                    self.trace.unlink(missing_ok=True)
+                    (self.root / 'client/pubspec.lock').write_text('reviewed-lock')
+                    self.environment[flag] = 'true'
+                    try:
+                        result = self.run_build(target)
+                    finally:
+                        self.environment.pop(flag)
+                    self.assertNotEqual(result.returncode, 0)
+                    if flag == 'CI_TEST_LOCK_DRIFT':
+                        self.assertIn('changed pubspec.lock', result.stderr)
+                    builds = [c for c in self.calls() if c['args'][:2] == ['build', 'apk']]
+                    self.assertTrue(builds)
+                    self.assertTrue(all('--config-only' in c['args'] for c in builds))
+                    self.assertFalse((self.root / 'temp/unsigned-apks').exists())
 
     def test_modern_sdk_cannot_be_relabeled_as_legacy(self):
         self.environment['CI_TEST_SDK'] = '3.47.7'
@@ -194,6 +245,31 @@ output = Path(sys.argv[sys.argv.index('--output')+1])
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(self.calls(), [])
                 self.environment = environment
+
+
+class LegacyMetadataTest(unittest.TestCase):
+    def test_legacy_classpath_metadata_matches_reviewed_modern_checksums(self):
+        ns = {'v': 'https://schema.gradle.org/dependency-verification'}
+        def pins(path):
+            root = ET.parse(path).getroot()
+            self.assertEqual(root.findtext('v:configuration/v:verify-metadata', namespaces=ns), 'true')
+            self.assertFalse(root.findall('v:configuration/v:trusted-artifacts/v:trust', ns))
+            return {
+                (c.get('group'), c.get('name'), c.get('version'), a.get('name')):
+                    {h.get('value') for h in a.findall('v:sha256', ns)}
+                for c in root.findall('v:components/v:component', ns)
+                for a in c.findall('v:artifact', ns)
+            }
+        modern = pins(ROOT / 'client/android/gradle/verification-metadata.xml')
+        legacy = pins(ROOT / 'compat/android6/verification-metadata.xml')
+        for key in (
+            ('com.google.guava', 'guava-parent', '33.3.1-jre', 'guava-parent-33.3.1-jre.pom'),
+            ('org.junit', 'junit-bom', '5.10.2', 'junit-bom-5.10.2.module'),
+            ('org.jetbrains.kotlinx', 'kotlinx-coroutines-bom', '1.8.0', 'kotlinx-coroutines-bom-1.8.0.pom'),
+        ):
+            with self.subTest(artifact=key):
+                self.assertTrue(modern[key])
+                self.assertEqual(legacy[key], modern[key])
 
 
 if __name__ == "__main__":

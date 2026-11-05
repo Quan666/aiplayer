@@ -80,6 +80,10 @@ SHA-256，再校验来源指纹、仓库、源码锁、补丁、recipe、API、A
 所有需要的 ABI 通过后才交给 Gradle；插件继续逐次校验，提供库无效时拒绝构建。
 SQLite 和 SMB 仍按应用构建编译，本次只拆分 Android FFmpeg / mpv 播放链。
 现代通用、ARM64 顺序共用 Flutter / Gradle 工作区，避免竞争构建目录。
+CI 先用 `pub get --enforce-lockfile` 检查依赖，再以相同目标参数执行
+`flutter build apk --release --pub --config-only` 生成发布模式插件注册。
+确认 `pubspec.lock` 内容未变后才以 `--no-pub` 正式编译，避免把
+`integration_test` 等开发插件注册进 release。配置失败或锁文件变化立即停止。
 
 CI 仍调用 `bash scripts/build_release.sh <目标>`：设置
 `AIPLAYER_ANDROID_UNSIGNED=true` 时进入专用 CI 暂存分支，使用 runner 上的
