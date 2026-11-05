@@ -21,7 +21,7 @@ dependencies:
   uuid: ^4.5.1
   qr: 4.0.1
   xml: ^6.6.1
-  desktop_drop: ^0.7.0
+  desktop_drop: ^0.8.4
   aiplayer_smb:
     path: ../packages/aiplayer_smb
   cryptography: ^2.9.0
