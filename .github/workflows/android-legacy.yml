@@ -37,7 +37,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y meson ninja-build nasm autoconf automake libtool pkg-config cmake build-essential patch
-          sdkmanager 'ndk;28.2.13676358'
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;28.2.13676358'
           printf 'ANDROID_NDK_HOME=%s/ndk/28.2.13676358\n' "$ANDROID_HOME" >> "$GITHUB_ENV"
       - name: Cache source downloads that the recipe verifies again
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -80,7 +80,7 @@ jobs:
           channel: stable
           cache: true
       - name: Install the pinned Android build platform
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"'
       - name: Download API 23 native libraries from this run
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
