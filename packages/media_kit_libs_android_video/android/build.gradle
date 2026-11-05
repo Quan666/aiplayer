@@ -1,5 +1,5 @@
+import groovy.json.JsonSlurper
 import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
 group 'com.alexmercerind.media_kit_libs_android_video'
@@ -24,6 +24,12 @@ rootProject.allprojects {
 
 apply plugin: 'com.android.library'
 
+def nativeApiValue = System.getenv('AIPLAYER_ANDROID_MIN_SDK') ?: '24'
+if (!(nativeApiValue in ['23', '24'])) {
+    throw new GradleException('AIPLAYER_ANDROID_MIN_SDK must be 23 or 24')
+}
+def nativeApi = nativeApiValue.toInteger()
+
 android {
     namespace 'com.alexmercerind.media_kit_libs_android_video'
     compileSdkVersion 36
@@ -32,23 +38,37 @@ android {
         targetCompatibility JavaVersion.VERSION_1_8
     }
     defaultConfig {
-        minSdkVersion 16
+        minSdkVersion nativeApi
     }
 }
 
-// The upstream default build disables pgssub. Pin the upstream full variant,
-// which includes all subtitle decoders, while preserving its non-GPL build.
-def nativeVersion = 'v1.1.8'
-def nativeChecksums = [
-    'arm64-v8a': '031aa9e76de6e0dea733d382252636f6237ded0aef797a561e6fc8b85c4f3ff1',
-    'armeabi-v7a': 'e4875bb02d58f643950a5e0ac2d4862336fd7c0b47d65455cbc7a5ba41cfe522',
-    'x86': '0d9a5b68c8bad247e24111673ca10ac645606e6eee308082241d7e90bc4015ea',
-    'x86_64': 'ebb01a3b48c81ce78e5b7f44f89f68e30aaed169e54f7baa100e03830d4ed96f',
+// Pub's lockfile cannot authenticate downloads made by a native build script.
+// Build the maintained FFmpeg source pin instead of the upstream FFmpeg 6.0 JARs.
+def repositoryRoot = projectDir.parentFile.parentFile.parentFile
+def sourceLock = new File(repositoryRoot, 'packages/media_kit_libs_android_video/native/sources.lock.json')
+def recipe = new File(repositoryRoot, 'scripts/build_android_native.py')
+def providedDirectory = System.getenv('AIPLAYER_ANDROID_NATIVE_DIR')
+def nativeDirectory = providedDirectory
+    ? new File(providedDirectory)
+    : new File(repositoryRoot, nativeApi == 23
+        ? '.local-build/native-player/artifacts-api23'
+        : '.local-build/native-player/artifacts')
+def targetAbis = [
+    'android-arm': 'armeabi-v7a',
+    'android-arm64': 'arm64-v8a',
+    'android-x86': 'x86',
+    'android-x64': 'x86_64',
 ]
-def nativeDirectory = layout.buildDirectory.dir("native-libraries/${nativeVersion}-full").get().asFile
-def nativeJars = nativeChecksums.keySet().collect { abi ->
-    new File(nativeDirectory, "full-${abi}.jar")
-}
+def requestedTargets = project.findProperty('target-platform')?.toString()?.split(',')
+def requiredAbis = requestedTargets
+    ? requestedTargets.collect { target ->
+        if (!targetAbis.containsKey(target)) {
+            throw new GradleException("Unsupported Android target ${target}")
+        }
+        targetAbis[target]
+    }.unique()
+    : targetAbis.values().toList()
+def nativeJars = requiredAbis.collect { abi -> new File(nativeDirectory, "full-${abi}.jar") }
 def sha256 = { File source ->
     def digest = MessageDigest.getInstance('SHA-256')
     source.withInputStream { input ->
@@ -60,34 +80,44 @@ def sha256 = { File source ->
     }
     digest.digest().encodeHex().toString()
 }
-
+def verifyNativeLibrary = { String abi ->
+    def jar = new File(nativeDirectory, "full-${abi}.jar")
+    def manifest = new File(nativeDirectory, "full-${abi}.json")
+    if (Files.isSymbolicLink(jar.toPath()) || Files.isSymbolicLink(manifest.toPath())) return false
+    if (!jar.isFile() || !manifest.isFile()) return false
+    def metadata = new JsonSlurper().parse(manifest)
+    metadata.abi == abi &&
+        metadata.api == nativeApi &&
+        metadata.sourcesLockSha256 == sha256(sourceLock) &&
+        metadata.recipeSha256 == sha256(recipe) &&
+        metadata.sha256 == sha256(jar)
+}
 def prepareNativeLibraries = tasks.register('prepareNativeLibraries') {
-    inputs.property('version', nativeVersion)
-    inputs.property('checksums', nativeChecksums)
+    inputs.files(sourceLock, recipe, fileTree(new File(sourceLock.parentFile, 'patches')))
+    inputs.property('abis', requiredAbis)
+    inputs.property('api', nativeApi)
     outputs.files(nativeJars)
+    // Gradle's up-to-date state must never bypass validation of restored artifacts.
+    outputs.upToDateWhen { false }
     doLast {
-        nativeDirectory.mkdirs()
-        nativeChecksums.each { abi, expectedDigest ->
-            def destination = new File(nativeDirectory, "full-${abi}.jar")
-            if (destination.exists() && sha256(destination) == expectedDigest) {
-                return
+        def sourceMetadata = new JsonSlurper().parse(sourceLock)
+        sourceMetadata.patches.each { name, expected ->
+            if (sha256(new File(sourceLock.parentFile, "patches/${name}")) != expected) {
+                throw new GradleException("Native patch hash mismatch: ${name}")
             }
-            def url = "https://github.com/media-kit/libmpv-android-video-build/releases/download/${nativeVersion}/full-${abi}.jar"
-            def partial = new File(nativeDirectory, "full-${abi}.jar.part")
-            try {
-                logger.lifecycle("Downloading media_kit native library ${nativeVersion}/full-${abi}.jar")
-                def connection = new URL(url).openConnection()
-                connection.connectTimeout = 30000
-                connection.readTimeout = 120000
-                connection.getInputStream().withCloseable { input ->
-                    partial.withOutputStream { output -> output << input }
-                }
-                if (sha256(partial) != expectedDigest) {
-                    throw new GradleException("SHA-256 mismatch for ${url}")
-                }
-                Files.move(partial.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            } finally {
-                partial.delete()
+        }
+        nativeDirectory.mkdirs()
+        requiredAbis.each { abi ->
+            if (verifyNativeLibrary(abi)) return
+            if (providedDirectory) {
+                throw new GradleException("Unverified native library for ${abi}, API ${nativeApi} in AIPLAYER_ANDROID_NATIVE_DIR; rebuild it from the locked sources")
+            }
+            project.providers.exec {
+                workingDir repositoryRoot
+                commandLine 'python3', recipe.absolutePath, '--abi', abi, '--api', nativeApi.toString(), '--output', nativeDirectory.absolutePath
+            }.result.get().assertNormalExitValue()
+            if (!verifyNativeLibrary(abi)) {
+                throw new GradleException("Native source build verification failed for ${abi}")
             }
         }
     }

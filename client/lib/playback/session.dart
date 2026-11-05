@@ -1,11 +1,18 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
+
 import 'package:flutter/foundation.dart';
+
 import 'dart:convert';
+
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+// Reuse media_kit's platform-specific resolved native library.
+// ignore: implementation_imports
+import 'package:media_kit/src/player/native/core/native_library.dart';
 import 'package:path/path.dart' as p;
+
 import '../core/network.dart';
 import '../core/logger.dart';
 import '../data/app_model.dart';
@@ -19,6 +26,7 @@ import '../sources/source.dart';
 import '../sources/range_bridge.dart';
 import 'resume.dart';
 import 'checkpoints.dart';
+import 'native_property_reader.dart';
 import 'subtitle_fonts.dart';
 import '../subtitles/choice.dart';
 import '../subtitles/document.dart';
@@ -53,13 +61,19 @@ class PlaybackSession extends ChangeNotifier {
   final AppModel model;
   SyncRecord _media;
   SyncRecord get media => _media;
+  bool get personalMedia => media.data['personalMedia'] == true;
+  final bool audioOnly;
+  String audioTitle = '', audioArtist = '', audioAlbum = '';
+  Future<void>? _audioMetadataWork;
   final PlaybackSourcePreference sourcePreference;
   final Map<String, dynamic>? expectedBinding;
   late final Player player = Player(
-    configuration: const PlayerConfiguration(
-      libass: true,
-      libassAndroidFont: 'assets/fonts/NotoSansSC-Regular.ttf',
-      libassAndroidFontName: _subtitleFontFamily,
+    configuration: PlayerConfiguration(
+      libass: !audioOnly,
+      libassAndroidFont: audioOnly
+          ? null
+          : 'assets/fonts/NotoSansSC-Regular.ttf',
+      libassAndroidFontName: audioOnly ? null : _subtitleFontFamily,
     ),
   );
   late final VideoController video = VideoController(
@@ -73,13 +87,23 @@ class PlaybackSession extends ChangeNotifier {
   String? playbackUri;
   DanmakuSession? danmaku;
   bool _danmakuStarted = false;
+  Future<void>? _danmakuPreparation;
+  Object? _danmakuConfiguration;
+  int _danmakuConfigurationRevision = 0;
   bool _danmakuPresentationActive = true;
 
   void setDanmakuPresentationActive(bool value) {
     if (closed || value == _danmakuPresentationActive) return;
     _danmakuPresentationActive = value;
+    if (!value) {
+      // A rapid hide/resume must not accept a decoder result requested for
+      // the previous visible interval.
+      _playbackErrorRevision++;
+      _recoveryDiagnosticRevision = null;
+    }
     danmaku?.setPresentationActive(value);
     _refreshFirstFramePresentation();
+    if (value) _thirdPartyPolicyChanged();
   }
 
   final _subscriptions = <StreamSubscription>[];
@@ -103,9 +127,17 @@ class PlaybackSession extends ChangeNotifier {
   Future<void> _progressWork = Future.value();
   Future<void> _technicalWork = Future.value();
   Future<void>? _diagnosticWork;
+  Future<void>? _errorRecoveryWork, _recoveryDiagnosticWork;
+  NativePropertyReader? _propertyReader;
+  int _playbackErrorRevision = 0;
+  int? _recoveryDiagnosticRevision;
+  String _playbackErrorDetail = '';
+  bool _codecAttemptPending = false;
   String? _technicalFingerprint;
   int _technicalAttempts = 0;
-  bool _technicalComplete = false;
+  int _technicalRevision = 0;
+  bool _technicalComplete = false, _technicalReading = false;
+  bool _technicalCaptureActive = false;
   bool _firstFrameRendered = false, _playbackErrorPending = false;
   bool _firstFrameSignalled = false, _watchingVideoOutput = false;
   Timer? _firstFrameRetry;
@@ -171,7 +203,9 @@ class PlaybackSession extends ChangeNotifier {
       !selectedSubtitleIsImage;
   bool get _shouldAutomaticallySimplify {
     final track = _selectedSubtitle;
-    return model.preferences.subtitleSimplify &&
+    return !personalMedia &&
+        !audioOnly &&
+        model.preferences.subtitleSimplify &&
         hasSubtitleForTools &&
         shouldAutomaticallySimplifySubtitle(track.language, track.title);
   }
@@ -189,6 +223,7 @@ class PlaybackSession extends ChangeNotifier {
   int _playbackIntentRevision = 0;
   bool get backgroundPlaybackBlocked => _backgroundPlaybackBlocked;
   int get backgroundPauseRevision => _backgroundPauseRevision;
+  int get playbackIntentRevision => _playbackIntentRevision;
 
   /// A native pause can be overtaken by a pending open. Retain the policy
   /// through source preparation, decoder opening and late playing events.
@@ -284,10 +319,40 @@ class PlaybackSession extends ChangeNotifier {
     this.model,
     SyncRecord media, {
     this.sourcePreference = PlaybackSourcePreference.automatic,
+    this.audioOnly = false,
     Map<String, dynamic>? expectedBinding,
   }) : _media = media,
        expectedBinding = playbackBindingSnapshot(expectedBinding) {
     model.addListener(_preferencesChanged);
+    model.thirdPartyNetwork.addListener(_thirdPartyPolicyChanged);
+    _danmakuConfiguration = _danmakuConfigurationKey;
+  }
+
+  Object get _danmakuConfigurationKey => (
+    model.settings['danmuOrigin'],
+    model.store.localModified('secret:danmuToken'),
+  );
+
+  void _thirdPartyPolicyChanged() {
+    if (!model.thirdPartyNetwork.enabled) {
+      if (danmaku?.episodeId == null) _danmakuStarted = false;
+      return;
+    }
+    if (closed ||
+        !ready ||
+        personalMedia ||
+        audioOnly ||
+        !_danmakuPresentationActive) {
+      return;
+    }
+    if (danmaku == null) {
+      unawaited(_prepareDanmaku());
+    } else if (danmaku!.visible &&
+        !danmaku!.busy &&
+        danmaku!.episodeId == null &&
+        !_danmakuStarted) {
+      _identifyDanmaku();
+    }
   }
 
   /// Playback, subtitle extraction, seeking previews and casting must use the
@@ -331,7 +396,18 @@ class PlaybackSession extends ChangeNotifier {
   }
 
   void _preferencesChanged() {
-    if (!ready || closed) return;
+    if (closed) return;
+    final configuration = _danmakuConfigurationKey;
+    if (configuration != _danmakuConfiguration) {
+      _danmakuConfiguration = configuration;
+      _danmakuConfigurationRevision++;
+      danmaku?.removeListener(_notify);
+      danmaku?.dispose();
+      danmaku = null;
+      _danmakuStarted = false;
+      _thirdPartyPolicyChanged();
+    }
+    if (!ready) return;
     final key = _preferencesKey(model.preferences);
     if (key == _requestedPreferences) return;
     _requestedPreferences = key;
@@ -600,6 +676,7 @@ class PlaybackSession extends ChangeNotifier {
 
   Future<void> _autoChooseSubtitle() async {
     if (closed ||
+        audioOnly ||
         !ready ||
         _subtitleUserSelected ||
         _subtitleAutoSelected ||
@@ -681,6 +758,7 @@ class PlaybackSession extends ChangeNotifier {
   dynamic get _native => player.platform;
 
   bool get _canConfirmFirstFrame =>
+      !audioOnly &&
       !closed &&
       ready &&
       !_backgroundPlaybackBlocked &&
@@ -688,6 +766,7 @@ class PlaybackSession extends ChangeNotifier {
       !player.state.buffering;
 
   void _refreshFirstFramePresentation() {
+    _scheduleTechnicalInfo();
     if (!_canConfirmFirstFrame) {
       _firstFrameRetry?.cancel();
       _firstFrameRetry = null;
@@ -731,7 +810,8 @@ class PlaybackSession extends ChangeNotifier {
     // Android's controller also completes its first-frame future when setting
     // the Surface size. Require an actual decoded frame and a settled buffer.
     try {
-      final frame = await _native.getProperty('video-frame-info');
+      final values = await _readNativeProperties(const ['video-frame-info']);
+      final frame = values['video-frame-info'];
       if (!_canConfirmFirstFrame ||
           frame == null ||
           frame.isEmpty ||
@@ -765,7 +845,7 @@ class PlaybackSession extends ChangeNotifier {
 
   Future<void> _prepareNativePlayback() async {
     await Future.wait([
-      _prepareSubtitleFonts(),
+      if (!audioOnly) _prepareSubtitleFonts(),
       _applyPreferences(),
       () async {
         // Keep read-ahead in RAM. The bridge already exposes local HTTP, so
@@ -773,6 +853,11 @@ class PlaybackSession extends ChangeNotifier {
         await _native.setProperty('cache-on-disk', 'no');
         await _native.setProperty('cache-pause-initial', 'no');
         await _native.setProperty('cache-pause-wait', '0.15');
+        if (audioOnly) {
+          await _native.setProperty('vid', 'no');
+          await _native.setProperty('sub-auto', 'no');
+          await _native.setProperty('sid', 'no');
+        }
       }(),
     ]);
   }
@@ -858,18 +943,19 @@ class PlaybackSession extends ChangeNotifier {
       await _nativeOpening;
       if (closed) return;
       final (uri, path) = preparedSource;
-      _subtitleSearchPath = path;
+      _subtitleSearchPath = personalMedia || audioOnly ? null : path;
       _subscriptions.add(
         player.stream.position.listen((position) {
           _anchor = position.inMicroseconds / 1000000;
           _clock.reset();
           final advanced = position > this.position.value;
           this.position.value = position;
-          if (_firstFrameRendered &&
+          if (_playbackErrorPending &&
+              _firstFrameRendered &&
               advanced &&
               player.state.playing &&
               !player.state.buffering) {
-            _recoverPlaybackError();
+            unawaited(_checkPlaybackErrorRecovery());
           }
         }),
       );
@@ -935,7 +1021,7 @@ class PlaybackSession extends ChangeNotifier {
             unawaited(
               saveProgress(completed: true).then(
                 (_) {
-                  if (!closed) model.changed();
+                  if (!closed && !personalMedia) model.changed();
                 },
                 onError: (Object error) =>
                     AppLog.instance.warning('观看记录', safeFailure(error).message),
@@ -949,17 +1035,19 @@ class PlaybackSession extends ChangeNotifier {
       _subscriptions.add(player.stream.error.listen(_playbackError));
       // mpv reports failed hardware decoder attempts as errors even when it
       // successfully falls back. A decoded first frame proves startup recovered.
-      video.rect.addListener(_videoOutputChanged);
-      _watchingVideoOutput = true;
-      unawaited(
-        video.waitUntilFirstFrameRendered
-            .then<void>((_) {
-              if (closed) return;
-              _firstFrameSignalled = true;
-              _videoOutputChanged();
-            })
-            .catchError((Object _) {}),
-      );
+      if (!audioOnly) {
+        video.rect.addListener(_videoOutputChanged);
+        _watchingVideoOutput = true;
+        unawaited(
+          video.waitUntilFirstFrameRendered
+              .then<void>((_) {
+                if (closed) return;
+                _firstFrameSignalled = true;
+                _videoOutputChanged();
+              })
+              .catchError((Object _) {}),
+        );
+      }
       _clock.start();
       final progress = model.store.get('progress', model.progressKey(media));
       final resumePosition =
@@ -1002,12 +1090,17 @@ class PlaybackSession extends ChangeNotifier {
       await _nativeOpening;
       if (closed) return;
       ready = true;
+      _thirdPartyPolicyChanged();
+      if (audioOnly) {
+        _audioMetadataWork = _readAudioMetadata();
+        unawaited(_audioMetadataWork);
+      }
       _restoreAfterBackground();
       _videoOutputChanged();
       model.activePlaybackMediaId = media.id;
       _scheduleTechnicalInfo();
       unawaited(_autoChooseSubtitle());
-      AppLog.instance.info('播放', '视频已打开');
+      AppLog.instance.info('播放', audioOnly ? '音频已打开' : '视频已打开');
       _checkpoints.start();
       _notify();
       unawaited(refreshDiagnostics());
@@ -1021,27 +1114,85 @@ class PlaybackSession extends ChangeNotifier {
     }
   }
 
-  Future<void> _prepareDanmaku() async {
+  Future<void> _prepareDanmaku() {
+    if (_danmakuPreparation != null) return _danmakuPreparation!;
+    final revision = _danmakuConfigurationRevision;
+    return _danmakuPreparation = _loadDanmaku().whenComplete(() {
+      _danmakuPreparation = null;
+      if (revision != _danmakuConfigurationRevision) _thirdPartyPolicyChanged();
+    });
+  }
+
+  Future<void> _loadDanmaku() async {
+    if (personalMedia ||
+        audioOnly ||
+        closed ||
+        !model.thirdPartyNetwork.enabled) {
+      return;
+    }
     // Credential lookup and matching run alongside source connection/decoding.
     // An optional service failure must never delay video or subtitle startup.
+    final revision = _danmakuConfigurationRevision;
     try {
       final api = await model.danmu();
-      if (closed || api == null) return;
-      danmaku = DanmakuSession(model.store, api, media.id)
-        ..addListener(_notify)
-        ..setPresentationActive(_danmakuPresentationActive);
+      if (closed ||
+          personalMedia ||
+          audioOnly ||
+          api == null ||
+          revision != _danmakuConfigurationRevision ||
+          !model.thirdPartyNetwork.enabled) {
+        return;
+      }
+      danmaku =
+          DanmakuSession(
+              model.store,
+              api,
+              media.id,
+              networkPolicy: model.thirdPartyNetwork,
+            )
+            ..addListener(_notify)
+            ..setPresentationActive(_danmakuPresentationActive);
       danmaku!.configure(
         isPlaying: player.state.playing && !player.state.buffering,
         show: model.preferences.danmuVisible,
         seconds: model.preferences.refreshInterval,
       );
-      if (danmaku!.visible) _identifyDanmaku();
+      if (danmaku!.visible && _danmakuPresentationActive) _identifyDanmaku();
       _notify();
     } catch (_) {
       if (closed) return;
       notice = '无法读取弹幕配置，请在设置中重新保存。';
       _notify();
     }
+  }
+
+  Future<void> _readAudioMetadata() async {
+    Future<String> value(String key) async {
+      try {
+        final result = '${await _native.getProperty('metadata/by-key/$key')}';
+        if (result == 'null') return '';
+        return (result.length > 2048 ? result.substring(0, 2048) : result)
+            .trim();
+      } catch (_) {
+        return '';
+      }
+    }
+
+    final fields = await Future.wait([
+      value('title'),
+      value('artist'),
+      value('album'),
+    ]);
+    if (closed) return;
+    if (audioTitle == fields[0] &&
+        audioArtist == fields[1] &&
+        audioAlbum == fields[2]) {
+      return;
+    }
+    audioTitle = fields[0];
+    audioArtist = fields[1];
+    audioAlbum = fields[2];
+    _notify();
   }
 
   /// Reuse catalogue / AI identity, including corrections made during playback.
@@ -1053,12 +1204,13 @@ class PlaybackSession extends ChangeNotifier {
   }
 
   void _identifyDanmaku() {
+    if (personalMedia || audioOnly || closed || danmaku == null) return;
     _danmakuStarted = true;
     unawaited(danmaku!.identify(danmakuIdentity));
   }
 
   Future<void> _findSubtitles(String path) async {
-    if (closed) return;
+    if (closed || personalMedia || audioOnly) return;
     try {
       if (source is HttpSource && !(source as HttpSource).webdav) return;
       final directory = source is LocalSource
@@ -1295,6 +1447,7 @@ class PlaybackSession extends ChangeNotifier {
             prompt: '${settings['aiSubtitlePrompt'] ?? defaultSubtitlePrompt}',
           );
           final translator = SubtitleTranslator(
+            transport: model.thirdPartyAiTransport,
             load: (key) {
               final value = model.store.local(key);
               return value is Map ? Map<String, dynamic>.from(value) : null;
@@ -1383,32 +1536,111 @@ class PlaybackSession extends ChangeNotifier {
 
   void _playbackError(String message) {
     if (closed) return;
-    AppLog.instance.error('播放内核', message);
+    _playbackErrorRevision++;
+    _playbackErrorDetail = message;
+    _codecAttemptPending = message.trim() == 'Could not open codec.';
+    if (_codecAttemptPending) {
+      // mpv emits this before trying another decoder. Preserve the message,
+      // but only classify it as a playback failure if recovery does not follow.
+      AppLog.instance.warning('播放内核', '解码器初始化尝试失败：$message');
+    } else {
+      AppLog.instance.error('播放内核', message);
+    }
     _playbackErrorPending = true;
     // Keep the diagnostic immediately, but allow automatic decoder fallback or
     // network recovery before displaying a persistent error over a valid frame.
     _errorTimer ??= Timer(const Duration(milliseconds: 1200), () {
       _errorTimer = null;
       if (closed || !_playbackErrorPending) return;
+      if (_codecAttemptPending) {
+        AppLog.instance.error('播放内核', '解码器尚未恢复：$_playbackErrorDetail');
+        _codecAttemptPending = false;
+      }
       error = _playbackErrorMessage;
       _notify();
     });
   }
 
+  Future<void> _checkPlaybackErrorRecovery() {
+    if (closed ||
+        !_playbackErrorPending ||
+        _backgroundPlaybackBlocked ||
+        !_danmakuPresentationActive) {
+      return Future.value();
+    }
+    return _errorRecoveryWork ??= () async {
+      final revision = _playbackErrorRevision;
+      final pauseRevision = _backgroundPauseRevision;
+      try {
+        // Native time-pos follows video while a decoder is active, but can
+        // follow audio after the video chain disappears. An old first frame
+        // plus advancing audio must not clear a decoder failure.
+        final values = await _readNativeProperties(const ['video-dec-params']);
+        final params = (values['video-dec-params'] ?? '').trim();
+        if (closed ||
+            revision != _playbackErrorRevision ||
+            pauseRevision != _backgroundPauseRevision ||
+            _backgroundPlaybackBlocked ||
+            !_danmakuPresentationActive ||
+            !player.state.playing ||
+            player.state.buffering ||
+            params.isEmpty ||
+            params == '{}' ||
+            params == 'null') {
+          return;
+        }
+        _recoverPlaybackError();
+      } catch (_) {
+        // Retain the failure if an active video decoder cannot be confirmed.
+      }
+    }().whenComplete(() => _errorRecoveryWork = null);
+  }
+
   void _recoverPlaybackError() {
     if (closed || !_playbackErrorPending) return;
     _playbackErrorPending = false;
+    _codecAttemptPending = false;
+    _recoveryDiagnosticRevision = ++_playbackErrorRevision;
     _errorTimer?.cancel();
     _errorTimer = null;
     AppLog.instance.info('播放', '错误后已继续输出画面');
+    if (!_backgroundPlaybackBlocked && _danmakuPresentationActive) {
+      unawaited(_logRecoveredDecoder());
+    }
     if (error == _playbackErrorMessage) {
       error = '';
       _notify();
     }
   }
 
+  Future<void> _logRecoveredDecoder() => _recoveryDiagnosticWork ??= () async {
+    while (!closed &&
+        !_backgroundPlaybackBlocked &&
+        _danmakuPresentationActive &&
+        _recoveryDiagnosticRevision != null) {
+      final revision = _recoveryDiagnosticRevision!;
+      _recoveryDiagnosticRevision = null;
+      // A diagnostics read begun before the failure may describe the old
+      // decoder. Finish it before recording the decoder after recovery.
+      await _diagnosticWork;
+      if (closed ||
+          revision != _playbackErrorRevision ||
+          _backgroundPlaybackBlocked ||
+          !_danmakuPresentationActive) {
+        continue;
+      }
+      await refreshDiagnostics();
+      if (!closed &&
+          revision == _playbackErrorRevision &&
+          !_backgroundPlaybackBlocked &&
+          _danmakuPresentationActive) {
+        AppLog.instance.info('播放诊断', '恢复后当前解码器：$decoder');
+      }
+    }
+  }().whenComplete(() => _recoveryDiagnosticWork = null);
+
   void _recordMetadata() {
-    if (closed || player.state.duration <= Duration.zero) return;
+    if (closed || audioOnly || player.state.duration <= Duration.zero) return;
     final video = player.state.videoParams;
     final rotated = (video.rotate ?? 0).abs() % 180 == 90;
     final width = video.dw ?? video.w, height = video.dh ?? video.h;
@@ -1421,59 +1653,84 @@ class PlaybackSession extends ChangeNotifier {
     _scheduleTechnicalInfo();
   }
 
+  bool get _canCaptureTechnicalInfo =>
+      _canConfirmFirstFrame && _firstFrameRendered;
+
   void _scheduleTechnicalInfo() {
-    if (closed ||
-        !ready ||
-        _technicalComplete ||
+    final active = _canCaptureTechnicalInfo;
+    if (active != _technicalCaptureActive) {
+      _technicalCaptureActive = active;
+      _technicalRevision++;
+    }
+    if (!active) {
+      _technicalTimer?.cancel();
+      _technicalTimer = null;
+      return;
+    }
+    if (_technicalComplete ||
         _technicalAttempts >= 3 ||
+        _technicalReading ||
         _technicalTimer != null) {
       return;
     }
-    // Native startup publishes several related changes. Read one coalesced
-    // snapshot, then retry only a bounded number of times for late bitrate data.
+    // Optional codec/bitrate reads must not compete with first-frame decode.
+    // Coalesce the settled output, with bounded retries for late bitrate data.
     _technicalTimer = Timer(const Duration(milliseconds: 700), () {
       _technicalTimer = null;
+      _technicalReading = true;
       _technicalWork = _technicalWork
           .then((_) => _captureTechnicalInfo())
           .catchError((Object error) {
             AppLog.instance.warning('视频规格', safeFailure(error).message);
+          })
+          .whenComplete(() {
+            _technicalReading = false;
+            _scheduleTechnicalInfo();
           });
     });
   }
 
   Future<void> _captureTechnicalInfo() async {
-    if (closed || _technicalComplete || _technicalAttempts >= 3) return;
+    if (!_canCaptureTechnicalInfo ||
+        _technicalComplete ||
+        _technicalAttempts >= 3) {
+      return;
+    }
     _technicalAttempts++;
-    Future<String> property(String name) async {
-      try {
-        final value = '${await _native.getProperty(name)}'.trim();
-        return value == 'null' || value == 'unknown' ? '' : value;
-      } catch (_) {
-        return '';
-      }
+    final revision = _technicalRevision;
+    // getProperty is async in media_kit but its native read can synchronously
+    // wait for mpv's core lock. Share the bounded off-isolate reader instead.
+    final values = await _readNativeProperties(const [
+      'file-format',
+      'current-tracks/video/codec',
+      'video-bitrate',
+      'video-format',
+      'video-codec',
+    ]);
+    if (!_canCaptureTechnicalInfo || revision != _technicalRevision) {
+      _technicalAttempts--;
+      return;
+    }
+    String property(String name) {
+      final value = (values[name] ?? '').trim();
+      return value == 'null' || value == 'unknown' ? '' : value;
     }
 
-    final values = await Future.wait([
-      property('file-format'),
-      property('current-tracks/video/codec'),
-      property('video-bitrate'),
-    ]);
-    if (closed) return;
-    var codec = values[1];
-    if (codec.isEmpty) codec = await property('video-format');
-    if (codec.isEmpty) codec = await property('video-codec');
-    if (closed ||
-        MediaTechnicalInfo.fingerprint(model.store, media) !=
-            _technicalFingerprint) {
+    var codec = property('current-tracks/video/codec');
+    if (codec.isEmpty) codec = property('video-format');
+    if (codec.isEmpty) codec = property('video-codec');
+    if (MediaTechnicalInfo.fingerprint(model.store, media) !=
+        _technicalFingerprint) {
       return;
     }
     final params = player.state.videoParams;
-    final bitrate = double.tryParse(values[2]);
+    final container = property('file-format');
+    final bitrate = double.tryParse(property('video-bitrate'));
     final actualBitrate = bitrate != null && bitrate.isFinite && bitrate > 0
         ? bitrate.round()
         : null;
     final info = MediaTechnicalInfo(
-      container: videoContainerLabel(values[0]),
+      container: videoContainerLabel(container),
       codec: videoCodecLabel(codec),
       width: params.w,
       height: params.h,
@@ -1482,12 +1739,11 @@ class PlaybackSession extends ChangeNotifier {
     );
     info.save(model.store, media);
     _technicalComplete =
-        values[0].isNotEmpty &&
+        container.isNotEmpty &&
         codec.isNotEmpty &&
         (params.w ?? 0) > 0 &&
         (params.h ?? 0) > 0 &&
         actualBitrate != null;
-    if (!_technicalComplete) _scheduleTechnicalInfo();
   }
 
   void _resumePreviews() {
@@ -1522,11 +1778,34 @@ class PlaybackSession extends ChangeNotifier {
   Future<void> refreshDiagnostics() => _diagnosticWork ??= _readDiagnostics()
       .whenComplete(() => _diagnosticWork = null);
 
+  Future<Map<String, String>> _readNativeProperties(List<String> names) async {
+    final platform = player.platform;
+    if (platform is! NativePlayer) {
+      // Test/platform substitutes provide their own asynchronous property API.
+      return {for (final name in names) name: await _native.getProperty(name)};
+    }
+    await platform.waitForPlayerInitialization;
+    await platform.waitForVideoControllerInitializationIfAttached;
+    final handle = await player.handle;
+    if (closed) return const {};
+    final reader = _propertyReader ??= NativePropertyReader(
+      libraryPath: NativeLibrary.path,
+      handleAddress: handle,
+    );
+    // media_kit's async getter still calls synchronous mpv_get_property_string.
+    // Perform those potentially locked native reads on a reused worker instead.
+    return reader.read(names);
+  }
+
   Future<void> _readDiagnostics() async {
-    if (closed) return;
+    if (closed || audioOnly) return;
     try {
-      final hw = await _native.getProperty('hwdec-current');
-      final codec = await _native.getProperty('video-codec');
+      final values = await _readNativeProperties(const [
+        'hwdec-current',
+        'video-codec',
+      ]);
+      final hw = values['hwdec-current'] ?? '';
+      final codec = values['video-codec'] ?? '';
       if (!closed) {
         final value = '${hw == '' || hw == 'no' ? '软件解码' : hw} · $codec';
         if (decoder != value) {
@@ -1546,6 +1825,8 @@ class PlaybackSession extends ChangeNotifier {
 
   Future<void> _captureProgressPreview() async {
     if (_transient ||
+        personalMedia ||
+        audioOnly ||
         !ready ||
         remotePlayback ||
         player.state.playing ||
@@ -1628,7 +1909,10 @@ class PlaybackSession extends ChangeNotifier {
       'updatedAt': DateTime.now().toUtc().toIso8601String(),
       'devicePlatform': Platform.operatingSystem,
     };
-    final watchedId = completed || position / duration >= .95
+    final watchedId =
+        !personalMedia &&
+            !audioOnly &&
+            (completed || position / duration >= .95)
         ? model.watchedKey(media)
         : null;
     // Snapshot before queuing: a slow write must never replace a later seek or
@@ -1640,7 +1924,7 @@ class PlaybackSession extends ChangeNotifier {
         data,
         watchedId: watchedId,
       );
-      if (changed) model.requestProgressSync();
+      if (changed && !personalMedia) model.requestProgressSync();
     });
     // Return errors to this caller without poisoning subsequent checkpoints.
     _progressWork = saving.catchError((Object _) {});
@@ -1676,6 +1960,7 @@ class PlaybackSession extends ChangeNotifier {
       AppLog.instance.warning('观看记录', safeFailure(e).message);
     }
     model.removeListener(_preferencesChanged);
+    model.thirdPartyNetwork.removeListener(_thirdPartyPolicyChanged);
     cancelSubtitleTask();
     _errorTimer?.cancel();
     _technicalTimer?.cancel();
@@ -1700,7 +1985,11 @@ class PlaybackSession extends ChangeNotifier {
       await _firstFrameWork;
     });
     await cleanup(() => _technicalWork);
+    await cleanup(() async => _errorRecoveryWork);
+    await cleanup(() async => _recoveryDiagnosticWork);
     await cleanup(() async => _diagnosticWork);
+    await cleanup(() async => _propertyReader?.close());
+    await cleanup(() async => _audioMetadataWork);
     await cleanup(() => _preferenceWork);
     for (final subscription in _subscriptions) {
       await cleanup(subscription.cancel);
@@ -1725,6 +2014,6 @@ class PlaybackSession extends ChangeNotifier {
     }
     _resumePreviews();
     if (_transient) await cleanup(() => model.disposeExternalMedia(media.id));
-    model.changed();
+    if (!personalMedia) model.changed();
   }
 }

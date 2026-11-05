@@ -94,7 +94,9 @@ void main() {
               request.response.statusCode = HttpStatus.multiStatus;
               request.response.write(_listing(path, children, bytes.length));
             }
-          } else if (path == '/share/$first' || path == '/share/$second') {
+          } else if (listings.values
+              .expand((entries) => entries)
+              .any((entry) => entry == path && !entry.endsWith('/'))) {
             request.response.headers.set('accept-ranges', 'bytes');
             request.response.headers.set('etag', '"folder-version-1"');
             request.response.contentLength = bytes.length;
@@ -175,13 +177,29 @@ void main() {
           expect(model.downloads.completedCount, 0);
           expect(model.downloads.libraryRevision, greaterThan(0));
           transferGate.complete();
-          await _completedFiles(model.downloads, 2);
+          await _completedFiles(model.downloads, 5);
           expect(listed.toSet(), listings.keys.toSet());
           expect(
             downloaded,
-            unorderedEquals(['/share/$first', '/share/$second']),
+            unorderedEquals([
+              '/share/$first',
+              '/share/$second',
+              '${folder}notes.txt',
+              '${folder}Show S01E01.srt',
+              '${folder}Season 2/cover.jpg',
+            ]),
           );
           expect(store.all('media'), hasLength(2));
+          for (final path in [
+            '${root}notes.txt',
+            '${root}Show S01E01.srt',
+            '${root}Season 2/cover.jpg',
+          ]) {
+            final task = model.downloads.entryForSource('dav', path)!;
+            expect(task.downloadOnly, isTrue);
+            expect(await File(task.localPath).readAsBytes(), bytes);
+            expect(model.sourceMedia('dav', path), isNull);
+          }
           final known = store.get('media', 'known-episode')!;
           expect(known.data['metadataTitle'], '保留的作品详情');
           expect(model.sourceMedia('dav', first)?.id, known.id);

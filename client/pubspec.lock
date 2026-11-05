@@ -390,12 +390,11 @@ packages:
     source: hosted
     version: "1.1.4"
   media_kit_libs_linux:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
-      name: media_kit_libs_linux
-      sha256: "2b473399a49ec94452c4d4ae51cfc0f6585074398d74216092bf3d54aac37ecf"
-      url: "https://pub.dev"
-    source: hosted
+      path: "../packages/media_kit_libs_linux"
+      relative: true
+    source: path
     version: "1.2.1"
   media_kit_libs_macos_video:
     dependency: transitive
@@ -414,12 +413,11 @@ packages:
     source: hosted
     version: "1.0.7"
   media_kit_libs_windows_video:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
-      name: media_kit_libs_windows_video
-      sha256: dff76da2778729ab650229e6b4ec6ec111eb5151431002cbd7ea304ff1f112ab
-      url: "https://pub.dev"
-    source: hosted
+      path: "../packages/media_kit_libs_windows_video"
+      relative: true
+    source: path
     version: "1.0.11"
   media_kit_video:
     dependency: "direct main"
@@ -573,6 +571,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.2.1"
+  qr:
+    dependency: "direct main"
+    description:
+      name: qr
+      sha256: f9461594b257c2ec882159fb8100db28408f6aacdba5b21f109708bce2e482b6
+      url: "https://pub.dev"
+    source: hosted
+    version: "4.0.1"
   record_use:
     dependency: transitive
     description:
@@ -613,10 +619,9 @@ packages:
   sqlite3_flutter_libs:
     dependency: "direct main"
     description:
-      name: sqlite3_flutter_libs
-      sha256: eeb9e3a45207649076b808f8a5a74d68770d0b7f26ccef6d5f43106eee5375ad
-      url: "https://pub.dev"
-    source: hosted
+      path: "../packages/sqlite3_flutter_libs"
+      relative: true
+    source: path
     version: "0.5.42"
   stack_trace:
     dependency: transitive
@@ -787,5 +792,5 @@ packages:
     source: hosted
     version: "3.1.4"
 sdks:
-  dart: ">=3.12.0 <4.0.0"
+  dart: ">=3.13.0 <4.0.0"
   flutter: ">=3.44.0"

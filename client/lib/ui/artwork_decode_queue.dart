@@ -32,6 +32,12 @@ class ArtworkDecodeQueue extends ChangeNotifier {
 
   bool get _enabled => !_disposed && ArtworkLifecycle.instance.value;
 
+  @visibleForTesting
+  int get activeCount => _active.length;
+
+  @visibleForTesting
+  int get pendingCount => _pending.length;
+
   void _lifecycleChanged() {
     if (!_enabled) {
       for (final request in _retained.toList(growable: false)) {
@@ -246,8 +252,14 @@ class ArtworkDecodeRequest {
   void refreshPriority() => _queue._refreshPriority(this);
 
   void cancel() {
-    if (_cancelled || _completed) return;
+    if (_cancelled) return;
     _cancelled = true;
+    if (_completed) {
+      // A disposed viewer may never draw the scheduled retention-release frame.
+      // Release this request's listener/image now; ImageCache owns its own copy.
+      _releaseImage();
+      return;
+    }
     _queue._cancel(this);
   }
 

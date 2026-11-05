@@ -4,6 +4,7 @@
 Examples:
   python3 scripts/package.py android --flutter /path/to/flutter
   python3 scripts/package.py android --android-abi arm64  # optional smaller APK
+  python3 scripts/package.py android --android-legacy  # prepared Android 6 checkout
   python3 scripts/package.py linux --skip-build
   python3 scripts/package.py windows --windows-installer  # Windows + Inno Setup
   python3 scripts/package.py macos    # run on macOS
@@ -36,7 +37,7 @@ CLIENT = ROOT / "client"
 APPLICATION_ID = "app.aiplayer.aiplayer"
 
 
-def run(command: list[str], *, cwd: Path = ROOT, capture: bool = False) -> str:
+def run(command: list[str], *, cwd: Path = ROOT, capture: bool = False, env: dict[str, str] | None = None) -> str:
     # Windows CreateProcess does not expand PATHEXT like PowerShell does:
     # "flutter" must resolve to flutter.bat before passing it to subprocess.
     # Keep an argument list so paths with spaces are quoted by subprocess.
@@ -44,7 +45,7 @@ def run(command: list[str], *, cwd: Path = ROOT, capture: bool = False) -> str:
     if executable is None:
         raise FileNotFoundError(f"Build tool not found: {command[0]}. Install it or provide its full path.")
     resolved = [str(Path(executable).resolve()), *command[1:]]
-    result = subprocess.run(resolved, cwd=cwd, check=True, text=True, stdout=subprocess.PIPE if capture else None)
+    result = subprocess.run(resolved, cwd=cwd, check=True, text=True, stdout=subprocess.PIPE if capture else None, env=env)
     return result.stdout or ""
 
 
@@ -158,13 +159,15 @@ def linux_package(output: Path, version: str) -> tuple[list[Path], dict]:
     return artifacts, {"architecture": arch, "runtime_dependencies": dependencies}
 
 
-def android_package(output: Path, abi: str, version: str, *, keep_alias: bool = True) -> tuple[list[Path], dict]:
+def android_package(output: Path, abi: str, version: str, *, keep_alias: bool = True, android_legacy: bool = False) -> tuple[list[Path], dict]:
+    if android_legacy and abi != "universal":
+        raise ValueError("Android 6 compatibility APKs must include both ARM32 and ARM64")
     from validate_apk import validate_apk
 
     source = CLIENT / "build/app/outputs/flutter-apk" / ("app-arm64-v8a-release.apk" if abi == "arm64" else "app-release.apk")
     if not source.is_file():
         raise RuntimeError(f"No Android release APK: {source}")
-    validation = validate_apk(source, abi=abi, expected_version=version)
+    validation = validate_apk(source, abi=abi, expected_version=version, android_legacy=android_legacy)
     expected_certificate = (ROOT / "signing/android-certificate.sha256").read_text().strip()
     if validation["certificate_sha256"] != expected_certificate:
         raise RuntimeError(
@@ -174,15 +177,16 @@ def android_package(output: Path, abi: str, version: str, *, keep_alias: bool = 
         )
     abis = validation["abis"]
     artifacts = []
+    suffix = "-legacy" if android_legacy else ("-arm64" if abi == "arm64" else "")
     if keep_alias:
-        target = output / ("aiplayer-android-arm64-release.apk" if abi == "arm64" else "aiplayer-android-release.apk")
+        target = output / f"aiplayer-android{suffix}-release.apk"
         shutil.copy2(source, target)
         artifacts.append(target)
     version_name = re.sub(r"[^0-9A-Za-z._-]", "_", validation["version_name"])
-    versioned = output / f"aiplayer-{version_name}-android{'-arm64' if abi == 'arm64' else ''}.apk"
+    versioned = output / f"aiplayer-{version_name}-android{suffix}.apk"
     shutil.copy2(source, versioned)
     artifacts.append(versioned)
-    return artifacts, {"architecture": "arm64-v8a" if abi == "arm64" else "universal", "abis": abis, "minimum_android": "7.0 (API 24)", "signing": "v1 + v2 + v3, existing local debug certificate (personal-use release)", "apk_validation": validation}
+    return artifacts, {"architecture": "arm32+arm64" if android_legacy else ("arm64-v8a" if abi == "arm64" else "universal"), "abis": abis, "minimum_android": "6.0 (API 23)" if android_legacy else "7.0 (API 24)", "signing": "v1 + v2 + v3, existing local debug certificate (personal-use release)", "apk_validation": validation}
 
 
 def windows_package(output: Path, version: str, *, installer: bool = False) -> tuple[list[Path], dict]:
@@ -264,6 +268,7 @@ def main() -> None:
     parser.add_argument("--flutter", default=os.environ.get("AIPLAYER_FLUTTER", "flutter"))
     parser.add_argument("--output-dir", type=Path, default=ROOT / "artifacts")
     parser.add_argument("--android-abi", choices=["universal", "arm64"], default="universal", help="Default Android APK runs on ARM32, ARM64 and x86_64; arm64 produces an optional smaller APK")
+    parser.add_argument("--android-legacy", action="store_true", help="Build/package the prepared Android 6 compatibility checkout with Flutter 3.32.8 and both ARM ABIs")
     parser.add_argument("--no-android-alias", action="store_true", help="Only produce the versioned APK, without a duplicate fixed-name alias (Android only)")
     parser.add_argument("--windows-installer", action="store_true", help="Also build an unsigned Windows EXE installer using Inno Setup 6")
     arguments = parser.parse_args()
@@ -271,6 +276,8 @@ def main() -> None:
         parser.error("--windows-installer requires the windows target")
     if arguments.no_android_alias and arguments.target != "android":
         parser.error("--no-android-alias requires the android target")
+    if arguments.android_legacy and (arguments.target != "android" or arguments.android_abi != "universal"):
+        parser.error("--android-legacy requires the android target with both ARM ABIs (omit --android-abi)")
     supported_host = {"linux": "Linux", "windows": "Windows", "macos": "Darwin", "ios": "Darwin"}
     expected = supported_host.get(arguments.target)
     if expected and platform.system() != expected:
@@ -280,6 +287,10 @@ def main() -> None:
         raise RuntimeError("Missing pubspec version")
     version = version_match.group(1)
     if not arguments.skip_build:
+        if arguments.android_legacy:
+            flutter_version = json.loads(run([arguments.flutter, "--version", "--machine"], cwd=CLIENT, capture=True))
+            if flutter_version.get("frameworkVersion") != "3.32.8":
+                raise RuntimeError("Android 6 builds require the pinned Flutter 3.32.8 SDK and prepared compatibility checkout; use scripts/package_android_legacy.sh")
         # Let Flutter refresh registrants for release. --no-pub can retain
         # integration_test's generated registration after an integration run.
         command = [arguments.flutter]
@@ -287,18 +298,22 @@ def main() -> None:
             command.append("--verbose")
         command += ["build", "apk" if arguments.target == "android" else arguments.target, "--release"]
         if arguments.target == "android":
-            command += ["--target-platform", "android-arm64" if arguments.android_abi == "arm64" else "android-arm,android-arm64,android-x64"]
+            targets = "android-arm,android-arm64" if arguments.android_legacy else ("android-arm64" if arguments.android_abi == "arm64" else "android-arm,android-arm64,android-x64")
+            command += ["--target-platform", targets]
             if arguments.android_abi == "arm64":
                 # Personal-use APK variants share the pubspec build number so
                 # users can switch between universal and ARM64 installations.
                 command += ["--split-per-abi", "--android-project-arg=force-version-code-ignoring-abi=true"]
         elif arguments.target == "ios":
             command += ["--no-codesign"]
-        run(command, cwd=CLIENT)
+        build_env = None
+        if arguments.target == "android":
+            build_env = {**os.environ, "AIPLAYER_ANDROID_MIN_SDK": "23" if arguments.android_legacy else "24"}
+        run(command, cwd=CLIENT, env=build_env)
     output = arguments.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     if arguments.target == "android":
-        artifacts, details = android_package(output, arguments.android_abi, version, keep_alias=not arguments.no_android_alias)
+        artifacts, details = android_package(output, arguments.android_abi, version, keep_alias=not arguments.no_android_alias, android_legacy=arguments.android_legacy)
     elif arguments.target == "linux":
         artifacts, details = linux_package(output, version)
     elif arguments.target == "windows":
@@ -312,7 +327,7 @@ def main() -> None:
         checksums.append(f"{checksum}  {path.name}\n")
         artifact_details.append({"name": path.name, "size_bytes": path.stat().st_size, "sha256": checksum})
         print(f"Packaged {path} ({path.stat().st_size:,} bytes)")
-    metadata_target = "android-arm64" if arguments.target == "android" and arguments.android_abi == "arm64" else arguments.target
+    metadata_target = "android-legacy" if arguments.android_legacy else ("android-arm64" if arguments.target == "android" and arguments.android_abi == "arm64" else arguments.target)
     write(output / f"SHA256SUMS-{metadata_target}", "".join(checksums))
     write(output / f"build-{metadata_target}.json", json.dumps({"version": version, "target": arguments.target, "mode": "release", "host": platform.platform(), "artifacts": [path.name for path in artifacts], "artifact_details": artifact_details, **details}, ensure_ascii=False, indent=2) + "\n")
 

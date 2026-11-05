@@ -31,9 +31,10 @@ class _HistoryModel extends AppModel {
   }
 
   @override
-  void ensureMediaPreview(String id) {
+  bool ensureMediaPreview(String id) {
     previews.add(id);
     previewRequests.add(id);
+    return true;
   }
 }
 

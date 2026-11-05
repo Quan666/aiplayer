@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:aiplayer/data/library_catalog.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/danmaku/release_name.dart';
@@ -222,21 +223,18 @@ void main() {
       store.dispose();
     }
   });
-  test(
-    'dot episode names do not turn codecs or hyphenated movie titles into episodes',
-    () {
-      expect(parseReleaseName('Series.01.mkv').anime, 'Series');
-      expect(parseReleaseName('Series.01.mkv').episode, '1');
-      for (final codec in ['264', '265']) {
-        final parsed = parseReleaseName('Show.H.$codec.mkv');
-        expect(parsed.anime, 'Show');
-        expect(parsed.episode, isEmpty);
-      }
-      expect(parseReleaseName('Spider-Man-2.mkv').episode, isEmpty);
-      expect(parseReleaseName('Spider-Man-2.mkv').anime, 'Spider-Man-2');
-      expect(parseReleaseName('1.5.mkv').episode, isEmpty);
-    },
-  );
+  test('dot episode names do not turn codecs or hyphenated movie titles into episodes', () {
+    expect(parseReleaseName('Series.01.mkv').anime, 'Series');
+    expect(parseReleaseName('Series.01.mkv').episode, '1');
+    for (final codec in ['264', '265']) {
+      final parsed = parseReleaseName('Show.H.$codec.mkv');
+      expect(parsed.anime, 'Show');
+      expect(parsed.episode, isEmpty);
+    }
+    expect(parseReleaseName('Spider-Man-2.mkv').episode, isEmpty);
+    expect(parseReleaseName('Spider-Man-2.mkv').anime, 'Spider-Man-2');
+    expect(parseReleaseName('1.5.mkv').episode, isEmpty);
+  });
   test(
     'single title-only files preserve explicit seasons and reject conflicts',
     () {
@@ -299,40 +297,33 @@ void main() {
       expect(a.contentFingerprint, isNot(replaced.contentFingerprint));
     },
   );
-  test(
-    'external open accepts video paths and URLs, rejects unsafe or unusable inputs',
-    () {
+  test('external open accepts video paths and URLs, rejects unsafe or unusable inputs', () {
+    expect(ExternalVideoRequest.parse({'path': '/tmp/视频.mkv'}).remote, isFalse);
+    expect(
+      ExternalVideoRequest.parse({'path': 'file:///tmp/%E8%A7%86%E9%A2%91.mp4'})
+          .location,
+      '/tmp/视频.mp4',
+    );
+    expect(
+      ExternalVideoRequest.parse({
+        'uri': 'https://example.org/video',
+        'name': '视频.mp4',
+      }).remote,
+      isTrue,
+    );
+    for (final raw in [
+      '',
+      'relative.mkv',
+      '/tmp/file.txt',
+      'content://unknown/1',
+      'https://user:secret@example.org/a.mp4',
+    ]) {
       expect(
-        ExternalVideoRequest.parse({'path': '/tmp/视频.mkv'}).remote,
-        isFalse,
+        () => ExternalVideoRequest.parse({'path': raw}),
+        throwsA(isA<AppFailure>()),
       );
-      expect(
-        ExternalVideoRequest.parse({
-          'path': 'file:///tmp/%E8%A7%86%E9%A2%91.mp4',
-        }).location,
-        '/tmp/视频.mp4',
-      );
-      expect(
-        ExternalVideoRequest.parse({
-          'uri': 'https://example.org/video',
-          'name': '视频.mp4',
-        }).remote,
-        isTrue,
-      );
-      for (final raw in [
-        '',
-        'relative.mkv',
-        '/tmp/file.txt',
-        'content://unknown/1',
-        'https://user:secret@example.org/a.mp4',
-      ]) {
-        expect(
-          () => ExternalVideoRequest.parse({'path': raw}),
-          throwsA(isA<AppFailure>()),
-        );
-      }
-    },
-  );
+    }
+  });
 }
 
 class _CatalogTransport implements JsonTransport {
@@ -423,50 +414,47 @@ void _jointCatalogTests() {
       tmdbCredential: () async => 'read-token',
     );
 
-    test(
-      'default search merges all sources and keeps same IDs in different types',
-      () async {
-        for (final preferred in ['bangumi', 'tmdb', 'legacy']) {
-          final transport = _CatalogTransport(
-            (uri) => _catalogReply(
-              uri,
-              bangumi: const [_bangumi, _bangumi],
-              movies: const [_movie],
-            ),
-          );
-          final results = await catalog(
-            transport,
-            provider: () => preferred,
-          ).search('Example');
+    test('default search merges all sources and keeps same IDs in different types', () async {
+      for (final preferred in ['bangumi', 'tmdb', 'legacy']) {
+        final transport = _CatalogTransport(
+          (uri) => _catalogReply(
+            uri,
+            bangumi: const [_bangumi, _bangumi],
+            movies: const [_movie],
+          ),
+        );
+        final results = await catalog(
+          transport,
+          provider: () => preferred,
+        ).search('Example');
+        expect(
+          results
+              .map(
+                (value) =>
+                    '${value['provider']}:${value['mediaType']}:${value['id']}',
+              )
+              .toSet(),
+          {'bangumi:tv:7', 'tmdb:tv:7', 'tmdb:movie:7'},
+        );
+        expect(results, hasLength(3));
+        if (preferred == 'bangumi') {
           expect(
-            results
-                .map(
-                  (value) =>
-                      '${value['provider']}:${value['mediaType']}:${value['id']}',
-                )
-                .toSet(),
-            {'bangumi:tv:7', 'tmdb:tv:7', 'tmdb:movie:7'},
+            transport.calls.map((uri) => uri.path),
+            containsAll([
+              '/search/subject/Example',
+              '/3/search/tv',
+              '/3/search/movie',
+            ]),
           );
-          expect(results, hasLength(3));
-          if (preferred == 'bangumi') {
-            expect(
-              transport.calls.map((uri) => uri.path),
-              containsAll([
-                '/search/subject/Example',
-                '/3/search/tv',
-                '/3/search/movie',
-              ]),
-            );
-          } else {
-            expect(
-              transport.calls,
-              isEmpty,
-              reason: 'Legacy provider preference shares persistent results',
-            );
-          }
+        } else {
+          expect(
+            transport.calls,
+            isEmpty,
+            reason: 'Legacy provider preference shares persistent results',
+          );
         }
-      },
-    );
+      }
+    });
 
     test(
       'one failed endpoint does not hide the other search results',
@@ -495,250 +483,230 @@ void _jointCatalogTests() {
       },
     );
 
-    test(
-      'missing TMDB credential retains Bangumi and explicit source remains available',
-      () async {
-        final transport = _CatalogTransport(_catalogReply);
-        final model = LibraryCatalog(
-          store,
-          transport: transport,
-          provider: () => 'tmdb',
-        );
-        expect((await model.search('Example')).single['provider'], 'bangumi');
-        expect(transport.calls.every((uri) => uri.host == 'api.bgm.tv'), true);
-        transport.calls.clear();
-        expect(
-          (await catalog(
-            transport,
-          ).search('Example', source: 'bangumi')).single['provider'],
-          'bangumi',
-        );
-        expect(transport.calls.every((uri) => uri.host == 'api.bgm.tv'), true);
-      },
-    );
+    test('missing TMDB credential retains Bangumi and explicit source remains available', () async {
+      final transport = _CatalogTransport(_catalogReply);
+      final model = LibraryCatalog(
+        store,
+        transport: transport,
+        provider: () => 'tmdb',
+      );
+      expect((await model.search('Example')).single['provider'], 'bangumi');
+      expect(transport.calls.every((uri) => uri.host == 'api.bgm.tv'), true);
+      transport.calls.clear();
+      expect(
+        (await catalog(
+          transport,
+        ).search('Example', source: 'bangumi')).single['provider'],
+        'bangumi',
+      );
+      expect(transport.calls.every((uri) => uri.host == 'api.bgm.tv'), true);
+    });
 
-    test(
-      'consistent animation prefers Bangumi and ignores legacy provider cache preferences',
-      () async {
-        var preferred = 'tmdb';
-        final transport = _CatalogTransport(_catalogReply);
-        final model = catalog(transport, provider: () => preferred);
-        expect((await model.resolve('Example', '1'))?['provider'], 'bangumi');
-        final count = transport.calls.length;
-        preferred = 'bangumi';
-        expect((await model.resolve('Example', '1'))?['provider'], 'bangumi');
-        expect(transport.calls.length, count);
-        expect(store.localEntries('subject-v5:'), hasLength(1));
-        expect(store.localEntries('subject-v4:'), isEmpty);
-      },
-    );
+    test('consistent animation prefers Bangumi and ignores legacy provider cache preferences', () async {
+      var preferred = 'tmdb';
+      final transport = _CatalogTransport(_catalogReply);
+      final model = catalog(transport, provider: () => preferred);
+      expect((await model.resolve('Example', '1'))?['provider'], 'bangumi');
+      final count = transport.calls.length;
+      preferred = 'bangumi';
+      expect((await model.resolve('Example', '1'))?['provider'], 'bangumi');
+      expect(transport.calls.length, count);
+      expect(store.localEntries('subject-v5:'), hasLength(1));
+      expect(store.localEntries('subject-v4:'), isEmpty);
+    });
 
-    test(
-      'TMDB TV or movie can resolve without Bangumi; episodic input never adopts a movie',
-      () async {
-        for (final movie in [false, true]) {
-          final transport = _CatalogTransport(
-            (uri) => _catalogReply(
-              uri,
-              bangumi: const [],
-              tv: movie ? const [] : const [_tv],
-              movies: movie ? const [_movie] : const [],
-            ),
-          );
-          final model = catalog(transport)..invalidateMetadataCaches();
-          final result = await model.resolve(
-            'Example',
-            movie ? '' : '2',
-            force: true,
-          );
-          expect(result?['provider'], 'tmdb');
-          expect(result?['mediaType'], movie ? 'movie' : 'tv');
-          if (movie) {
-            expect(await model.resolve('Example', '3', force: true), isNull);
-          } else {
-            expect(result?['season'], '2');
-          }
-        }
-      },
-    );
-
-    test(
-      'independent source failure permits a complete match without caching a partial lookup',
-      () async {
-        final transport = _CatalogTransport((uri) {
-          if (uri.host == 'api.bgm.tv') throw const AppFailure('Bangumi 离线');
-          return _catalogReply(uri);
-        });
-        expect(
-          (await catalog(transport).resolve('Example', '1'))?['provider'],
-          'tmdb',
-        );
-        expect(store.localEntries('subject-v5:'), isEmpty);
-        final inverse = _CatalogTransport((uri) {
-          if (uri.host == 'api.themoviedb.org') {
-            throw const AppFailure('TMDB 离线');
-          }
-          return _catalogReply(uri);
-        });
-        final inverseCatalog = catalog(inverse)..invalidateMetadataCaches();
-        expect(
-          (await inverseCatalog.resolve('Example', '1'))?['provider'],
-          'bangumi',
-        );
-      },
-    );
-
-    test(
-      'conflicting years, original titles, live-action types and ambiguity remain unresolved',
-      () async {
-        final cases =
-            <
-              ({
-                List<Map<String, dynamic>> bangumi,
-                List<Map<String, dynamic>> tv,
-              })
-            >[
-              (
-                bangumi: [
-                  {..._bangumi, 'date': '2020-01-01'},
-                ],
-                tv: [_tv],
-              ),
-              (
-                bangumi: [
-                  {..._bangumi, 'name': '原作甲'},
-                ],
-                tv: [
-                  {..._tv, 'original_name': '原作乙'},
-                ],
-              ),
-              (
-                bangumi: [_bangumi],
-                tv: [
-                  {
-                    ..._tv,
-                    'genres': [
-                      {'id': 18, 'name': '剧情'},
-                    ],
-                  },
-                ],
-              ),
-              (
-                bangumi: [
-                  _bangumi,
-                  {..._bangumi, 'id': 8},
-                ],
-                tv: [_tv],
-              ),
-              (
-                bangumi: [_bangumi],
-                tv: [
-                  _tv,
-                  {..._tv, 'id': 8},
-                ],
-              ),
-            ];
-        for (final entry in cases) {
-          final transport = _CatalogTransport(
-            (uri) => _catalogReply(uri, bangumi: entry.bangumi, tv: entry.tv),
-          );
-          final model = catalog(transport)..invalidateMetadataCaches();
-          expect(
-            await model.resolve('示例', '1', force: true),
-            isNull,
-            reason: '$entry',
-          );
-        }
-      },
-    );
-
-    test(
-      'cancelled cache access and late automatic replies never publish metadata',
-      () async {
-        final cached = catalog(_CatalogTransport(_catalogReply));
-        await cached.resolve('Example', '1');
-        final cancelled = CancelToken()..cancel();
-        await expectLater(
-          cached.resolve('Example', '1', cancel: cancelled),
-          throwsA(isA<Cancelled>()),
-        );
-
-        var strategy = 'conservative';
-        final gate = Completer<Map<String, dynamic>>();
-        final started = Completer<void>();
-        final delayed = LibraryCatalog(
-          store,
-          strategy: () => strategy,
-          transport: _CatalogTransport((uri) {
-            if (uri.path.startsWith('/search/subject/')) {
-              if (!started.isCompleted) started.complete();
-              return gate.future;
-            }
-            return _catalogReply(uri);
-          }),
-        );
-        final request = delayed.resolve('Other', '1', force: true);
-        await started.future;
-        strategy = 'off';
-        gate.complete({
-          'list': [_bangumi],
-        });
-        expect(await request, isNull);
-        expect(
-          store.localEntries('subject-v5:'),
-          hasLength(1),
-          reason: 'Only the original completed lookup is cached',
-        );
-      },
-    );
-
-    test(
-      'directory AI fallback covers unparsed files and invalidates when its context changes',
-      () async {
-        var aiContext = 'enabled:model-a';
-        var calls = 0;
-        final entries = [
-          const SourceEntry(
-            name: 'unstructured.mkv',
-            path: '/folder/unstructured.mkv',
+    test('TMDB TV or movie can resolve without Bangumi; episodic input never adopts a movie', () async {
+      for (final movie in [false, true]) {
+        final transport = _CatalogTransport(
+          (uri) => _catalogReply(
+            uri,
+            bangumi: const [],
+            tv: movie ? const [] : const [_tv],
+            movies: movie ? const [_movie] : const [],
           ),
-        ];
-        final result = DirectoryCollection(
-          title: 'Example',
-          season: '1',
-          videos: entries,
-          identities: {
-            entries.single.path: const ReleaseName('Example', '1', '1'),
-          },
-          subject: _bangumi,
-          episodeTitles: const {'1': '开始'},
         );
-        final model = LibraryCatalog(
-          store,
-          transport: _CatalogTransport(_catalogReply),
-          aiContext: () => aiContext,
-          aiFallback: (source, path, files, cancel) async {
-            calls++;
-            expect(files, entries);
-            return result;
-          },
+        final model = catalog(transport)..invalidateMetadataCaches();
+        final result = await model.resolve(
+          'Example',
+          movie ? '' : '2',
+          force: true,
         );
-        expect(await model.inspect('local', '/folder', entries), same(result));
+        expect(result?['provider'], 'tmdb');
+        expect(result?['mediaType'], movie ? 'movie' : 'tv');
+        if (movie) {
+          expect(await model.resolve('Example', '3', force: true), isNull);
+        } else {
+          expect(result?['season'], '2');
+        }
+      }
+    });
+
+    test('independent source failure permits a complete match without caching a partial lookup', () async {
+      final transport = _CatalogTransport((uri) {
+        if (uri.host == 'api.bgm.tv') throw const AppFailure('Bangumi 离线');
+        return _catalogReply(uri);
+      });
+      expect(
+        (await catalog(transport).resolve('Example', '1'))?['provider'],
+        'tmdb',
+      );
+      expect(store.localEntries('subject-v5:'), isEmpty);
+      final inverse = _CatalogTransport((uri) {
+        if (uri.host == 'api.themoviedb.org') {
+          throw const AppFailure('TMDB 离线');
+        }
+        return _catalogReply(uri);
+      });
+      final inverseCatalog = catalog(inverse)..invalidateMetadataCaches();
+      expect(
+        (await inverseCatalog.resolve('Example', '1'))?['provider'],
+        'bangumi',
+      );
+    });
+
+    test('conflicting years, original titles, live-action types and ambiguity remain unresolved', () async {
+      final cases =
+          <
+            ({
+              List<Map<String, dynamic>> bangumi,
+              List<Map<String, dynamic>> tv,
+            })
+          >[
+            (
+              bangumi: [
+                {..._bangumi, 'date': '2020-01-01'},
+              ],
+              tv: [_tv],
+            ),
+            (
+              bangumi: [
+                {..._bangumi, 'name': '原作甲'},
+              ],
+              tv: [
+                {..._tv, 'original_name': '原作乙'},
+              ],
+            ),
+            (
+              bangumi: [_bangumi],
+              tv: [
+                {
+                  ..._tv,
+                  'genres': [
+                    {'id': 18, 'name': '剧情'},
+                  ],
+                },
+              ],
+            ),
+            (
+              bangumi: [
+                _bangumi,
+                {..._bangumi, 'id': 8},
+              ],
+              tv: [_tv],
+            ),
+            (
+              bangumi: [_bangumi],
+              tv: [
+                _tv,
+                {..._tv, 'id': 8},
+              ],
+            ),
+          ];
+      for (final entry in cases) {
+        final transport = _CatalogTransport(
+          (uri) => _catalogReply(uri, bangumi: entry.bangumi, tv: entry.tv),
+        );
+        final model = catalog(transport)..invalidateMetadataCaches();
         expect(
-          (await model.inspect('local', '/folder', entries))?.subject,
-          _bangumi,
+          await model.resolve('示例', '1', force: true),
+          isNull,
+          reason: '$entry',
         );
-        expect(calls, 1);
-        aiContext = 'enabled:model-b';
-        expect(model.directoryPreview('local', '/folder'), isNull);
-        await model.inspect('local', '/folder', entries);
-        expect(calls, 2);
-      },
-    );
+      }
+    });
+
+    test('cancelled cache access and late automatic replies never publish metadata', () async {
+      final cached = catalog(_CatalogTransport(_catalogReply));
+      await cached.resolve('Example', '1');
+      final cancelled = CancelToken()..cancel();
+      await expectLater(
+        cached.resolve('Example', '1', cancel: cancelled),
+        throwsA(isA<Cancelled>()),
+      );
+
+      var strategy = 'conservative';
+      final gate = Completer<Map<String, dynamic>>();
+      final started = Completer<void>();
+      final delayed = LibraryCatalog(
+        store,
+        strategy: () => strategy,
+        transport: _CatalogTransport((uri) {
+          if (uri.path.startsWith('/search/subject/')) {
+            if (!started.isCompleted) started.complete();
+            return gate.future;
+          }
+          return _catalogReply(uri);
+        }),
+      );
+      final request = delayed.resolve('Other', '1', force: true);
+      await started.future;
+      strategy = 'off';
+      gate.complete({
+        'list': [_bangumi],
+      });
+      expect(await request, isNull);
+      expect(
+        store.localEntries('subject-v5:'),
+        hasLength(1),
+        reason: 'Only the original completed lookup is cached',
+      );
+    });
+
+    test('directory AI fallback covers unparsed files and invalidates when its context changes', () async {
+      var aiContext = 'enabled:model-a';
+      var calls = 0;
+      final entries = [
+        const SourceEntry(
+          name: 'unstructured.mkv',
+          path: '/folder/unstructured.mkv',
+        ),
+      ];
+      final result = DirectoryCollection(
+        title: 'Example',
+        season: '1',
+        videos: entries,
+        identities: {
+          entries.single.path: const ReleaseName('Example', '1', '1'),
+        },
+        subject: _bangumi,
+        episodeTitles: const {'1': '开始'},
+      );
+      final model = LibraryCatalog(
+        store,
+        transport: _CatalogTransport(_catalogReply),
+        aiContext: () => aiContext,
+        aiFallback: (source, path, files, cancel) async {
+          calls++;
+          expect(files, entries);
+          return result;
+        },
+      );
+      expect(await model.inspect('local', '/folder', entries), same(result));
+      expect(
+        (await model.inspect('local', '/folder', entries))?.subject,
+        _bangumi,
+      );
+      expect(calls, 1);
+      aiContext = 'enabled:model-b';
+      expect(model.directoryPreview('local', '/folder'), isNull);
+      await model.inspect('local', '/folder', entries);
+      expect(calls, 2);
+    });
 
     test(
       'directory keeps its resolved subject and retries failed episode details',
       () async {
+        var automatic = true;
         var episodeRequests = 0;
         final transport = _CatalogTransport((uri) {
           if (uri.path == '/v0/episodes') {
@@ -754,7 +722,11 @@ void _jointCatalogTests() {
           }
           return _catalogReply(uri);
         });
-        final model = LibraryCatalog(store, transport: transport);
+        final model = LibraryCatalog(
+          store,
+          transport: transport,
+          automaticEnabled: () => automatic,
+        );
         const entries = [
           SourceEntry(name: 'Example S01E01.mkv', path: '/Example/E01.mkv'),
         ];
@@ -769,11 +741,20 @@ void _jointCatalogTests() {
           isFalse,
         );
         expect(
-          LibraryCatalog(
-            store,
-          ).directoryPreview('local', '/Example')?.collection?.metadataComplete,
+          LibraryCatalog(store)
+              .directoryPreview('local', '/Example')
+              ?.collection
+              ?.metadataComplete,
           isFalse,
         );
+        automatic = false;
+        final requests = transport.calls.length;
+        final cached = await model.inspect('local', '/Example', entries);
+        expect(cached?.subject?['id'], 7);
+        expect(cached?.metadataComplete, isFalse);
+        expect(cached?.episodeTitles, isEmpty);
+        expect(transport.calls, hasLength(requests));
+        automatic = true;
         final second = await model.inspect('local', '/Example', entries);
         expect(second?.subject?['id'], 7);
         expect(second?.metadataComplete, isTrue);
@@ -788,113 +769,102 @@ void _jointCatalogTests() {
       },
     );
 
-    test(
-      'directory metadata is discarded when episode lookup finishes after cancellation or disabling',
-      () async {
-        for (final cancelRequest in [false, true]) {
-          final branchStore = AppStore(':memory:');
-          addTearDown(branchStore.dispose);
-          var strategy = 'conservative';
-          final gate = Completer<Map<String, dynamic>>();
-          final started = Completer<void>();
-          final token = CancelToken();
-          final model = LibraryCatalog(
-            branchStore,
-            strategy: () => strategy,
-            transport: _CatalogTransport((uri) {
-              if (uri.path == '/v0/episodes') {
-                started.complete();
-                return gate.future;
-              }
-              return _catalogReply(uri);
-            }),
-          );
-          final entries = [
-            for (var episode = 1; episode <= 2; episode++)
-              SourceEntry(
-                name: 'Example S01E0$episode.mkv',
-                path: '/episodes/Example S01E0$episode.mkv',
-              ),
-          ];
-          final request = model.inspect(
-            'local',
-            '/episodes',
-            entries,
-            cancel: token,
-          );
-          await started.future;
-          if (cancelRequest) {
-            token.cancel();
-          } else {
-            strategy = 'off';
-          }
-          gate.complete({
-            'data': [
-              {'sort': 1, 'name_cn': '开始'},
-            ],
-          });
-          if (cancelRequest) {
-            await expectLater(request, throwsA(isA<Cancelled>()));
-            expect(branchStore.localEntries('episode-names:'), isEmpty);
-          } else {
-            expect((await request)?.subject, isNull);
-          }
-          expect(branchStore.localEntries('directory-preview:'), isEmpty);
-        }
-      },
-    );
-
-    test(
-      'directory fallback does not publish after cancellation or disabling metadata',
-      () async {
-        for (final cancelRequest in [false, true]) {
-          var strategy = 'conservative';
-          final gate = Completer<DirectoryCollection?>();
-          final started = Completer<void>();
-          final token = CancelToken();
-          final entries = [
-            const SourceEntry(
-              name: 'unstructured.mkv',
-              path: '/late/unstructured.mkv',
-            ),
-          ];
-          final model = LibraryCatalog(
-            store,
-            strategy: () => strategy,
-            aiFallback: (_, _, _, _) {
+    test('directory metadata is discarded when episode lookup finishes after cancellation or disabling', () async {
+      for (final cancelRequest in [false, true]) {
+        final branchStore = AppStore(':memory:');
+        addTearDown(branchStore.dispose);
+        var strategy = 'conservative';
+        final gate = Completer<Map<String, dynamic>>();
+        final started = Completer<void>();
+        final token = CancelToken();
+        final model = LibraryCatalog(
+          branchStore,
+          strategy: () => strategy,
+          transport: _CatalogTransport((uri) {
+            if (uri.path == '/v0/episodes') {
               started.complete();
               return gate.future;
-            },
-          );
-          final request = model.inspect(
-            'local',
-            '/late',
-            entries,
-            cancel: token,
-          );
-          await started.future;
-          if (cancelRequest) {
-            token.cancel();
-          } else {
-            strategy = 'off';
-          }
-          gate.complete(
-            DirectoryCollection(
-              title: 'Example',
-              season: '1',
-              videos: entries,
-              identities: const {},
-              subject: _bangumi,
+            }
+            return _catalogReply(uri);
+          }),
+        );
+        final entries = [
+          for (var episode = 1; episode <= 2; episode++)
+            SourceEntry(
+              name: 'Example S01E0$episode.mkv',
+              path: '/episodes/Example S01E0$episode.mkv',
             ),
-          );
-          if (cancelRequest) {
-            await expectLater(request, throwsA(isA<Cancelled>()));
-          } else {
-            expect(await request, isNull);
-          }
-          expect(store.localEntries('directory-preview:'), isEmpty);
+        ];
+        final request = model.inspect(
+          'local',
+          '/episodes',
+          entries,
+          cancel: token,
+        );
+        await started.future;
+        if (cancelRequest) {
+          token.cancel();
+        } else {
+          strategy = 'off';
         }
-      },
-    );
+        gate.complete({
+          'data': [
+            {'sort': 1, 'name_cn': '开始'},
+          ],
+        });
+        if (cancelRequest) {
+          await expectLater(request, throwsA(isA<Cancelled>()));
+          expect(branchStore.localEntries('episode-names:'), isEmpty);
+        } else {
+          expect((await request)?.subject, isNull);
+        }
+        expect(branchStore.localEntries('directory-preview:'), isEmpty);
+      }
+    });
+
+    test('directory fallback does not publish after cancellation or disabling metadata', () async {
+      for (final cancelRequest in [false, true]) {
+        var strategy = 'conservative';
+        final gate = Completer<DirectoryCollection?>();
+        final started = Completer<void>();
+        final token = CancelToken();
+        final entries = [
+          const SourceEntry(
+            name: 'unstructured.mkv',
+            path: '/late/unstructured.mkv',
+          ),
+        ];
+        final model = LibraryCatalog(
+          store,
+          strategy: () => strategy,
+          aiFallback: (_, _, _, _) {
+            started.complete();
+            return gate.future;
+          },
+        );
+        final request = model.inspect('local', '/late', entries, cancel: token);
+        await started.future;
+        if (cancelRequest) {
+          token.cancel();
+        } else {
+          strategy = 'off';
+        }
+        gate.complete(
+          DirectoryCollection(
+            title: 'Example',
+            season: '1',
+            videos: entries,
+            identities: const {},
+            subject: _bangumi,
+          ),
+        );
+        if (cancelRequest) {
+          await expectLater(request, throwsA(isA<Cancelled>()));
+        } else {
+          expect(await request, isNull);
+        }
+        expect(store.localEntries('directory-preview:'), isEmpty);
+      }
+    });
   });
 }

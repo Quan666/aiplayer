@@ -14,7 +14,7 @@ void main() {
   setUp(() => overrideSystemProxyPlatformForTesting('test'));
 
   test(
-    'folder scanning rejects sibling aliases and filters non-video files',
+    'folder scanning rejects sibling aliases and includes non-video files',
     () async {
       final fixture = await _Folders.create({
         'allowed': [
@@ -40,17 +40,18 @@ void main() {
           entry: _folder('allowed/'),
         );
         await _until(
-          () => manager.completedCount == 2 || manager.failedCount > 0,
+          () => manager.completedCount == 3 || manager.failedCount > 0,
         );
         expect(manager.failedCount, 0);
         expect(manager.entries.values.any((entry) => entry.isDirectory), false);
         expect(fixture.gets.toSet(), {
           'allowed/good.mp4',
           'allowed/child/extra.mkv',
+          'allowed/readme.nfo',
         });
         expect(fixture.listed, ['allowed', 'allowed/child']);
         expect(fixture.store.records('media'), hasLength(2));
-        expect(manager.completedLocations, hasLength(2));
+        expect(manager.completedLocations, hasLength(3));
       } finally {
         await manager.close();
         manager.dispose();
@@ -59,69 +60,117 @@ void main() {
     },
   );
 
-  test(
-    'equivalent folder selection is one persistent scan and traversal is rejected',
-    () async {
-      final fixture = await _Folders.create({
-        'allowed': [('allowed/one.mp4', false)],
-      });
-      final manager = fixture.manager(active: false);
-      try {
-        await manager.enqueueFolder(
-          sourceId: 'dav',
-          entry: _folder('allowed/'),
-        );
-        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('allowed'));
-        expect(manager.taskIds, hasLength(1));
-        expect(manager.pausedCount, 1);
-        await expectLater(
-          manager.enqueueFolder(sourceId: 'dav', entry: _folder('../escape')),
-          throwsA(anything),
-        );
-        expect(manager.taskIds, hasLength(1));
-        expect(fixture.listed, isEmpty);
-        manager.setActive(true);
-        await _until(() => manager.completedCount == 1);
-        expect(fixture.listed, ['allowed']);
-      } finally {
-        await manager.close();
-        manager.dispose();
-        await fixture.close();
-      }
-    },
-  );
+  test('equivalent folder selection is one persistent scan and traversal is rejected', () async {
+    final fixture = await _Folders.create({
+      'allowed': [('allowed/one.mp4', false)],
+    });
+    final manager = fixture.manager(active: false);
+    try {
+      await manager.enqueueFolder(sourceId: 'dav', entry: _folder('allowed/'));
+      await manager.enqueueFolder(sourceId: 'dav', entry: _folder('allowed'));
+      expect(manager.taskIds, hasLength(1));
+      expect(manager.pausedCount, 1);
+      await expectLater(
+        manager.enqueueFolder(sourceId: 'dav', entry: _folder('../escape')),
+        throwsA(anything),
+      );
+      expect(manager.taskIds, hasLength(1));
+      expect(fixture.listed, isEmpty);
+      manager.setActive(true);
+      await _until(() => manager.completedCount == 1);
+      expect(fixture.listed, ['allowed']);
+    } finally {
+      await manager.close();
+      manager.dispose();
+      await fixture.close();
+    }
+  });
 
-  test(
-    'more than 2000 discovered videos fail before registration or child admission',
-    () async {
-      final fixture = await _Folders.create({
-        'large': [
-          for (var i = 0; i < 2001; i++) ('large/episode-$i.mp4', false),
-        ],
+  test('personal folder downloads every format without film registration and reuses downloaded bindings', () async {
+    final names = ['Family.mp4', '001.JPG', '001.ARW', '001.xmp', 'song.FLAC'];
+    final fixture = await _Folders.create({
+      'Album': [for (final name in names) ('Album/$name', false)],
+    });
+    final manager = fixture.manager();
+    try {
+      await manager.enqueueFolder(
+        sourceId: 'dav',
+        entry: _folder('Album'),
+        personalMedia: true,
+      );
+      await _until(
+        () => manager.completedCount == names.length || manager.failedCount > 0,
+      );
+      expect(manager.failedCount, 0);
+      expect(fixture.store.records('media'), isEmpty);
+      expect(manager.libraryRevision, 0);
+      expect(
+        manager.entries.values.every((entry) => entry.downloadOnly),
+        isTrue,
+      );
+      final downloaded = manager.entryForSource('dav', 'Album/Family.mp4')!;
+      fixture.store.save('media', 'personal', {
+        'fileName': 'Family.mp4',
+        'personalMedia': true,
+        'localOnly': true,
       });
-      final manager = fixture.manager();
-      try {
-        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('large'));
-        await _until(() => manager.failedCount == 1);
-        expect(manager.taskIds, hasLength(1));
-        expect(manager.entries.values.single.isDirectory, true);
-        expect(manager.entries.values.single.error, contains('2000'));
-        expect(
-          manager.entries.values.single.discoveredFiles,
-          lessThanOrEqualTo(2000),
-        );
-        expect(fixture.store.records('media'), isEmpty);
-        expect(fixture.gets, isEmpty);
-        expect(manager.completedLocations, isEmpty);
-        await manager.cancel(manager.taskIds.single);
-        expect(manager.entries, isEmpty);
-      } finally {
-        await manager.close();
-        manager.dispose();
-        await fixture.close();
-      }
-    },
-  );
+      fixture.store.setLocal('location:personal', {
+        'id': 'personal',
+        'source': 'dav',
+        'path': 'Album/Family.mp4',
+        'size': 32,
+      });
+      final gets = fixture.gets.length;
+      await manager.enqueueFolder(
+        sourceId: 'dav',
+        entry: _folder('Album'),
+        personalMedia: true,
+      );
+      await _until(() => manager.activeCount == 0);
+      expect(manager.failedCount, 0);
+      expect(manager.completedCount, names.length);
+      expect(
+        manager.entryForSource('dav', 'Album/Family.mp4')!.mediaId,
+        downloaded.mediaId,
+      );
+      expect(fixture.gets.length, gets);
+      expect(fixture.store.records('media'), hasLength(1));
+    } finally {
+      await manager.close();
+      manager.dispose();
+      await fixture.close();
+    }
+  });
+
+  test('more than 2000 discovered files fail before registration or child admission', () async {
+    final fixture = await _Folders.create({
+      'large': [
+        for (var i = 0; i < 2001; i++)
+          ('large/file-$i.${['mp4', 'jpg', 'arw', 'txt'][i % 4]}', false),
+      ],
+    });
+    final manager = fixture.manager();
+    try {
+      await manager.enqueueFolder(sourceId: 'dav', entry: _folder('large'));
+      await _until(() => manager.failedCount == 1);
+      expect(manager.taskIds, hasLength(1));
+      expect(manager.entries.values.single.isDirectory, true);
+      expect(manager.entries.values.single.error, contains('2000'));
+      expect(
+        manager.entries.values.single.discoveredFiles,
+        lessThanOrEqualTo(2000),
+      );
+      expect(fixture.store.records('media'), isEmpty);
+      expect(fixture.gets, isEmpty);
+      expect(manager.completedLocations, isEmpty);
+      await manager.cancel(manager.taskIds.single);
+      expect(manager.entries, isEmpty);
+    } finally {
+      await manager.close();
+      manager.dispose();
+      await fixture.close();
+    }
+  });
 
   test(
     'directory frontier is bounded and does not recurse indefinitely',
@@ -148,16 +197,14 @@ void main() {
   test(
     'empty folder remains an actionable failed scan and retry rescans it',
     () async {
-      final fixture = await _Folders.create({
-        'empty': [('empty/readme.txt', false)],
-      });
+      final fixture = await _Folders.create({'empty': []});
       final manager = fixture.manager();
       try {
         await manager.enqueueFolder(sourceId: 'dav', entry: _folder('empty'));
         await _until(() => manager.failedCount == 1);
         final task = manager.entries.values.single;
         expect(task.isDirectory, true);
-        expect(task.error, '文件夹中没有可下载的视频。');
+        expect(task.error, '文件夹中没有可下载的文件。');
         fixture.listings['empty'] = [('empty/new.mp4', false)];
         await manager.retry(task.mediaId);
         await _until(() => manager.completedCount == 1);
@@ -231,58 +278,50 @@ void main() {
     },
   );
 
-  test(
-    'folder admission never overwrites an old completed task after media rebinding',
-    () async {
-      final fixture = await _Folders.create({
-        'new': [('new/one.mp4', false)],
+  test('folder admission never overwrites an old completed task after media rebinding', () async {
+    final fixture = await _Folders.create({
+      'new': [('new/one.mp4', false)],
+    });
+    fixture.store.save('media', 'one', {'title': 'One', 'fileName': 'one.mp4'});
+    final original = {
+      'id': 'one',
+      'source': 'dav',
+      'path': 'old.mp4',
+      'size': 32,
+    };
+    fixture.store.setLocal('location:one', original);
+    final manager = fixture.manager();
+    try {
+      await manager.enqueue(
+        media: fixture.store.get('media', 'one')!,
+        location: original,
+      );
+      await _until(() => manager.completedCount == 1);
+      final completed = manager.entryFor('one')!;
+      final revision = manager.completedRevision;
+      fixture.store.setLocal('location:one', {
+        ...original,
+        'path': 'new/one.mp4',
+        'previewRevision': 'new-binding',
       });
-      fixture.store.save('media', 'one', {
-        'title': 'One',
-        'fileName': 'one.mp4',
-      });
-      final original = {
-        'id': 'one',
-        'source': 'dav',
-        'path': 'old.mp4',
-        'size': 32,
-      };
-      fixture.store.setLocal('location:one', original);
-      final manager = fixture.manager();
-      try {
-        await manager.enqueue(
-          media: fixture.store.get('media', 'one')!,
-          location: original,
-        );
-        await _until(() => manager.completedCount == 1);
-        final completed = manager.entryFor('one')!;
-        final revision = manager.completedRevision;
-        fixture.store.setLocal('location:one', {
-          ...original,
-          'path': 'new/one.mp4',
-          'previewRevision': 'new-binding',
-        });
-        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('new'));
-        await _until(() => manager.failedCount == 1);
-        expect(manager.entryFor('one')!.isComplete, true);
-        expect(manager.entryFor('one')!.remotePath, 'old.mp4');
-        expect(manager.entryFor('one')!.localPath, completed.localPath);
-        expect(manager.completedRevision, revision);
-        expect(await File(completed.localPath).exists(), true);
-        expect(fixture.gets, ['old.mp4']);
-        expect(
-          manager.entries.values
-              .singleWhere((entry) => entry.isDirectory)
-              .error,
-          contains('旧视频位置'),
-        );
-      } finally {
-        await manager.close();
-        manager.dispose();
-        await fixture.close();
-      }
-    },
-  );
+      await manager.enqueueFolder(sourceId: 'dav', entry: _folder('new'));
+      await _until(() => manager.failedCount == 1);
+      expect(manager.entryFor('one')!.isComplete, true);
+      expect(manager.entryFor('one')!.remotePath, 'old.mp4');
+      expect(manager.entryFor('one')!.localPath, completed.localPath);
+      expect(manager.completedRevision, revision);
+      expect(await File(completed.localPath).exists(), true);
+      expect(fixture.gets, ['old.mp4']);
+      expect(
+        manager.entries.values.singleWhere((entry) => entry.isDirectory).error,
+        contains('旧视频位置'),
+      );
+    } finally {
+      await manager.close();
+      manager.dispose();
+      await fixture.close();
+    }
+  });
 
   test(
     'reselecting a folder retries its failed files and keeps completed files',
@@ -310,10 +349,9 @@ void main() {
         final libraryRevision = manager.libraryRevision;
         await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
         await _until(
-          () =>
-              manager.libraryRevision > libraryRevision &&
-              manager.activeCount == 0,
+          () => manager.completedCount == 4 && manager.activeCount == 0,
         );
+        expect(manager.libraryRevision, libraryRevision);
         expect(manager.completedCount, 4);
         expect(manager.failedCount, 0);
         expect(manager.taskIds.toSet(), originalIds);
@@ -338,117 +376,107 @@ void main() {
     },
   );
 
-  test(
-    'folder retries preserve manual pauses and roll back after a binding conflict',
-    () async {
-      final paths = [for (var i = 1; i <= 4; i++) 'Show/Show S01E0$i.mp4'];
-      final fixture = await _Folders.create({
-        'Show': [for (final path in paths) (path, false)],
-      });
-      fixture.failures.addAll(paths.skip(1));
-      fixture.store.save('media', 'paused', {
-        'title': p.posix.basename(paths.first),
-        'fileName': p.posix.basename(paths.first),
-      });
-      final pausedLocation = {
-        'id': 'paused',
-        'source': 'dav',
-        'path': paths.first,
-        'size': 32,
+  test('folder retries preserve manual pauses and roll back after a binding conflict', () async {
+    final paths = [for (var i = 1; i <= 4; i++) 'Show/Show S01E0$i.mp4'];
+    final fixture = await _Folders.create({
+      'Show': [for (final path in paths) (path, false)],
+    });
+    fixture.failures.addAll(paths.skip(1));
+    fixture.store.save('media', 'paused', {
+      'title': p.posix.basename(paths.first),
+      'fileName': p.posix.basename(paths.first),
+    });
+    final pausedLocation = {
+      'id': 'paused',
+      'source': 'dav',
+      'path': paths.first,
+      'size': 32,
+    };
+    fixture.store.setLocal('location:paused', pausedLocation);
+    final manager = fixture.manager(active: false);
+    try {
+      await manager.enqueue(
+        media: fixture.store.get('media', 'paused')!,
+        location: pausedLocation,
+      );
+      await manager.pause('paused');
+      await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+      manager.setActive(true);
+      await _until(() => manager.failedCount == 3 && manager.activeCount == 0);
+      final originalIds = manager.taskIds.toSet();
+      final failed = {
+        for (final entry in manager.entries.values)
+          if (entry.status == OfflineDownloadStatus.failed)
+            entry.mediaId: entry,
       };
-      fixture.store.setLocal('location:paused', pausedLocation);
-      final manager = fixture.manager(active: false);
+      expect(manager.entryFor('paused')?.userPaused, true);
+      expect(manager.pausedCount, 1);
+      expect(fixture.gets, unorderedEquals(paths.skip(1)));
+
+      final stale = failed.values.singleWhere(
+        (entry) => entry.remotePath == paths.last,
+      );
+      final location = Map<String, dynamic>.from(
+        fixture.store.local('location:${stale.mediaId}'),
+      );
+      fixture.store.setLocal('location:${stale.mediaId}', {
+        ...location,
+        'previewRevision': 'rebound',
+      });
+      fixture.failures.clear();
+      await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+      await _until(() => manager.failedCount == 4 && manager.activeCount == 0);
+      final scan = manager.entries.values.singleWhere(
+        (entry) => entry.isDirectory,
+      );
+      expect(scan.error, contains('旧视频位置'));
+      expect(manager.entryFor('paused')?.userPaused, true);
+      expect(manager.pausedCount, 1);
+      expect(fixture.gets, unorderedEquals(paths.skip(1)));
+      final database = sqlite3.open(
+        p.join(fixture.directory.path, 'downloads.sqlite'),
+        mode: OpenMode.readOnly,
+      );
       try {
-        await manager.enqueue(
-          media: fixture.store.get('media', 'paused')!,
-          location: pausedLocation,
-        );
-        await manager.pause('paused');
-        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
-        manager.setActive(true);
-        await _until(
-          () => manager.failedCount == 3 && manager.activeCount == 0,
-        );
-        final originalIds = manager.taskIds.toSet();
-        final failed = {
-          for (final entry in manager.entries.values)
-            if (entry.status == OfflineDownloadStatus.failed)
-              entry.mediaId: entry,
-        };
-        expect(manager.entryFor('paused')?.userPaused, true);
-        expect(manager.pausedCount, 1);
-        expect(fixture.gets, unorderedEquals(paths.skip(1)));
-
-        final stale = failed.values.singleWhere(
-          (entry) => entry.remotePath == paths.last,
-        );
-        final location = Map<String, dynamic>.from(
-          fixture.store.local('location:${stale.mediaId}'),
-        );
-        fixture.store.setLocal('location:${stale.mediaId}', {
-          ...location,
-          'previewRevision': 'rebound',
-        });
-        fixture.failures.clear();
-        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
-        await _until(
-          () => manager.failedCount == 4 && manager.activeCount == 0,
-        );
-        final scan = manager.entries.values.singleWhere(
-          (entry) => entry.isDirectory,
-        );
-        expect(scan.error, contains('旧视频位置'));
-        expect(manager.entryFor('paused')?.userPaused, true);
-        expect(manager.pausedCount, 1);
-        expect(fixture.gets, unorderedEquals(paths.skip(1)));
-        final database = sqlite3.open(
-          p.join(fixture.directory.path, 'downloads.sqlite'),
-          mode: OpenMode.readOnly,
-        );
-        try {
-          for (final entry in failed.values) {
-            expect(manager.entryFor(entry.mediaId)?.status, entry.status);
-            expect(manager.entryFor(entry.mediaId)?.error, entry.error);
-            final saved =
-                jsonDecode(
-                      database.select(
-                            'SELECT value FROM downloads WHERE id=?',
-                            [entry.mediaId],
-                          ).single['value']
-                          as String,
-                    )
-                    as Map;
-            expect(saved['status'], 'failed');
-            expect(saved['error'], entry.error);
-          }
-        } finally {
-          database.dispose();
+        for (final entry in failed.values) {
+          expect(manager.entryFor(entry.mediaId)?.status, entry.status);
+          expect(manager.entryFor(entry.mediaId)?.error, entry.error);
+          final saved = jsonDecode(
+            database.select('SELECT value FROM downloads WHERE id=?', [
+                  entry.mediaId,
+                ]).single['value']
+                as String,
+          ) as Map;
+          expect(saved['status'], 'failed');
+          expect(saved['error'], entry.error);
         }
-
-        await manager.cancel(scan.mediaId);
-        fixture.store.setLocal('location:${stale.mediaId}', location);
-        await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
-        await _until(
-          () => manager.completedCount == 3 && manager.activeCount == 0,
-        );
-        expect(manager.failedCount, 0);
-        expect(manager.pausedCount, 1);
-        expect(manager.entryFor('paused')?.userPaused, true);
-        expect(manager.taskIds.toSet(), originalIds);
-        expect(
-          fixture.gets,
-          unorderedEquals([...paths.skip(1), ...paths.skip(1)]),
-        );
-        await manager.resume('paused');
-        await _until(() => manager.completedCount == 4);
-        expect(fixture.gets.where((path) => path == paths.first), hasLength(1));
       } finally {
-        await manager.close();
-        manager.dispose();
-        await fixture.close();
+        database.dispose();
       }
-    },
-  );
+
+      await manager.cancel(scan.mediaId);
+      fixture.store.setLocal('location:${stale.mediaId}', location);
+      await manager.enqueueFolder(sourceId: 'dav', entry: _folder('Show'));
+      await _until(
+        () => manager.completedCount == 3 && manager.activeCount == 0,
+      );
+      expect(manager.failedCount, 0);
+      expect(manager.pausedCount, 1);
+      expect(manager.entryFor('paused')?.userPaused, true);
+      expect(manager.taskIds.toSet(), originalIds);
+      expect(
+        fixture.gets,
+        unorderedEquals([...paths.skip(1), ...paths.skip(1)]),
+      );
+      await manager.resume('paused');
+      await _until(() => manager.completedCount == 4);
+      expect(fixture.gets.where((path) => path == paths.first), hasLength(1));
+    } finally {
+      await manager.close();
+      manager.dispose();
+      await fixture.close();
+    }
+  });
 }
 
 SourceEntry _folder(String path) => SourceEntry(
@@ -482,9 +510,8 @@ class _Folders {
   _Folders(this.root, this.server, this.store, this.listings) {
     store.setLocal('sources', [source]);
     server.listen((request) async {
-      final raw = Uri.decodeComponent(
-        request.uri.path,
-      ).substring('/dav/'.length);
+      final raw = Uri.decodeComponent(request.uri.path)
+          .substring('/dav/'.length);
       final path = raw.replaceFirst(RegExp(r'/$'), '');
       final response = request.response;
       try {

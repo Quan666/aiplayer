@@ -5,6 +5,13 @@ import 'store.dart';
 
 String _text(Object? value) => value?.toString().trim() ?? '';
 
+/// Parsed filenames and translated display strings are not catalogue matches.
+bool hasRecognizedMediaMetadata(SyncRecord record) =>
+    ['tmdbId', 'bangumiId'].any((key) {
+      final id = _text(record.data[key]);
+      return id.isNotEmpty && id != '0';
+    });
+
 String _episodeNumber(Object? value, {String fallback = ''}) {
   final text = _text(value);
   if (text.isEmpty) return fallback;
@@ -69,6 +76,7 @@ String mediaDisplayTitle(SyncRecord record, {String? episodeTitle}) {
 
 /// A display grouping only. Individual video/version progress is never merged.
 String mediaSeriesKey(SyncRecord record) {
+  if (record.data['personalMedia'] == true) return 'file:${record.id}';
   final rawSeason = _text(record.data['season']);
   final number = num.tryParse(rawSeason);
   final season = rawSeason.isEmpty

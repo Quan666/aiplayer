@@ -12,11 +12,13 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def restore() -> None:
-    encoded = os.environ.get("ANDROID_KEYSTORE_BASE64", "")
+def restore(*, encoded: str | None = None, destination: str | Path | None = None) -> None:
+    if encoded is None:
+        encoded = os.environ.pop("ANDROID_KEYSTORE_BASE64", "")
     if not encoded:
         raise ValueError("Configure repository secret ANDROID_KEYSTORE_BASE64 with the existing keystore; refusing to generate a new key")
-    destination = os.environ.get("AIPLAYER_ANDROID_KEYSTORE")
+    if destination is None:
+        destination = os.environ.get("AIPLAYER_ANDROID_KEYSTORE")
     if not destination:
         raise ValueError("Set AIPLAYER_ANDROID_KEYSTORE to a temporary output path")
     try:

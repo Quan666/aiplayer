@@ -1,4 +1,5 @@
 import 'dart:io';
+
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/ui/glass.dart';
@@ -48,6 +49,16 @@ void main() {
         await tester.tap(find.text('不显示隐藏文件和文件夹'));
         await tester.pumpAndSettle();
         expect(model.preferences.hideHiddenFiles, false);
+        await tester.scrollUntilVisible(
+          find.text('作品资料'),
+          250,
+          scrollable: find
+              .descendant(
+                of: find.byKey(const PageStorageKey('settings-general')),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
         expect(find.text('作品资料'), findsOneWidget);
         final key = find.byWidgetPredicate(
           (w) =>
@@ -85,10 +96,11 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('资料配置已保存'), findsNothing);
         final pages = find.byKey(const ValueKey('settings-pages'));
-        await tester.dragFrom(
-          tester.getTopLeft(pages) + const Offset(700, 12),
-          const Offset(-600, 0),
-        );
+        // Swipe the section heading, outside the horizontally editable API
+        // token field whose position changes as preference controls are added.
+        await tester.ensureVisible(find.text('作品资料'));
+        await tester.pumpAndSettle();
+        await tester.drag(find.text('作品资料'), const Offset(-600, 0));
         await tester.pumpAndSettle();
         expect(find.text('默认倍速'), findsOneWidget);
         await tester.dragFrom(
@@ -129,11 +141,22 @@ void main() {
         expect(find.text('TMDB 译名辅助'), findsNothing);
         expect(find.textContaining('Bangumi + TMDB 联合检索'), findsNothing);
         expect(model.preferences.aiMetadataEnabled, isFalse);
-        await tester.ensureVisible(find.text('AI 自动识别信息'));
+        await tester.scrollUntilVisible(
+          find.text('AI 自动识别信息'),
+          250,
+          scrollable: find
+              .descendant(
+                of: find.byKey(const PageStorageKey('settings-general')),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
+        await tester.pumpAndSettle();
         await tester.tap(find.text('AI 自动识别信息'));
         await tester.pumpAndSettle();
         expect(model.preferences.aiMetadataEnabled, isTrue);
         await tester.ensureVisible(find.text('识别未匹配的视频'));
+        await tester.pumpAndSettle();
         await tester.tap(find.text('识别未匹配的视频'));
         await tester.pumpAndSettle();
         expect(model.refreshes, 1);

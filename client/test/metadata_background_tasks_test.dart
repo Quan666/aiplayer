@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/library_catalog.dart';
@@ -225,6 +226,7 @@ void main() {
     store = AppStore('${directory.path}/test.db')
       ..setLocal('settings', {
         'metadataStrategy': 'conservative',
+        'autoIdentifyOnFolderOpen': true,
         'aiMetadataEnabled': true,
         'aiSubtitleModel': 'configured-model',
       });
@@ -252,58 +254,116 @@ void main() {
   }
 
   test(
-    'locked checkpoint writes keep the event loop free and save the latest cancellation',
+    'automatic off rejects new jobs while manual recognition remains available',
     () async {
-      model.setForeground(false);
-      final records = List.generate(6, (i) => add('locked-$i'));
-      await model.flushMetadataTasks();
-      final blocker = AppStore.openExisting(store.path);
-      // A UI write must fail immediately instead of masking a regression with
-      // SQLite's busy wait. Only the independent worker may wait/retry.
-      store.db.execute('PRAGMA busy_timeout=0');
-      blocker.db.execute('BEGIN IMMEDIATE');
-      var locked = true;
-      try {
-        final tasks = [
-          for (final record in records)
-            model.startMetadataTask([record], manual: false),
-        ];
-        for (final task in tasks) {
-          model.cancelMetadataTask(task);
-        }
-        var saved = false;
-        final flush = model.flushMetadataTasks().then((_) => saved = true);
-        // No widget frames are pumped while backgrounded and the writer is held.
-        await Future<void>.delayed(const Duration(milliseconds: 75));
-        expect(saved, false);
-        expect(model.fakeCatalog.normalQueries, isEmpty);
-        expect(tasks.every((task) => task.cancelled), true);
-        blocker.db.execute('COMMIT');
-        locked = false;
-        await flush;
-        await Future.wait(tasks.map((task) => task.done));
-        expect(store.local('metadata:pending-tasks'), isEmpty);
-        model.setForeground(true);
-        await Future<void>.delayed(Duration.zero);
-        expect(model.fakeCatalog.normalQueries, isEmpty);
-        final writes =
-            store.db
-                    .select(
-                      "SELECT value FROM store_change_counters WHERE scope='metadataTasks'",
-                    )
-                    .single['value']
-                as int;
-        expect(
-          writes,
-          lessThanOrEqualTo(2),
-          reason: 'one in flight plus the latest snapshot',
-        );
-      } finally {
-        if (locked) blocker.db.execute('ROLLBACK');
-        blocker.dispose();
-      }
+      await model.updatePreferences({'autoIdentifyOnFolderOpen': false});
+      final record = add('opt-out');
+      final automatic = model.startMetadataTask(
+        [record],
+        ai: true,
+        manual: false,
+      );
+      await automatic.done;
+      expect(automatic.cancelled, isTrue);
+      expect(model.ai.singles, isEmpty);
+      expect(model.metadataTasks, isEmpty);
+      final manual = model.startMetadataTask([record], ai: true);
+      await manual.done;
+      expect(manual.matched, 1);
     },
   );
+
+  test(
+    'turning off cancels in-flight AI without frames and never revives it',
+    () async {
+      model.ai.gate = Completer<void>();
+      model.ai.ignoreCancellation = true;
+      final task = model.startMetadataTask(
+        [add('late-off')],
+        ai: true,
+        manual: false,
+      );
+      await model.ai.started.future;
+      final saving = model.updatePreferences({
+        'autoIdentifyOnFolderOpen': false,
+      });
+      expect(task.cancelled, isTrue);
+      expect(model.ai.attemptTokens.single.cancelled, isTrue);
+      await saving;
+      model.ai.gate!.complete();
+      await task.done;
+      await Future<void>.delayed(Duration.zero);
+      expect(model.fakeCatalog.queries, isEmpty);
+      expect(store.get('media', 'late-off')!.data['bangumiId'], isNull);
+      await model.updatePreferences({'autoIdentifyOnFolderOpen': true});
+      model.setForeground(false);
+      model.setForeground(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(model.fakeCatalog.queries, isEmpty);
+      expect(model.ai.attemptTokens, hasLength(1));
+    },
+  );
+
+  test('manual bulk refresh works while automatic matching is off and skips personal media', () async {
+    await model.updatePreferences({'autoIdentifyOnFolderOpen': false});
+    add('manual-refresh');
+    final personal = add('personal');
+    store.save('media', personal.id, {...personal.data, 'personalMedia': true});
+    await model.refreshMetadata();
+    expect(store.get('media', 'manual-refresh')!.data['bangumiId'], isNotNull);
+    expect(store.get('media', 'personal')!.data['bangumiId'], isNull);
+  });
+
+  test('locked checkpoint writes keep the event loop free and save the latest cancellation', () async {
+    model.setForeground(false);
+    final records = List.generate(6, (i) => add('locked-$i'));
+    await model.flushMetadataTasks();
+    final blocker = AppStore.openExisting(store.path);
+    // A UI write must fail immediately instead of masking a regression with
+    // SQLite's busy wait. Only the independent worker may wait/retry.
+    store.db.execute('PRAGMA busy_timeout=0');
+    blocker.db.execute('BEGIN IMMEDIATE');
+    var locked = true;
+    try {
+      final tasks = [
+        for (final record in records)
+          model.startMetadataTask([record], manual: false),
+      ];
+      for (final task in tasks) {
+        model.cancelMetadataTask(task);
+      }
+      var saved = false;
+      final flush = model.flushMetadataTasks().then((_) => saved = true);
+      // No widget frames are pumped while backgrounded and the writer is held.
+      await Future<void>.delayed(const Duration(milliseconds: 75));
+      expect(saved, false);
+      expect(model.fakeCatalog.normalQueries, isEmpty);
+      expect(tasks.every((task) => task.cancelled), true);
+      blocker.db.execute('COMMIT');
+      locked = false;
+      await flush;
+      await Future.wait(tasks.map((task) => task.done));
+      expect(store.local('metadata:pending-tasks'), isEmpty);
+      model.setForeground(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(model.fakeCatalog.normalQueries, isEmpty);
+      final writes =
+          store.db
+                  .select(
+                    "SELECT value FROM store_change_counters WHERE scope='metadataTasks'",
+                  )
+                  .single['value']
+              as int;
+      expect(
+        writes,
+        lessThanOrEqualTo(2),
+        reason: 'one in flight plus the latest snapshot',
+      );
+    } finally {
+      if (locked) blocker.db.execute('ROLLBACK');
+      blocker.dispose();
+    }
+  });
 
   test(
     'disposing behind a writer lock drains the suspended checkpoint',
@@ -331,10 +391,9 @@ void main() {
         store = AppStore('${directory.path}/test.db');
         model = _Model(store, directory);
         await model.startBackgroundWork();
-        final restored = model.metadataTasks.single;
-        expect(restored.id, task.id);
-        await restored.done;
-        expect(restored.matched, 1);
+        expect(model.metadataTasks, isEmpty);
+        expect(model.fakeCatalog.normalQueries, isEmpty);
+        await model.flushMetadataTasks();
         expect(store.local('metadata:pending-tasks'), isEmpty);
       } finally {
         if (locked) blocker.db.execute('ROLLBACK');
@@ -402,27 +461,24 @@ void main() {
     },
   );
 
-  test(
-    'a detail timeout keeps manual matching from waiting for the episode endpoint too',
-    () async {
-      final record = add('offline-details');
-      model.fakeCatalog.detailsFailure = const NetworkUnavailable(
-        '服务长时间未收到数据，请重试。',
-      );
-      model.fakeCatalog.episodeGate = Completer<void>();
-      final task = model.startMetadataSelectionTask(
-        [record],
-        _subject('Selected'),
-        season: '1',
-      );
-      await task.done.timeout(const Duration(seconds: 3));
-      expect(task.matched, 1);
-      expect(task.error, isEmpty);
-      expect(store.get('media', record.id)!.data['metadataTitle'], 'Selected');
-      expect(model.fakeCatalog.episodeCalls, 0);
-      expect(task.status, '已匹配 1 个视频');
-    },
-  );
+  test('a detail timeout keeps manual matching from waiting for the episode endpoint too', () async {
+    final record = add('offline-details');
+    model.fakeCatalog.detailsFailure = const NetworkUnavailable(
+      '服务长时间未收到数据，请重试。',
+    );
+    model.fakeCatalog.episodeGate = Completer<void>();
+    final task = model.startMetadataSelectionTask(
+      [record],
+      _subject('Selected'),
+      season: '1',
+    );
+    await task.done.timeout(const Duration(seconds: 3));
+    expect(task.matched, 1);
+    expect(task.error, isEmpty);
+    expect(store.get('media', record.id)!.data['metadataTitle'], 'Selected');
+    expect(model.fakeCatalog.episodeCalls, 0);
+    expect(task.status, '已匹配 1 个视频');
+  });
 
   test(
     'deleting a batch cancels a selection and ignores its late response',
@@ -455,25 +511,22 @@ void main() {
     },
   );
 
-  test(
-    'manual selection refreshes an old reviewed snapshot on the database worker',
-    () async {
-      final record = add('stale-selection');
-      store.save('media', record.id, {...record.data, 'duration': 2462});
-      final currentRevision = store.get('media', record.id)!.revision;
-      expect(currentRevision, isNot(record.revision));
-      final selection = model.startMetadataSelectionTask(
-        [record],
-        _subject('Chosen'),
-        season: '1',
-      );
-      await selection.done;
-      expect(selection.matched, 1);
-      expect(selection.error, isEmpty);
-      expect(store.get('media', record.id)!.data['metadataTitle'], 'Chosen');
-      expect(store.get('media', record.id)!.data['duration'], 2462);
-    },
-  );
+  test('manual selection refreshes an old reviewed snapshot on the database worker', () async {
+    final record = add('stale-selection');
+    store.save('media', record.id, {...record.data, 'duration': 2462});
+    final currentRevision = store.get('media', record.id)!.revision;
+    expect(currentRevision, isNot(record.revision));
+    final selection = model.startMetadataSelectionTask(
+      [record],
+      _subject('Chosen'),
+      season: '1',
+    );
+    await selection.done;
+    expect(selection.matched, 1);
+    expect(selection.error, isEmpty);
+    expect(store.get('media', record.id)!.data['metadataTitle'], 'Chosen');
+    expect(store.get('media', record.id)!.data['duration'], 2462);
+  });
 
   test(
     'manual selection rejects renamed or removed files before fetching details',
@@ -532,52 +585,46 @@ void main() {
     },
   );
 
-  test(
-    'manual selection reuses the reviewed filename identity without another AI request',
-    () async {
-      final record = add('known-identity');
-      final batch = model.startMetadataTask([record], ai: true);
-      await batch.done;
-      final parsed = batch.results[record.id]!.identity;
-      final calls = model.ai.batches.length;
-      model.ai.gate = Completer<void>();
-      final selection = model.startMetadataSelectionTask(
-        batch.records,
-        _subject('Manual choice'),
-        season: '2',
-        identity: parsed,
-        parentTask: batch,
-      );
-      await selection.done;
-      expect(selection.matched, 1);
-      expect(model.ai.batches.length, calls);
-      expect(store.get('media', record.id)!.data['episode'], '1');
-      expect(store.get('media', record.id)!.data['season'], '2');
-    },
-  );
+  test('manual selection reuses the reviewed filename identity without another AI request', () async {
+    final record = add('known-identity');
+    final batch = model.startMetadataTask([record], ai: true);
+    await batch.done;
+    final parsed = batch.results[record.id]!.identity;
+    final calls = model.ai.batches.length;
+    model.ai.gate = Completer<void>();
+    final selection = model.startMetadataSelectionTask(
+      batch.records,
+      _subject('Manual choice'),
+      season: '2',
+      identity: parsed,
+      parentTask: batch,
+    );
+    await selection.done;
+    expect(selection.matched, 1);
+    expect(model.ai.batches.length, calls);
+    expect(store.get('media', record.id)!.data['episode'], '1');
+    expect(store.get('media', record.id)!.data['season'], '2');
+  });
 
-  test(
-    'automatic tasks wait for foreground and playback without blocking manual work',
-    () async {
-      model.setForeground(false);
-      final automatic = model.startMetadataTask([
-        add('automatic'),
-      ], manual: false);
-      final manual = model.startMetadataTask([add('manual', work: 'Manual')]);
-      await manual.done;
-      expect(manual.matched, 1);
-      expect(automatic.running, true);
-      expect(model.fakeCatalog.normalQueries, ['Manual']);
-      model.activePlaybackMediaId = 'playing';
-      model.setForeground(true);
-      await Future<void>.delayed(Duration.zero);
-      expect(model.fakeCatalog.normalQueries, ['Manual']);
-      model.activePlaybackMediaId = null;
-      await automatic.done;
-      expect(automatic.matched, 1);
-      expect(model.fakeCatalog.normalQueries, ['Manual', 'Example']);
-    },
-  );
+  test('automatic tasks wait for foreground and playback without blocking manual work', () async {
+    model.setForeground(false);
+    final automatic = model.startMetadataTask([
+      add('automatic'),
+    ], manual: false);
+    final manual = model.startMetadataTask([add('manual', work: 'Manual')]);
+    await manual.done;
+    expect(manual.matched, 1);
+    expect(automatic.running, true);
+    expect(model.fakeCatalog.normalQueries, ['Manual']);
+    model.activePlaybackMediaId = 'playing';
+    model.setForeground(true);
+    await Future<void>.delayed(Duration.zero);
+    expect(model.fakeCatalog.normalQueries, ['Manual']);
+    model.activePlaybackMediaId = null;
+    await automatic.done;
+    expect(automatic.matched, 1);
+    expect(model.fakeCatalog.normalQueries, ['Manual', 'Example']);
+  });
 
   test(
     'cancelling a suspended task keeps it from restarting on resume',
@@ -721,40 +768,34 @@ void main() {
     },
   );
 
-  test(
-    'background cancellation preserves identities saved before optional episode lookup',
-    () async {
-      model.fakeCatalog.normalSubjects['Example'] = _subject('Example');
-      model.fakeCatalog.episodeGate = Completer<void>();
-      final task = model.startMetadataTask([
-        add('identity-ready'),
-      ], manual: false);
-      await model.fakeCatalog.episodeStarted.future;
-      model.setForeground(false);
-      await Future<void>.delayed(Duration.zero);
-      expect(task.running, true);
-      expect(task.matched, 1);
-      expect(
-        store.get('media', 'identity-ready')!.data['bangumiId'],
-        isNotNull,
-      );
-      expect(store.local('episodeTitle:identity-ready'), isNull);
-      model.fakeCatalog.episodeGate!.complete();
-      model.setForeground(true);
-      await task.done;
-      expect(task.matched, 1);
-      expect(task.failed, 0);
-      expect(task.cancelled, false);
-      expect(model.fakeCatalog.normalQueries, ['Example']);
-      expect(model.fakeCatalog.episodeCalls, 2);
-      expect(store.local('episodeTitle:identity-ready'), 'Official episode 1');
-      expect(store.local('metadata:pending-tasks'), isEmpty);
-    },
-  );
+  test('background cancellation preserves identities saved before optional episode lookup', () async {
+    model.fakeCatalog.normalSubjects['Example'] = _subject('Example');
+    model.fakeCatalog.episodeGate = Completer<void>();
+    final task = model.startMetadataTask([
+      add('identity-ready'),
+    ], manual: false);
+    await model.fakeCatalog.episodeStarted.future;
+    model.setForeground(false);
+    await Future<void>.delayed(Duration.zero);
+    expect(task.running, true);
+    expect(task.matched, 1);
+    expect(store.get('media', 'identity-ready')!.data['bangumiId'], isNotNull);
+    expect(store.local('episodeTitle:identity-ready'), isNull);
+    model.fakeCatalog.episodeGate!.complete();
+    model.setForeground(true);
+    await task.done;
+    expect(task.matched, 1);
+    expect(task.failed, 0);
+    expect(task.cancelled, false);
+    expect(model.fakeCatalog.normalQueries, ['Example']);
+    expect(model.fakeCatalog.episodeCalls, 2);
+    expect(store.local('episodeTitle:identity-ready'), 'Official episode 1');
+    expect(store.local('metadata:pending-tasks'), isEmpty);
+  });
 
   for (final ai in [false, true]) {
     test(
-      'restarting resumes pending episode names without repeating completed identification (AI $ai)',
+      'restart preserves committed identities without reviving automatic episode work (AI $ai)',
       () async {
         model.fakeCatalog.normalSubjects['Example'] = {
           ..._subject('Example'),
@@ -779,7 +820,7 @@ void main() {
           'mediaType': 'tv',
           'id': _subject('Example')['id'],
         });
-        final savedId = task.id;
+        expect(task.running, isTrue);
         model.dispose();
         await model.flushMetadataTasks();
         await Future<void>.delayed(Duration.zero);
@@ -787,19 +828,19 @@ void main() {
         store = AppStore('${directory.path}/test.db');
         model = _Model(store, directory);
         await Future<void>.delayed(Duration.zero);
-        final restored = model.metadataTasks.single;
-        expect(restored.id, savedId);
-        await restored.done;
-        expect(restored.matched, 2);
-        expect(restored.failed, 0);
+        expect(model.metadataTasks, isEmpty);
         expect(model.fakeCatalog.normalQueries, isEmpty);
         expect(model.ai.batches, isEmpty);
-        expect(model.fakeCatalog.episodeCalls, 1);
-        expect(store.local('episodeTitle:pending-name'), 'Official episode 1');
+        expect(model.fakeCatalog.episodeCalls, 0);
         expect(
-          store.local('episodeTitle:pending-name-2'),
-          'Official episode 2',
+          store.get('media', 'pending-name')!.data['bangumiId'],
+          isNotNull,
         );
+        expect(
+          store.get('media', 'pending-name-2')!.data['bangumiId'],
+          isNotNull,
+        );
+        await model.flushMetadataTasks();
         expect(store.local('metadata:pending-tasks'), isEmpty);
       },
     );
@@ -972,34 +1013,31 @@ void main() {
     expect(model.ai.confirmations, hasLength(2));
   });
 
-  test(
-    'same-name episodic and non-episodic identities do not share movie confirmation',
-    () async {
-      model.ai.overrides['Example E01.mkv'] = const AiMediaIdentity(
-        fileName: 'Example E01.mkv',
-        name: 'Example',
-        kind: 'anime',
-        confidence: .99,
-      );
-      model.ai.overrides['Example E02.mkv'] = const AiMediaIdentity(
-        fileName: 'Example E02.mkv',
-        name: 'Example',
-        kind: 'anime',
-        episode: '2',
-        confidence: .98,
-      );
-      model.fakeCatalog.overrides['Example'] = [
-        _subject('Example', type: 'movie'),
-        _subject('Example'),
-      ];
-      final first = add('first'), second = add('second', episode: 2);
-      final task = model.startMetadataTask([first, second], ai: true);
-      await task.done;
-      expect(store.get('media', first.id)!.data['metadataType'], 'movie');
-      expect(store.get('media', second.id)!.data['metadataType'], 'tv');
-      expect(store.get('media', second.id)!.data['episode'], '2');
-    },
-  );
+  test('same-name episodic and non-episodic identities do not share movie confirmation', () async {
+    model.ai.overrides['Example E01.mkv'] = const AiMediaIdentity(
+      fileName: 'Example E01.mkv',
+      name: 'Example',
+      kind: 'anime',
+      confidence: .99,
+    );
+    model.ai.overrides['Example E02.mkv'] = const AiMediaIdentity(
+      fileName: 'Example E02.mkv',
+      name: 'Example',
+      kind: 'anime',
+      episode: '2',
+      confidence: .98,
+    );
+    model.fakeCatalog.overrides['Example'] = [
+      _subject('Example', type: 'movie'),
+      _subject('Example'),
+    ];
+    final first = add('first'), second = add('second', episode: 2);
+    final task = model.startMetadataTask([first, second], ai: true);
+    await task.done;
+    expect(store.get('media', first.id)!.data['metadataType'], 'movie');
+    expect(store.get('media', second.id)!.data['metadataType'], 'tv');
+    expect(store.get('media', second.id)!.data['episode'], '2');
+  });
 
   test(
     'explicit cancellation releases the task queue without saving late results',
@@ -1023,25 +1061,22 @@ void main() {
     },
   );
 
-  test(
-    'late batch results preserve changed revisions and unchanged siblings still apply',
-    () async {
-      model.fakeCatalog.searchGate = Completer<void>();
-      final first = add('first'), second = add('second', episode: 2);
-      final task = model.startMetadataTask([first, second], ai: true);
-      await model.fakeCatalog.firstSearch.future;
-      store.save('media', first.id, {...first.data, 'series': 'User edit'});
-      final edited = store.get('media', first.id)!;
-      model.fakeCatalog.searchGate!.complete();
-      await task.done;
-      expect(task.matched, 1);
-      expect(task.failed, 1);
-      expect(store.get('media', first.id)!.data, edited.data);
-      expect(store.get('media', first.id)!.revision, edited.revision);
-      expect(store.local('episodeTitle:${first.id}'), isNull);
-      expect(store.get('media', second.id)!.data['bangumiId'], isNotNull);
-    },
-  );
+  test('late batch results preserve changed revisions and unchanged siblings still apply', () async {
+    model.fakeCatalog.searchGate = Completer<void>();
+    final first = add('first'), second = add('second', episode: 2);
+    final task = model.startMetadataTask([first, second], ai: true);
+    await model.fakeCatalog.firstSearch.future;
+    store.save('media', first.id, {...first.data, 'series': 'User edit'});
+    final edited = store.get('media', first.id)!;
+    model.fakeCatalog.searchGate!.complete();
+    await task.done;
+    expect(task.matched, 1);
+    expect(task.failed, 1);
+    expect(store.get('media', first.id)!.data, edited.data);
+    expect(store.get('media', first.id)!.revision, edited.revision);
+    expect(store.local('episodeTitle:${first.id}'), isNull);
+    expect(store.get('media', second.id)!.data['bangumiId'], isNotNull);
+  });
 
   test(
     'restarting resumes only unfinished records with the saved revision',
@@ -1128,23 +1163,20 @@ void main() {
     expect(store.local('metadata:pending-tasks'), isEmpty);
   });
 
-  test(
-    'repeated starts share one running task and observer removal does not cancel it',
-    () async {
-      model.ai.gate = Completer<void>();
-      final records = [add('first'), add('second', episode: 2)];
-      final task = model.startMetadataTask(records, ai: true);
-      expect(model.startMetadataTask(records, ai: true), same(task));
-      void listener() {}
-      task.addListener(listener);
-      await model.ai.started.future;
-      task.removeListener(listener);
-      expect(task.running, isTrue);
-      model.ai.gate!.complete();
-      await task.done;
-      expect(task.cancelled, isFalse);
-      expect(task.matched, 2);
-      expect(model.ai.batches, hasLength(1));
-    },
-  );
+  test('repeated starts share one running task and observer removal does not cancel it', () async {
+    model.ai.gate = Completer<void>();
+    final records = [add('first'), add('second', episode: 2)];
+    final task = model.startMetadataTask(records, ai: true);
+    expect(model.startMetadataTask(records, ai: true), same(task));
+    void listener() {}
+    task.addListener(listener);
+    await model.ai.started.future;
+    task.removeListener(listener);
+    expect(task.running, isTrue);
+    model.ai.gate!.complete();
+    await task.done;
+    expect(task.cancelled, isFalse);
+    expect(task.matched, 2);
+    expect(model.ai.batches, hasLength(1));
+  });
 }

@@ -13,7 +13,6 @@ extension _CacheMaintenance on AppModel {
       _directoryEnrichmentCancel.cancel();
       _directoryEnrichmentCancel = CancelToken();
       _directoryRecognitionCancel?.cancel();
-      _metadataTimer?.cancel();
       _pauseAutomaticMetadataTasks();
       for (final task in _metadataTasks) {
         if (task.manual && task.running) cancelMetadataTask(task);
@@ -57,7 +56,6 @@ extension _CacheMaintenance on AppModel {
         _posterCache?.setActive(_foreground);
         previews?.resume();
         _releaseAutomaticWork();
-        if (_metadataPending.isNotEmpty) unawaited(_identifyPending());
         if (_syncAgain || watchingSync) {
           unawaited(synchronize(quiet: true));
         } else {

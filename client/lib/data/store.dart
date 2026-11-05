@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+
 import 'package:uuid/uuid.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
@@ -76,7 +77,9 @@ class AppStore {
   final Map<String, int> _recordRevisions = {};
   int _revision = 0, _unknownRevision = 0;
   int _localRevision = 0, _locationRevision = 0;
+  int _sourceConfigurationCounter = 0, _sourceConfigurationRevision = 0;
   int _knownChanges = 0;
+  bool _knownAutocommit = true;
   late int _dataVersion;
   Map<String, int> _changeCounters = {};
   Future<void> _playbackWrites = Future.value();
@@ -157,7 +160,7 @@ class AppStore {
   }
 
   void _createChangeCounters() {
-    const version = 5;
+    const version = 6;
     int schemaVersion() =>
         db.select('PRAGMA user_version').first.values.first as int;
     if (schemaVersion() >= version) return;
@@ -227,13 +230,18 @@ class AppStore {
     for (final table in ['records', 'local', 'cache', 'conflicts']) {
       for (final event in ['INSERT', 'UPDATE', 'DELETE']) {
         final row = event == 'DELETE' ? 'OLD' : 'NEW';
+        String sourceConfiguration(String row) =>
+            "($row.key='sources' OR substr($row.key,1,15)='externalSource:')";
         final scope = switch (table) {
           'records' || 'conflicts' =>
             "CASE WHEN $row.kind IN ('progress','watched')"
                 '${event == 'UPDATE' ? ' AND OLD.kind=NEW.kind' : ''}'
                 " THEN $row.kind ELSE 'other' END",
           'local' =>
-            "CASE WHEN $row.key='settings'"
+            'CASE WHEN ${sourceConfiguration(row)}'
+                '${event == 'UPDATE' ? ' OR ${sourceConfiguration('OLD')}' : ''}'
+                " THEN 'sourceConfig'"
+                " WHEN $row.key='settings'"
                 '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
                 " THEN 'settings'"
                 " WHEN $row.key='metadata:pending-tasks'"
@@ -268,7 +276,9 @@ class AppStore {
     ).first;
     _knownChanges = row['changes'] as int;
     _dataVersion = row['data_version'] as int;
+    _knownAutocommit = db.autocommit;
     _changeCounters = _readChangeCounters();
+    _sourceConfigurationCounter = _changeCounters['sourceConfig'] ?? 0;
   }
 
   PreparedStatement _statement(String sql) =>
@@ -315,6 +325,22 @@ class AppStore {
     return own > _unknownRevision ? own : _unknownRevision;
   }
 
+  /// Exact source identity clock, unaffected by unrelated worker/cache writes.
+  /// The durable trigger also covers direct SQL and renames across key scopes;
+  /// a local monotonic revision keeps a rolled-back counter from reusing a
+  /// revision observed for uncommitted source content.
+  int get sourceConfigurationRevision {
+    _checkChanges();
+    return _sourceConfigurationRevision;
+  }
+
+  void _observeSourceConfiguration(Map<String, int> counters) {
+    final counter = counters['sourceConfig'] ?? 0;
+    if (counter == _sourceConfigurationCounter) return;
+    _sourceConfigurationCounter = counter;
+    _sourceConfigurationRevision = ++_revision;
+  }
+
   /// Cheap invalidation for view snapshots. Known writes only invalidate their
   /// own kind. Playback worker commits invalidate progress, while unrelated
   /// external edits still invalidate every snapshot. No record JSON is read.
@@ -344,14 +370,22 @@ class AppStore {
     ).first;
     final changes = row['changes'] as int;
     final version = row['data_version'] as int;
+    final autocommit = db.autocommit;
     var unknown = changes != _knownChanges;
-    if (unknown || version != _dataVersion) {
+    if (unknown || version != _dataVersion || autocommit != _knownAutocommit) {
       final counters = _readChangeCounters();
+      _observeSourceConfiguration(counters);
       final changed = {
         for (final scope in {...counters.keys, ..._changeCounters.keys})
           if (counters[scope] != _changeCounters[scope]) scope,
       };
-      unknown |= changed.isEmpty || changed.contains('other');
+      // Source edits remain conservative for all existing snapshot consumers,
+      // including UPDATEs renaming a settings/location key into or out of the
+      // source scope. Only sourceConfigurationRevision uses the exact clock.
+      unknown |=
+          (changed.isEmpty && (unknown || version != _dataVersion)) ||
+          changed.contains('other') ||
+          changed.contains('sourceConfig');
       if (!unknown) {
         for (final scope in changed) {
           final revision = ++_revision;
@@ -407,6 +441,7 @@ class AppStore {
     }
     _knownChanges = changes;
     _dataVersion = version;
+    _knownAutocommit = autocommit;
   }
 
   void _written({String? kind, String? localKey, int? changes}) {
@@ -415,9 +450,17 @@ class AppStore {
     // Exclusion mutations additionally maintain their durable admission clock.
     // Add only this statement's changes, preserving any earlier unknown writes.
     _knownChanges += changes ?? count * 2;
+    // ROLLBACK itself does not change total_changes/data_version. Remember
+    // writes inside a transaction so direct SQL rollback can still restore
+    // observed counters without broad invalidation after an ordinary commit.
+    // A later managed write must not hide an unobserved transaction exit.
+    if (!db.autocommit) _knownAutocommit = false;
     if (count == 0) return;
     final scope = kind == 'progress' || kind == 'watched'
         ? kind!
+        : localKey == 'sources' ||
+              localKey?.startsWith('externalSource:') == true
+        ? 'sourceConfig'
         : localKey == 'settings'
         ? 'settings'
         : localKey == 'metadata:pending-tasks'
@@ -434,6 +477,10 @@ class AppStore {
       ifAbsent: () => count,
     );
     final revision = ++_revision;
+    if (scope == 'sourceConfig') {
+      _sourceConfigurationCounter = _changeCounters['sourceConfig']!;
+      _sourceConfigurationRevision = revision;
+    }
     if (kind != null) _recordRevisions[kind] = revision;
     if (localKey != null) {
       _localRevision = revision;
@@ -1077,7 +1124,9 @@ class AppStore {
       _unknownRevision = ++_revision;
       _locationIndex = null;
       _locationKeys.clear();
-      _changeCounters = _readChangeCounters();
+      final counters = _readChangeCounters();
+      _observeSourceConfiguration(counters);
+      _changeCounters = counters;
       rethrow;
     }
   }

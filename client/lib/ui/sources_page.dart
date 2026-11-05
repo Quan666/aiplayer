@@ -12,7 +12,12 @@ import 'package:uuid/uuid.dart';
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
+import '../data/album_catalog_worker.dart';
+import '../data/album_images.dart';
+import '../data/album_catalog.dart';
+import '../data/album_view_settings.dart';
 import '../data/store.dart';
+import '../data/text_document.dart';
 import '../data/library_catalog.dart';
 import '../data/library_snapshot.dart';
 import '../data/local_directory_removal.dart';
@@ -25,6 +30,15 @@ import '../sources/directory_sort.dart';
 import '../sources/directory_sort_worker.dart';
 import '../sources/favorites.dart';
 import '../sources/source.dart';
+import '../sources/apple_access.dart';
+import 'album_page.dart';
+import 'album_viewer_route.dart';
+import 'album_thumbnail.dart';
+import 'television_input.dart';
+import 'album_video_thumbnail.dart';
+import 'music_page.dart';
+import 'remote_control.dart';
+import 'secret_text_field.dart';
 import 'glass.dart';
 import 'theme/settings_styles.dart';
 import 'theme/library_styles.dart';
@@ -33,12 +47,15 @@ import 'navigation_reveal.dart';
 import 'media_details_content.dart';
 import 'library_page.dart' show showLibraryMediaDetails;
 import 'offline_download_controls.dart';
+import 'artwork_lifecycle.dart';
+import 'artwork_scroll_scope.dart';
 import 'media_file_details.dart';
 import 'media_source_selection.dart';
 import 'media_artwork.dart';
 import 'metadata_match_dialog.dart';
 import 'metadata_tasks_sheet.dart';
 import 'desktop_window_frame.dart';
+import 'text_file_page.dart';
 
 String _sourceLabel(String kind) => switch (kind) {
   'smb' => 'SMB',
@@ -72,48 +89,50 @@ Future<void> showDirectoryOptions(
         }
 
         return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                GlassSelect<String>(
-                  label: '排序',
-                  value: value.field,
-                  options: const [
-                    GlassOption('name', '名称'),
-                    GlassOption('modified', '修改时间'),
-                    GlassOption('size', '大小'),
-                    GlassOption('type', '类型'),
-                  ],
-                  onChanged: (field) => change(value.copyWith(field: field)),
-                ),
-                const SizedBox(height: 4),
-                SwitchListTile.adaptive(
-                  title: const Text('降序'),
-                  value: value.descending,
-                  onChanged: (descending) =>
-                      change(value.copyWith(descending: descending)),
-                ),
-                if (showSubtitleOption)
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  GlassSelect<String>(
+                    label: '排序',
+                    value: value.field,
+                    options: const [
+                      GlassOption('name', '名称'),
+                      GlassOption('modified', '修改时间'),
+                      GlassOption('size', '大小'),
+                      GlassOption('type', '类型'),
+                    ],
+                    onChanged: (field) => change(value.copyWith(field: field)),
+                  ),
+                  const SizedBox(height: 4),
                   SwitchListTile.adaptive(
-                    title: const Text('显示字幕文件'),
-                    value: value.showSubtitles,
-                    onChanged: (show) =>
-                        change(value.copyWith(showSubtitles: show)),
+                    title: const Text('降序'),
+                    value: value.descending,
+                    onChanged: (descending) =>
+                        change(value.copyWith(descending: descending)),
                   ),
-                if (onApplyAll != null) ...[
-                  const Divider(height: 8),
-                  ListTile(
-                    leading: const Icon(Icons.folder_copy_outlined),
-                    title: const Text('应用到所有文件夹'),
-                    onTap: () {
-                      onApplyAll(value);
-                      Navigator.pop(context);
-                    },
-                  ),
+                  if (showSubtitleOption)
+                    SwitchListTile.adaptive(
+                      title: const Text('显示字幕文件'),
+                      value: value.showSubtitles,
+                      onChanged: (show) =>
+                          change(value.copyWith(showSubtitles: show)),
+                    ),
+                  if (onApplyAll != null) ...[
+                    const Divider(height: 8),
+                    ListTile(
+                      leading: const Icon(Icons.folder_copy_outlined),
+                      title: const Text('应用到所有文件夹'),
+                      onTap: () {
+                        onApplyAll(value);
+                        Navigator.pop(context);
+                      },
+                    ),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
         );
@@ -147,19 +166,13 @@ IconData sourceFileIcon(String name) {
   ).hasMatch(name)) {
     return Icons.audio_file_outlined;
   }
-  if (RegExp(
-    r'\.(jpg|jpeg|png|webp|gif|bmp|avif)$',
-    caseSensitive: false,
-  ).hasMatch(name)) {
+  if (isImageFile(name)) {
     return Icons.image_outlined;
   }
   if (RegExp(r'\.(zip|rar|7z|tar|gz)$', caseSensitive: false).hasMatch(name)) {
     return Icons.folder_zip_outlined;
   }
-  if (RegExp(
-    r'\.(txt|nfo|xml|json|md|pdf)$',
-    caseSensitive: false,
-  ).hasMatch(name)) {
+  if (isTextFile(name) || name.toLowerCase().endsWith('.pdf')) {
     return Icons.description_outlined;
   }
   return Icons.insert_drive_file_outlined;
@@ -279,10 +292,10 @@ DirectoryCollection? _knownCollection(
   // metadata worker. Lazy folder rows can reuse its preview without scanning
   // the complete folder again on the UI isolate.
   if ((folder?.entries.length ?? 0) >= 256 || preview.videos.length >= 256) {
-    return preview;
+    return preview.recognized ? preview : null;
   }
   final value = preview;
-  if (folder == null) return value;
+  if (folder == null) return value.recognized ? value : null;
   final paths = value.videos.map((entry) => entry.path).toSet();
   final records = [
     for (var index = 0; index < folder.entries.length; index++)
@@ -302,12 +315,13 @@ DirectoryCollection? _knownCollection(
   final donors = manual.isEmpty ? verified : manual;
   final keys = verified.map(mediaSeriesKey).toSet();
   if (keys.length > 1) return null;
-  if (keys.isEmpty) return value;
+  if (keys.isEmpty) return value.recognized ? value : null;
   return value.withMetadata(mediaFieldsSubject(donors.first.data), {
     ...value.episodeTitles,
     for (final record in records)
-      if ((model.store.local('episodeTitle:${record.id}') as String?)
-              ?.isNotEmpty ==
+      if ((model.store.local(
+            'episodeTitle:${record.id}',
+          ) as String?)?.isNotEmpty ==
           true)
         '${record.data['episode']}':
             model.store.local('episodeTitle:${record.id}') as String,
@@ -421,6 +435,17 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   Completer<void>? _localSnapshotDone;
   bool _foreground = true, _visible = true;
   Object? _renderedRevision;
+  Object? _sourcesSnapshotKey;
+  List<Map<String, dynamic>> _sourcesSnapshot = const [];
+
+  List<Map<String, dynamic>> get _currentSources {
+    final key = (model, model.store.localKeyRevision('sources'));
+    if (_sourcesSnapshotKey != key) {
+      _sourcesSnapshot = model.sources;
+      _sourcesSnapshotKey = key;
+    }
+    return _sourcesSnapshot;
+  }
 
   Object get _rootRevision => (
     model.store,
@@ -504,8 +529,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     if (!mounted || opened != null) return;
     // A retained tab rebuilds with the latest snapshots on activation.
     if (!widget.active || !_visible || !_foreground) return;
-    unawaited(_loadLocalSnapshot());
     if (_renderedRevision == _rootRevision) return;
+    unawaited(_loadLocalSnapshot());
     if (localOpen) _prepareLocal();
     setState(() {});
   }
@@ -661,7 +686,9 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     model.store,
     model.downloads.completedRevision,
     model.store.recordsRevision('media'),
-    model.store.recordsRevision('progress'),
+    // The root shows counts and folders; playback progress is only visible
+    // inside the local browser. Opening it reloads the latest resume snapshot.
+    localOpen ? model.store.recordsRevision('progress') : null,
     model.store.locationRevision,
     model.store.localKeyRevision('sources'),
     model.store.localPrefixRevision('technical:'),
@@ -702,7 +729,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       _localHiddenEntries = snapshot.localHiddenEntries;
       _localSubtitleEntries = snapshot.localSubtitleEntries;
       _localHiddenSubtitleEntries = snapshot.localHiddenSubtitleEntries;
-      _prepareLocal();
+      if (localOpen) _prepareLocal();
       setState(() {});
     } on Cancelled {
       retry = true;
@@ -730,7 +757,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     if (_localSourceNamesRevision != sourceRevision) {
       _localSourceNamesRevision = sourceRevision;
       _localSourceNames = Map.unmodifiable({
-        for (final source in model.sources)
+        for (final source in _currentSources)
           '${source['id']}':
               '${source['label'] ?? _sourceLabel(source['kind'])}',
       });
@@ -898,6 +925,30 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _openLocalAlbum() async {
+    try {
+      final path = _localPath.isNotEmpty
+          ? _localPath
+          : await FilePicker.platform.getDirectoryPath();
+      if (path == null || !mounted) return;
+      await AppleFileAccess.remember(path);
+      if (!mounted) return;
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => SourceBrowser(
+            model: model,
+            source: const {'id': 'local', 'kind': 'local', 'label': '本地'},
+            initialPath: path,
+            initialAlbumMode: true,
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted) await _sourceFailure(context, error, '打开相册失败');
+    }
+  }
+
   Widget _menu(Map<String, dynamic> source) => PopupMenuButton<String>(
     tooltip: '来源选项',
     icon: const Icon(Icons.more_horiz_rounded, size: 21),
@@ -934,7 +985,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
 
   Widget _root() {
     final desktop = MediaQuery.sizeOf(context).width >= 1000;
-    final sources = model.sources;
+    final sources = _currentSources;
     final sourcesById = {for (final source in sources) source['id']: source};
     final saved = favorites.available(
       sources.map((source) => source['id'] as String),
@@ -968,6 +1019,16 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
                         _FolderHeader(
                           title: '来源',
                           actions: [
+                            IconButton(
+                              tooltip: '手机控制',
+                              onPressed: () => showRemoteControlDialog(context),
+                              icon: const Icon(Icons.phonelink),
+                            ),
+                            IconButton(
+                              tooltip: '打开本地相册',
+                              onPressed: _openLocalAlbum,
+                              icon: const Icon(Icons.photo_library_outlined),
+                            ),
                             IconButton(
                               tooltip: '添加来源',
                               onPressed: () => _configure(),
@@ -1140,8 +1201,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
     final action = await showGlassBottomSheet<String>(
       context: context,
       builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+        child: ListView(
+          shrinkWrap: true,
           children: [
             if (_hasLocalPlaybackAlternatives(item))
               ListTile(
@@ -1486,9 +1547,8 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
         if (result.skipped > 0) '${result.skipped} 个位置已改变，未删除',
         if (result.failed > 0) '${result.failed} 个删除失败',
       ].join('，');
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(details)));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(details)));
       if (result.failed > 0) AppLog.instance.warning('本地视频', result.error);
     } on Cancelled {
       // The user cancelled or the page/model was disposed while preparing.
@@ -1534,6 +1594,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
   }
 
   Widget _local() {
+    final trailingMenus = _showFileRowMenus(context);
     final media = _localSearch.results;
     final directory = _localDirectories[_localPath];
     final details = directory?.details;
@@ -1562,7 +1623,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
                       directory: true,
                     ),
               onTap: () => _openLocalDirectory(entry.path),
-              trailing: _localDirectoryMenu(folder),
+              trailing: trailingMenus ? _localDirectoryMenu(folder) : null,
               onLongPress: () => _deleteLocalDirectory(folder),
             );
           }
@@ -1577,12 +1638,13 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
                   ? entry.name
                   : _localEpisodeTitle(item),
               showTechnical: directory!.episodes.length != 1,
+              showTrailing: trailingMenus,
               onPlay: () {
                 _localSearch.dismiss();
                 widget.onPlay(item);
               },
               onLongPress: () => _localMetadataOptions(item),
-              trailing: _localVideoMenu(item),
+              trailing: trailingMenus ? _localVideoMenu(item) : null,
             );
           }
           final progress = playbackProgressLabel(model.progressFor(item));
@@ -1601,7 +1663,7 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
             ].where((line) => line.isNotEmpty).join('\n'),
             video: true,
             leading: _localArtwork(item),
-            trailing: _localVideoMenu(item),
+            trailing: trailingMenus ? _localVideoMenu(item) : null,
             onTap: () {
               _localSearch.dismiss();
               widget.onPlay(item);
@@ -1620,52 +1682,64 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
             onBack: _backLocal,
             actions: [
               IconButton(
-                tooltip: '搜索',
-                onPressed: _localSearch.toggle,
-                icon: const Icon(Icons.search_rounded, size: 21),
+                tooltip: '相册模式',
+                onPressed: _openLocalAlbum,
+                icon: const Icon(Icons.photo_library_outlined),
               ),
-              if (details == null)
-                IconButton(
-                  tooltip: '排序与显示',
-                  onPressed: _sortLocal,
-                  icon: const Icon(Icons.sort_rounded, size: 21),
-                ),
               IconButton(
-                tooltip: '导入视频',
-                onPressed: widget.onImport,
-                icon: const Icon(Icons.add_rounded),
+                tooltip: '排序与显示',
+                onPressed: _sortLocal,
+                icon: const Icon(Icons.sort_rounded, size: 21),
               ),
-              if ((!Platform.isAndroid && !Platform.isIOS) ||
-                  _localPath.isNotEmpty)
-                PopupMenuButton<String>(
-                  tooltip: '本地视频选项',
-                  icon: const Icon(Icons.more_horiz_rounded),
-                  onSelected: (action) {
-                    if (action == 'delete' && directory != null) {
-                      unawaited(_deleteLocalDirectory(directory));
-                    } else {
+              PopupMenuButton<String>(
+                key: const ValueKey('local-folder-menu'),
+                tooltip: '本地视频选项',
+                icon: const Icon(Icons.more_horiz_rounded),
+                onSelected: (action) {
+                  switch (action) {
+                    case 'search':
+                      _localSearch.toggle();
+                    case 'import':
+                      widget.onImport();
+                    case 'delete':
+                      if (directory != null) {
+                        unawaited(_deleteLocalDirectory(directory));
+                      }
+                    case 'scan':
                       _scanFolder();
-                    }
-                  },
-                  itemBuilder: (_) => [
-                    if (_localPath.isNotEmpty && directory != null)
-                      PopupMenuItem(
-                        height: GlassMetrics.menuItemHeight,
-                        padding: GlassMetrics.menuItemPadding,
-                        enabled: _localFolderDeleting == null,
-                        value: 'delete',
-                        child: const Text('删除文件夹'),
-                      ),
-                    if (!Platform.isAndroid && !Platform.isIOS)
-                      PopupMenuItem(
-                        height: GlassMetrics.menuItemHeight,
-                        padding: GlassMetrics.menuItemPadding,
-                        enabled: !model.scanning,
-                        value: 'scan',
-                        child: const Text('扫描文件夹'),
-                      ),
-                  ],
-                ),
+                  }
+                },
+                itemBuilder: (_) => [
+                  const PopupMenuItem(
+                    height: GlassMetrics.menuItemHeight,
+                    padding: GlassMetrics.menuItemPadding,
+                    value: 'search',
+                    child: Text('搜索'),
+                  ),
+                  const PopupMenuItem(
+                    height: GlassMetrics.menuItemHeight,
+                    padding: GlassMetrics.menuItemPadding,
+                    value: 'import',
+                    child: Text('导入视频'),
+                  ),
+                  if (_localPath.isNotEmpty && directory != null)
+                    PopupMenuItem(
+                      height: GlassMetrics.menuItemHeight,
+                      padding: GlassMetrics.menuItemPadding,
+                      enabled: _localFolderDeleting == null,
+                      value: 'delete',
+                      child: const Text('删除文件夹'),
+                    ),
+                  if (!Platform.isAndroid && !Platform.isIOS)
+                    PopupMenuItem(
+                      height: GlassMetrics.menuItemHeight,
+                      padding: GlassMetrics.menuItemPadding,
+                      enabled: !model.scanning,
+                      value: 'scan',
+                      child: const Text('扫描文件夹'),
+                    ),
+                ],
+              ),
             ],
           ),
           if (_localSearch.shown) _FolderSearchField(_localSearch),
@@ -1700,7 +1774,6 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
                 _localSearch.dismiss();
                 widget.onPlay(item);
               },
-              onSort: _sortLocal,
               onMatch: () => _matchSourceRecords(
                 context,
                 model,
@@ -1736,6 +1809,12 @@ class _SourcesPageState extends State<SourcesPage> with WidgetsBindingObserver {
       poster: poster,
       cache: model.posterCache,
       thumbnail: path,
+      thumbnailRevision: model.mediaPreviewImageRevision(media.id),
+      thumbnailChanges: model,
+      thumbnailRevisionOf: () => model.mediaPreviewImageRevision(media.id),
+      onThumbnailError: (path, error) =>
+          model.retryMissingMediaPreview(media.id, path, error),
+      onThumbnailReady: (path) => model.mediaPreviewReady(media.id, path),
       loadWhileScrolling: true,
       placeholder: fallback(),
       onRequestPreview: poster.isEmpty && !directory
@@ -2062,13 +2141,22 @@ class _FolderHeader extends StatelessWidget {
                     title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: SettingsStyles.of(
-                      context,
-                    ).sourceTitle(nested: onBack != null),
+                    style: SettingsStyles.of(context)
+                        .sourceTitle(nested: onBack != null),
                   ),
           ),
         ),
-        ...actions,
+        IconButtonTheme(
+          data: IconButtonThemeData(
+            style: IconButton.styleFrom(
+              minimumSize: const Size(36, 36),
+              maximumSize: const Size(36, 36),
+              padding: const EdgeInsets.all(6),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: actions),
+        ),
       ],
     ),
   );
@@ -2127,6 +2215,15 @@ class _ContentList extends StatelessWidget {
   );
 }
 
+bool _showFileRowMenus(BuildContext context) =>
+    TelevisionMode.of(context) ||
+    switch (Theme.of(context).platform) {
+      TargetPlatform.macOS ||
+      TargetPlatform.windows ||
+      TargetPlatform.linux => true,
+      _ => false,
+    };
+
 class _FolderRow extends StatelessWidget {
   final String title, subtitle;
   final bool video;
@@ -2148,42 +2245,37 @@ class _FolderRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Material(
     type: MaterialType.transparency,
-    child: ListTile(
-      dense: true,
-      visualDensity: SettingsStyles.folderRowDensity,
-      contentPadding: contentPadding,
-      horizontalTitleGap: 10,
-      minLeadingWidth: LibraryStyles.listArtworkSize.width,
-      shape: SettingsStyles.folderRowShape,
-      leading: SizedBox.fromSize(
-        size: LibraryStyles.listArtworkSize,
-        child: Center(child: leading ?? _FolderIcon(video: video)),
+    child: GestureDetector(
+      onSecondaryTap: onLongPress,
+      child: ListTile(
+        dense: true,
+        visualDensity: SettingsStyles.folderRowDensity,
+        contentPadding: contentPadding,
+        horizontalTitleGap: 10,
+        minLeadingWidth: LibraryStyles.listArtworkSize.width,
+        shape: SettingsStyles.folderRowShape,
+        leading: SizedBox.fromSize(
+          size: LibraryStyles.listArtworkSize,
+          child: Center(child: leading ?? _FolderIcon(video: video)),
+        ),
+        title: Text(
+          title,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: AppStyles.of(context).title14,
+        ),
+        subtitle: subtitle.isEmpty
+            ? null
+            : Text(
+                subtitle,
+                maxLines: video ? 3 : 1,
+                overflow: TextOverflow.ellipsis,
+                style: AppStyles.of(context).caption,
+              ),
+        trailing: trailing,
+        onTap: onTap,
+        onLongPress: onLongPress,
       ),
-      title: Text(
-        title,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-        style: AppStyles.of(context).title14,
-      ),
-      subtitle: subtitle.isEmpty
-          ? null
-          : Text(
-              subtitle,
-              maxLines: video ? 3 : 1,
-              overflow: TextOverflow.ellipsis,
-              style: AppStyles.of(context).caption,
-            ),
-      trailing:
-          trailing ??
-          (video
-              ? Icon(
-                  Icons.play_arrow_rounded,
-                  size: 20,
-                  color: GlassPalette.of(context).muted,
-                )
-              : null),
-      onTap: onTap,
-      onLongPress: onLongPress,
     ),
   );
 }
@@ -2216,11 +2308,10 @@ String _fileSize(int size) => size <= 0
     ? '${(size / 1024 / 1024 / 1024).toStringAsFixed(1)} GB'
     : '${(size / 1024 / 1024).toStringAsFixed(1)} MB';
 
-typedef SourceConnector =
-    Future<SourceAdapter> Function(
-      Map<String, dynamic> source,
-      String password,
-    );
+typedef SourceConnector = Future<SourceAdapter> Function(
+  Map<String, dynamic> source,
+  String password,
+);
 
 /// Full-page editor. The alias below keeps older callers source-compatible.
 class SourceEditorPage extends StatefulWidget {
@@ -2417,29 +2508,34 @@ class _SourceEditorPageState extends State<SourceEditorPage> {
     String? hint,
   }) => Padding(
     padding: const EdgeInsets.only(bottom: 12),
-    child: TextField(
-      controller: fields[key],
-      enabled: !testing,
-      obscureText: key == 'password',
-      autocorrect: false,
-      enableSuggestions: key != 'password',
-      style: AppStyles.of(context).bodyLarge,
-      keyboardType: keyboard ?? TextInputType.text,
-      onChanged: key == 'host'
-          ? (value) {
-              if (value.contains('://') || value.startsWith(r'\\')) {
-                _parseHost();
-              }
-            }
-          : null,
-      onEditingComplete: key == 'host'
-          ? () {
-              _parseHost();
-              FocusScope.of(context).nextFocus();
-            }
-          : null,
-      decoration: InputDecoration(labelText: label, hintText: hint),
-    ),
+    child: key == 'password'
+        ? SecretTextField(
+            controller: fields[key]!,
+            enabled: !testing,
+            style: AppStyles.of(context).bodyLarge,
+            decoration: InputDecoration(labelText: label, hintText: hint),
+          )
+        : TextField(
+            controller: fields[key],
+            enabled: !testing,
+            autocorrect: false,
+            style: AppStyles.of(context).bodyLarge,
+            keyboardType: keyboard ?? TextInputType.text,
+            onChanged: key == 'host'
+                ? (value) {
+                    if (value.contains('://') || value.startsWith(r'\\')) {
+                      _parseHost();
+                    }
+                  }
+                : null,
+            onEditingComplete: key == 'host'
+                ? () {
+                    _parseHost();
+                    FocusScope.of(context).nextFocus();
+                  }
+                : null,
+            decoration: InputDecoration(labelText: label, hintText: hint),
+          ),
   );
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -2724,6 +2820,7 @@ class SourceBrowser extends StatefulWidget {
   final String? associateId;
   final String? initialPath, initialName;
   final bool embedded, active;
+  final bool? initialAlbumMode;
   final VoidCallback? onExit, onEdit, onRemove;
   final Future<void> Function(SyncRecord)? onPlay;
   final Future<void> Function(MediaPlaybackChoice)? onPlaySource;
@@ -2734,6 +2831,7 @@ class SourceBrowser extends StatefulWidget {
     this.associateId,
     this.initialPath,
     this.initialName,
+    this.initialAlbumMode,
     this.embedded = false,
     this.active = true,
     this.onExit,
@@ -2748,6 +2846,17 @@ class SourceBrowser extends StatefulWidget {
 
 class _SourceBrowserState extends State<SourceBrowser>
     with WidgetsBindingObserver {
+  final _albumSettings = AlbumCatalogWorker();
+  AlbumImageService? _localDirectoryWorker;
+  AlbumImageService? _fileImages;
+  bool _fileImagesPreparing = false;
+  int _fileImagesRevision = 0;
+  bool _albumMode = false, _modeReady = false;
+  bool _toolbarMenuOpen = false;
+  bool _initialModePending = true;
+  Map<String, dynamic> _albumInitialSettings = const {};
+  List<SourceEntry>? _albumInitialEntries;
+  int _modeGeneration = 0;
   SourceAdapter? adapter;
   List<SourceEntry> _entries = [];
   List<SourceEntry> get entries => _entries;
@@ -2779,6 +2888,14 @@ class _SourceBrowserState extends State<SourceBrowser>
   MediaCollectionDetails? _headerDetails;
   SyncRecord? _headerLatest;
   final folderCollections = <String, DirectoryCollection?>{};
+  final _folderVideoCovers = <String, SourceEntry>{};
+  final _videoThumbnails =
+      <(String, int, int), ({String path, Object revision})>{};
+  Object? _videoThumbnailRevision;
+  Object _videoContentRevision() => (
+    widget.model.store.sourceConfigurationRevision,
+    widget.model.cacheRevision,
+  );
   final _listedFolders = <String>{};
   final folderQueue = <({SourceEntry entry, String parent})>[];
   final inspectedFolders = <String>{};
@@ -2803,6 +2920,8 @@ class _SourceBrowserState extends State<SourceBrowser>
   Future<void>? _manualRefreshWork;
   bool get _canRefresh =>
       mounted &&
+      _modeReady &&
+      !_albumMode &&
       widget.active &&
       _routeCurrent &&
       _foreground &&
@@ -2897,6 +3016,7 @@ class _SourceBrowserState extends State<SourceBrowser>
   @override
   void initState() {
     super.initState();
+    _videoThumbnailRevision = _videoContentRevision();
     WidgetsBinding.instance.addObserver(this);
     final lifecycle = WidgetsBinding.instance.lifecycleState;
     _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
@@ -2938,11 +3058,107 @@ class _SourceBrowserState extends State<SourceBrowser>
       ));
     }
     _restoreSearch();
-    _open();
+    unawaited(_restoreAlbumMode());
+  }
+
+  Future<void> _restoreAlbumMode({bool reconnect = true}) async {
+    final ticket = ++_modeGeneration;
+    _pauseRefresh();
+    _modeReady = false;
+    var album = false;
+    Map<String, dynamic> settings = const {};
+    try {
+      if (widget.associateId == null &&
+          widget.source['kind'] != 'http' &&
+          widget.model.store.path != ':memory:') {
+        settings = await _albumSettings.readPreferences(
+          albumSettingsPath(
+            widget.model.documents.path,
+            widget.source['id'] as String,
+            current,
+          ),
+        );
+        album = settings['album'] == true;
+      }
+    } catch (_) {
+      // An unreadable optional view preference cannot block file access.
+    }
+    if (!mounted || ticket != _modeGeneration) return;
+    if (_initialModePending && widget.initialAlbumMode != null) {
+      album = widget.initialAlbumMode!;
+    }
+    _initialModePending = false;
+    setState(() {
+      _modeReady = true;
+      _albumMode = album;
+      _albumInitialSettings = settings;
+      _albumInitialEntries = cached[current];
+    });
+    _search.setActive(_canRefresh);
+    if (!album) {
+      if (reconnect) {
+        await _open();
+      } else {
+        await _load();
+      }
+    }
+  }
+
+  Future<void> _setAlbumMode(bool value) async {
+    final ticket = ++_modeGeneration;
+    _pauseRefresh();
+    _directoryCancel.cancel();
+    _sorter.cancelPending();
+    generation++;
+    if (value) {
+      // The file browser already owns this listing and its view preferences.
+      // AlbumPage persists its own mode after preparing the first snapshot.
+      setState(() {
+        _albumInitialEntries = cached[current];
+        _albumInitialSettings = {..._albumInitialSettings, 'album': true};
+        _albumMode = true;
+        _modeReady = true;
+      });
+      return;
+    }
+    final path = albumSettingsPath(
+      widget.model.documents.path,
+      widget.source['id'] as String,
+      current,
+    );
+    setState(() {
+      _modeReady = false;
+    });
+    Map<String, dynamic> restored = _albumInitialSettings;
+    try {
+      final settings = await _albumSettings.readPreferences(path);
+      restored = {...settings, 'album': value};
+      await _albumSettings.savePreferences(path, restored);
+    } catch (_) {
+      // The current view remains usable when saving its preference fails.
+    }
+    if (!mounted || ticket != _modeGeneration) return;
+    setState(() {
+      _albumMode = value;
+      _modeReady = true;
+      _albumInitialSettings = restored;
+    });
+    _search.setActive(_canRefresh);
+    if (!value) await _open();
   }
 
   void _modelChanged() {
+    final preferences = widget.model.preferences;
+    for (final images in [_localDirectoryWorker, _fileImages]) {
+      images?.updateCacheLimits(
+        thumbnailBytes: preferences.albumThumbnailCacheBytes,
+        originalBytes: preferences.albumOriginalCacheBytes,
+        metadataBytes: preferences.albumMetadataCacheBytes,
+      );
+    }
     _modelDirty = true;
+    _videoThumbnailRevision = _videoContentRevision();
+    if (_albumMode || !_modeReady) return;
     final cacheRevision = widget.model.cacheRevision;
     if (_cacheRevision != null && _cacheRevision != cacheRevision) {
       _refreshCancel?.cancel();
@@ -2950,6 +3166,8 @@ class _SourceBrowserState extends State<SourceBrowser>
       _directoryCancel.cancel();
       cached.clear();
       folderCollections.clear();
+      _folderVideoCovers.clear();
+      _videoThumbnails.clear();
       _listedFolders.clear();
       folderQueue.clear();
       inspectedFolders.clear();
@@ -3037,6 +3255,15 @@ class _SourceBrowserState extends State<SourceBrowser>
       _sourceSelectionCancel?.cancel();
     }
     if (oldWidget.model != widget.model || sourceChanged) {
+      _folderVideoCovers.clear();
+      _videoThumbnails.clear();
+      _videoThumbnailRevision = _videoContentRevision();
+      _localDirectoryWorker?.dispose();
+      _localDirectoryWorker = null;
+      _fileImagesRevision++;
+      _fileImagesPreparing = false;
+      _fileImages?.dispose();
+      _fileImages = null;
       _directoryCancel.cancel();
       _refreshCancel?.cancel();
       oldWidget.model.cancelDirectoryRecognition();
@@ -3052,14 +3279,18 @@ class _SourceBrowserState extends State<SourceBrowser>
       _queueRefresh();
     }
     if (!widget.active) _pauseRefresh();
-    if (oldWidget.model != widget.model || sourceChanged) unawaited(_open());
+    if (oldWidget.model != widget.model || sourceChanged) {
+      _modeReady = false;
+      unawaited(_restoreAlbumMode());
+    }
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final wasCurrent = _routeCurrent;
-    _routeCurrent = ModalRoute.isCurrentOf(context) ?? true;
+    _routeCurrent =
+        _toolbarMenuOpen || (ModalRoute.isCurrentOf(context) ?? true);
     if (!_routeCurrent) {
       _pauseRefresh();
     } else if (!wasCurrent) {
@@ -3085,6 +3316,8 @@ class _SourceBrowserState extends State<SourceBrowser>
   }
 
   void _pauseRefresh() {
+    _localDirectoryWorker?.setActive(false);
+    _fileImages?.setActive(false);
     _search.setActive(false);
     _refreshCancel?.cancel();
     _loadCancel?.cancel();
@@ -3093,7 +3326,10 @@ class _SourceBrowserState extends State<SourceBrowser>
   }
 
   void _queueRefresh() {
-    if (_canRefresh) _search.setActive(true);
+    if (_canRefresh) {
+      _search.setActive(true);
+      _fileImages?.setActive(true);
+    }
     if (_canRefresh && _openPending) {
       unawaited(_open());
       return;
@@ -3194,6 +3430,20 @@ class _SourceBrowserState extends State<SourceBrowser>
     CancelToken token,
   ) async {
     token.check();
+    if (widget.source['id'] == 'local') {
+      // Reuse the bounded local directory worker when switching a picked
+      // local album to files; enumeration/stat calls never run on the UI.
+      final worker = _localDirectoryWorker ??= AlbumImageService(
+        cacheDirectory: p.join(widget.model.documents.path, 'album-images-v1'),
+        sourceId: 'local',
+        source: const {'id': 'local', 'kind': 'local'},
+        maxThumbnailBytes: widget.model.preferences.albumThumbnailCacheBytes,
+        maxCacheBytes: widget.model.preferences.albumOriginalCacheBytes,
+        maxMetadataBytes: widget.model.preferences.albumMetadataCacheBytes,
+      );
+      worker.setActive(_canRefresh);
+      return worker.listDirectory(directory, cancel: token);
+    }
     // A refresh owns its connection. Cancelling a hidden page must not close
     // the adapter used by the bounded folder preview queue.
     SourceAdapter? connection;
@@ -3336,9 +3586,9 @@ class _SourceBrowserState extends State<SourceBrowser>
           fingerprint ?? await _listingFingerprint(directory, found, token);
       if (!_canRefresh || ticket != generation || current != directory) return;
       final visible = await _visible(found);
-      // Opening a folder establishes its complete episode list immediately.
-      // A cached poster may describe an older subset of files and must never
-      // substitute for the listing that was just opened.
+      // Reconcile actual files with genuinely known identities. A cached poster
+      // must never substitute for the listing that was just opened, and parsed
+      // filenames alone do not establish a recognized collection.
       final resolved = reconcile
           ? await widget.model.synchronizeDirectoryEntriesInBackground(
               widget.source['id'],
@@ -3374,6 +3624,7 @@ class _SourceBrowserState extends State<SourceBrowser>
         directory,
         visible,
         cancel: token,
+        allowAutomatic: widget.model.automaticMetadataEnabled,
       );
       if (_canRefresh &&
           !token.cancelled &&
@@ -3394,7 +3645,7 @@ class _SourceBrowserState extends State<SourceBrowser>
             ? membership ?? value
             : membership?.withMetadata(value.subject, value.episodeTitles) ??
                   value;
-        final updated = value == null || (!reconcile && value.subject == null)
+        final updated = value == null || !value.recognized
             ? enriched
             : await widget.model.synchronizeCollectionInBackground(
                 widget.source['id'],
@@ -3445,7 +3696,7 @@ class _SourceBrowserState extends State<SourceBrowser>
             return;
           }
         }
-        if (widget.model.catalog.strategy() == 'off' ||
+        if (!widget.model.automaticMetadataEnabled ||
             (value == null && resolved == null) ||
             metadataComplete) {
           _completedInspections[directory] = (prepared, revision);
@@ -3576,6 +3827,15 @@ class _SourceBrowserState extends State<SourceBrowser>
               }
               cached[item.entry.path] = found;
               final visible = await _visible(found);
+              // A one-entry directory needs no scan. Larger listings use the
+              // existing bounded worker without moving that work into build.
+              final sole = visible.length == 1 ? visible.single : null;
+              final singleVideo = visible.length <= 1
+                  ? sole != null && !sole.directory && isVideo(sole.name)
+                        ? sole
+                        : null
+                  : await _sorter.singleVideo(visible);
+              token.check();
               var value =
                   await widget.model.catalog.inspect(
                     widget.source['id'],
@@ -3583,6 +3843,7 @@ class _SourceBrowserState extends State<SourceBrowser>
                     visible,
                     directoryModified: item.entry.modified,
                     cancel: token,
+                    allowAutomatic: false,
                   ) ??
                   (visible.length < 256
                       ? widget.model.collectionFromEntries(
@@ -3621,6 +3882,7 @@ class _SourceBrowserState extends State<SourceBrowser>
               }
               return (
                 path: item.entry.path,
+                singleVideo: singleVideo,
                 collection: value == null
                     ? null
                     : await widget.model.synchronizeCollectionInBackground(
@@ -3665,10 +3927,18 @@ class _SourceBrowserState extends State<SourceBrowser>
                 value.listedVideoCount,
                 value.membershipComplete,
                 value.poster,
+                value.videos.length == 1
+                    ? (
+                        value.videos.single.path,
+                        value.videos.single.size,
+                        value.videos.single.modified,
+                      )
+                    : null,
               );
         var changed = false;
         for (final result in results.nonNulls) {
           _listedFolders.add(result.path);
+          changed |= _rememberFolderVideo(result.path, result.singleVideo);
           changed |=
               presentation(folderCollections[result.path]) !=
               presentation(result.collection);
@@ -3689,45 +3959,155 @@ class _SourceBrowserState extends State<SourceBrowser>
   Widget _entryArtwork(SourceEntry entry) {
     if (entry.directory) {
       final ticket = generation;
+      final collection = folderCollections[entry.path];
+      final revision = (
+        generation,
+        _folderInspectionRevision,
+        _folderRequestRevision,
+        entry.path,
+      );
+      void inspect() {
+        if (mounted && ticket == generation) _queueFolder(entry);
+      }
+
+      final singleVideo = _folderVideoCovers[entry.path];
+      if ((collection?.poster.isEmpty ?? true) && singleVideo != null) {
+        return _videoArtwork(
+          singleVideo,
+          placeholder: const _FolderIcon(),
+          visibleIdleRevision: revision,
+          onVisibleIdle: inspect,
+        );
+      }
+      // Recognized posters take priority. Album's manually selected image is
+      // independent of the file browser's ordinary video screenshot policy.
       return _posterOrFrame(
-        poster: folderCollections[entry.path]?.poster ?? '',
+        poster: collection?.poster ?? '',
         folder: true,
-        visibleIdleRevision: (
-          generation,
-          _folderInspectionRevision,
-          _folderRequestRevision,
-          entry.path,
-        ),
-        onVisibleIdle: () {
-          if (mounted && ticket == generation) _queueFolder(entry);
-        },
+        visibleIdleRevision: revision,
+        onVisibleIdle: inspect,
       );
     }
-    if (!isVideo(entry.name) && widget.source['kind'] != 'http') {
-      return _FolderIcon(fileName: entry.name);
+    if (isImageFile(entry.name) && _fileImages != null) {
+      return SizedBox(
+        width: LibraryStyles.listArtworkSize.width,
+        height: LibraryStyles.listArtworkSize.height,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: AlbumThumbnail(
+            service: _fileImages!,
+            entry: entry,
+            edge: (64 * MediaQuery.devicePixelRatioOf(context)).ceil(),
+            placeholder: _FolderIcon(fileName: entry.name),
+          ),
+        ),
+      );
     }
-    final sourceId = widget.source['id'] as String;
-    final id = widget.model.sourcePreviewId(sourceId, entry.path);
-    final frame = widget.model.thumbnailPath(id);
-    final ticket = generation;
-    return _posterOrFrame(
-      frame: frame,
-      folder: false,
-      tryRequestPreview: () async {
-        final model = widget.model;
-        final revision = model.cacheRevision;
-        if (!_canRefresh) return false;
-        final needed = await model.needsMediaPreview(id);
-        if (needed &&
-            _canRefresh &&
-            identical(model, widget.model) &&
-            revision == model.cacheRevision &&
-            ticket == generation) {
-          return model.tryEnsureSourceMediaPreview(sourceId, entry);
-        }
-        return !needed;
-      },
+    if (isVideo(entry.name) || widget.source['kind'] == 'http') {
+      return _videoArtwork(entry);
+    }
+    return _FolderIcon(fileName: entry.name);
+  }
+
+  bool _rememberFolderVideo(String directory, SourceEntry? video) {
+    final previous = _folderVideoCovers[directory];
+    if (video == null) {
+      return _folderVideoCovers.remove(directory) != null;
+    }
+    if (previous?.path == video.path &&
+        previous?.size == video.size &&
+        previous?.modified == video.modified) {
+      return false;
+    }
+    if (_folderVideoCovers.length >= 256 && previous == null) {
+      _folderVideoCovers.remove(_folderVideoCovers.keys.first);
+    }
+    _folderVideoCovers[directory] = video;
+    return true;
+  }
+
+  Widget _videoArtwork(
+    SourceEntry entry, {
+    Widget? placeholder,
+    Object? visibleIdleRevision,
+    VoidCallback? onVisibleIdle,
+  }) {
+    final owner = widget.model;
+    final source = widget.source['id'] as String;
+    final identity = (entry.path, entry.size, entry.modified);
+    final prepared = _videoThumbnails[identity];
+    return SizedBox(
+      width: LibraryStyles.listArtworkSize.width,
+      height: LibraryStyles.listArtworkSize.height,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: AlbumVideoThumbnail(
+          model: owner,
+          sourceId: source,
+          entry: entry,
+          firstFrame: false,
+          edge: (64 * MediaQuery.devicePixelRatioOf(context)).ceil(),
+          active: _canRefresh,
+          initialThumbnail: prepared?.revision == _videoThumbnailRevision
+              ? prepared?.path
+              : null,
+          onThumbnailChanged: (path) {
+            if (!mounted ||
+                owner != widget.model ||
+                source != widget.source['id']) {
+              return;
+            }
+            _videoThumbnails.remove(identity);
+            if (path == null) return;
+            // Other videos completing a capture must not blank this warm
+            // frame. The child still validates the current binding in the
+            // background, including a removed or replaced prepared file.
+            _videoThumbnailRevision = _videoContentRevision();
+            if (_videoThumbnails.length >= 256) {
+              _videoThumbnails.remove(_videoThumbnails.keys.first);
+            }
+            _videoThumbnails[identity] = (
+              path: path,
+              revision: _videoThumbnailRevision!,
+            );
+          },
+          placeholder: placeholder,
+          visibleIdleRevision: visibleIdleRevision,
+          onVisibleIdle: onVisibleIdle,
+        ),
+      ),
     );
+  }
+
+  Future<void> _prepareFileImages() async {
+    if (_fileImages != null || _fileImagesPreparing || !_canRefresh) return;
+    _fileImagesPreparing = true;
+    final ticket = _fileImagesRevision;
+    final owner = widget.model;
+    final source = Map<String, dynamic>.unmodifiable(widget.source);
+    try {
+      final sourceId = source['id'] as String;
+      final password = sourceId == 'local'
+          ? ''
+          : await owner.secrets.read(key: 'source:$sourceId') ?? '';
+      if (!mounted || ticket != _fileImagesRevision) return;
+      final service = AlbumImageService(
+        cacheDirectory: p.join(owner.documents.path, 'album-images-v1'),
+        documentsPath: owner.documents.path,
+        sourceId: sourceId,
+        source: source,
+        password: password,
+        maxThumbnailBytes: owner.preferences.albumThumbnailCacheBytes,
+        maxCacheBytes: owner.preferences.albumOriginalCacheBytes,
+        maxMetadataBytes: owner.preferences.albumMetadataCacheBytes,
+      );
+      service.setActive(_canRefresh);
+      setState(() => _fileImages = service);
+    } catch (error) {
+      AppLog.instance.warning('图片预览', safeFailure(error).message);
+    } finally {
+      if (ticket == _fileImagesRevision) _fileImagesPreparing = false;
+    }
   }
 
   DirectoryCollection? _folderCollection(SourceEntry entry) {
@@ -3755,7 +4135,8 @@ class _SourceBrowserState extends State<SourceBrowser>
       // Preview lookup enriches existing records after layout. Only opening
       // this folder adds its unplayed episodes to the library.
     }
-    return folderCollections[entry.path];
+    final value = folderCollections[entry.path];
+    return value?.recognized == true ? value : null;
   }
 
   Widget _posterOrFrame({
@@ -3831,7 +4212,10 @@ class _SourceBrowserState extends State<SourceBrowser>
     }
     _collectionRecords = folder?.series[seriesKey] ?? const [];
     final first = _collectionRecords.firstOrNull;
-    _hasCollectionHeader = value != null && first != null;
+    _hasCollectionHeader =
+        value?.recognized == true &&
+        first != null &&
+        hasRecognizedMediaMetadata(first);
     _headerSeriesRecords = first == null ? null : snapshot?.seriesFor(first);
     _headerDetails = first == null ? null : snapshot?.detailsFor(first);
     _headerLatest = folder?.latestBySeries[seriesKey];
@@ -3892,7 +4276,6 @@ class _SourceBrowserState extends State<SourceBrowser>
             ),
           );
         },
-        onSort: _sortMenu,
         onDownload: _canDownloadFromSource ? _selectDownloads : null,
       ),
     );
@@ -3946,6 +4329,8 @@ class _SourceBrowserState extends State<SourceBrowser>
       return;
     }
     _openPending = false;
+    unawaited(_prepareFileImages());
+    _fileImages?.setActive(true);
     cached.clear();
     _listingFingerprints.clear();
     _completedInspections.clear();
@@ -3954,6 +4339,7 @@ class _SourceBrowserState extends State<SourceBrowser>
     );
     _resetFolderInspections();
     folderCollections.clear();
+    _folderVideoCovers.clear();
     _listedFolders.clear();
     _setCollection(null);
     final ticket = ++generation;
@@ -4137,7 +4523,7 @@ class _SourceBrowserState extends State<SourceBrowser>
       paths.removeLast();
       _restoreSearch();
       _remember(captureOffset: false);
-      _load();
+      unawaited(_restoreAlbumMode(reconnect: false));
     } else if (widget.onExit != null) {
       widget.onExit!();
     } else {
@@ -4154,12 +4540,115 @@ class _SourceBrowserState extends State<SourceBrowser>
       paths.add((path: entry.path, name: entry.name));
       _restoreSearch();
       _remember(captureOffset: false);
-      await _load();
+      await _restoreAlbumMode(reconnect: false);
       return;
     }
+    if (widget.associateId == null &&
+        !isVideo(entry.name) &&
+        !isImageFile(entry.name) &&
+        !isAudioFile(entry.name) &&
+        widget.source['kind'] != 'http') {
+      try {
+        if (isTextFile(entry.name)) {
+          await openSourceDocument(
+            context,
+            model: widget.model,
+            sourceId: widget.source['id'] as String,
+            source: widget.source,
+            entry: entry,
+          );
+        } else {
+          await _entryOptions(entry);
+        }
+      } catch (failure) {
+        if (mounted) await _sourceFailure(context, failure, '打开文件失败');
+      }
+      return;
+    }
+    final owner = widget.model;
+    final ticket = generation;
+    final revision = ++_sourceSelectionRevision;
+    final token = _sourceSelectionCancel = CancelToken();
+    bool selected() =>
+        mounted &&
+        widget.active &&
+        _foreground &&
+        identical(owner, widget.model) &&
+        ticket == generation &&
+        revision == _sourceSelectionRevision &&
+        !token.cancelled;
     setState(() => playing = true);
     _pauseRefresh();
     try {
+      if (isImageFile(entry.name) && widget.associateId == null) {
+        final source = Map<String, dynamic>.unmodifiable(widget.source);
+        final sourceId = source['id'] as String;
+        final snapshot = await _albumSettings.build(
+          allEntries,
+          sourceId: sourceId,
+          directory: current,
+          options: AlbumOptions(
+            groupPhotos: false,
+            showDirectories: false,
+            sortField: sorting.field,
+            descending: sorting.descending,
+            hideHiddenFiles: hideHidden,
+          ),
+        );
+        if (!selected()) return;
+        final index = snapshot.indexByPath[entry.path];
+        if (index == null) return;
+        final password = sourceId == 'local'
+            ? ''
+            : await owner.secrets.read(key: 'source:$sourceId') ?? '';
+        if (!mounted || !selected()) return;
+        await Navigator.push<int>(
+          context,
+          AlbumViewerRoute<int>(
+            builder: (_) => AlbumViewer(
+              model: owner,
+              source: source,
+              password: password,
+              snapshot: snapshot,
+              initialIndex: index,
+              initialPreview: _fileImages?.peek(entry),
+              albumMode: false,
+            ),
+          ),
+        );
+        return;
+      }
+      if (isAudioFile(entry.name) && widget.associateId == null) {
+        final queue = await _albumSettings.build(
+          allEntries,
+          sourceId: widget.source['id'] as String,
+          directory: current,
+          options: AlbumOptions(
+            kinds: {MediaKind.audio},
+            showDirectories: false,
+            sortField: sorting.field,
+            descending: sorting.descending,
+            hideHiddenFiles: hideHidden,
+          ),
+        );
+        if (!selected()) return;
+        await PlayerPage.waitForDisposals();
+        if (!selected()) return;
+        await MusicPage.waitForDisposals();
+        if (!mounted || !selected()) return;
+        await Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => MusicPage(
+              model: widget.model,
+              sourceId: widget.source['id'] as String,
+              entries: queue.audioEntries,
+              initialIndex: queue.audioIndexByPath[entry.path] ?? 0,
+            ),
+          ),
+        );
+        return;
+      }
       final id = widget.model.addMedia(
         widget.source['id'],
         entry,
@@ -4177,7 +4666,7 @@ class _SourceBrowserState extends State<SourceBrowser>
         await widget.onPlay!(media);
       } else if (mounted) {
         await PlayerPage.waitForDisposals();
-        if (!mounted) return;
+        if (!mounted || !selected()) return;
         await Navigator.push(
           context,
           PageRouteBuilder(
@@ -4188,10 +4677,21 @@ class _SourceBrowserState extends State<SourceBrowser>
           ),
         );
       }
+    } on Cancelled {
+      // A lifecycle/source change revokes this launch, even after resuming.
+    } on AlbumCatalogCancelled {
+      // A newer source selection owns the queue.
     } catch (failure) {
-      if (mounted) await _sourceFailure(context, failure, '打开视频失败');
+      if (mounted && selected()) {
+        await _sourceFailure(context, failure, '打开媒体失败');
+      }
     } finally {
-      if (mounted) {
+      token.cancel();
+      final ownsSelection = identical(_sourceSelectionCancel, token);
+      if (ownsSelection) {
+        _sourceSelectionCancel = null;
+      }
+      if (mounted && ownsSelection) {
         setState(() => playing = false);
         _queueRefresh();
       }
@@ -4201,9 +4701,8 @@ class _SourceBrowserState extends State<SourceBrowser>
   Future<void> _scan() async {
     await widget.model.scan(widget.source['id'], current, cancel: cancel);
     if (mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(widget.model.status)));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(widget.model.status)));
     }
   }
 
@@ -4294,24 +4793,32 @@ class _SourceBrowserState extends State<SourceBrowser>
       context,
       widget.model,
       widget.source['id'] as String,
-      displayedEntries
-          .where(
-            (entry) =>
-                entry.directory ||
-                isVideo(entry.name) ||
-                widget.source['kind'] == 'http',
-          )
-          .toList(),
+      displayedEntries,
     );
   }
 
   Future<void> _downloadFolder(SourceEntry entry) async {
     if (!_canDownloadFromSource || !entry.directory) return;
     _search.dismiss();
+    final model = widget.model;
+    final sourceId = widget.source['id'] as String;
     try {
-      await widget.model.downloadSourceEntries(widget.source['id'] as String, [
-        entry,
-      ]);
+      if (!await confirmFolderDownload(
+        context,
+        folderCount: 1,
+        folderName: entry.name,
+      )) {
+        return;
+      }
+      if (!mounted ||
+          widget.model != model ||
+          widget.source['id'] != sourceId ||
+          !_canDownloadFromSource ||
+          !(ModalRoute.of(context)?.isCurrent ?? true) ||
+          !ArtworkLifecycle.instance.value) {
+        return;
+      }
+      await model.downloadSourceEntries(sourceId, [entry]);
       if (mounted) showGlassSuccess(context, '已加入下载任务');
     } catch (failure) {
       if (mounted) await _sourceFailure(context, failure, '添加下载失败');
@@ -4410,18 +4917,34 @@ class _SourceBrowserState extends State<SourceBrowser>
 
   Future<void> _entryOptions(SourceEntry entry) async {
     _search.dismiss();
+    if (!entry.directory && !isVideo(entry.name)) {
+      await showSourceFileDownloadMenu(
+        context,
+        widget.model,
+        widget.source['id'] as String,
+        entry,
+        source: widget.source,
+      );
+      return;
+    }
     final action = await showGlassBottomSheet<String>(
       context: context,
       builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+        child: ListView(
+          shrinkWrap: true,
           children: [
             if (entry.directory && _canDownloadFromSource)
               ListTile(
                 leading: const Icon(Icons.download_outlined),
                 title: const Text('下载文件夹'),
-                subtitle: const Text('包含子文件夹内的视频'),
+                subtitle: const Text('包含所有子目录中的文件'),
                 onTap: () => Navigator.pop(context, 'download-folder'),
+              ),
+            if (!entry.directory && _canDownloadFromSource)
+              ListTile(
+                leading: const Icon(Icons.download_outlined),
+                title: Text(entry.directory ? '下载文件夹' : '下载文件'),
+                onTap: () => Navigator.pop(context, 'download-file'),
               ),
             if (_hasPlaybackAlternatives(entry))
               ListTile(
@@ -4475,6 +4998,21 @@ class _SourceBrowserState extends State<SourceBrowser>
     }
     if (action == 'download-folder') {
       await _downloadFolder(entry);
+      return;
+    }
+    if (action == 'download-file') {
+      final model = widget.model;
+      final sourceId = widget.source['id'] as String;
+      if (model.downloads.entryForSource(sourceId, entry.path) != null) {
+        await showSourceFileDownloadMenu(context, model, sourceId, entry);
+      } else {
+        try {
+          await model.downloadSourceEntries(sourceId, [entry]);
+          if (mounted) showGlassSuccess(context, '已加入下载任务');
+        } catch (failure) {
+          if (mounted) await _sourceFailure(context, failure, '添加下载失败');
+        }
+      }
       return;
     }
     if (action == 'file-details') {
@@ -4563,6 +5101,11 @@ class _SourceBrowserState extends State<SourceBrowser>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _modeGeneration++;
+    _localDirectoryWorker?.dispose();
+    _fileImagesRevision++;
+    _fileImages?.dispose();
+    unawaited(_albumSettings.flushPreferencesAndClose());
     _refreshCancel?.cancel();
     _sourceSelectionCancel?.cancel();
     _remember();
@@ -4579,20 +5122,36 @@ class _SourceBrowserState extends State<SourceBrowser>
 
   @override
   Widget build(BuildContext context) {
+    if (!_modeReady) return const Center(child: CircularProgressIndicator());
+    if (_albumMode) {
+      return AlbumPage(
+        key: ValueKey((widget.model, widget.source['id'], current)),
+        model: widget.model,
+        source: widget.source,
+        initialPath: current,
+        initialName:
+            paths.lastOrNull?.name ?? widget.source['label'] as String?,
+        initialEntries: _albumInitialEntries,
+        initialSettings: _albumInitialSettings,
+        active: widget.active,
+        onExit: _back,
+        onFileView: (path, name) {
+          if (path != current) {
+            _remember();
+            paths.add((path: path, name: name));
+            _restoreSearch();
+          }
+          unawaited(_setAlbumMode(false));
+        },
+      );
+    }
     final displayed = displayedEntries;
     final value = collection;
     final records = value == null ? const <SyncRecord>[] : _collectionRecords;
     final hasCollectionHeader = value != null && _hasCollectionHeader;
     final width = MediaQuery.sizeOf(context).width;
     final desktop = width >= 1000;
-    final desktopMenus =
-        desktop ||
-        switch (Theme.of(context).platform) {
-          TargetPlatform.macOS ||
-          TargetPlatform.windows ||
-          TargetPlatform.linux => true,
-          _ => false,
-        };
+    final desktopMenus = _showFileRowMenus(context);
     final inset = desktop
         ? GlassMetrics.desktopPageInset
         : (width < 600 ? 12.0 : 24.0);
@@ -4619,27 +5178,28 @@ class _SourceBrowserState extends State<SourceBrowser>
                     '来源',
                 onBack: _back,
                 actions: [
+                  if (widget.associateId == null &&
+                      widget.source['kind'] != 'http')
+                    IconButton(
+                      tooltip: '相册模式',
+                      onPressed: () => unawaited(_setAlbumMode(true)),
+                      icon: const Icon(Icons.photo_library_outlined),
+                    ),
                   IconButton(
-                    tooltip: '搜索',
-                    onPressed: _search.toggle,
-                    icon: const Icon(Icons.search_rounded, size: 21),
+                    tooltip: '排序与显示',
+                    onPressed: _sortMenu,
+                    icon: const Icon(Icons.sort_rounded, size: 21),
                   ),
-                  if (!hasCollectionHeader)
-                    IconButton(
-                      tooltip: '排序与显示',
-                      onPressed: _sortMenu,
-                      icon: const Icon(Icons.sort_rounded, size: 21),
-                    ),
-                  if (!hasCollectionHeader && _canDownloadFromSource)
-                    IconButton(
-                      tooltip: '选择下载',
-                      onPressed: _selectDownloads,
-                      icon: const Icon(Icons.download_rounded, size: 21),
-                    ),
                   PopupMenuButton<String>(
+                    key: const ValueKey('source-folder-menu'),
                     tooltip: '文件夹选项',
+                    onOpened: () => _toolbarMenuOpen = true,
+                    onCanceled: () => _toolbarMenuOpen = false,
                     icon: const Icon(Icons.more_horiz_rounded),
                     onSelected: (action) {
+                      _toolbarMenuOpen = false;
+                      if (action == 'search') _search.toggle();
+                      if (action == 'download') unawaited(_selectDownloads());
                       if (action == 'refresh') unawaited(_refreshManually());
                       if (action == 'scan') _scan();
                       if (action == 'download-folder') {
@@ -4661,6 +5221,19 @@ class _SourceBrowserState extends State<SourceBrowser>
                       }
                     },
                     itemBuilder: (_) => [
+                      const PopupMenuItem(
+                        height: GlassMetrics.menuItemHeight,
+                        padding: GlassMetrics.menuItemPadding,
+                        value: 'search',
+                        child: Text('搜索'),
+                      ),
+                      if (_canDownloadFromSource)
+                        const PopupMenuItem(
+                          height: GlassMetrics.menuItemHeight,
+                          padding: GlassMetrics.menuItemPadding,
+                          value: 'download',
+                          child: Text('选择下载'),
+                        ),
                       if (hasCollectionHeader) ...[
                         PopupMenuItem<String>(
                           height: GlassMetrics.menuItemHeight,
@@ -4789,9 +5362,8 @@ class _SourceBrowserState extends State<SourceBrowser>
                                 SelectableText(
                                   error,
                                   textAlign: TextAlign.center,
-                                  style: SettingsStyles.of(
-                                    context,
-                                  ).sourceErrorMessage,
+                                  style: SettingsStyles.of(context)
+                                      .sourceErrorMessage,
                                 ),
                                 const SizedBox(height: 12),
                                 Wrap(
@@ -4843,6 +5415,7 @@ class _SourceBrowserState extends State<SourceBrowser>
                             final playable =
                                 entry.directory ||
                                 isVideo(entry.name) ||
+                                widget.associateId == null ||
                                 widget.source['kind'] == 'http';
                             final media = entry.directory
                                 ? null
@@ -4858,56 +5431,68 @@ class _SourceBrowserState extends State<SourceBrowser>
                                   ? savedEpisode
                                   : collection?.episodeLabel(entry.path) ?? '';
                               final sourceId = widget.source['id'] as String;
-                              return MediaDetailsEpisodeTile(
-                                key: ValueKey(entry.path),
-                                model: widget.model,
-                                item:
-                                    media ??
-                                    SyncRecord(
-                                      kind: 'media',
-                                      id: widget.model.sourcePreviewId(
-                                        sourceId,
-                                        entry.path,
-                                      ),
-                                      data: {
-                                        'title': entry.name,
-                                        'fileName': entry.name,
-                                        'size': entry.size,
-                                      },
-                                    ),
-                                title:
-                                    collection!.episodeCount == 0 &&
-                                        collection!.videos.length > 1
-                                    ? entry.name
-                                    : episode.isEmpty
-                                    ? null
-                                    : episode,
-                                sourceId: sourceId,
-                                sourceEntry: entry,
-                                showTechnical:
-                                    _headerSeriesRecords?.length != 1,
-                                onPlay: () => _select(entry),
-                                onLongPress: widget.associateId == null
+                              return GestureDetector(
+                                onSecondaryTap: widget.associateId == null
                                     ? () => _entryOptions(entry)
                                     : null,
-                                trailing: widget.associateId == null
-                                    ? IconButton(
-                                        key: ValueKey(
-                                          'video-options:${entry.path}',
+                                child: MediaDetailsEpisodeTile(
+                                  key: ValueKey(entry.path),
+                                  model: widget.model,
+                                  item:
+                                      media ??
+                                      SyncRecord(
+                                        kind: 'media',
+                                        id: widget.model.sourcePreviewId(
+                                          sourceId,
+                                          entry.path,
                                         ),
-                                        tooltip: '视频选项',
-                                        icon: const Icon(Icons.more_vert),
-                                        onPressed: () => _entryOptions(entry),
-                                      )
-                                    : null,
+                                        data: {
+                                          'title': entry.name,
+                                          'fileName': entry.name,
+                                          'size': entry.size,
+                                        },
+                                      ),
+                                  title:
+                                      collection!.episodeCount == 0 &&
+                                          collection!.videos.length > 1
+                                      ? entry.name
+                                      : episode.isEmpty
+                                      ? null
+                                      : episode,
+                                  sourceId: sourceId,
+                                  sourceEntry: entry,
+                                  showTechnical:
+                                      _headerSeriesRecords?.length != 1,
+                                  showTrailing: desktopMenus,
+                                  onPlay: () => _select(entry),
+                                  onLongPress: widget.associateId == null
+                                      ? () => _entryOptions(entry)
+                                      : null,
+                                  trailing:
+                                      widget.associateId == null && desktopMenus
+                                      ? IconButton(
+                                          key: ValueKey(
+                                            'video-options:${entry.path}',
+                                          ),
+                                          tooltip: '视频选项',
+                                          icon: const Icon(Icons.more_vert),
+                                          onPressed: () => _entryOptions(entry),
+                                        )
+                                      : null,
+                                ),
                               );
                             }
-                            final savedEpisode = media == null
+                            final recognized =
+                                media != null &&
+                                hasRecognizedMediaMetadata(media);
+                            final savedEpisode = !recognized
                                 ? ''
                                 : widget.model.episodeLabel(media);
                             final episode = savedEpisode.isNotEmpty
                                 ? savedEpisode
-                                : collection?.episodeLabel(entry.path) ?? '';
+                                : collection?.recognized == true
+                                ? collection!.episodeLabel(entry.path)
+                                : '';
                             final progress = media == null
                                 ? ''
                                 : playbackProgressLabel(
@@ -4941,14 +5526,16 @@ class _SourceBrowserState extends State<SourceBrowser>
                                 : _fileSize(entry.size);
                             return Opacity(
                               key: ValueKey(entry.path),
-                              opacity: playable ? 1 : .45,
+                              opacity: playable || widget.associateId == null
+                                  ? 1
+                                  : .45,
                               child: _FolderRow(
                                 contentPadding: EdgeInsets.zero,
                                 title:
                                     group?.displayName ??
                                     (hasCollectionHeader && episode.isNotEmpty
                                         ? episode
-                                        : media != null
+                                        : recognized
                                         ? widget.model.displayTitle(media)
                                         : entry.name),
                                 subtitle: group != null
@@ -4975,14 +5562,27 @@ class _SourceBrowserState extends State<SourceBrowser>
                                 onTap: () {
                                   if (playable) _select(entry);
                                 },
-                                onLongPress:
-                                    playable &&
-                                        widget.associateId == null &&
-                                        !(entry.directory && desktopMenus)
+                                onLongPress: widget.associateId == null
                                     ? () => _entryOptions(entry)
                                     : null,
-                                trailing: !playable
-                                    ? const SizedBox(width: 20)
+                                trailing:
+                                    !entry.directory &&
+                                        !isVideo(entry.name) &&
+                                        widget.associateId == null &&
+                                        desktopMenus
+                                    ? IconButton(
+                                        key: ValueKey(
+                                          'file-options:${entry.path}',
+                                        ),
+                                        tooltip: '文件选项',
+                                        icon: const Icon(
+                                          Icons.more_horiz_rounded,
+                                          size: 20,
+                                        ),
+                                        onPressed: () => _entryOptions(entry),
+                                      )
+                                    : !playable
+                                    ? null
                                     : entry.directory &&
                                           widget.associateId == null &&
                                           desktopMenus
@@ -4996,39 +5596,26 @@ class _SourceBrowserState extends State<SourceBrowser>
                                             Icon(
                                               Icons.star_rounded,
                                               size: 18,
-                                              color: GlassPalette.of(
-                                                context,
-                                              ).accent,
+                                              color: GlassPalette.of(context)
+                                                  .accent,
                                             ),
                                           _folderEntryMenu(entry),
                                         ],
                                       )
                                     : !entry.directory &&
-                                          widget.associateId == null
-                                    ? Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          if (widget.source['id'] != 'local')
-                                            OfflineDownloadButton(
-                                              model: widget.model,
-                                              item: specRecord,
-                                              sourceId:
-                                                  widget.source['id'] as String,
-                                              sourceEntry: entry,
-                                            ),
-                                          IconButton(
-                                            key: ValueKey(
-                                              'video-options:${entry.path}',
-                                            ),
-                                            tooltip: '视频选项',
-                                            icon: const Icon(
-                                              Icons.more_horiz_rounded,
-                                              size: 20,
-                                            ),
-                                            onPressed: () =>
-                                                _entryOptions(entry),
-                                          ),
-                                        ],
+                                          widget.associateId == null &&
+                                          desktopMenus &&
+                                          isVideo(entry.name)
+                                    ? IconButton(
+                                        key: ValueKey(
+                                          'video-options:${entry.path}',
+                                        ),
+                                        tooltip: '视频选项',
+                                        icon: const Icon(
+                                          Icons.more_horiz_rounded,
+                                          size: 20,
+                                        ),
+                                        onPressed: () => _entryOptions(entry),
                                       )
                                     : entry.directory &&
                                           favorites.contains(
@@ -5057,7 +5644,10 @@ class _SourceBrowserState extends State<SourceBrowser>
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) _back();
       },
-      child: body,
+      child: ArtworkScrollScope(
+        onActivityChanged: (scrolling) => _fileImages?.setScrolling(scrolling),
+        child: body,
+      ),
     );
     // The browser keeps its toolbar fixed; only scrolling page headers consume
     // their top inset inside the list. Keep these controls below the status bar.

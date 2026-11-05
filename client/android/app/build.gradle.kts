@@ -51,7 +51,9 @@ android {
         release {
             // Personal-use release builds reuse the local debug certificate.
             // Store distribution requires a dedicated signing configuration.
-            signingConfig = signingConfigs.getByName("debug")
+            if (System.getenv("AIPLAYER_ANDROID_UNSIGNED") != "true") {
+                signingConfig = signingConfigs.getByName("debug")
+            }
         }
     }
 }

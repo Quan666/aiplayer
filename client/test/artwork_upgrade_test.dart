@@ -95,10 +95,15 @@ void main() {
       }
       expect(_pixels(tester), hasLength(1));
       expect(_pixels(tester).single.image!.height, 180);
+      final resident = tester.element(find.byType(Image));
+      PaintingBinding.instance.imageCache
+        ..clear()
+        ..clearLiveImages();
       cache.upgrade(poster, source);
       var upgraded = false;
       for (var i = 0; i < 60; i++) {
         await tester.pump();
+        expect(tester.element(find.byType(Image)), same(resident));
         final visible = _pixels(tester).toList();
         expect(
           visible,

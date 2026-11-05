@@ -1,4 +1,5 @@
 import 'dart:ui';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -84,6 +85,34 @@ Future<T?> showGlassBottomSheet<T>({
     ),
   ),
 );
+
+/// Content determines the height; long lazy lists receive a finite viewport.
+/// Use a min-sized Column, loose Flexible and shrink-wrapped list inside this
+/// bound, so short sheets never reserve a screen-sized empty area.
+class GlassSheetBody extends StatelessWidget {
+  final Widget child;
+  final double maxFraction;
+  const GlassSheetBody({
+    super.key,
+    required this.child,
+    this.maxFraction = .82,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final available =
+        (media.size.height -
+                media.viewInsets.bottom -
+                media.padding.vertical -
+                16)
+            .clamp(0.0, media.size.height * maxFraction);
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxHeight: available),
+      child: child,
+    );
+  }
+}
 
 /// Applies compact rows only to menus and sheets, leaving page and player rows
 /// under their own themes. Minimum heights still allow text to grow or wrap.
@@ -460,9 +489,8 @@ class _GlassSelectState<T> extends State<GlassSelect<T>> {
               selected?.label ?? '',
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
-              style: AppStyles.of(
-                context,
-              ).selectionLabel(enabled: widget.enabled),
+              style: AppStyles.of(context)
+                  .selectionLabel(enabled: widget.enabled),
             ),
           ),
         ),

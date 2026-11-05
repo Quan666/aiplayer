@@ -1,5 +1,7 @@
 import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
@@ -296,10 +298,10 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
       context: context,
       isScrollControlled: true,
       builder: (sheet) => SafeArea(
-        child: SizedBox(
-          height: MediaQuery.sizeOf(sheet).height * .6,
+        child: GlassSheetBody(
           child: ListView.builder(
             key: const ValueKey('metadata-record-picker'),
+            shrinkWrap: true,
             padding: const EdgeInsets.symmetric(vertical: 4),
             itemCount: _records.length,
             itemBuilder: (context, index) {
@@ -641,9 +643,8 @@ class _MetadataMatchSheetState extends State<_MetadataMatchSheet> {
                               Container(
                                 key: const ValueKey('metadata-task-status'),
                                 padding: const EdgeInsets.all(8),
-                                decoration: LibraryStyles.of(
-                                  context,
-                                ).taskStatus,
+                                decoration: LibraryStyles.of(context)
+                                    .taskStatus,
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [

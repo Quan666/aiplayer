@@ -1,7 +1,9 @@
 import 'dart:convert';
+
 import 'package:crypto/crypto.dart' as hash;
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../sources/favorites.dart';
@@ -319,7 +321,10 @@ class SyncProfile {
 
     final settings = Map<String, dynamic>.from(store.local('settings') ?? {});
     for (final key in settings.keys.where(
-      (key) => key != 'syncOrigin' && key != 'syncToken',
+      (key) =>
+          key != 'syncOrigin' &&
+          key != 'syncToken' &&
+          key != 'autoIdentifyOnFolderOpen',
     )) {
       put('setting', key, settings[key]);
     }
@@ -1227,6 +1232,7 @@ class SyncProfile {
     final key = entry.key, value = entry.value;
     switch (entry.type) {
       case 'setting':
+        if (key == 'autoIdentifyOnFolderOpen') return;
         final settings = Map<String, dynamic>.from(
           store.local('settings') ?? {},
         );
@@ -1315,9 +1321,10 @@ class SyncProfile {
       case 'artwork':
         await artwork?.apply(key, value, deleted: deleted);
       case 'favorite':
-        final favorites = SourceFavorites(
-          store,
-        ).all.where((f) => f.key != key).map((f) => f.toJson()).toList();
+        final favorites = SourceFavorites(store).all
+            .where((f) => f.key != key)
+            .map((f) => f.toJson())
+            .toList();
         if (!deleted) favorites.add(Map<String, dynamic>.from(value));
         store.setLocal(SourceFavorites.storageKey, favorites);
       case 'local':
@@ -1434,9 +1441,10 @@ class SyncProfile {
             .toString(),
       'binding' => (store.get('media', key)?.data['title'] ?? '').toString(),
       'favorite' =>
-        SourceFavorites(
-              store,
-            ).all.where((f) => f.key == key).firstOrNull?.name ??
+        SourceFavorites(store).all
+                .where((f) => f.key == key)
+                .firstOrNull
+                ?.name ??
             '',
       'secret' =>
         {

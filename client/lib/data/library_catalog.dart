@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:async';
 import 'dart:isolate';
+
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
+
 import '../core/logger.dart';
 import '../core/network.dart';
 import 'media_identity.dart';
@@ -122,6 +124,11 @@ class DirectoryCollection {
   /// False when a transient catalogue failure left only partial metadata.
   /// The available subject can be shown while the missing stage is retried.
   final bool metadataComplete;
+  bool get recognized {
+    final id = '${subject?['id'] ?? ''}'.trim();
+    return id.isNotEmpty && id != '0';
+  }
+
   final int? _preparedEpisodeCount;
   final int? _listedVideoCount;
   final bool? _membershipComplete;
@@ -134,11 +141,9 @@ class DirectoryCollection {
     this.episodeTitles = const {},
     this.metadataComplete = true,
     int? episodeCount,
-    int? listedVideoCount,
-    bool? membershipComplete,
-  }) : _preparedEpisodeCount = episodeCount,
-       _listedVideoCount = listedVideoCount,
-       _membershipComplete = membershipComplete;
+    this._listedVideoCount,
+    this._membershipComplete,
+  }) : _preparedEpisodeCount = episodeCount;
   int get listedVideoCount => _listedVideoCount ?? videos.length;
   bool get membershipComplete =>
       _membershipComplete ?? videos.length == listedVideoCount;
@@ -735,6 +740,9 @@ class LibraryCatalog {
   final AppStore store;
   final String Function() provider;
   final String Function() strategy;
+  final bool Function() automaticEnabled;
+  CancelToken _automaticCancel = CancelToken();
+  int _automaticRevision = 0;
   final bool Function() tmdbNameAssist;
   late final TmdbCatalog tmdb;
   final Future<String> Function() tmdbCredential;
@@ -812,6 +820,7 @@ class LibraryCatalog {
     JsonTransport? transport,
     String Function()? provider,
     String Function()? strategy,
+    bool Function()? automaticEnabled,
     bool Function()? tmdbNameAssist,
     Future<String> Function()? tmdbCredential,
     this.aiFallback,
@@ -826,6 +835,7 @@ class LibraryCatalog {
        transport = transport ?? IoJsonTransport(),
        provider = provider ?? (() => 'bangumi'),
        strategy = strategy ?? (() => 'conservative'),
+       automaticEnabled = automaticEnabled ?? (() => true),
        tmdbNameAssist = tmdbNameAssist ?? (() => true),
        aiContext = aiContext ?? (() => ''),
        tmdbCredential = tmdbCredential ?? (() async => '') {
@@ -834,6 +844,35 @@ class LibraryCatalog {
   static const headers = {
     'User-Agent': 'AIPlayer/0.5.26 (personal anime library)',
   };
+
+  /// Revokes automatic requests immediately, without affecting explicit search
+  /// or the valid local directory previews used when automatic matching is off.
+  void cancelAutomaticRecognition() {
+    _automaticCancel.cancel();
+    _automaticCancel = CancelToken();
+    _automaticRevision++;
+  }
+
+  Future<T> _withAutomaticCancellation<T>(
+    CancelToken? caller,
+    Future<T> Function(CancelToken) work,
+  ) async {
+    final lifetime = _automaticCancel;
+    final token = CancelToken();
+    caller?.check();
+    lifetime.check();
+    final subscriptions = [
+      for (final input in {lifetime, ?caller})
+        input.whenCancelled.asStream().listen((_) => token.cancel()),
+    ];
+    try {
+      return await work(token);
+    } finally {
+      for (final subscription in subscriptions) {
+        unawaited(subscription.cancel());
+      }
+    }
+  }
 
   Future<Map<String, dynamic>> _bangumiRequest(
     Uri uri, {
@@ -872,6 +911,8 @@ class LibraryCatalog {
   /// A compact revision for browser completion checks, independent of file
   /// membership. Reading it does not hash or parse a directory on the UI isolate.
   Object directoryInspectionRevision(String sourceId) => (
+    automaticEnabled(),
+    _automaticRevision,
     strategy(),
     provider(),
     tmdbNameAssist(),
@@ -1501,12 +1542,28 @@ class LibraryCatalog {
     String season, {
     CancelToken? cancel,
     bool force = false,
+  }) {
+    if (force) return _resolve(title, season, cancel: cancel, force: true);
+    if (!automaticEnabled()) return Future.value(null);
+    return _withAutomaticCancellation(
+      cancel,
+      (token) => _resolve(title, season, cancel: token),
+    );
+  }
+
+  Future<Map<String, dynamic>?> _resolve(
+    String title,
+    String season, {
+    CancelToken? cancel,
+    bool force = false,
   }) async {
     if (cacheMaintenance) throw const Cancelled();
     cancel?.check();
     final selectedStrategy = strategy();
     final revision = _cacheRevision;
-    if (!force && selectedStrategy == 'off') return null;
+    if (!force && (!automaticEnabled() || selectedStrategy == 'off')) {
+      return null;
+    }
     title = metadataQuery(title, preserveSeason: false);
     if (title.isEmpty) return null;
     final tmdbContext = await _tmdbContext(cancel: cancel);
@@ -1520,7 +1577,9 @@ class LibraryCatalog {
         'subject-v5:all:$matchStrategy:$configured:${normalizedSeries(title)}:$season';
     final saved = store.local(key) ?? store.local(legacyKey);
     cancel?.check();
-    if (strategy() != selectedStrategy || revision != _cacheRevision) {
+    if ((!force && !automaticEnabled()) ||
+        strategy() != selectedStrategy ||
+        revision != _cacheRevision) {
       return null;
     }
     if (saved is Map && saved['subject'] is Map) {
@@ -1556,7 +1615,9 @@ class LibraryCatalog {
       }
     }
     cancel?.check();
-    if (strategy() != selectedStrategy || revision != _cacheRevision) {
+    if ((!force && !automaticEnabled()) ||
+        strategy() != selectedStrategy ||
+        revision != _cacheRevision) {
       return null;
     }
     // Failed, ambiguous and empty matches must remain eligible for retry.
@@ -1765,6 +1826,31 @@ class LibraryCatalog {
     List<SourceEntry> entries, {
     int? directoryModified,
     CancelToken? cancel,
+    bool allowAutomatic = true,
+  }) {
+    final permitted = allowAutomatic && automaticEnabled();
+    return _withAutomaticCancellation(
+      cancel,
+      (token) => _inspect(
+        sourceId,
+        path,
+        entries,
+        directoryModified: directoryModified,
+        cancel: token,
+        allowAutomatic: permitted,
+        share: cancel == null,
+      ),
+    );
+  }
+
+  Future<DirectoryCollection?> _inspect(
+    String sourceId,
+    String path,
+    List<SourceEntry> entries, {
+    int? directoryModified,
+    CancelToken? cancel,
+    required bool allowAutomatic,
+    required bool share,
   }) async {
     if (cacheMaintenance) throw const Cancelled();
     cancel?.check();
@@ -1817,6 +1903,14 @@ class LibraryCatalog {
                 metadataComplete: cachedCollection.metadataComplete,
               ) ??
               cachedCollection;
+    if ((!allowAutomatic || !automaticEnabled() || strategy() == 'off') &&
+        cached?.fingerprint == key &&
+        currentWithCachedMetadata?.recognized == true) {
+      // An incomplete episode-title cache remains useful while automatic
+      // requests are disabled. Never fetch names just to display known facts.
+      cancel?.check();
+      return currentWithCachedMetadata;
+    }
     if (cached != null &&
         cached.fingerprint == key &&
         currentWithCachedMetadata != null &&
@@ -1832,7 +1926,10 @@ class LibraryCatalog {
     Future<DirectoryCollection?> inspectFresh() async {
       final collection = prepared.allowCollection ? prepared.collection : null;
       var result = collection;
-      if (collection != null && strategy() != 'off') {
+      if (collection != null &&
+          allowAutomatic &&
+          automaticEnabled() &&
+          strategy() != 'off') {
         try {
           final episodeRevision = episodeNamesRevision;
           final subject = await resolve(
@@ -1884,6 +1981,8 @@ class LibraryCatalog {
       }
       if (result?.subject == null &&
           prepared.allowCollection &&
+          allowAutomatic &&
+          automaticEnabled() &&
           strategy() != 'off' &&
           aiFallback != null) {
         try {
@@ -1953,8 +2052,8 @@ class LibraryCatalog {
     }
 
     // A cancelled browser must not cancel another browser's shared lookup.
-    if (cancel != null) return inspectFresh();
-    final pendingKey = '$key:$sourceEpoch';
+    if (!share) return inspectFresh();
+    final pendingKey = '$key:$sourceEpoch:$allowAutomatic:$_automaticRevision';
     final existing = _pending[pendingKey];
     if (existing != null) return existing;
     late final Future<DirectoryCollection?> request;

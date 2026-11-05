@@ -8,11 +8,57 @@ import '../core/logger.dart';
 import '../core/network.dart';
 import 'session.dart';
 
+class RemotePlaybackStatus {
+  final bool active, playing;
+  final int positionMs, durationMs;
+  const RemotePlaybackStatus({
+    this.active = false,
+    this.playing = false,
+    this.positionMs = 0,
+    this.durationMs = 0,
+  });
+  Object get revision => (active, playing, positionMs, durationMs);
+}
+
 /// One owner for headset, remote and system transport controls. Native position
 /// displays extrapolate from state changes; this bridge never polls playback.
 class PlayerMediaControls {
   static const _channel = MethodChannel('app.aiplayer/media_controls');
   static PlayerMediaControls? _owner;
+  static final _remoteStatus = ValueNotifier(const RemotePlaybackStatus());
+  static ValueListenable<RemotePlaybackStatus> get remoteStatus =>
+      _remoteStatus;
+
+  /// App-scoped transport commands from an explicitly paired phone. Uses the
+  /// existing session owner and lifecycle checks, never platform key injection.
+  static Future<bool> dispatchRemote(
+    String action, {
+    int? positionMs,
+    required bool Function() isCurrent,
+  }) async {
+    final owner = _owner;
+    if (!isCurrent() ||
+        owner == null ||
+        !owner._acceptsCommands ||
+        owner._session!.backgroundPlaybackBlocked ||
+        !const {
+          'play',
+          'pause',
+          'toggle',
+          'next',
+          'previous',
+          'seek',
+          'seekForward',
+          'seekBackward',
+        }.contains(action) ||
+        action == 'next' && owner._next == null ||
+        action == 'previous' && owner._previous == null) {
+      return false;
+    }
+    await owner._command(action, positionMs: positionMs);
+    return isCurrent();
+  }
+
   static int _nextSessionId = DateTime.now().microsecondsSinceEpoch;
   PlaybackSession? _session;
   Future<void> Function()? _closeHook;
@@ -117,6 +163,17 @@ class PlayerMediaControls {
     );
     if (_published == snapshot) return;
     _published = snapshot;
+    if (_owner == this) {
+      final remote = RemotePlaybackStatus(
+        active: active,
+        playing: state.playing,
+        positionMs: (_seekingTo ?? state.position).inMilliseconds,
+        durationMs: state.duration.inMilliseconds,
+      );
+      if (_remoteStatus.value.revision != remote.revision) {
+        _remoteStatus.value = remote;
+      }
+    }
     _pendingUpdate = {
       'sessionId': _sessionId,
       'active': active,
@@ -314,6 +371,9 @@ class PlayerMediaControls {
     _awaitingSeekPosition = false;
     _pendingUpdate = null;
     _published = null;
+    if (_owner == this && _remoteStatus.value.active) {
+      _remoteStatus.value = const RemotePlaybackStatus();
+    }
   }
 
   Future<void> close() async {

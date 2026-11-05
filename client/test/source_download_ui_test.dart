@@ -10,7 +10,9 @@ import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/media_details_content.dart';
 import 'package:aiplayer/ui/sources_page.dart';
+import 'package:aiplayer/ui/television_input.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -37,21 +39,42 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.byTooltip('下载视频'), findsNWidgets(2));
-      await tester.tap(find.byTooltip('下载视频').first);
+      expect(find.byTooltip('下载视频'), findsNothing);
+      await tester.longPress(find.byKey(const ValueKey('/share/alpha.mkv')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('下载文件'));
       await tester.pumpAndSettle();
       expect(model.requests, [
         ['dav', '/share/alpha.mkv'],
       ]);
-      await tester.tap(find.byTooltip('选择下载'));
+      await tester.longPress(find.byKey(const ValueKey('/share/notes.nfo')));
       await tester.pumpAndSettle();
-      expect(find.byType(CheckboxListTile), findsNWidgets(2));
+      expect(find.text('重新识别影视资料'), findsNothing);
+      await tester.tap(find.text('下载文件'));
+      await tester.pumpAndSettle();
+      expect(model.requests.last, ['dav', '/share/notes.nfo']);
+      final mouse = await tester.createGesture(
+        kind: PointerDeviceKind.mouse,
+        buttons: kSecondaryMouseButton,
+      );
+      await mouse.down(
+        tester.getCenter(find.byKey(const ValueKey('/share/notes.nfo'))),
+      );
+      await mouse.up();
+      await tester.pumpAndSettle();
+      expect(find.text('下载文件'), findsOneWidget);
+      await tester.tap(find.text('下载文件'));
+      await tester.pumpAndSettle();
+      expect(model.requests.last, ['dav', '/share/notes.nfo']);
+      await _folderAction(tester, '选择下载');
+      await tester.pumpAndSettle();
+      expect(find.byType(CheckboxListTile), findsNWidgets(3));
       expect(
         find.descendant(
           of: find.byKey(const ValueKey('download-selection-list')),
           matching: find.text('notes.nfo'),
         ),
-        findsNothing,
+        findsOneWidget,
       );
       await tester.tap(find.byKey(const ValueKey('download-select:1')));
       await tester.pump();
@@ -95,20 +118,23 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        await tester.tap(find.byTooltip('选择下载'));
+        await _folderAction(tester, '选择下载');
         await tester.pumpAndSettle();
-        expect(find.byType(CheckboxListTile), findsNWidgets(3));
-        expect(find.text('文件夹包含所有子目录中的视频。'), findsOneWidget);
+        expect(find.byType(CheckboxListTile), findsNWidgets(4));
+        expect(find.text('包含所有子目录中的文件。'), findsOneWidget);
         final selection = find.byKey(const ValueKey('download-selection-list'));
         expect(
           find.descendant(of: selection, matching: find.text('notes.nfo')),
-          findsNothing,
+          findsOneWidget,
         );
         await tester.tap(find.widgetWithText(CheckboxListTile, 'Season'));
         await tester.pump();
         await tester.tap(find.widgetWithText(CheckboxListTile, 'alpha.mkv'));
         await tester.pump();
         await tester.tap(find.text('下载 (2)'));
+        await tester.pumpAndSettle();
+        expect(find.text('下载文件夹？'), findsOneWidget);
+        await tester.tap(find.text('下载'));
         await tester.pumpAndSettle();
         expect(model.requests.single, [
           'dav',
@@ -120,8 +146,11 @@ void main() {
 
         await tester.longPress(find.byKey(const ValueKey('/share/Season/')));
         await tester.pumpAndSettle();
-        expect(find.text('包含子文件夹内的视频'), findsOneWidget);
+        expect(find.text('包含所有子目录中的文件'), findsOneWidget);
         await tester.tap(find.text('下载文件夹'));
+        await tester.pumpAndSettle();
+        expect(find.text('下载文件夹？'), findsOneWidget);
+        await tester.tap(find.text('下载'));
         await tester.pumpAndSettle();
         expect(model.requests.last, ['dav', '/share/Season/']);
         expect(model.batches.last.single.directory, isTrue);
@@ -129,6 +158,9 @@ void main() {
         await tester.tap(find.byTooltip('文件夹选项'));
         await tester.pumpAndSettle();
         await tester.tap(find.text('下载当前文件夹（含子目录）'));
+        await tester.pumpAndSettle();
+        expect(find.text('下载文件夹？'), findsOneWidget);
+        await tester.tap(find.text('下载'));
         await tester.pumpAndSettle();
         expect(model.requests.last, ['dav', '']);
         expect(model.batches.last.single.directory, isTrue);
@@ -141,6 +173,65 @@ void main() {
       }
     },
   );
+
+  for (final television in [false, true]) {
+    testWidgets(
+      'file row actions follow mobile and TV device mode: $television',
+      (tester) async {
+        FlutterSecureStorage.setMockInitialValues({});
+        await tester.binding.setSurfaceSize(const Size(1100, 700));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        final directory = Directory.systemTemp.createTempSync(
+          'source-actions-',
+        );
+        final store = AppStore(':memory:')
+          ..setLocal('settings', {
+            'metadataStrategy': 'off',
+            'autoDiscover': false,
+          });
+        final model = _SourceModel(store, directory, withFolder: true);
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: GlassPalette.theme().copyWith(
+                platform: TargetPlatform.android,
+              ),
+              home: TelevisionMode(
+                enabled: television,
+                child: SourceBrowser(
+                  model: model,
+                  source: const {'id': 'dav', 'kind': 'webdav', 'label': 'DAV'},
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          for (final path in [
+            '/share/Season/',
+            '/share/alpha.mkv',
+            '/share/notes.nfo',
+          ]) {
+            final row = find.descendant(
+              of: find.byKey(ValueKey(path)),
+              matching: find.byType(ListTile),
+            );
+            expect(
+              tester.widget<ListTile>(row).trailing,
+              television ? isNotNull : isNull,
+            );
+          }
+          expect(find.byIcon(Icons.play_arrow_rounded), findsNothing);
+          expect(find.byTooltip('下载视频'), findsNothing);
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox());
+          model.dispose();
+          store.dispose();
+          directory.deleteSync(recursive: true);
+        }
+      },
+    );
+  }
 
   testWidgets(
     'desktop folder menu opens from its trailing button and keeps row navigation',
@@ -182,7 +273,7 @@ void main() {
                 find.descendant(of: folder, matching: find.byType(ListTile)),
               )
               .onLongPress,
-          isNull,
+          isNotNull,
         );
 
         await tester.tap(menu);
@@ -205,6 +296,9 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('取消收藏'), findsOneWidget);
         await tester.tap(find.text('下载文件夹'));
+        await tester.pumpAndSettle();
+        expect(find.text('下载文件夹？'), findsOneWidget);
+        await tester.tap(find.text('下载'));
         await tester.pumpAndSettle();
         expect(model.requests.single, ['dav', '/share/Season/']);
         expect(model.batches.single.single.directory, isTrue);
@@ -286,8 +380,8 @@ void main() {
         );
         expect(find.byTooltip('已下载'), findsNothing);
         expect(find.byIcon(Icons.download_done_rounded), findsNothing);
-        await tester.tap(
-          find.byKey(const ValueKey('local-video-options:episode')),
+        await tester.longPress(
+          find.byKey(const ValueKey('local-video:episode')),
         );
         await tester.pumpAndSettle();
         await tester.tap(find.text('影视详情'));
@@ -314,8 +408,8 @@ void main() {
         expect(find.byTooltip('选择下载'), findsOneWidget);
         Navigator.of(tester.element(overview)).pop();
         await tester.pumpAndSettle();
-        await tester.tap(
-          find.byKey(const ValueKey('local-video-options:episode')),
+        await tester.longPress(
+          find.byKey(const ValueKey('local-video:episode')),
         );
         await tester.pumpAndSettle();
         await tester.tap(find.text('删除本地视频'));
@@ -323,8 +417,8 @@ void main() {
         await tester.tap(find.text('取消'));
         await tester.pumpAndSettle();
         expect(model.downloads.entryFor('episode'), isNotNull);
-        await tester.tap(
-          find.byKey(const ValueKey('local-video-options:episode')),
+        await tester.longPress(
+          find.byKey(const ValueKey('local-video:episode')),
         );
         await tester.pumpAndSettle();
         await tester.tap(find.text('删除本地视频'));
@@ -483,7 +577,7 @@ void main() {
 
         position().jumpTo(0);
         await tester.pumpAndSettle();
-        await tester.tap(find.byTooltip('搜索'));
+        await _folderAction(tester, '搜索');
         await tester.pumpAndSettle();
         final search = find.byKey(const ValueKey('folder-search-field'));
         await tester.enterText(search, 'Season');
@@ -502,8 +596,8 @@ void main() {
         await waitFor(find.text('Season 2'));
         await tester.tap(find.text('Season 2'));
         await tester.pumpAndSettle();
-        await tester.tap(
-          find.byKey(const ValueKey('local-video-options:nested')),
+        await tester.longPress(
+          find.byKey(const ValueKey('local-video:nested')),
         );
         await tester.pumpAndSettle();
         await tester.tap(find.text('删除本地视频'));
@@ -545,8 +639,9 @@ class _SourceModel extends AppModel {
   @override
   Future<void> downloadSourceEntries(
     String sourceId,
-    Iterable<SourceEntry> entries,
-  ) async {
+    Iterable<SourceEntry> entries, {
+    bool personalMedia = false,
+  }) async {
     final selected = entries.toList();
     batches.add(selected);
     requests.add([sourceId, for (final entry in selected) entry.path]);
@@ -655,4 +750,21 @@ class _CompletedDownloads extends ChangeNotifier implements OfflineDownloads {
   void changed() => notifyListeners();
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+Future<void> _folderAction(WidgetTester tester, String label) async {
+  final direct = find.byTooltip(label);
+  if (direct.evaluate().isNotEmpty) {
+    await tester.tap(direct.first);
+    return;
+  }
+  final folder = find.byKey(const ValueKey('source-folder-menu'));
+  await tester.tap(
+    folder.evaluate().isNotEmpty
+        ? folder
+        : find.byKey(const ValueKey('local-folder-menu')),
+  );
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
 }

@@ -1,6 +1,8 @@
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
 import '../core/network.dart';
 import '../core/logger.dart';
 import '../danmaku/api.dart';
@@ -11,6 +13,7 @@ import 'glass.dart';
 import 'theme/settings_styles.dart';
 import 'logs_page.dart';
 import 'search_header.dart';
+import 'secret_text_field.dart';
 import '../subtitles/settings.dart';
 import 'library_page.dart';
 import 'navigation_reveal.dart';
@@ -413,7 +416,88 @@ class _SettingsPageState extends State<SettingsPage>
     ),
     const SizedBox(height: 8),
     toggle('不显示隐藏文件和文件夹', 'hideHiddenFiles', prefs.hideHiddenFiles),
+    toggle(
+      '第三方服务联网',
+      'thirdPartyNetworkingEnabled',
+      prefs.thirdPartyNetworkingEnabled,
+      hint: '控制弹幕、作品资料、海报和 AI 请求；媒体来源与设备同步不受影响。',
+    ),
   ]);
+  Widget caches() => section('缓存', [
+    select<int>(
+      '图片内存缓存',
+      'decodedImageCacheMiB',
+      prefs.decodedImageCacheMiB,
+      _cacheOptions(prefs.decodedImageCacheMiB, const [
+        32,
+        64,
+        100,
+        128,
+        256,
+        512,
+      ]),
+    ),
+    select<int>(
+      '相册缩略图磁盘缓存',
+      'albumThumbnailCacheMiB',
+      prefs.albumThumbnailCacheMiB,
+      _cacheOptions(prefs.albumThumbnailCacheMiB, const [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+      ]),
+    ),
+    select<int>(
+      '相册大图磁盘缓存',
+      'albumOriginalCacheMiB',
+      prefs.albumOriginalCacheMiB,
+      _cacheOptions(prefs.albumOriginalCacheMiB, const [
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+      ]),
+    ),
+    select<int>(
+      '相册信息缓存',
+      'albumMetadataCacheMiB',
+      prefs.albumMetadataCacheMiB,
+      _cacheOptions(prefs.albumMetadataCacheMiB, const [
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+      ]),
+    ),
+    select<int>(
+      '外部打开临时缓存',
+      'externalFileCacheMiB',
+      prefs.externalFileCacheMiB,
+      _cacheOptions(prefs.externalFileCacheMiB, const [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+      ]),
+    ),
+  ]);
+  List<GlassOption<int>> _cacheOptions(int current, List<int> choices) => [
+    for (final value in {...choices, current}.toList()..sort())
+      GlassOption(
+        value,
+        value % 1024 == 0 ? '${value ~/ 1024} GiB' : '$value MiB',
+      ),
+  ];
   Widget playback() => section('播放', [
     toggle('打开视频后自动播放', 'autoPlay', prefs.autoPlay),
     toggle(
@@ -734,11 +818,8 @@ class _SettingsPageState extends State<SettingsPage>
       decoration: const InputDecoration(labelText: '服务地址'),
     ),
     const SizedBox(height: 12),
-    TextField(
+    SecretTextField(
       controller: token,
-      obscureText: true,
-      autocorrect: false,
-      enableSuggestions: false,
       decoration: const InputDecoration(labelText: 'Token'),
     ),
     const SizedBox(height: 12),
@@ -771,11 +852,8 @@ class _SettingsPageState extends State<SettingsPage>
         decoration: const InputDecoration(labelText: '同步服务地址'),
       ),
       const SizedBox(height: 12),
-      TextField(
+      SecretTextField(
         controller: syncToken,
-        obscureText: true,
-        autocorrect: false,
-        enableSuggestions: false,
         decoration: const InputDecoration(labelText: '同步 Token（至少 24 字符）'),
       ),
       const SizedBox(height: 8),
@@ -882,19 +960,27 @@ class _SettingsPageState extends State<SettingsPage>
           model.catalog.invalidateDirectoryPreviews(sourceId);
         }
       }
+      // Saving a key also revokes requests made with the previous key, even
+      // when a subsequent connection test fails.
+      model.changed();
       if (test) {
         if (key.isEmpty) throw const AppFailure('请先填写 TMDB API Key 或读取令牌。');
         final apiKey = RegExp(r'^[a-fA-F0-9]{32}$').hasMatch(key);
-        await IoJsonTransport(inactivity: const Duration(seconds: 12)).send(
-          Uri.https(
-            'api.themoviedb.org',
-            '/3/authentication',
-            apiKey ? {'api_key': key} : null,
-          ),
-          headers: apiKey ? const {} : {'Authorization': 'Bearer $key'},
-        );
+        await model.thirdPartyNetwork
+            .jsonTransport(
+              transport: IoJsonTransport(
+                inactivity: const Duration(seconds: 12),
+              ),
+            )
+            .send(
+              Uri.https(
+                'api.themoviedb.org',
+                '/3/authentication',
+                apiKey ? {'api_key': key} : null,
+              ),
+              headers: apiKey ? const {} : {'Authorization': 'Bearer $key'},
+            );
       }
-      model.changed();
       if (mounted) showGlassSuccess(context, test ? 'TMDB 连接成功' : '资料配置已保存');
     } catch (error) {
       if (mounted) showFailure(context, error);
@@ -904,11 +990,20 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Widget metadata() => section('作品资料', [
-    select('自动识别', 'metadataStrategy', prefs.metadataStrategy, const [
-      GlassOption('off', '关闭 · 仅手动匹配'),
-      GlassOption('conservative', '严格 · 名称和季度唯一吻合'),
-      GlassOption('balanced', '扩展 · 唯一相近名称'),
-    ]),
+    toggle(
+      '进入文件夹自动识别',
+      'autoIdentifyOnFolderOpen',
+      prefs.autoIdentifyOnFolderOpen,
+    ),
+    select(
+      '匹配策略',
+      'metadataStrategy',
+      prefs.metadataStrategy == 'off' ? 'conservative' : prefs.metadataStrategy,
+      const [
+        GlassOption('conservative', '严格 · 名称和季度唯一吻合'),
+        GlassOption('balanced', '扩展 · 唯一相近名称'),
+      ],
+    ),
     toggle(
       'AI 自动识别信息',
       'aiMetadataEnabled',
@@ -918,7 +1013,7 @@ class _SettingsPageState extends State<SettingsPage>
     Align(
       alignment: Alignment.centerLeft,
       child: TextButton.icon(
-        onPressed: refreshingMetadata || prefs.metadataStrategy == 'off'
+        onPressed: refreshingMetadata
             ? null
             : () async {
                 setState(() => refreshingMetadata = true);
@@ -940,11 +1035,8 @@ class _SettingsPageState extends State<SettingsPage>
       style: AppStyles.of(context).micro,
     ),
     const SizedBox(height: 12),
-    TextField(
+    SecretTextField(
       controller: tmdbKey,
-      obscureText: true,
-      autocorrect: false,
-      enableSuggestions: false,
       decoration: const InputDecoration(
         labelText: 'TMDB API Key / 读取令牌',
         helperText: '填写 API Key（v3）或 API Read Access Token；安全保存，启用同步后加密同步。',
@@ -999,7 +1091,7 @@ class _SettingsPageState extends State<SettingsPage>
         'general',
         '常规',
         Icons.tune_rounded,
-        '外观 主题 浅色 深色 隐藏文件 文件夹 来源 资料 AI 自动识别 文件名 匹配 作品 信息 Bangumi TMDB API Key 海报 季度',
+        '外观 主题 浅色 深色 隐藏文件 文件夹 来源 资料 AI 自动识别 文件名 匹配 作品 信息 Bangumi TMDB API Key 海报 季度 第三方 联网 隐私 网络',
       ),
       (
         'playback',
@@ -1027,6 +1119,12 @@ class _SettingsPageState extends State<SettingsPage>
       ),
       ('sync', '同步', Icons.sync_rounded, '设备 连接 服务 Token 冲突'),
       (
+        'advanced',
+        '高级',
+        Icons.settings_outlined,
+        '相册 缩略图 大图 图片 内存 磁盘 缓存 容量 信息 临时 外部打开 MiB GiB MB GB',
+      ),
+      (
         'about',
         '关于',
         Icons.info_outline_rounded,
@@ -1040,6 +1138,7 @@ class _SettingsPageState extends State<SettingsPage>
       'danmaku' => [danmaku, danmakuService],
       'ai' => [aiTranslation],
       'sync' => synchronization(),
+      'advanced' => [caches],
       _ => [about],
     };
     final matches = groups

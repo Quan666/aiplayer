@@ -7,6 +7,7 @@ import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/library_catalog.dart';
 import 'package:aiplayer/data/media_previews.dart';
 import 'package:aiplayer/data/store.dart';
+import 'package:aiplayer/data/source_preview.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -128,64 +129,62 @@ void main() {
     await root.delete(recursive: true);
   });
 
-  test(
-    'cancelled callers still notify committed directory writes but not unchanged data',
-    () async {
-      for (final listing in [false, true]) {
-        var notifications = 0;
-        void changed() => notifications++;
-        model.addListener(changed);
-        Future<Object?> run(CancelToken cancel) => listing
-            ? model.synchronizeDirectoryEntriesInBackground(
-                'local',
-                '${root.path}/Show',
-                entries,
-                cancel: cancel,
-              )
-            : model.synchronizeCollectionInBackground(
-                'local',
-                collection,
-                cancel: cancel,
-              );
-        final before = await model.loadLibrarySnapshot();
-        final token = _CancelAfterResult();
-        await expectLater(run(token), throwsA(isA<Cancelled>()));
-        expect(token.checks, 3);
-        final snapshot = await model.loadLibrarySnapshot();
-        expect(snapshot.media, hasLength(3));
-        expect(notifications, listing ? 0 : 1);
-        if (listing) expect(snapshot, same(before));
-
-        notifications = 0;
-        await expectLater(run(_CancelAfterResult()), throwsA(isA<Cancelled>()));
-        expect(notifications, 0);
-        expect(await model.loadLibrarySnapshot(), same(snapshot));
-        model.removeListener(changed);
-      }
-    },
-  );
-
-  test(
-    'a cancelled listing with its own commit still invalidates an already visible library',
-    () async {
-      final before = await model.loadLibrarySnapshot();
+  test('cancelled callers still notify committed directory writes but not unchanged data', () async {
+    for (final listing in [false, true]) {
       var notifications = 0;
-      model.addListener(() => notifications++);
-      await expectLater(
-        model.synchronizeDirectoryEntriesInBackground(
-          'local',
-          '${root.path}/Show',
-          entries,
-          cancel: _CancelAfterResult(),
-        ),
-        throwsA(isA<Cancelled>()),
-      );
-      final after = await model.loadLibrarySnapshot();
-      expect(after, isNot(same(before)));
-      expect(after.media, hasLength(3));
-      expect(notifications, 1);
-    },
-  );
+      void changed() => notifications++;
+      model.addListener(changed);
+      Future<Object?> run(CancelToken cancel) => listing
+          ? model.synchronizeDirectoryEntriesInBackground(
+              'local',
+              '${root.path}/Show',
+              entries,
+              cancel: cancel,
+            )
+          : model.synchronizeCollectionInBackground(
+              'local',
+              collection,
+              cancel: cancel,
+            );
+      final before = await model.loadLibrarySnapshot();
+      final token = _CancelAfterResult();
+      await expectLater(run(token), throwsA(isA<Cancelled>()));
+      expect(token.checks, 3);
+      final snapshot = await model.loadLibrarySnapshot();
+      expect(snapshot.media, hasLength(3));
+      expect(notifications, listing ? 0 : 1);
+      if (listing) expect(snapshot, same(before));
+
+      notifications = 0;
+      await expectLater(run(_CancelAfterResult()), throwsA(isA<Cancelled>()));
+      expect(notifications, 0);
+      expect(await model.loadLibrarySnapshot(), same(snapshot));
+      model.removeListener(changed);
+    }
+  });
+
+  test('a cancelled listing with its own commit still invalidates an already visible library', () async {
+    // Opening an explicitly imported library item authorizes completing its
+    // directory. Passive metadata-OFF browsing must not import parser guesses.
+    final anchor = model.addMedia('local', entries.first);
+    final before = await model.loadLibrarySnapshot();
+    var notifications = 0;
+    model.addListener(() => notifications++);
+    await expectLater(
+      model.synchronizeDirectoryEntriesInBackground(
+        'local',
+        '${root.path}/Show',
+        entries,
+        anchorId: anchor,
+        cancel: _CancelAfterResult(),
+      ),
+      throwsA(isA<Cancelled>()),
+    );
+    final after = await model.loadLibrarySnapshot();
+    expect(after, isNot(same(before)));
+    expect(after.media, hasLength(3));
+    expect(notifications, 1);
+  });
 
   test(
     'cancelling a hung source closes it without waiting for a listing response',
@@ -213,98 +212,79 @@ void main() {
     },
   );
 
-  test(
-    'fresh recognized folder imports every episode and replaces a warm library snapshot',
-    () async {
-      final empty = await model.loadLibrarySnapshot();
-      expect(empty.media, isEmpty);
-      var notifications = 0;
-      model.addListener(() => notifications++);
-      // The user-facing recognition action formerly omitted importMissing and
-      // updated only played records. The default must complete recognized data.
-      await model.synchronizeCollectionInBackground('local', collection);
-      final loaded = await model.loadLibrarySnapshot();
-      expect(loaded.media, hasLength(3));
-      expect(loaded.series.values.single.map((e) => e.data['episode']), [
-        '1',
-        '2',
-        '3',
-      ]);
-      expect(loaded.media.every((e) => e.data['bangumiId'] == '7'), isTrue);
-      expect(store.records('progress'), isEmpty);
-      expect(notifications, 1);
-      await model.synchronizeCollectionInBackground('local', collection);
-      expect(await model.loadLibrarySnapshot(), same(loaded));
-      expect(notifications, 1);
-    },
-  );
+  test('fresh recognized folder imports every episode and replaces a warm library snapshot', () async {
+    final empty = await model.loadLibrarySnapshot();
+    expect(empty.media, isEmpty);
+    var notifications = 0;
+    model.addListener(() => notifications++);
+    // The user-facing recognition action formerly omitted importMissing and
+    // updated only played records. The default must complete recognized data.
+    await model.synchronizeCollectionInBackground('local', collection);
+    final loaded = await model.loadLibrarySnapshot();
+    expect(loaded.media, hasLength(3));
+    expect(loaded.series.values.single.map((e) => e.data['episode']), [
+      '1',
+      '2',
+      '3',
+    ]);
+    expect(loaded.media.every((e) => e.data['bangumiId'] == '7'), isTrue);
+    expect(store.records('progress'), isEmpty);
+    expect(notifications, 1);
+    await model.synchronizeCollectionInBackground('local', collection);
+    expect(await model.loadLibrarySnapshot(), same(loaded));
+    expect(notifications, 1);
+  });
 
-  test(
-    'a broken directory cache cannot prevent reading newly added source episodes',
-    () async {
-      final id = model.addMedia('local', entries.first);
-      model.failCache = true;
-      final loaded = await model.loadSeriesEpisodes(store.get('media', id)!);
-      expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
-    },
-  );
+  test('a broken directory cache cannot prevent reading newly added source episodes', () async {
+    final id = model.addMedia('local', entries.first);
+    model.failCache = true;
+    final loaded = await model.loadSeriesEpisodes(store.get('media', id)!);
+    expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
+  });
 
-  test(
-    'explicit series refresh retries offline sources and recovers after cancellation',
-    () async {
-      final id = model.addMedia('local', entries.first);
-      final record = store.get('media', id)!;
-      final offline = _OfflineSource();
-      model.connection = offline;
-      for (var attempt = 1; attempt <= 2; attempt++) {
-        expect(await model.loadSeriesEpisodes(record), hasLength(1));
-        expect(offline.requests, attempt);
-      }
-      final delayed = _DelayedSource();
-      model.connection = delayed;
-      final cancel = CancelToken();
-      final pending = model.loadSeriesEpisodes(record, cancel: cancel);
-      await delayed.started.future;
-      cancel.cancel();
-      await expectLater(pending, throwsA(isA<Cancelled>()));
-      expect(delayed.closes, 1);
-      delayed.listing.complete(entries);
-      model.connection = null;
-      expect(await model.loadSeriesEpisodes(record), hasLength(3));
-    },
-  );
+  test('explicit series refresh retries offline sources and recovers after cancellation', () async {
+    final id = model.addMedia('local', entries.first);
+    final record = store.get('media', id)!;
+    final offline = _OfflineSource();
+    model.connection = offline;
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      expect(await model.loadSeriesEpisodes(record), hasLength(1));
+      expect(offline.requests, attempt);
+    }
+    final delayed = _DelayedSource();
+    model.connection = delayed;
+    final cancel = CancelToken();
+    final pending = model.loadSeriesEpisodes(record, cancel: cancel);
+    await delayed.started.future;
+    cancel.cancel();
+    await expectLater(pending, throwsA(isA<Cancelled>()));
+    expect(delayed.closes, 1);
+    delayed.listing.complete(entries);
+    model.connection = null;
+    expect(await model.loadSeriesEpisodes(record), hasLength(3));
+  });
 
-  test(
-    'single old-library seed recovers all cached episodes on disk while offline',
-    () async {
-      final id = model.addMedia('local', entries.first);
-      final old = await model.loadLibrarySnapshot();
-      expect(old.media, hasLength(1));
-      model.cached = collection;
-      model.connection = _OfflineSource();
-      final recovered = await model.loadSeriesEpisodes(old.byId[id]!);
-      expect(recovered.map((e) => e.data['episode']), ['1', '2', '3']);
-      expect(recovered.map((e) => e.data['episodeTitle']), [
-        '第一集',
-        '第二集',
-        '第三集',
-      ]);
-      expect(store.records('progress'), isEmpty);
-    },
-  );
+  test('single old-library seed recovers all cached episodes on disk while offline', () async {
+    final id = model.addMedia('local', entries.first);
+    final old = await model.loadLibrarySnapshot();
+    expect(old.media, hasLength(1));
+    model.cached = collection;
+    model.connection = _OfflineSource();
+    final recovered = await model.loadSeriesEpisodes(old.byId[id]!);
+    expect(recovered.map((e) => e.data['episode']), ['1', '2', '3']);
+    expect(recovered.map((e) => e.data['episodeTitle']), ['第一集', '第二集', '第三集']);
+    expect(store.records('progress'), isEmpty);
+  });
 
-  test(
-    'offline parsed folder shortcuts recover unplayed episodes without catalogue metadata',
-    () async {
-      final id = model.addMedia('local', entries.first);
-      model.cached = identifyDirectory('${root.path}/Show', entries);
-      model.connection = _OfflineSource();
-      final loaded = await model.loadSeriesEpisodes(store.get('media', id)!);
-      expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
-      expect(loaded.every((item) => item.data['bangumiId'] == null), isTrue);
-      expect(store.records('progress'), isEmpty);
-    },
-  );
+  test('offline parsed folder shortcuts recover unplayed episodes without catalogue metadata', () async {
+    final id = model.addMedia('local', entries.first);
+    model.cached = identifyDirectory('${root.path}/Show', entries);
+    model.connection = _OfflineSource();
+    final loaded = await model.loadSeriesEpisodes(store.get('media', id)!);
+    expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
+    expect(loaded.every((item) => item.data['bangumiId'] == null), isTrue);
+    expect(store.records('progress'), isEmpty);
+  });
 
   test(
     'real source directory completes a series despite trailers and other shows',
@@ -335,129 +315,111 @@ void main() {
     },
   );
 
-  test(
-    'series completion follows each existing source directory with its own anchor',
-    () async {
-      await File(entries[1].path).delete();
-      await File(entries[2].path).delete();
-      final other = await Directory('${root.path}/Another copy').create();
-      final sibling = <SourceEntry>[];
-      for (final episode in [2, 3]) {
-        final file = await File(
-          '${other.path}/Show S01E0$episode.mkv',
-        ).writeAsBytes([episode]);
-        sibling.add(await LocalSource().stat(file.path));
-      }
-      final first = model.addMedia('local', entries.first);
-      model.addMedia('local', sibling.first);
-      final loaded = await model.loadSeriesEpisodes(store.get('media', first)!);
-      expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
-      expect(model.sourceMedia('local', sibling.last.path), isNotNull);
-    },
-  );
+  test('series completion follows each existing source directory with its own anchor', () async {
+    await File(entries[1].path).delete();
+    await File(entries[2].path).delete();
+    final other = await Directory('${root.path}/Another copy').create();
+    final sibling = <SourceEntry>[];
+    for (final episode in [2, 3]) {
+      final file = await File('${other.path}/Show S01E0$episode.mkv')
+          .writeAsBytes([episode]);
+      sibling.add(await LocalSource().stat(file.path));
+    }
+    final first = model.addMedia('local', entries.first);
+    model.addMedia('local', sibling.first);
+    final loaded = await model.loadSeriesEpisodes(store.get('media', first)!);
+    expect(loaded.map((item) => item.data['episode']), ['1', '2', '3']);
+    expect(model.sourceMedia('local', sibling.last.path), isNotNull);
+  });
 
-  test(
-    'removing the selected record while its listing is pending cannot import siblings',
-    () async {
-      final id = model.addMedia('local', entries.first);
-      final selected = store.get('media', id)!;
-      final source = _DelayedSource();
-      model.connection = source;
-      final work = model.loadSeriesEpisodes(selected);
-      await source.started.future;
-      await model.removeMedia(selected);
-      source.listing.complete(entries);
-      expect(await work, isEmpty);
-      expect((await model.loadLibrarySnapshot()).media, isEmpty);
-    },
-  );
+  test('removing the selected record while its listing is pending cannot import siblings', () async {
+    final id = model.addMedia('local', entries.first);
+    final selected = store.get('media', id)!;
+    final source = _DelayedSource();
+    model.connection = source;
+    final work = model.loadSeriesEpisodes(selected);
+    await source.started.future;
+    await model.removeMedia(selected);
+    source.listing.complete(entries);
+    expect(await work, isEmpty);
+    expect((await model.loadLibrarySnapshot()).media, isEmpty);
+  });
 
-  test(
-    'directory cancellation before a delayed listing completes does not add episodes',
-    () async {
-      final id = model.addMedia('local', entries.first);
-      final source = _DelayedSource();
-      model.connection = source;
-      final cancel = CancelToken();
-      final work = model.loadSeriesEpisodes(
-        store.get('media', id)!,
-        cancel: cancel,
-      );
-      await source.started.future;
-      cancel.cancel();
-      source.listing.complete(entries);
-      await expectLater(work, throwsA(isA<Cancelled>()));
-      expect((await model.loadLibrarySnapshot()).media, hasLength(1));
-    },
-  );
+  test('directory cancellation before a delayed listing completes does not add episodes', () async {
+    final id = model.addMedia('local', entries.first);
+    final source = _DelayedSource();
+    model.connection = source;
+    final cancel = CancelToken();
+    final work = model.loadSeriesEpisodes(
+      store.get('media', id)!,
+      cancel: cancel,
+    );
+    await source.started.future;
+    cancel.cancel();
+    source.listing.complete(entries);
+    await expectLater(work, throwsA(isA<Cancelled>()));
+    expect((await model.loadLibrarySnapshot()).media, hasLength(1));
+  });
 
-  test(
-    'recognition promotes existing browsing frames and technical metadata without recapture',
-    () async {
-      final entry = entries[1];
-      final browsingId = model.ensureSourceMediaPreview('local', entry);
-      final request = MediaPreviewRequest(
-        browsingId,
-        'local',
-        entry.path,
-        entry.size,
-      );
-      final frame = await File(
-        '${root.path}/frame.jpg',
-      ).writeAsBytes([1, 2, 3]);
-      store.setLocal('preview:$browsingId', {
-        'path': frame.path,
-        'fingerprint': request.fingerprint,
-        'contentFingerprint': request.contentFingerprint,
-        'formatVersion': MediaPreview.formatVersion,
-      });
-      store.setLocal('mediaMetadata:$browsingId', {
-        'fingerprint': request.contentFingerprint,
-        'duration': 90.0,
-        'width': 1920,
-        'height': 1080,
-      });
-      await model.synchronizeCollectionInBackground('local', collection);
-      final episode = model.sourceMedia('local', entry.path)!;
-      expect(episode.id, isNot(browsingId));
-      expect(model.thumbnailPath(episode.id), frame.path);
-      expect(await model.needsMediaPreview(episode.id), isFalse);
-      expect(model.mediaDuration(episode), 90);
-      expect(model.mediaDimensions(episode), (width: 1920, height: 1080));
-      expect(store.local('preview:$browsingId'), isNull);
-      expect(store.local('mediaMetadata:$browsingId'), isNull);
-    },
-  );
+  test('recognition promotes existing browsing frames and technical metadata without recapture', () async {
+    final entry = entries[1];
+    final browsingId = model.ensureSourceMediaPreview('local', entry);
+    final request = MediaPreviewRequest(
+      browsingId,
+      'local',
+      entry.path,
+      entry.size,
+    );
+    final frame = await File('${root.path}/frame.jpg').writeAsBytes([1, 2, 3]);
+    store.setLocal('preview:$browsingId', {
+      'path': frame.path,
+      'fingerprint': request.fingerprint,
+      'contentFingerprint': request.contentFingerprint,
+      'formatVersion': MediaPreview.formatVersion,
+    });
+    store.setLocal('mediaMetadata:$browsingId', {
+      'fingerprint': request.contentFingerprint,
+      'duration': 90.0,
+      'width': 1920,
+      'height': 1080,
+    });
+    await model.synchronizeCollectionInBackground('local', collection);
+    final episode = model.sourceMedia('local', entry.path)!;
+    expect(episode.id, isNot(browsingId));
+    expect(model.thumbnailPath(episode.id), frame.path);
+    expect(await model.needsMediaPreview(episode.id), isFalse);
+    expect(model.mediaDuration(episode), 90);
+    expect(model.mediaDimensions(episode), (width: 1920, height: 1080));
+    expect(store.local('preview:$browsingId'), isNull);
+    expect(store.local('mediaMetadata:$browsingId'), isNull);
+  });
 
-  test(
-    'unrecognized collections need explicit import while recognized update-only remains available',
-    () async {
-      await model.synchronizeCollectionInBackground(
-        'local',
-        collection.withMetadata(null, {}),
-      );
-      expect((await model.loadLibrarySnapshot()).media, isEmpty);
-      await model.synchronizeCollectionInBackground(
-        'local',
-        collection,
-        importMissing: false,
-      );
-      expect((await model.loadLibrarySnapshot()).media, isEmpty);
-      final id = model.addMedia('local', entries.first);
-      await model.synchronizeCollectionInBackground(
-        'local',
-        collection,
-        importMissing: false,
-      );
-      expect(store.get('media', id)!.data['bangumiId'], '7');
-      expect((await model.loadLibrarySnapshot()).media, hasLength(1));
-      await model.synchronizeCollectionInBackground(
-        'local',
-        collection.withMetadata(null, {}),
-      );
-      expect((await model.loadLibrarySnapshot()).media, hasLength(3));
-    },
-  );
+  test('unrecognized collections need explicit import while recognized update-only remains available', () async {
+    await model.synchronizeCollectionInBackground(
+      'local',
+      collection.withMetadata(null, {}),
+    );
+    expect((await model.loadLibrarySnapshot()).media, isEmpty);
+    await model.synchronizeCollectionInBackground(
+      'local',
+      collection,
+      importMissing: false,
+    );
+    expect((await model.loadLibrarySnapshot()).media, isEmpty);
+    final id = model.addMedia('local', entries.first);
+    await model.synchronizeCollectionInBackground(
+      'local',
+      collection,
+      importMissing: false,
+    );
+    expect(store.get('media', id)!.data['bangumiId'], '7');
+    expect((await model.loadLibrarySnapshot()).media, hasLength(1));
+    await model.synchronizeCollectionInBackground(
+      'local',
+      collection.withMetadata(null, {}),
+    );
+    expect((await model.loadLibrarySnapshot()).media, hasLength(3));
+  });
 
   test(
     'a newer library frame wins over a browsing frame during promotion',
@@ -480,71 +442,169 @@ void main() {
     },
   );
 
-  test(
-    'a browsing capture finishing after recognition publishes to its new library ID',
-    () async {
-      model.dispose();
-      final started = Completer<void>();
-      final captured = Completer<MediaPreview>();
-      model = _Model(
-        store,
-        root,
-        enableThumbnails: true,
-        previewCapture: (uri, cancel) {
-          started.complete();
-          return captured.future;
-        },
-      );
-      final entry = entries.first;
+  test('a browsing capture finishing after recognition publishes to its new library ID', () async {
+    model.dispose();
+    final started = Completer<void>();
+    final captured = Completer<MediaPreview>();
+    model = _Model(
+      store,
+      root,
+      enableThumbnails: true,
+      previewCapture: (uri, cancel) {
+        started.complete();
+        return captured.future;
+      },
+    );
+    final entry = entries.first;
+    final browsingId = model.ensureSourceMediaPreview('local', entry);
+    await started.future.timeout(const Duration(seconds: 5));
+    await model.synchronizeCollectionInBackground('local', collection);
+    final id = model.sourceMedia('local', entry.path)!.id;
+    expect(store.local('location:$id')['previewRevision'], '${entry.modified}');
+    final ready = Completer<void>();
+    model.addListener(() {
+      if (!ready.isCompleted && model.thumbnailPath(id) != null) {
+        ready.complete();
+      }
+    });
+    captured.complete(
+      MediaPreview(Uint8List.fromList([1, 2, 3]), 90, 1920, 1080),
+    );
+    await ready.future.timeout(const Duration(seconds: 5));
+    expect(model.thumbnailPath(id), isNotNull);
+    expect(await model.needsMediaPreview(id), isFalse);
+    expect(store.local('preview:$browsingId'), isNull);
+    expect(model.mediaDimensions(store.get('media', id)!), (
+      width: 1920,
+      height: 1080,
+    ));
+    await model.pausePreviews();
+  });
+
+  test('explicit import also retains its browsing frame but rejects changed content', () async {
+    for (final changed in [false, true]) {
+      final entry = entries[changed ? 1 : 0];
       final browsingId = model.ensureSourceMediaPreview('local', entry);
-      await started.future.timeout(const Duration(seconds: 5));
-      await model.synchronizeCollectionInBackground('local', collection);
-      final id = model.sourceMedia('local', entry.path)!.id;
-      final ready = Completer<void>();
-      model.addListener(() {
-        if (!ready.isCompleted && model.thumbnailPath(id) != null) {
-          ready.complete();
-        }
-      });
-      captured.complete(
-        MediaPreview(Uint8List.fromList([1, 2, 3]), 90, 1920, 1080),
+      final request = MediaPreviewRequest(
+        browsingId,
+        'local',
+        entry.path,
+        changed ? entry.size + 100 : entry.size,
       );
-      await ready.future.timeout(const Duration(seconds: 5));
-      expect(model.thumbnailPath(id), isNotNull);
-      expect(await model.needsMediaPreview(id), isFalse);
-      expect(store.local('preview:$browsingId'), isNull);
-      expect(model.mediaDimensions(store.get('media', id)!), (
-        width: 1920,
-        height: 1080,
-      ));
-      await model.pausePreviews();
-    },
-  );
+      store.setLocal('preview:$browsingId', {
+        'path': '${root.path}/$browsingId.jpg',
+        'fingerprint': request.fingerprint,
+        'contentFingerprint': request.contentFingerprint,
+        'formatVersion': MediaPreview.formatVersion,
+      });
+      final id = model.addMedia('local', entry);
+      expect(
+        model.thumbnailPath(id),
+        changed ? isNull : '${root.path}/$browsingId.jpg',
+      );
+    }
+  });
+
+  test('browse revision promotion keeps the same file and rejects changed size or mtime', () {
+    for (var index = 0; index < 3; index++) {
+      final entry = entries[index];
+      final browseId = browsingMediaId('local', entry.path);
+      store.setLocal('browse:$browseId', {
+        'source': 'local',
+        'path': entry.path,
+        'size': entry.size,
+        'previewRevision': '${entry.modified}',
+      });
+      final request = MediaPreviewRequest(
+        browseId,
+        'local',
+        entry.path,
+        entry.size,
+        revision: '${entry.modified}',
+      );
+      store.setLocal('preview:$browseId', {
+        'path': '${root.path}/frame-$index.jpg',
+        'fingerprint': request.fingerprint,
+        'contentFingerprint': request.contentFingerprint,
+        'formatVersion': MediaPreview.formatVersion,
+      });
+      final id = model.addMedia(
+        'local',
+        SourceEntry(
+          name: entry.name,
+          path: entry.path,
+          size: entry.size + (index == 1 ? 1 : 0),
+          modified: entry.modified + (index == 2 ? 1 : 0),
+        ),
+      );
+      expect(
+        store.local('location:$id')['previewRevision'],
+        index == 0 ? '${entry.modified}' : isNull,
+      );
+      expect(
+        model.thumbnailPath(id),
+        index == 0 ? '${root.path}/frame-$index.jpg' : isNull,
+      );
+    }
+  });
 
   test(
-    'explicit import also retains its browsing frame but rejects changed content',
+    'browse revision cannot promote a replaced source or an excluded file',
     () async {
-      for (final changed in [false, true]) {
-        final entry = entries[changed ? 1 : 0];
-        final browsingId = model.ensureSourceMediaPreview('local', entry);
-        final request = MediaPreviewRequest(
-          browsingId,
-          'local',
+      final entry = entries.first;
+      const source = {
+        'id': 'nas',
+        'kind': 'webdav',
+        'url': 'http://old.example/',
+        'user': 'reader',
+      };
+      store.setLocal('sources', [source]);
+      final browseId = browsingMediaId('nas', entry.path);
+      final revision = browsePreviewRevision(store, 'nas', '${entry.modified}');
+      store.setLocal('browse:$browseId', {
+        'source': 'nas',
+        'path': entry.path,
+        'size': entry.size,
+        'previewRevision': revision,
+        'fileRevision': '${entry.modified}',
+      });
+      expect(
+        matchingBrowsingPreviewRevision(
+          store,
+          'nas',
           entry.path,
-          changed ? entry.size + 100 : entry.size,
-        );
-        store.setLocal('preview:$browsingId', {
-          'path': '${root.path}/$browsingId.jpg',
-          'fingerprint': request.fingerprint,
-          'contentFingerprint': request.contentFingerprint,
-          'formatVersion': MediaPreview.formatVersion,
-        });
-        final id = model.addMedia('local', entry);
-        expect(
-          model.thumbnailPath(id),
-          changed ? isNull : '${root.path}/$browsingId.jpg',
-        );
-      }
+          entry.size,
+          entry.modified,
+        ),
+        revision,
+      );
+      store.setLocal('sources', [
+        {...source, 'url': 'http://new.example/'},
+      ]);
+      expect(
+        matchingBrowsingPreviewRevision(
+          store,
+          'nas',
+          entry.path,
+          entry.size,
+          entry.modified,
+        ),
+        isNull,
+      );
+      expect(hasCurrentPreviewOrigin(store, 'nas', revision), false);
+      store.setLocal('sources', [source]);
+      final id = model.addMedia('nas', entry);
+      await model.removeMedia(store.get('media', id)!);
+      expect(
+        matchingBrowsingPreviewRevision(
+          store,
+          'nas',
+          entry.path,
+          entry.size,
+          entry.modified,
+        ),
+        isNull,
+      );
     },
   );
 }

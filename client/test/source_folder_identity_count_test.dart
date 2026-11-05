@@ -199,7 +199,8 @@ class _Fixture {
       root = await Directory.systemTemp.createTemp('source-identity-count-');
       store = AppStore(disk ? '${root.path}/library.db' : ':memory:')
         ..setLocal('settings', {
-          'metadataStrategy': 'off',
+          'metadataStrategy': ai ? 'conservative' : 'off',
+          'autoIdentifyOnFolderOpen': ai,
           'autoDiscover': false,
         });
       final entries = _listing(extra: extra);
@@ -285,19 +286,21 @@ void main() {
     final storage = disk ? 'worker database' : 'memory database';
 
     testWidgets(
-      '$storage keeps the complete AI episode list before and after import',
+      '$storage identifies on entry and then keeps the complete AI episode list',
       (tester) async {
         final fixture = _Fixture();
         try {
           await fixture.mount(tester, disk: disk, ai: true);
           final model = fixture.model as _AiModel;
-          expect(find.text('4 集'), findsOneWidget);
+          expect(find.text(_folder), findsOneWidget);
+          expect(find.text('4 个视频'), findsNothing);
           expect(fixture.store.records('media'), isEmpty);
-          expect(model.aiCalls, 1);
+          expect(model.aiCalls, 0);
           await fixture.refresh(tester);
-          expect(find.text('4 集'), findsOneWidget);
+          expect(find.text(_folder), findsOneWidget);
+          expect(find.text('4 个视频'), findsNothing);
           expect(fixture.store.records('media'), isEmpty);
-          expect(model.aiCalls, 1);
+          expect(model.aiCalls, 0);
           await fixture.enter(tester);
           await _settle(
             tester,
@@ -312,6 +315,7 @@ void main() {
             '4',
           );
           await fixture.back(tester);
+          expect(model.aiCalls, 1);
           expect(find.text('4 集'), findsOneWidget);
           expect(tester.takeException(), isNull);
         } finally {

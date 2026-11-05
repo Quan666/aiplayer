@@ -1,7 +1,8 @@
-FROM golang:1.27.3-bookworm AS source
+FROM golang:1.27.3-bookworm@sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9 AS source
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+RUN go mod verify
 COPY *.go ./
 
 FROM source AS test
@@ -18,7 +19,7 @@ RUN CGO_ENABLED=1 go build -trimpath \
 FROM scratch AS binary
 COPY --from=build /out/aiplayer-sync /aiplayer-sync
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 RUN groupadd -g 10001 syncuser && useradd -u 10001 -g syncuser syncuser && mkdir /data && chown syncuser:syncuser /data
 COPY --from=build /out/aiplayer-sync /usr/local/bin/aiplayer-sync
 USER syncuser

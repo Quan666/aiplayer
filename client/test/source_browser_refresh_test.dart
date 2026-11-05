@@ -15,18 +15,52 @@ import 'package:flutter_test/flutter_test.dart';
 
 class _RealHttp extends HttpOverrides {}
 
+class _ObservedCatalog extends LibraryCatalog {
+  final void Function() inspected;
+  _ObservedCatalog(
+    super.store, {
+    required this.inspected,
+    super.strategy,
+    super.prepareDirectory,
+    super.persistDirectory,
+    super.readDirectory,
+  });
+  @override
+  Future<DirectoryCollection?> inspect(
+    String sourceId,
+    String path,
+    List<SourceEntry> entries, {
+    int? directoryModified,
+    CancelToken? cancel,
+    bool allowAutomatic = true,
+  }) async {
+    final value = await super.inspect(
+      sourceId,
+      path,
+      entries,
+      directoryModified: directoryModified,
+      cancel: cancel,
+      allowAutomatic: allowAutomatic,
+    );
+    inspected();
+    return value;
+  }
+}
+
 class _WebDavModel extends AppModel {
   final String address;
   int reconciliations = 0;
   int preparations = 0;
   int completedCollections = 0;
+  int completedInspections = 0;
   _WebDavModel(super.store, super.documents, this.address)
     : super(backgroundWork: false);
 
   @override
   LibraryCatalog get catalog => _trackedCatalog;
-  late final _trackedCatalog = LibraryCatalog(
+  late final _trackedCatalog = _ObservedCatalog(
     store,
+    inspected: () => completedInspections++,
     strategy: () => 'off',
     prepareDirectory: (source, path, context, entries, cancel) async {
       final prepared = await super.catalog.prepareDirectory!(
@@ -282,7 +316,15 @@ class _AutomaticCatalogTransport implements JsonTransport {
 }
 
 class _AutomaticModel extends _ControlledModel {
-  _AutomaticModel(super.store, super.documents);
+  _AutomaticModel(super.store, super.documents) {
+    if (preferences.metadataStrategy != 'off' &&
+        !settings.containsKey('autoIdentifyOnFolderOpen')) {
+      store.setLocal('settings', {
+        ...settings,
+        'autoIdentifyOnFolderOpen': true,
+      });
+    }
+  }
   final transport = _AutomaticCatalogTransport();
   int reconciliations = 0;
   @override
@@ -290,6 +332,7 @@ class _AutomaticModel extends _ControlledModel {
   late final _automaticCatalog = LibraryCatalog(
     store,
     strategy: () => preferences.metadataStrategy,
+    automaticEnabled: () => automaticMetadataEnabled,
     transport: transport,
   );
 
@@ -313,6 +356,41 @@ class _AutomaticModel extends _ControlledModel {
 }
 
 void main() {
+  testWidgets(
+    'child folder previews never identify before entering the folder',
+    (tester) async {
+      final root = Directory.systemTemp.createTempSync('source-preview-local-');
+      final store = AppStore(':memory:');
+      final model = _AutomaticModel(store, root)..folders = true;
+      model.transport.failing = false;
+      try {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SourceBrowser(
+              model: model,
+              source: const {'id': 'nas', 'kind': 'webdav'},
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(model.automaticMetadataEnabled, isTrue);
+        expect(model.paths, contains('Series'));
+        expect(model.transport.searches, 0);
+        expect(model.transport.episodeRequests, 0);
+        expect(model.media, isEmpty);
+        await tester.tap(find.byKey(const ValueKey('Series')));
+        await tester.pumpAndSettle();
+        expect(model.transport.searches, greaterThan(0));
+        expect(model.media, hasLength(1));
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        model.dispose();
+        store.dispose();
+        root.deleteSync(recursive: true);
+      }
+    },
+  );
+
   testWidgets('source home and local videos refresh from short lists', (
     tester,
   ) async {
@@ -383,7 +461,7 @@ void main() {
           );
           await tester.pumpAndSettle();
           expect(model.requests, 2);
-          expect(find.textContaining('已收录 2 集'), findsOneWidget);
+          expect(find.text('Example S01E02.mkv'), findsOneWidget);
           expect(tester.takeException(), isNull);
         } finally {
           await tester.pumpWidget(const SizedBox());
@@ -413,7 +491,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('搜索'));
+      await _folderAction(tester, '搜索');
       await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField), 'Example');
       await tester.pump(const Duration(milliseconds: 300));
@@ -565,7 +643,7 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        expect(find.textContaining('已收录 1 集'), findsOneWidget);
+        expect(find.text('Example S01E01.mkv'), findsOneWidget);
         expect(model.transport.episodeRequests, 1);
         final token = model.transport.episodeCancel!;
         await tester.pump(const Duration(minutes: 5));
@@ -624,7 +702,7 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        expect(find.textContaining('已收录 1 集'), findsOneWidget);
+        expect(find.text('Example S01E01.mkv'), findsOneWidget);
         final firstSearches = model.transport.searches;
         expect(firstSearches, greaterThan(0));
         await tester.pump(const Duration(minutes: 10));
@@ -670,9 +748,8 @@ void main() {
         );
         await tester.pumpAndSettle();
         expect(model.transport.searches, 0);
-        expect(find.textContaining('已收录 1 集'), findsOneWidget);
-        store.setLocal('settings', {'metadataStrategy': 'conservative'});
-        model.changed();
+        expect(find.text('Example S01E01.mkv'), findsOneWidget);
+        await model.updatePreferences({'autoIdentifyOnFolderOpen': true});
         await tester.pumpAndSettle();
         expect(find.text('自动识别的系列'), findsOneWidget);
         expect(model.reconciliations, 1);
@@ -721,7 +798,7 @@ void main() {
       expect(first.connections, 0);
       expect(second.connections, 2);
       expect(second.requests, 1);
-      expect(find.textContaining('已收录 1 集'), findsOneWidget);
+      expect(find.text('Example S01E01.mkv'), findsOneWidget);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
       await tester.pumpWidget(surface(first));
       await tester.pumpAndSettle();
@@ -822,7 +899,7 @@ void main() {
       update(() => active = true);
       await tester.pumpAndSettle();
       expect(model.requests, 1);
-      expect(find.textContaining('已收录 1 集'), findsOneWidget);
+      expect(find.text('Example S01E01.mkv'), findsOneWidget);
       final closed = model.closed;
       opening.complete(_Connection(model));
       await tester.pumpAndSettle();
@@ -888,6 +965,7 @@ void main() {
       final store = AppStore(':memory:')
         ..setLocal('settings', {'metadataStrategy': 'off'});
       final model = _ControlledModel(store, root);
+      model.addMedia('direct', model.listing.first);
       late StateSetter update;
       var active = true;
       try {
@@ -913,6 +991,7 @@ void main() {
         final record = model.media.single;
         store.save('media', record.id, {
           ...record.data,
+          'bangumiId': '7',
           'metadataTitle': '更新后的作品',
         });
         final gate = model.snapshotGate = Completer<void>();
@@ -924,10 +1003,10 @@ void main() {
         gate.complete();
         model.snapshotGate = null;
         await tester.pumpAndSettle();
-        expect(find.text('更新后的作品'), findsNothing);
+        expect(find.textContaining('更新后的作品'), findsNothing);
         update(() => active = true);
         await tester.pumpAndSettle();
-        expect(find.text('更新后的作品'), findsOneWidget);
+        expect(find.textContaining('更新后的作品'), findsOneWidget);
         expect(model.stats, 1);
       } finally {
         model.snapshotGate?.complete();
@@ -982,7 +1061,8 @@ void main() {
           reason:
               'The cancelled network listing is fetched again after resume.',
         );
-        expect(find.text('Example'), findsOneWidget);
+        expect(find.text('Series'), findsOneWidget);
+        expect(find.text('Example'), findsNothing);
         expect(model.media, isEmpty);
         expect(tester.takeException(), isNull);
       } finally {
@@ -1030,7 +1110,8 @@ void main() {
         );
         await tester.pumpAndSettle();
         expect(model.paths.where((path) => path == 'Series'), hasLength(2));
-        expect(find.text('Example'), findsOneWidget);
+        expect(find.text('Series'), findsOneWidget);
+        expect(find.text('Example'), findsNothing);
         expect(model.media, isEmpty);
         expect(tester.takeException(), isNull);
       } finally {
@@ -1092,12 +1173,14 @@ void main() {
         model.listing = _videos(3);
         update(() => active = true);
         await tester.pumpAndSettle();
-        expect(find.textContaining('已收录 3 集'), findsOneWidget);
+        expect(find.text('Example S01E03.mkv'), findsOneWidget);
         expect(model.requests, 3);
         expect(model.maxActive, 1);
         pending.complete(_videos(5));
         await tester.pumpAndSettle();
-        expect(model.media, hasLength(3));
+        expect(model.media, isEmpty);
+        expect(find.text('Example S01E03.mkv'), findsOneWidget);
+        expect(find.text('Example S01E05.mkv'), findsNothing);
         expect(tester.takeException(), isNull);
       } finally {
         await tester.pumpWidget(const SizedBox());
@@ -1150,7 +1233,7 @@ void main() {
             );
             await tester.pumpAndSettle();
             expect(model.requests, pausedRequests + 1);
-            expect(find.textContaining('已收录 2 集'), findsOneWidget);
+            expect(find.text('Example S01E02.mkv'), findsOneWidget);
             await tester.pump(const Duration(minutes: 10));
             await tester.pumpAndSettle();
             expect(model.requests, pausedRequests + 1);
@@ -1202,12 +1285,12 @@ void main() {
       await tester.pump(const Duration(minutes: 10));
       await tester.pumpAndSettle();
       expect(model.requests, 2);
-      expect(find.textContaining('已收录 1 集'), findsOneWidget);
+      expect(find.text('Example S01E01.mkv'), findsOneWidget);
       model.failing = false;
       model.listing = _videos(2);
       await _refresh(tester);
       expect(model.requests, 3);
-      expect(find.textContaining('已收录 2 集'), findsOneWidget);
+      expect(find.text('Example S01E02.mkv'), findsOneWidget);
       await tester.pump(const Duration(minutes: 10));
       await tester.pumpAndSettle();
       expect(model.requests, 3);
@@ -1308,21 +1391,21 @@ void main() {
         await tester.tap(folder);
         await _settle(
           tester,
-          () => find.textContaining('已收录 1 集').evaluate().isNotEmpty,
+          () => find.text('Example S01E01.mkv').evaluate().isNotEmpty,
         );
         await tester.pumpAndSettle();
 
         await tester.tap(find.byTooltip('返回'));
         await _settle(tester, () => folder.evaluate().isNotEmpty);
         available = 3;
-        final beforeCollections = model.completedCollections;
+        final beforeCollections = model.completedInspections;
         final beforeReopen = requests
             .where((path) => path == '/dav/Series/')
             .length;
         await tester.tap(folder);
         await _settle(
           tester,
-          () => find.textContaining('已收录 3 集').evaluate().isNotEmpty,
+          () => find.text('Example S01E03.mkv').evaluate().isNotEmpty,
         );
         expect(
           requests.where((path) => path == '/dav/Series/').length,
@@ -1330,7 +1413,7 @@ void main() {
         );
         await _settle(
           tester,
-          () => model.completedCollections > beforeCollections,
+          () => model.completedInspections > beforeCollections,
         );
         await tester.runAsync(() => model.loadLibrarySnapshot());
         await tester.pumpAndSettle();
@@ -1374,9 +1457,9 @@ void main() {
         );
         await _settle(
           tester,
-          () => find.textContaining('已收录 4 集').evaluate().isNotEmpty,
+          () => find.text('Example S01E04.mkv').evaluate().isNotEmpty,
         );
-        await _settle(tester, () => model.media.length == 4);
+        expect(model.media, isEmpty);
         await _settle(tester, () => changedFinished);
         update(() => active = false);
         await tester.pumpAndSettle();
@@ -1391,7 +1474,7 @@ void main() {
         await tester.pump();
         await _settle(
           tester,
-          () => find.textContaining('已收录 5 集').evaluate().isNotEmpty,
+          () => find.text('Example S01E05.mkv').evaluate().isNotEmpty,
         );
 
         unawaited(
@@ -1411,7 +1494,7 @@ void main() {
         await tester.pumpAndSettle();
         await _settle(
           tester,
-          () => find.textContaining('已收录 6 集').evaluate().isNotEmpty,
+          () => find.text('Example S01E06.mkv').evaluate().isNotEmpty,
         );
 
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
@@ -1429,7 +1512,7 @@ void main() {
         await tester.pump();
         await _settle(
           tester,
-          () => find.textContaining('已收录 7 集').evaluate().isNotEmpty,
+          () => find.text('Example S01E07.mkv').evaluate().isNotEmpty,
         );
         await tester.pumpWidget(const SizedBox());
         final closedRequests = requests.length;
@@ -1451,4 +1534,21 @@ void main() {
       }
     },
   );
+}
+
+Future<void> _folderAction(WidgetTester tester, String label) async {
+  final direct = find.byTooltip(label);
+  if (direct.evaluate().isNotEmpty) {
+    await tester.tap(direct.first);
+    return;
+  }
+  final folder = find.byKey(const ValueKey('source-folder-menu'));
+  await tester.tap(
+    folder.evaluate().isNotEmpty
+        ? folder
+        : find.byKey(const ValueKey('local-folder-menu')),
+  );
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
 }

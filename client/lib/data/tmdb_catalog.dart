@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:isolate';
+
 import 'package:crypto/crypto.dart';
+
 import '../core/network.dart';
 import 'catalog_cache.dart';
 import 'library_catalog.dart' show metadataQuery, normalizedSeries;
@@ -52,6 +54,15 @@ class TmdbCatalog {
     final response = await _cache.load<Map<String, dynamic>>(
       key,
       fetch: (token) async {
+        // A credential can be removed while a disk-cache miss or another
+        // catalogue request is awaited. Never send that captured old key.
+        final current = (await credential()).trim();
+        token.check();
+        if (current.isEmpty ||
+            current != secret ||
+            revision != _cacheRevision) {
+          throw const AppFailure('TMDB 服务配置已变更，请重新发起请求。');
+        }
         final result = await transport.send(
           Uri.https('api.themoviedb.org', '/3/$path', {
             'language': 'zh-CN',

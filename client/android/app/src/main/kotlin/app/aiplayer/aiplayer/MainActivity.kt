@@ -33,6 +33,7 @@ import java.net.Inet4Address
 class MainActivity : FlutterActivity() {
     private var windowModeChannel: MethodChannel? = null
     private var externalVideos: ExternalVideoHandler? = null
+    private var externalFiles: ExternalFileHandler? = null
     private var systemProxy: SystemProxyHandler? = null
     private var mediaControls: MediaControlsHandler? = null
     private var deviceInfoChannel: MethodChannel? = null
@@ -53,6 +54,11 @@ class MainActivity : FlutterActivity() {
     private val pipPlayAction get() = "$packageName.PIP_PLAY"
     private val pipPauseAction get() = "$packageName.PIP_PAUSE"
 
+    private fun isTelevision(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK) ==
+            Configuration.UI_MODE_TYPE_TELEVISION ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         deviceInfoChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger,
@@ -64,12 +70,16 @@ class MainActivity : FlutterActivity() {
                         ?.takeIf { it.isNotBlank() } ?: Build.MODEL
                     val model = if (Build.MODEL.startsWith(Build.MANUFACTURER, ignoreCase = true))
                         Build.MODEL else "${Build.MANUFACTURER} ${Build.MODEL}"
-                    result.success(mapOf("name" to name, "model" to model, "platform" to "Android"))
+                    result.success(mapOf("name" to name, "model" to model,
+                        "platform" to "Android", "isTelevision" to isTelevision()))
                 }
             }
         }
         externalVideos = ExternalVideoHandler(this, flutterEngine.dartExecutor.binaryMessenger)
         externalVideos?.accept(intent)
+        externalFiles?.close()
+        externalFiles = ExternalFileHandler(this, flutterEngine.dartExecutor.binaryMessenger)
+        externalFiles?.setResumed(displayActive)
         systemProxy?.close()
         systemProxy = SystemProxyHandler(flutterEngine.dartExecutor.binaryMessenger)
         mediaControls?.close()
@@ -309,7 +319,7 @@ class MainActivity : FlutterActivity() {
         orientationListener?.disable()
         orientationListener = null
         lastGravityOrientation = null
-        if (!enabled) return
+        if (!enabled || isTelevision()) return
         orientationListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(degrees: Int) {
                 if (degrees == ORIENTATION_UNKNOWN) return
@@ -414,6 +424,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        externalFiles?.setResumed(true)
         displayActive = true
         applyRefreshRatePreference()
         lastGravityOrientation = null
@@ -421,6 +432,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onPause() {
+        externalFiles?.setResumed(false)
         displayActive = false
         applyRefreshRatePreference()
         orientationListener?.disable()
@@ -436,6 +448,8 @@ class MainActivity : FlutterActivity() {
         deviceInfoChannel = null
         externalVideos?.close()
         externalVideos = null
+        externalFiles?.close()
+        externalFiles = null
         systemProxy?.close()
         systemProxy = null
         mediaControls?.close()

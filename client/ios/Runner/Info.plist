@@ -34,7 +34,7 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>发现并连接局域网 NAS、WebDAV 和同步服务以播放视频。</string>
+	<string>连接局域网 NAS、WebDAV 和同步服务以浏览及播放媒体，并在您开启手机控制后接收配对手机的操作。</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_smb._tcp</string>

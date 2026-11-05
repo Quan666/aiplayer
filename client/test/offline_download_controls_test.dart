@@ -102,8 +102,9 @@ class _Model extends AppModel {
   @override
   Future<void> downloadSourceEntries(
     String sourceId,
-    Iterable<SourceEntry> entries,
-  ) async {
+    Iterable<SourceEntry> entries, {
+    bool personalMedia = false,
+  }) async {
     final batch = entries.toList();
     sourceBatches.add(batch);
     sourceRequested.add((sourceId, batch.map((item) => item.path).toList()));
@@ -553,11 +554,22 @@ void main() {
     );
     await tester.tap(find.text('打开'));
     await tester.pumpAndSettle();
-    expect(find.text('文件夹包含所有子目录中的视频。'), findsOneWidget);
+    expect(find.text('包含所有子目录中的文件。'), findsOneWidget);
     expect(find.byIcon(Icons.folder_outlined), findsOneWidget);
     await tester.tap(find.text('全选'));
     await tester.pump();
     await tester.tap(find.text('下载 (2)'));
+    await tester.pumpAndSettle();
+    expect(find.text('下载文件夹？'), findsOneWidget);
+    expect(find.textContaining('以及选中的 1 个文件'), findsOneWidget);
+    expect(model.sourceRequested, isEmpty);
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    expect(find.text('下载 (2)'), findsOneWidget);
+    expect(model.sourceRequested, isEmpty);
+    await tester.tap(find.text('下载 (2)'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('下载'));
     await tester.pumpAndSettle();
     expect(model.sourceRequested.single.$2, [
       '/share/Season/',

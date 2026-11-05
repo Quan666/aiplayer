@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:math' show max;
+
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
+
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
@@ -48,9 +50,8 @@ void showFailure(BuildContext context, Object error) {
   final failure = safeFailure(error);
   AppLog.instance.error('操作', failure.message);
   if (context.mounted) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(failure.message)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(failure.message)));
   }
 }
 
@@ -609,9 +610,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
 
   Future<void> _removeItems(List<SyncRecord> items) async {
     try {
-      final managedCount = (await Future.wait(
-        items.map(model.isManagedImport),
-      )).where((managed) => managed).length;
+      final managedCount = (await Future.wait(items.map(model.isManagedImport)))
+          .where((managed) => managed)
+          .length;
       final downloadCount = items
           .where((item) => model.downloads.entryFor(item.id) != null)
           .length;
@@ -1148,6 +1149,13 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         children: [
           MediaArtwork(
             thumbnail: view?.thumbnail,
+            thumbnailRevision: model.mediaPreviewImageRevision(media.id),
+            thumbnailChanges: model,
+            thumbnailRevisionOf: () =>
+                model.mediaPreviewImageRevision(media.id),
+            onThumbnailError: (path, error) =>
+                model.retryMissingMediaPreview(media.id, path, error),
+            onThumbnailReady: (path) => model.mediaPreviewReady(media.id, path),
             loadWhileScrolling: true,
             onRequestPreview: view == null
                 ? null
@@ -1192,9 +1200,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                       value: fraction,
                       minHeight: LibraryStyles.progressHeight,
                       color: GlassPalette.of(context).onMedia,
-                      backgroundColor: LibraryStyles.of(
-                        context,
-                      ).mediaProgressTrack,
+                      backgroundColor: LibraryStyles.of(context)
+                          .mediaProgressTrack,
                     ),
                   ],
                 ),
@@ -1264,6 +1271,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         title: title,
         poster: details?.poster ?? '',
         thumbnail: model.thumbnailPath(media.id),
+        thumbnailRevision: model.mediaPreviewImageRevision(media.id),
+        thumbnailChanges: model,
+        thumbnailRevisionOf: () => model.mediaPreviewImageRevision(media.id),
         videoCount: videoCount,
         episodeCount: isSeries ? details?.availableEpisodes ?? 0 : 0,
         duration: model.mediaDuration(media),
@@ -1281,6 +1291,9 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         onDetails: () => _details(title, items),
         onRemove: () => _removeItems(items),
         onRequestPreview: () => _requestPreview(media),
+        onThumbnailError: (path, error) =>
+            model.retryMissingMediaPreview(media.id, path, error),
+        onThumbnailReady: (path) => model.mediaPreviewReady(media.id, path),
       ),
     );
   }
@@ -1948,16 +1961,24 @@ class _PosterTile extends StatefulWidget {
   final PosterCache cache;
   final String title, poster, mediaId;
   final String? thumbnail;
+  final int thumbnailRevision;
+  final Listenable? thumbnailChanges;
+  final Object? Function()? thumbnailRevisionOf;
   final int videoCount, episodeCount;
   final double duration;
   final bool selecting, selected, enabled;
   final VoidCallback onTap, onDetails, onRequestPreview, onSelect;
   final VoidCallback? onRemove;
+  final void Function(String, Object)? onThumbnailError;
+  final ValueChanged<String>? onThumbnailReady;
   const _PosterTile({
     required this.cache,
     required this.title,
     required this.poster,
     required this.thumbnail,
+    this.thumbnailRevision = 0,
+    this.thumbnailChanges,
+    this.thumbnailRevisionOf,
     required this.videoCount,
     required this.episodeCount,
     required this.duration,
@@ -1969,6 +1990,8 @@ class _PosterTile extends StatefulWidget {
     required this.onSelect,
     required this.onDetails,
     this.onRemove,
+    this.onThumbnailError,
+    this.onThumbnailReady,
     required this.onRequestPreview,
   });
   @override
@@ -2059,14 +2082,18 @@ class _PosterTileState extends State<_PosterTile> {
                             cache: widget.cache,
                             poster: widget.poster,
                             thumbnail: widget.thumbnail,
+                            thumbnailRevision: widget.thumbnailRevision,
+                            thumbnailChanges: widget.thumbnailChanges,
+                            thumbnailRevisionOf: widget.thumbnailRevisionOf,
+                            onThumbnailError: widget.onThumbnailError,
+                            onThumbnailReady: widget.onThumbnailReady,
                             loadWhileScrolling: true,
                             onRequestPreview: widget.onRequestPreview,
                           ),
                           if (widget.selecting && widget.selected)
                             ColoredBox(
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.primary.withValues(alpha: .2),
+                              color: Theme.of(context).colorScheme.primary
+                                  .withValues(alpha: .2),
                             ),
                           Positioned(
                             top: 4,
@@ -2095,9 +2122,8 @@ class _PosterTileState extends State<_PosterTile> {
                                         icon: Icon(
                                           Icons.info_outline_rounded,
                                           color: c.onMedia,
-                                          shadows: LibraryStyles.of(
-                                            context,
-                                          ).posterIconShadows,
+                                          shadows: LibraryStyles.of(context)
+                                              .posterIconShadows,
                                           size: LibraryStyles.iconButton,
                                         ),
                                       ),
@@ -2118,9 +2144,8 @@ class _PosterTileState extends State<_PosterTile> {
                                 icon: Icon(
                                   Icons.more_horiz_rounded,
                                   color: c.onMedia,
-                                  shadows: LibraryStyles.of(
-                                    context,
-                                  ).posterIconShadows,
+                                  shadows: LibraryStyles.of(context)
+                                      .posterIconShadows,
                                 ),
                                 onSelected: _runAction,
                                 itemBuilder: (_) => _posterActions,
@@ -2591,12 +2616,10 @@ class _SeriesDetailsSheetState extends State<_SeriesDetailsSheet>
   }
 
   @override
-  Widget build(BuildContext context) => DraggableScrollableSheet(
-    expand: false,
-    initialChildSize: .8,
-    builder: (_, scroll) => ListView.builder(
+  Widget build(BuildContext context) => GlassSheetBody(
+    child: ListView.builder(
+      shrinkWrap: true,
       key: const ValueKey('series-details-list'),
-      controller: scroll,
       scrollCacheExtent: const ScrollCacheExtent.viewport(.75),
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       itemCount: _episodes.length + 1,

@@ -31,6 +31,7 @@ final _collection = identifyDirectory('Series', _videos)!.withMetadata(
 class _CachedCatalog extends LibraryCatalog {
   _CachedCatalog(super.store) : super(strategy: () => 'off');
   Completer<DirectoryCollection?>? pendingInspection;
+  int networkInspections = 0;
   @override
   DirectoryPreview? directoryPreview(
     String sourceId,
@@ -53,9 +54,15 @@ class _CachedCatalog extends LibraryCatalog {
     List<SourceEntry> entries, {
     int? directoryModified,
     CancelToken? cancel,
-  }) async => path == 'Series'
-      ? await (pendingInspection?.future ?? Future.value(_collection))
-      : null;
+    bool allowAutomatic = true,
+  }) async {
+    if (path != 'Series') return null;
+    // A genuine cached subject remains immediately available with automatic
+    // requests disabled; the optional network gate must never be entered.
+    if (!allowAutomatic || strategy() == 'off') return _collection;
+    networkInspections++;
+    return await (pendingInspection?.future ?? Future.value(_collection));
+  }
 }
 
 class _OfflineSeries extends SourceAdapter {
@@ -207,6 +214,7 @@ void main() {
         expect(find.textContaining('已收录 1 集'), findsOneWidget);
         expect(store.records('progress'), isEmpty);
         expect(plays, 0);
+        expect(model._catalog.networkInspections, 0);
       } finally {
         pending.complete(null);
         await tester.pumpAndSettle();
@@ -249,6 +257,7 @@ void main() {
         expect(store.records('progress'), isEmpty);
         expect(plays, 0);
         expect(pending.isCompleted, isFalse);
+        expect(model._catalog.networkInspections, 0);
         pending.complete(_collection);
         await tester.pumpAndSettle();
         expect(model.media, hasLength(3));

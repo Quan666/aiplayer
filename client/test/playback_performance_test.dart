@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:aiplayer/data/app_model.dart';
+import 'package:aiplayer/core/third_party_network.dart';
 import 'package:aiplayer/data/preferences.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/playback/session.dart';
@@ -296,6 +297,8 @@ class _Session extends PlaybackSession {
 }
 
 class _Model extends ChangeNotifier implements AppModel {
+  @override
+  final thirdPartyNetwork = ThirdPartyNetworkPolicy();
   _Model({AppStore? store}) : store = store ?? AppStore(':memory:');
 
   final _settings = <String, dynamic>{};
@@ -334,6 +337,7 @@ class _Model extends ChangeNotifier implements AppModel {
 
   @override
   void dispose() {
+    thirdPartyNetwork.dispose();
     store.dispose();
     super.dispose();
   }
@@ -343,6 +347,8 @@ class _Model extends ChangeNotifier implements AppModel {
   @override
   AppPreferences get preferences => AppPreferences(_settings);
   @override
+  Map<String, dynamic> get settings => _settings;
+  @override
   Future<void> updatePreferences(Map<String, dynamic> patch) async {
     _settings.addAll(patch);
     notifyListeners();
@@ -351,7 +357,7 @@ class _Model extends ChangeNotifier implements AppModel {
   @override
   void changed() => notifyListeners();
   @override
-  void ensureMediaPreview(String id) {}
+  bool ensureMediaPreview(String id) => true;
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

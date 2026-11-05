@@ -1,15 +1,20 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+
 import 'package:crypto/crypto.dart';
+
 import 'dart:io';
 import 'dart:math' show max;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
+
 import '../core/network.dart';
+import '../core/third_party_network.dart';
 import '../core/logger.dart';
 import '../danmaku/api.dart';
 import 'media_identity.dart';
@@ -25,6 +30,7 @@ import 'sync.dart';
 import 'sync_profile.dart';
 import 'sync_artwork.dart';
 import 'media_previews.dart';
+import 'media_preview_persistence.dart';
 import 'library_catalog.dart';
 import 'cache_maintenance.dart';
 import 'library_snapshot.dart';
@@ -111,6 +117,16 @@ class AppModel extends ChangeNotifier {
   final Directory documents;
   final bool backgroundWork;
   final FlutterSecureStorage secrets;
+  late final ThirdPartyNetworkPolicy thirdPartyNetwork =
+      ThirdPartyNetworkPolicy(enabled: preferences.thirdPartyNetworkingEnabled);
+  late final SubtitleAiTransport thirdPartyAiTransport =
+      PolicySubtitleAiTransport(
+        thirdPartyNetwork,
+        credential: () async =>
+            await secrets.read(key: 'aiSubtitleToken') ?? '',
+      );
+  Object? _thirdPartyCredentialRevision;
+  int _thirdPartyStoreRevision = -1;
   OfflineDownloads? _downloads;
   Future<void>? _downloadsRestoreWork;
   int _downloadCompletedRevision = 0;
@@ -121,8 +137,9 @@ class AppModel extends ChangeNotifier {
       _downloadMedia(records);
   Future<void> downloadSourceEntries(
     String sourceId,
-    Iterable<SourceEntry> entries,
-  ) => _downloadSourceEntries(sourceId, entries);
+    Iterable<SourceEntry> entries, {
+    bool personalMedia = false,
+  }) => _downloadSourceEntries(sourceId, entries, personalMedia: personalMedia);
   Future<void> deleteDownload(String id) => downloads.delete(id);
 
   Future<LocalDirectoryRemovalPlan> prepareLocalDirectoryRemoval(
@@ -248,6 +265,9 @@ class AppModel extends ChangeNotifier {
   }) async {
     cancel?.check();
     if (_disposed) throw const Cancelled();
+    if (media.data['personalMedia'] == true) {
+      return MediaPlaybackChoice(media, PlaybackSourcePreference.original);
+    }
     if (media.data['transient'] == true) {
       // Explicitly opened external files retain their own playback and cleanup
       // identity, even when their parsed episode matches a library record.
@@ -305,6 +325,17 @@ class AppModel extends ChangeNotifier {
   PosterCache? _posterCache;
   PosterCache get posterCache => _posterCache ??= (PosterCache(
     directory: Directory(p.join(documents.path, 'poster-cache-v1')),
+    networkPolicy: thirdPartyNetwork,
+    configurationChanges: this,
+    // External commits may advance key revisions without changing credentials.
+    // Only committed credential values should revoke in-flight artwork work.
+    configurationRevision: () => (
+      store.local('metadataCredentialsRevision'),
+      store.localModified('secret:tmdb.apiKey'),
+    ),
+    canFetch: (uri) async =>
+        uri.host.toLowerCase() != 'image.tmdb.org' ||
+        (await secrets.read(key: 'tmdb.apiKey'))?.trim().isNotEmpty == true,
   )..setActive(_foreground && !_clearingCaches));
 
   void _prefetchPoster(String url) {
@@ -412,9 +443,11 @@ class AppModel extends ChangeNotifier {
   late final titleTranslations = MediaTitleTranslations(
     store,
     settings: () => settings,
+    transport: thirdPartyAiTransport,
   );
   late final MediaAiRecognition mediaAi = MediaAiRecognition(
     store,
+    transport: thirdPartyAiTransport,
     folderAnalyzer: _analyzeMetadataFolderInBackground,
   );
   late final SyncProfile syncProfile = SyncProfile(
@@ -433,10 +466,10 @@ class AppModel extends ChangeNotifier {
     _activePlaybackMediaId = id;
     _syncResumeTimer?.cancel();
     if (id != null) {
+      catalog.cancelAutomaticRecognition();
       _directoryEnrichmentCancel.cancel();
       _directoryEnrichmentCancel = CancelToken();
       _pauseAutomaticMetadataTasks();
-      _metadataTimer?.cancel();
       _syncTimer?.cancel();
       _syncTimer = null;
       _syncWatch?.cancel();
@@ -458,7 +491,6 @@ class AppModel extends ChangeNotifier {
             return;
           }
           unawaited(synchronize(quiet: true));
-          unawaited(_identifyPending());
         });
       }
     }
@@ -466,8 +498,13 @@ class AppModel extends ChangeNotifier {
 
   late final LibraryCatalog catalog = LibraryCatalog(
     store,
+    transport: thirdPartyNetwork.jsonTransport(),
     provider: () => settings['metadataProvider'] as String? ?? 'bangumi',
     strategy: () => settings['metadataStrategy'] as String? ?? 'conservative',
+    automaticEnabled: () =>
+        automaticMetadataEnabled &&
+        _foreground &&
+        activePlaybackMediaId == null,
     tmdbNameAssist: () => preferences.tmdbNameAssist,
     aiFallback: _identifyDirectoryWithAi,
     aiContext: () => _metadataAiContext,
@@ -583,11 +620,9 @@ class AppModel extends ChangeNotifier {
   bool recognizingDirectory = false;
   DirectoryRecognitionProgress directoryRecognitionProgress =
       const DirectoryRecognitionProgress();
-  final _metadataPending = <String>{};
   Map<String, List<SyncRecord>>? _batchMetadataDonors;
   Map<String, bool>? _batchMediaBindings;
-  Timer? _metadataTimer;
-  bool _identifying = false;
+  int _automaticSettingsWrites = 0;
   final List<MetadataTask> _metadataTasks = [];
   final _metadataLookups = _MetadataLimiter(3);
   bool _metadataWorkerRunning = false;
@@ -617,7 +652,13 @@ class AppModel extends ChangeNotifier {
   MediaPreviewQueue? _previews;
   final _previewDiagnostics = <String>{};
   final _previewFileChecks = <String, Future<bool>>{};
+  final _missingPreviewRepairs = <(String, String), _MissingPreviewRepair>{};
+  final _missingPreviewFailures = <String, ({String path, int attempts})>{};
+  final _missingPreviewImageRevisions = <String, int>{};
+  int _missingPreviewImageSerial = 0;
   final _pendingPreviewChecks = <String>{};
+  final _previewCheckCancels = <String, CancelToken>{};
+  final _waitingPreviewChecks = <String>{};
   final _pendingBrowsePreviews = <String, MediaPreviewRequest>{};
   final _browsePreviewCapacity = ValueNotifier<int>(0);
   ValueListenable<int> get sourcePreviewCapacity => _browsePreviewCapacity;
@@ -627,6 +668,7 @@ class AppModel extends ChangeNotifier {
   int _previewPauses = 0;
   final _playbackPreviewWork = <Future<void>>{};
   bool _disposed = false;
+  bool _browsePreviewsBlocked = false;
   String status = '';
   bool scanning = false;
   AppModel(
@@ -648,11 +690,53 @@ class AppModel extends ChangeNotifier {
         directory: Directory(p.join(documents.path, 'previews')),
         openSource: adapter,
         capture: previewCapture,
+        onCapacity: _previewCapacityAvailable,
         isCurrent: (request) => _currentPreviewId(request) != null,
-        onReady: (request, path, preview) {
-          final id = _currentPreviewId(request);
-          if (id == null) return;
-          final oldPath = (store.local('preview:$id') as Map?)?['path'];
+        onReady: (request, path, preview) async {
+          final cancel = _previews?.activeCancellation;
+          if (cancel == null ||
+              cancel.cancelled ||
+              _clearingCaches ||
+              _currentPreviewId(request) == null) {
+            return;
+          }
+          final input = <String, dynamic>{
+            'id': request.id,
+            'source': request.source,
+            'sourcePath': request.path,
+            'size': request.size,
+            'revision': request.revision,
+            'position': request.position,
+            'previewPath': path,
+            'capturedPosition': preview.capturedPosition,
+            'firstFrame': request.firstFrame,
+            'originalResolution': request.originalResolution,
+            'formatVersion': MediaPreview.formatVersion,
+            'duration': preview.duration,
+            'width': preview.width,
+            'height': preview.height,
+          };
+          PersistedMediaPreview? saved;
+          if (store.path == ':memory:') {
+            store.transaction(() {
+              saved = persistCapturedMediaPreview(store, input);
+            });
+          } else {
+            saved = await (_localStateWorker ??= LocalStateWorker(
+              store.path,
+            )).persistMediaPreview(input, cancel: cancel);
+          }
+          cancel.check();
+          if (saved == null ||
+              _disposed ||
+              _clearingCaches ||
+              !_foreground ||
+              _currentPreviewId(request) == null ||
+              store.get('media', saved!.id)?.deleted == true ||
+              _previewRequest(saved!.id)?.fingerprint != request.fingerprint) {
+            return;
+          }
+          final oldPath = saved!.previousPath;
           if (oldPath is String &&
               oldPath != path &&
               p.isWithin(p.join(documents.path, 'previews'), oldPath)) {
@@ -660,25 +744,13 @@ class AppModel extends ChangeNotifier {
               File(oldPath).delete().catchError((Object _) => File(oldPath)),
             );
           }
-          store.setLocal('preview:$id', {
-            'path': path,
-            'fingerprint': request.fingerprint,
-            'contentFingerprint': request.contentFingerprint,
-            'requestedPosition': request.position,
-            'capturedPosition': preview.capturedPosition,
-            'formatVersion': MediaPreview.formatVersion,
-          });
-          recordMediaMetadata(
-            id,
-            duration: preview.duration,
-            width: preview.width,
-            height: preview.height,
-          );
           AppLog.instance.info(
             '封面',
             '视频封面已生成（${preview.width ?? 0} × ${preview.height ?? 0}）。',
           );
-          if (!_disposed) notifyListeners();
+          if (!_disposed) {
+            _notifySourcePreviewChanged(saved!.id, prepared: true);
+          }
         },
         onError: (error) => AppLog.instance.warning(
           '封面',
@@ -686,6 +758,7 @@ class AppModel extends ChangeNotifier {
         ),
       );
     }
+    _syncThirdPartyNetworkPolicy();
   }
   Future<void>? _backgroundStart;
   bool _foreground = true;
@@ -700,9 +773,8 @@ class AppModel extends ChangeNotifier {
       return Future.error(const Cancelled());
     }
     cancel?.check();
-    return _librarySourceRefreshWork ??= _refreshLibrarySources(
-      cancel,
-    ).whenComplete(() => _librarySourceRefreshWork = null);
+    return _librarySourceRefreshWork ??= _refreshLibrarySources(cancel)
+        .whenComplete(() => _librarySourceRefreshWork = null);
   }
 
   /// The app starts this after its first frame, keeping library repair and
@@ -717,11 +789,8 @@ class AppModel extends ChangeNotifier {
       await _restoreMetadataGaps();
       if (_disposed) return;
       _restoreMetadataTasks();
-      _metadataPending.addAll(
-        (store.local('metadata:automatic-pending') as List? ?? const [])
-            .whereType<String>(),
-      );
-      unawaited(_identifyPending());
+      // Old import/playback queues are intentionally not restored. Automatic
+      // recognition starts only from a currently visible directory visit.
       unawaited(synchronize(quiet: true));
     } catch (error) {
       if (!_disposed) {
@@ -736,12 +805,12 @@ class AppModel extends ChangeNotifier {
     _downloads?.setActive(foreground);
     _posterCache?.setActive(foreground && !_clearingCaches);
     if (!foreground) {
+      catalog.cancelAutomaticRecognition();
       _librarySourceRefreshCancel?.cancel();
       _directoryEnrichmentCancel.cancel();
       _directoryEnrichmentCancel = CancelToken();
       _pauseAutomaticMetadataTasks();
       unawaited(pausePreviews());
-      _metadataTimer?.cancel();
       _syncTimer?.cancel();
       _syncTimer = null;
       _syncResumeTimer?.cancel();
@@ -756,7 +825,6 @@ class AppModel extends ChangeNotifier {
       if (backgroundWork) {
         _nextSyncAttempt = null;
         unawaited(synchronize(quiet: true));
-        unawaited(_identifyPending());
       }
     }
   }
@@ -1014,24 +1082,124 @@ class AppModel extends ChangeNotifier {
     return _preferences!;
   }
 
+  bool get automaticMetadataEnabled =>
+      !_disposed &&
+      thirdPartyNetwork.enabled &&
+      _automaticSettingsWrites == 0 &&
+      preferences.autoIdentifyOnFolderOpen &&
+      preferences.metadataStrategy != 'off';
+
+  void _syncThirdPartyNetworkPolicy() {
+    if (_disposed) return;
+    final revision = store.localRevision;
+    if (revision == _thirdPartyStoreRevision) return;
+    _thirdPartyStoreRevision = revision;
+    _refreshSettingsSnapshot();
+    final credentials = (
+      store.localModified('secret:danmuToken'),
+      store.localModified('secret:aiSubtitleToken'),
+      store.localModified('secret:tmdb.apiKey'),
+      store.local('metadataCredentialsRevision'),
+      _settingsSnapshot['danmuOrigin'],
+      _settingsSnapshot['aiSubtitleOrigin'],
+      _settingsSnapshot['aiSubtitleModel'],
+    );
+    if (_thirdPartyCredentialRevision != null &&
+        _thirdPartyCredentialRevision != credentials) {
+      thirdPartyNetwork.cancelRequests();
+    }
+    _thirdPartyCredentialRevision = credentials;
+    final enabled = preferences.thirdPartyNetworkingEnabled;
+    if (thirdPartyNetwork.enabled == enabled) return;
+    thirdPartyNetwork.setEnabled(enabled);
+    if (!enabled) {
+      catalog.cancelAutomaticRecognition();
+      _directoryEnrichmentCancel.cancel();
+      _directoryEnrichmentCancel = CancelToken();
+      _directoryRecognitionCancel?.cancel();
+      _pauseAutomaticMetadataTasks();
+    } else {
+      _releaseAutomaticWork();
+    }
+  }
+
+  void _cancelAutomaticMetadataWork() {
+    catalog.cancelAutomaticRecognition();
+    _directoryEnrichmentCancel.cancel();
+    _directoryEnrichmentCancel = CancelToken();
+    for (final task in _metadataTasks) {
+      if (!task.manual && task.running) cancelMetadataTask(task);
+    }
+  }
+
+  Future<void> _patchPreferences(
+    Map<String, dynamic> patch, {
+    List<String> remove = const [],
+  }) async {
+    final changesAutomatic = {...patch.keys, ...remove}.any(
+      const {
+        'autoIdentifyOnFolderOpen',
+        'metadataStrategy',
+        'aiMetadataEnabled',
+        'aiSubtitleOrigin',
+        'aiSubtitleModel',
+      }.contains,
+    );
+    if (changesAutomatic) {
+      _automaticSettingsWrites++;
+      _cancelAutomaticMetadataWork();
+    }
+    try {
+      if (store.path == ':memory:') {
+        final next = settings;
+        for (final key in remove) {
+          next.remove(key);
+        }
+        store.setLocal('settings', {...next, ...patch});
+        store.removeLocal('metadata:automatic-pending');
+      } else {
+        await (_localStateWorker ??= LocalStateWorker(
+          store.path,
+        )).patchSettings(patch, remove: remove);
+      }
+    } finally {
+      if (changesAutomatic) _automaticSettingsWrites--;
+      _syncThirdPartyNetworkPolicy();
+    }
+  }
+
   Future<void> updatePreferences(Map<String, dynamic> patch) async {
+    if (_disposed) return;
     final checked = preferences.checkedPatch(patch);
     final current = settings;
+    if (checked['autoIdentifyOnFolderOpen'] == true &&
+        (checked['metadataStrategy'] ?? current['metadataStrategy']) == 'off') {
+      checked['metadataStrategy'] = 'conservative';
+    }
     checked.removeWhere((key, value) => current[key] == value);
     if (checked.isEmpty) return;
     final revision = store.localKeyRevision('settings');
-    store.setLocal('settings', {...current, ...checked});
-    if (store.localKeyRevision('settings') != revision) notifyListeners();
+    await _patchPreferences(checked);
+    if (!_disposed && store.localKeyRevision('settings') != revision) {
+      notifyListeners();
+    }
   }
 
   Future<void> resetPreferences() async {
-    final next = settings;
-    for (final key in [...AppPreferences.defaults.keys, 'shortcuts']) {
-      next.remove(key);
-    }
+    if (_disposed) return;
     final revision = store.localKeyRevision('settings');
-    store.setLocal('settings', next);
-    if (store.localKeyRevision('settings') != revision) notifyListeners();
+    await _patchPreferences(
+      {},
+      remove: [
+        ...AppPreferences.defaults.keys.where(
+          (key) => key != 'thirdPartyNetworkingEnabled',
+        ),
+        'shortcuts',
+      ],
+    );
+    if (!_disposed && store.localKeyRevision('settings') != revision) {
+      notifyListeners();
+    }
   }
 
   ThemeMode get themeMode => store.local('appearance:theme') == 'dark'
@@ -1067,18 +1235,19 @@ class AppModel extends ChangeNotifier {
     if (_mediaSnapshotRevision != revision) {
       _mediaSnapshot = List.unmodifiable([
         for (final record in store.all('media'))
-          SyncRecord(
-            id: record.id,
-            kind: record.kind,
-            data: _immutableJson(record.data) as Map<String, dynamic>,
-            modifiedAt: record.modifiedAt,
-            deviceId: record.deviceId,
-            deviceName: record.deviceName,
-            version: record.version,
-            revision: record.revision,
-            deleted: record.deleted,
-            dirty: record.dirty,
-          ),
+          if (record.data['personalMedia'] != true)
+            SyncRecord(
+              id: record.id,
+              kind: record.kind,
+              data: _immutableJson(record.data) as Map<String, dynamic>,
+              modifiedAt: record.modifiedAt,
+              deviceId: record.deviceId,
+              deviceName: record.deviceName,
+              version: record.version,
+              revision: record.revision,
+              deleted: record.deleted,
+              dirty: record.dirty,
+            ),
       ]);
       _mediaSnapshotRevision = revision;
     }
@@ -1179,7 +1348,8 @@ class AppModel extends ChangeNotifier {
     }
     // Secure storage is asynchronous; preserve preferences changed while the
     // connection credentials were being saved.
-    store.setLocal('settings', {...settings, ...value});
+    await _patchPreferences(value);
+    if (_disposed) return;
     AppLog.instance.info('设置', '连接配置已保存。');
     notifyListeners();
     if (value.containsKey('syncOrigin') || syncToken != null) {
@@ -1196,12 +1366,24 @@ class AppModel extends ChangeNotifier {
   }
 
   Future<DanmuApiClient?> danmu() async {
+    if (!thirdPartyNetwork.enabled) return null;
     final token = await secrets.read(key: 'danmuToken');
-    if (token == null || token.isEmpty) return null;
+    if (!thirdPartyNetwork.enabled || token == null || token.trim().isEmpty) {
+      return null;
+    }
     AppLog.instance.rememberSecret(token);
     return DanmuApiClient(
       settings['danmuOrigin'] ?? DanmuApiClient.defaultOrigin,
       token,
+      transport: thirdPartyNetwork.jsonTransport(
+        authorize: (cancel) async {
+          final current = await secrets.read(key: 'danmuToken');
+          cancel.check();
+          if (current == null || current.trim().isEmpty || current != token) {
+            throw const AppFailure('弹幕服务配置已变更，请重新发起请求。');
+          }
+        },
+      ),
     );
   }
 
@@ -1222,6 +1404,8 @@ class AppModel extends ChangeNotifier {
           'port',
           'share',
           'url',
+          'user',
+          'domain',
         ].any((key) => previous[key] != persisted[key]);
     if (index < 0) {
       list.add(persisted);
@@ -1230,6 +1414,19 @@ class AppModel extends ChangeNotifier {
     }
     store.setLocal('sources', list);
     _discardBrowsePreviews(source: source['id'] as String);
+    _previews?.cancelSource(source['id'] as String);
+    if (locationChanged) {
+      if (store.path == ':memory:') {
+        store.transaction(
+          () => invalidateSourceBrowsePreviews(store, source['id'] as String),
+        );
+      } else {
+        await (_localStateWorker ??= LocalStateWorker(
+          store.path,
+        )).invalidateBrowsePreviews(source['id'] as String);
+        if (_disposed) return;
+      }
+    }
     for (final location in store.locations.where(
       (v) => v['source'] == source['id'],
     )) {
@@ -1537,6 +1734,9 @@ class AppModel extends ChangeNotifier {
               path,
               entries,
               hideHidden: preferences.hideHiddenFiles,
+              // Opening an existing library series explicitly may complete
+              // its files; passive source browsing must not import guesses.
+              importUnrecognized: anchorId != null,
               anchorId: anchorId,
               cancel: cancel ?? _metadataCancel,
             )
@@ -1547,6 +1747,7 @@ class AppModel extends ChangeNotifier {
               path,
               entries,
               hideHidden: preferences.hideHiddenFiles,
+              importUnrecognized: anchorId != null,
               anchorId: anchorId,
               cancel: cancel ?? _metadataCancel,
             );
@@ -1664,7 +1865,7 @@ class AppModel extends ChangeNotifier {
   }) async {
     cancel.check();
     _metadataCancel.check();
-    if (preferences.metadataStrategy == 'off') return;
+    if (!automaticMetadataEnabled) return;
     if (_disposed || !_foreground || activePlaybackMediaId != null) {
       return;
     }
@@ -1683,6 +1884,7 @@ class AppModel extends ChangeNotifier {
     void checkCurrent() {
       cancel.check();
       if (_disposed ||
+          !automaticMetadataEnabled ||
           revision != catalog.directoryInspectionRevision(sourceId) ||
           !mapEquals(configuration, sourceConfiguration()) ||
           !_equalMetadata(binding, store.local('location:$anchorId'))) {
@@ -1739,7 +1941,7 @@ class AppModel extends ChangeNotifier {
       if (_disposed || !_foreground || activePlaybackMediaId != null) {
         return;
       }
-      if (preferences.metadataStrategy == 'off') return;
+      if (!automaticMetadataEnabled) return;
       await synchronizeCollectionInBackground(
         sourceId,
         collection.withMetadata(subject, names),
@@ -1776,6 +1978,7 @@ class AppModel extends ChangeNotifier {
     SourceEntry entry, {
     String? associateId,
     bool notify = true,
+    bool personalMedia = false,
   }) {
     // Explicit playback/import can restore a file previously removed from the
     // library; passive directory completion must respect that removal.
@@ -1784,26 +1987,41 @@ class AppModel extends ChangeNotifier {
     final id = associateId ?? existing?['id'] ?? const Uuid().v4();
     final previous = store.get('media', id);
     if (previous == null || previous.deleted) {
-      final guess = mediaIdentity(entry);
+      final guess = personalMedia
+          ? const ReleaseName('')
+          : mediaIdentity(entry);
       store.save('media', id, {
         'title': entry.name,
         'fileName': entry.name,
-        'series': guess.anime.isEmpty ? '未分类' : guess.anime,
+        'series': personalMedia
+            ? entry.name
+            : guess.anime.isEmpty
+            ? '未分类'
+            : guess.anime,
         'season': guess.season,
         'episode': guess.episode,
         'size': entry.size,
         'duration': 0,
-        if (sourceId == 'local') 'localOnly': true,
+        if (personalMedia) 'personalMedia': true,
+        if (sourceId == 'local' || personalMedia) 'localOnly': true,
       });
     }
+    final previewRevision =
+        existing?['previewRevision'] ??
+        matchingBrowsingPreviewRevision(
+          store,
+          sourceId,
+          entry.path,
+          entry.size,
+          entry.modified,
+        );
     store.setLocal('location:$id', {
       'id': id,
       'source': sourceId,
       'path': entry.path,
       'size': entry.size,
       'modified': entry.modified,
-      if (existing?['previewRevision'] != null)
-        'previewRevision': existing?['previewRevision'],
+      'previewRevision': ?previewRevision,
     });
     adoptBrowsingMediaPreview(store, sourceId, entry.path, id);
     if (_batchMediaBindings != null) {
@@ -1813,17 +2031,42 @@ class AppModel extends ChangeNotifier {
     } else {
       syncProfile.rememberLocalMedia(id);
     }
-    _reuseVerifiedMetadata(id);
-    _scheduleIdentification(id);
+    if (!personalMedia &&
+        store.get('media', id)?.data['personalMedia'] != true) {
+      _reuseVerifiedMetadata(id);
+    }
     if (notify) notifyListeners();
     return id;
+  }
+
+  Future<SyncRecord> preparePersonalMediaForPlayback(
+    String sourceId,
+    SourceEntry entry, {
+    CancelToken? cancel,
+  }) async {
+    cancel?.check();
+    if (_disposed || entry.directory) throw const Cancelled();
+    late final SyncRecord record;
+    if (store.path == ':memory:') {
+      store.transaction(() {
+        record = registerPersonalMediaForPlayback(store, sourceId, entry);
+      });
+    } else {
+      record = await (_localStateWorker ??= LocalStateWorker(
+        store.path,
+      )).preparePersonalMediaForPlayback(sourceId, entry, cancel: cancel);
+    }
+    cancel?.check();
+    if (_disposed) throw const Cancelled();
+    return record;
   }
 
   Future<void> _restoreMetadataGaps() async {
     await _waitForAutomaticWork(_metadataCancel);
     final groups = <String, List<SyncRecord>>{};
     for (final item in media) {
-      if ('${item.data['episode'] ?? ''}'.isNotEmpty) {
+      if (item.data['personalMedia'] != true &&
+          '${item.data['episode'] ?? ''}'.isNotEmpty) {
         (groups[_identityKey(item)] ??= []).add(item);
       }
     }
@@ -1893,6 +2136,7 @@ class AppModel extends ChangeNotifier {
   void _reuseVerifiedMetadata(String id) {
     final record = store.get('media', id);
     if (record == null ||
+        record.data['personalMedia'] == true ||
         record.deleted ||
         store.local('manualMetadata:$id') == true ||
         record.data['bangumiId'] != null ||
@@ -1956,63 +2200,11 @@ class AppModel extends ChangeNotifier {
     'metadataType',
   ];
 
-  void _scheduleIdentification(String id) {
-    if (_disposed || preferences.metadataStrategy == 'off') return;
-    if (!_metadataPending.add(id)) return;
-    if (_batchMediaBindings != null) return;
-    store.setLocal('metadata:automatic-pending', _metadataPending.toList());
-    if (_clearingCaches || !_foreground || activePlaybackMediaId != null) {
-      return;
-    }
-    _metadataTimer?.cancel();
-    _metadataTimer = Timer(const Duration(milliseconds: 350), _identifyPending);
-  }
-
-  Future<void> _identifyPending() async {
-    if (_disposed ||
-        _identifying ||
-        _clearingCaches ||
-        !_foreground ||
-        activePlaybackMediaId != null ||
-        preferences.metadataStrategy == 'off') {
-      return;
-    }
-    _identifying = true;
-    try {
-      while (_metadataPending.isNotEmpty &&
-          !_disposed &&
-          !_clearingCaches &&
-          _foreground &&
-          activePlaybackMediaId == null &&
-          preferences.metadataStrategy != 'off') {
-        final ids = _metadataPending.toList();
-        _metadataPending.clear();
-        store.setLocal('metadata:automatic-pending', <String>[]);
-        final records = [for (final id in ids) store.get('media', id)]
-            .whereType<SyncRecord>()
-            .where(
-              (record) =>
-                  !record.deleted &&
-                  store.local('manualMetadata:${record.id}') != true &&
-                  record.data['bangumiId'] == null &&
-                  record.data['tmdbId'] == null,
-            )
-            .toList();
-        if (records.isNotEmpty) {
-          await startMetadataTask(records, manual: false, label: '自动识别').done;
-        }
-      }
-    } finally {
-      _identifying = false;
-    }
-  }
-
   Iterable<SyncRecord> _metadataRecords(Set<String>? mediaIds) {
     if (mediaIds == null) return media;
     final ids = mediaIds.toList()..sort();
-    return [
-      for (final id in ids) ?store.get('media', id),
-    ].where((record) => !record.deleted && record.data['transient'] != true);
+    return [for (final id in ids) ?store.get('media', id)]
+        .where((record) => !record.deleted && record.data['transient'] != true);
   }
 
   Future<void> _applyEpisodeNames(
@@ -2076,13 +2268,14 @@ class AppModel extends ChangeNotifier {
   }
 
   Future<void> refreshMetadata() async {
-    await _restoreMetadataGaps();
-    for (final item in media) {
-      if (store.local('manualMetadata:${item.id}') != true) {
-        _metadataPending.add(item.id);
-      }
-    }
-    await _identifyPending();
+    final records = store.path == ':memory:'
+        ? unmatchedMetadataCandidates(store)
+        : await (_localStateWorker ??= LocalStateWorker(
+            store.path,
+          )).unmatchedMetadataCandidates();
+    if (_disposed) throw const Cancelled();
+    if (records.isEmpty) return;
+    await startMetadataTask(records, manual: true, label: '识别未匹配的视频').done;
   }
 
   Future<String> importExternalFile(
@@ -2106,9 +2299,8 @@ class AppModel extends ChangeNotifier {
     final displayName = p.basename(name.replaceAll('\\', '/'));
     final extension = p.extension(displayName);
     final stem = p.basenameWithoutExtension(displayName);
-    final safeStem = String.fromCharCodes(
-      stem.runes.take(60),
-    ).replaceAll(RegExp(r'[\x00-\x1f<>:"|?*]'), '_');
+    final safeStem = String.fromCharCodes(stem.runes.take(60))
+        .replaceAll(RegExp(r'[\x00-\x1f<>:"|?*]'), '_');
     final directory = Directory(
       p.join(documents.path, 'media', const Uuid().v4()),
     );
@@ -2278,16 +2470,16 @@ class AppModel extends ChangeNotifier {
 
   String? _currentPreviewId(MediaPreviewRequest request) {
     if (_disposed) return null;
-    // A browse capture may finish after recognition has imported the video.
-    // Publish directly to its library ID, while rejecting a newer playback
-    // position, replaced source content or a record removed in the meantime.
-    final id = request.id.startsWith('browse-')
-        ? sourceMedia(request.source, request.path)?.id ?? request.id
-        : request.id;
+    // The worker resolves any newly imported library ID when committing. This
+    // hot currentness check uses point reads instead of rebuilding locations.
+    final id = request.id;
     if (store.get('media', id)?.deleted != false &&
         (store.local('browse:$id') == null ||
-            store.local(_sourceExclusionKey(request.source, request.path)) ==
-                true)) {
+            (!request.firstFrame &&
+                store.local(
+                      _sourceExclusionKey(request.source, request.path),
+                    ) ==
+                    true))) {
       return null;
     }
     return _previewRequest(id)?.fingerprint == request.fingerprint ? id : null;
@@ -2305,8 +2497,282 @@ class AppModel extends ChangeNotifier {
   String sourcePreviewId(String sourceId, String path) =>
       sourceMedia(sourceId, path)?.id ?? browsingMediaId(sourceId, path);
 
+  String? _sourcePreviewNotificationId;
+
+  /// During a single-cover notification, unrelated cells can retain their
+  /// binding without any SQL revision reads. Null means a general model edit.
+  String? get sourcePreviewNotificationId => _sourcePreviewNotificationId;
+
+  void _notifySourcePreviewChanged(String id, {bool prepared = false}) {
+    if (prepared && _missingPreviewImageRevisions.containsKey(id)) {
+      // A cached row can coalesce null -> freshly generated same path between
+      // frames. Publish a fresh stream revision after the actual commit too.
+      _publishMissingPreviewRepair(id);
+      return;
+    }
+    final previous = _sourcePreviewNotificationId;
+    _sourcePreviewNotificationId = id;
+    try {
+      super.notifyListeners();
+    } finally {
+      _sourcePreviewNotificationId = previous;
+    }
+  }
+
+  @override
+  void notifyListeners() {
+    if (!_disposed) _syncThirdPartyNetworkPolicy();
+    // A listener may synchronously make a broader edit while a cover is being
+    // published. That nested notification must still invalidate every row.
+    final previous = _sourcePreviewNotificationId;
+    _sourcePreviewNotificationId = null;
+    try {
+      super.notifyListeners();
+    } finally {
+      _sourcePreviewNotificationId = previous;
+    }
+  }
+
+  Object get sourcePreviewRevision => (
+    store.recordsRevision('media'),
+    store.locationRevision,
+    store.localPrefixRevision('preview:'),
+    store.localPrefixRevision('browse:'),
+    store.sourceConfigurationRevision,
+    cacheRevision,
+  );
+
+  Future<SourcePreviewBinding> readSourceMediaPreview(
+    String sourceId,
+    SourceEntry entry, {
+    required CancelToken cancel,
+    bool albumCover = false,
+    bool originalResolution = false,
+  }) async {
+    if (_disposed) throw const Cancelled();
+    cancel.check();
+    final binding = store.path == ':memory:'
+        ? await readSourcePreviewBinding(
+            store,
+            sourceId,
+            entry,
+            MediaPreview.formatVersion,
+            albumCover: albumCover,
+            originalResolution: originalResolution,
+          )
+        : await (_localStateWorker ??= LocalStateWorker(
+            store.path,
+          )).sourcePreviewBinding(
+            sourceId,
+            entry,
+            MediaPreview.formatVersion,
+            cancel: cancel,
+            albumCover: albumCover,
+            originalResolution: originalResolution,
+          );
+    if (_disposed) throw const Cancelled();
+    cancel.check();
+    return binding;
+  }
+
+  /// Repair a missing generated cover without touching its source video.
+  /// Existing capture admission, cancellation and failure backoff still apply.
+  Future<bool> retryMissingMediaPreview(String id, String path, Object error) {
+    if (_disposed || _clearingCaches || error is! FileSystemException) {
+      return Future.value(false);
+    }
+    final saved = store.local('preview:$id');
+    if (saved is! Map) return Future.value(false);
+    if (saved['path'] != path) {
+      // Another capture already replaced this path. Rebind a stale row using
+      // its normal prepared-path revision; never invalidate the newer cache.
+      _notifySourcePreviewChanged(id);
+      return Future.value(false);
+    }
+    final repairKey = (id, path);
+    final pending = _missingPreviewRepairs[repairKey];
+    if (pending != null) return pending.done.future;
+    if (_missingPreviewRepairs.length >= 64) return Future.value(false);
+    final previous = _missingPreviewFailures[id];
+    final attempts = previous?.path == path ? previous!.attempts : 0;
+    if (attempts >= 2) return Future.value(false);
+    while (_missingPreviewFailures.length >= 256) {
+      _missingPreviewFailures.remove(_missingPreviewFailures.keys.first);
+    }
+    _missingPreviewFailures[id] = (path: path, attempts: attempts + 1);
+    final request = _previewRequest(id);
+    final repair = _MissingPreviewRepair(
+      id,
+      path,
+      Map<String, dynamic>.from(saved),
+      cacheRevision,
+      _previewContentIdentity(id),
+      request?.source,
+    );
+    _missingPreviewRepairs[repairKey] = repair;
+    _startMissingPreviewRepair(repair);
+    return repair.done.future;
+  }
+
+  bool _missingPreviewRepairCurrent(_MissingPreviewRepair repair) =>
+      !_disposed &&
+      !_clearingCaches &&
+      repair.cacheRevision == cacheRevision &&
+      identical(_missingPreviewRepairs[(repair.id, repair.path)], repair) &&
+      repair.contentIdentity == _previewContentIdentity(repair.id);
+
+  (String, String, int, String)? _previewContentIdentity(String id) {
+    final request = _previewRequest(id);
+    return request == null
+        ? null
+        : (request.source, request.path, request.size, request.revision);
+  }
+
+  int mediaPreviewImageRevision(String id) =>
+      _missingPreviewImageRevisions[id] ?? 0;
+
+  void _publishMissingPreviewRepair(String id) {
+    if (!_missingPreviewImageRevisions.containsKey(id) &&
+        _missingPreviewImageRevisions.length >= 256) {
+      _missingPreviewImageRevisions.remove(
+        _missingPreviewImageRevisions.keys.first,
+      );
+    }
+    _missingPreviewImageRevisions[id] = ++_missingPreviewImageSerial;
+    _notifySourcePreviewChanged(id);
+  }
+
+  void _finishMissingPreviewRepair(
+    _MissingPreviewRepair repair,
+    bool repaired,
+  ) {
+    if (identical(_missingPreviewRepairs[(repair.id, repair.path)], repair)) {
+      _missingPreviewRepairs.remove((repair.id, repair.path));
+    }
+    if (!repair.done.isCompleted) repair.done.complete(repaired);
+  }
+
+  void _startMissingPreviewRepair(_MissingPreviewRepair repair) {
+    if (repair.running ||
+        !_foreground ||
+        _previewPauses > 0 ||
+        activePlaybackMediaId != null) {
+      return;
+    }
+    if (!_missingPreviewRepairCurrent(repair)) {
+      _finishMissingPreviewRepair(repair, false);
+      return;
+    }
+    repair.running = true;
+    final token = repair.cancel = CancelToken();
+    unawaited(() async {
+      try {
+        // A pause can arrive after the previous worker committed but before
+        // its reply. Resume still publishes that null path exactly once.
+        if (store.local('preview:${repair.id}') == null) {
+          _publishMissingPreviewRepair(repair.id);
+          _finishMissingPreviewRepair(repair, true);
+          return;
+        }
+        var removed = false;
+        if (store.path == ':memory:') {
+          if (!await File(repair.path).exists()) {
+            token.check();
+            store.transaction(
+              () => removed = discardPreparedMediaPreview(
+                store,
+                repair.id,
+                repair.expected,
+              ),
+            );
+          }
+        } else {
+          removed = await (_localStateWorker ??= LocalStateWorker(store.path))
+              .discardMissingMediaPreview(
+                repair.id,
+                repair.path,
+                repair.expected,
+                cancel: token,
+              );
+        }
+        var restored = false;
+        final currentPath =
+            (store.local('preview:${repair.id}') as Map?)?['path'];
+        final rebound = currentPath is String && currentPath != repair.path;
+        if (!removed && currentPath == repair.path) {
+          restored = await File(repair.path).exists();
+        }
+        token.check();
+        if (!_missingPreviewRepairCurrent(repair)) {
+          _finishMissingPreviewRepair(repair, false);
+          return;
+        }
+        if (removed || restored) {
+          _publishMissingPreviewRepair(repair.id);
+          // The affected artwork now receives a null thumbnail. Its existing
+          // visible/idle admission requests capture, including after resume.
+        } else if (rebound) {
+          _notifySourcePreviewChanged(repair.id);
+        }
+        _finishMissingPreviewRepair(repair, removed || restored);
+      } on Cancelled {
+        // Lifecycle cancellation retains this bounded intent and its original
+        // attempt budget. Source edits/cache clear/disposal remove it directly.
+        if (!token.cancelled || !_missingPreviewRepairCurrent(repair)) {
+          _finishMissingPreviewRepair(repair, false);
+        }
+      } catch (_) {
+        // Keep the old metadata on a transient database failure. A later
+        // visible visit can retry; failed cache maintenance cannot break play.
+        _finishMissingPreviewRepair(repair, false);
+      } finally {
+        repair.running = false;
+        repair.cancel = null;
+        if (!repair.done.isCompleted &&
+            _foreground &&
+            _previewPauses == 0 &&
+            activePlaybackMediaId == null) {
+          _startMissingPreviewRepair(repair);
+        }
+      }
+    }());
+  }
+
+  void _cancelMissingPreviewRepairs({String? source, bool retain = false}) {
+    for (final repair in _missingPreviewRepairs.values.toList(
+      growable: false,
+    )) {
+      if (source != null && repair.source != source) continue;
+      repair.cancel?.cancel();
+      if (!retain) _finishMissingPreviewRepair(repair, false);
+    }
+  }
+
+  /// Only an actual decoded frame resets consecutive missing-file repairs.
+  void mediaPreviewReady(String id, String path) {
+    if (!_disposed && _missingPreviewFailures[id]?.path == path) {
+      _missingPreviewFailures.remove(id);
+    }
+  }
+
   /// A visible artwork can wait for capacity instead of losing its one request.
-  bool tryEnsureSourceMediaPreview(String sourceId, SourceEntry entry) {
+  bool tryEnsureSourceMediaPreview(
+    String sourceId,
+    SourceEntry entry, {
+    SourcePreviewBinding? binding,
+  }) {
+    if (binding != null) {
+      if (!_canPrepareBrowsePreviews) return false;
+      if (binding.id != binding.browseId) {
+        return ensureMediaPreview(binding.id);
+      }
+      if (_pendingBrowsePreviews.length >= 64 &&
+          !_pendingBrowsePreviews.containsKey(binding.browseId)) {
+        return false;
+      }
+      _queueBrowsePreview(binding.browseId, sourceId, entry);
+      return true;
+    }
     if (_canPrepareBrowsePreviews &&
         _pendingBrowsePreviews.length >= 64 &&
         !_pendingBrowsePreviews.containsKey(
@@ -2329,18 +2795,64 @@ class AppModel extends ChangeNotifier {
       ensureMediaPreview(id);
       return id;
     }
+    if (!_pendingBrowsePreviews.containsKey(id) &&
+        _pendingBrowsePreviews.length >= 64) {
+      return id;
+    }
+    _queueBrowsePreview(id, sourceId, entry);
+    return id;
+  }
+
+  void _queueBrowsePreview(String id, String sourceId, SourceEntry entry) {
     final pending = _pendingBrowsePreviews[id];
-    if (pending == null && _pendingBrowsePreviews.length >= 64) return id;
-    if (pending == null || pending.size != entry.size) {
+    final revision = entry.modified == 0 ? '' : '${entry.modified}';
+    if (pending == null ||
+        pending.size != entry.size ||
+        pending.revision != revision) {
       _pendingBrowsePreviews[id] = MediaPreviewRequest(
         id,
         sourceId,
         entry.path,
         entry.size,
+        revision: revision,
       );
     }
     _startBrowsePreviews();
-    return id;
+  }
+
+  /// Release a preview requested by a cell that left the active viewport.
+  /// This never deletes a completed frame or clears the failure backoff.
+  void cancelSourceMediaPreview(
+    String sourceId,
+    String path, {
+    SourcePreviewBinding? binding,
+    bool albumCover = false,
+    bool originalResolution = false,
+  }) {
+    final browseId =
+        binding?.browseId ??
+        (albumCover
+            ? albumVideoPreviewId(
+                sourceId,
+                path,
+                originalResolution: originalResolution,
+              )
+            : browsingMediaId(sourceId, path));
+    final pending = _pendingBrowsePreviews[browseId];
+    if (pending != null) _removeBrowsePreview(pending);
+    if (_activeBrowsePreview?.id == browseId) {
+      _browsePreviewCancel?.cancel();
+    }
+    _previews?.cancelPending(browseId);
+    _waitingPreviewChecks.remove(browseId);
+    _previewCheckCancels[browseId]?.cancel();
+    final id =
+        binding?.id ?? (albumCover ? null : sourceMedia(sourceId, path)?.id);
+    if (id != null) {
+      _waitingPreviewChecks.remove(id);
+      _previewCheckCancels[id]?.cancel();
+      _previews?.cancelPending(id);
+    }
   }
 
   bool get _canPrepareBrowsePreviews =>
@@ -2353,6 +2865,7 @@ class AppModel extends ChangeNotifier {
 
   void _startBrowsePreviews() {
     if (!_canPrepareBrowsePreviews ||
+        _browsePreviewsBlocked ||
         _browsePreviewWork != null ||
         _pendingBrowsePreviews.isEmpty) {
       return;
@@ -2369,13 +2882,22 @@ class AppModel extends ChangeNotifier {
       final token = _browsePreviewCancel = CancelToken();
       _activeBrowsePreview = request;
       try {
+        var resolvedId = request.id;
         // Register only requested artwork. The database transaction, index
         // decoding and lock retry share one worker instead of the UI isolate.
         if (store.path == ':memory:') {
+          final previewRevision = browsePreviewRevision(
+            store,
+            request.source,
+            request.revision,
+          );
           store.setLocal('browse:${request.id}', {
             'source': request.source,
             'path': request.path,
             'size': request.size,
+            if (previewRevision.isNotEmpty) 'previewRevision': previewRevision,
+            if (previewRevision != request.revision)
+              'fileRevision': request.revision,
           });
           final index = List<String>.from(
             store.local('browse:index') ?? <String>[],
@@ -2385,22 +2907,27 @@ class AppModel extends ChangeNotifier {
             store.setLocal('browse:index', index);
           }
         } else {
-          await (_localStateWorker ??= LocalStateWorker(
-            store.path,
-          )).registerBrowse(
-            request.id,
-            request.source,
-            request.path,
-            request.size,
-            cancel: token,
-          );
+          resolvedId =
+              await (_localStateWorker ??= LocalStateWorker(
+                store.path,
+              )).registerBrowse(
+                request.id,
+                request.source,
+                request.path,
+                request.size,
+                cancel: token,
+                previewRevision: request.revision,
+              );
         }
         token.check();
         if (!_canPrepareBrowsePreviews) return;
         if (!identical(_pendingBrowsePreviews[request.id], request)) continue;
-        _removeBrowsePreview(request);
         // Recognition may have imported this file while the write waited.
-        ensureMediaPreview(sourcePreviewId(request.source, request.path));
+        if (!ensureMediaPreview(resolvedId)) {
+          _browsePreviewsBlocked = true;
+          return;
+        }
+        _removeBrowsePreview(request);
       } on Cancelled {
         // Keep this bounded request for resume, unless its source was removed.
         // A stopped worker also reports Cancelled, but retrying it immediately
@@ -2428,6 +2955,15 @@ class AppModel extends ChangeNotifier {
   }
 
   void _discardBrowsePreviews({String? source}) {
+    _cancelMissingPreviewRepairs(source: source);
+    _waitingPreviewChecks.removeWhere(
+      (id) => source == null || _previewRequest(id)?.source == source,
+    );
+    for (final entry in _previewCheckCancels.entries) {
+      if (source == null || _previewRequest(entry.key)?.source == source) {
+        entry.value.cancel();
+      }
+    }
     final wasFull = _pendingBrowsePreviews.length == 64;
     if (source == null || _activeBrowsePreview?.source == source) {
       _browsePreviewCancel?.cancel();
@@ -2479,6 +3015,9 @@ class AppModel extends ChangeNotifier {
     final saved = store.local('preview:$id');
     if (saved is! Map ||
         saved['formatVersion'] != MediaPreview.formatVersion ||
+        (request.firstFrame &&
+            (saved['firstFrame'] != true ||
+                saved['albumVersion'] != albumPreviewVersion)) ||
         (saved['fingerprint'] != request.fingerprint &&
             saved['contentFingerprint'] != request.contentFingerprint) ||
         saved['path'] is! String) {
@@ -2503,28 +3042,66 @@ class AppModel extends ChangeNotifier {
     return !await check;
   }
 
-  void ensureMediaPreview(String id) {
+  bool ensureMediaPreview(String id) {
     if (_disposed ||
         _clearingCaches ||
         _previews == null ||
         activePlaybackMediaId != null) {
-      return;
+      return false;
     }
-    if (!_pendingPreviewChecks.add(id)) return;
+    if (_pendingPreviewChecks.contains(id) ||
+        _waitingPreviewChecks.contains(id)) {
+      if (_previewCheckCancels[id]?.cancelled == true &&
+          _waitingPreviewChecks.length < 64) {
+        _waitingPreviewChecks.add(id);
+      }
+      return true;
+    }
+    if (_pendingPreviewChecks.length >= 64 || _previews!.isFull) {
+      if (_waitingPreviewChecks.length >= 64) return false;
+      _waitingPreviewChecks.add(id);
+      return true;
+    }
+    _pendingPreviewChecks.add(id);
+    final cancel = _previewCheckCancels[id] = CancelToken();
     unawaited(
-      _ensureMediaPreview(id)
+      _ensureMediaPreview(id, cancel)
           .catchError((Object error) {
             if (!_disposed) {
               AppLog.instance.warning('封面', safeFailure(error).message);
             }
           })
-          .whenComplete(() => _pendingPreviewChecks.remove(id)),
+          .whenComplete(() {
+            _pendingPreviewChecks.remove(id);
+            _previewCheckCancels.remove(id);
+            _previewCapacityAvailable();
+          }),
     );
+    return true;
   }
 
-  Future<void> _ensureMediaPreview(String id) async {
+  void _previewCapacityAvailable() {
+    if (!_canPrepareBrowsePreviews) return;
+    if (_previews?.isFull != true) {
+      // Start one deferred check per release. Its completion advances to the
+      // next demand, so one freed decoder slot never fans out 64 disk reads.
+      final id = _waitingPreviewChecks.firstOrNull;
+      if (id != null && _pendingPreviewChecks.length < 64) {
+        _waitingPreviewChecks.remove(id);
+        ensureMediaPreview(id);
+      }
+      _browsePreviewsBlocked = false;
+      _startBrowsePreviews();
+    }
+    _browsePreviewCapacity.value++;
+  }
+
+  Future<void> _ensureMediaPreview(String id, CancelToken cancel) async {
     final revision = cacheRevision;
-    while (!_disposed && _previews != null && activePlaybackMediaId == null) {
+    while (!_disposed &&
+        !cancel.cancelled &&
+        _previews != null &&
+        activePlaybackMediaId == null) {
       final record = store.get('media', id);
       final request = _previewRequest(id);
       if (request == null ||
@@ -2534,9 +3111,14 @@ class AppModel extends ChangeNotifier {
       final saved = store.local('preview:$id');
       final needed = await needsMediaPreview(id);
       if (_disposed ||
+          cancel.cancelled ||
           _clearingCaches ||
           revision != cacheRevision ||
           activePlaybackMediaId != null) {
+        return;
+      }
+      if (!_canPrepareBrowsePreviews) {
+        if (_waitingPreviewChecks.length < 64) _waitingPreviewChecks.add(id);
         return;
       }
       // A newer playback frame, source edit or progress update can arrive
@@ -2549,7 +3131,15 @@ class AppModel extends ChangeNotifier {
         continue;
       }
       if (needed) {
-        _previews!.schedule(request, priority: request.position != null);
+        final accepted = _previews!.schedule(
+          request,
+          priority: request.position != null || request.originalResolution,
+        );
+        if (!accepted && _previews!.isFull) {
+          // Registration and file checks can outlive the last free queue slot.
+          // Preserve bounded demand until a decoder release or cancellation.
+          if (_waitingPreviewChecks.length < 64) _waitingPreviewChecks.add(id);
+        }
       }
       return;
     }
@@ -2655,12 +3245,13 @@ class AppModel extends ChangeNotifier {
     }
     if (!_disposed) {
       requestArtworkSync(id);
-      notifyListeners();
+      _notifySourcePreviewChanged(id, prepared: true);
     }
   }
 
   Future<void> pausePreviews() async {
     _previewPauses++;
+    _cancelMissingPreviewRepairs(retain: true);
     _browsePreviewCancel?.cancel();
     await _previews?.pause();
   }
@@ -2668,7 +3259,13 @@ class AppModel extends ChangeNotifier {
   void resumePreviews() {
     if (_previewPauses > 0) _previewPauses--;
     _previews?.resume();
+    _previewCapacityAvailable();
     _startBrowsePreviews();
+    for (final repair in _missingPreviewRepairs.values.toList(
+      growable: false,
+    )) {
+      _startMissingPreviewRepair(repair);
+    }
   }
 
   void recordMediaMetadata(
@@ -2921,7 +3518,6 @@ class AppModel extends ChangeNotifier {
           }
           var imported = 0;
           final bindings = <String, bool>{};
-          final pendingBefore = Set<String>.of(_metadataPending);
           _batchMetadataDonors = donors;
           _batchMediaBindings = bindings;
           try {
@@ -2941,21 +3537,10 @@ class AppModel extends ChangeNotifier {
                 localIds: bindings.keys.where((id) => bindings[id]!),
                 remoteIds: bindings.keys.where((id) => !bindings[id]!),
               );
-              if (!setEquals(pendingBefore, _metadataPending)) {
-                store.setLocal(
-                  'metadata:automatic-pending',
-                  _metadataPending.toList(),
-                );
-              }
             });
             // Imports only inherit the captured donors. Own writes need no
             // rescan, but edits/sync between batches must rebuild the index.
             donorRevision = store.recordsRevision('media');
-          } catch (_) {
-            _metadataPending
-              ..clear()
-              ..addAll(pendingBefore);
-            rethrow;
           } finally {
             _batchMetadataDonors = null;
             _batchMediaBindings = null;
@@ -2982,8 +3567,6 @@ class AppModel extends ChangeNotifier {
       }
       scanning = false;
       notifyListeners();
-      // Process committed batches even after cancellation or a later failure.
-      unawaited(_identifyPending());
     }
   }
 
@@ -3357,18 +3940,20 @@ class AppModel extends ChangeNotifier {
       task._attemptCancel?.cancel();
       if (!task._done.isCompleted) task._done.complete();
     }
-    _posterCache?.close();
     _syncTimer?.cancel();
     _syncDebounce?.cancel();
     _syncResumeTimer?.cancel();
     _syncWatch?.cancel();
     _activeSync?.cancel();
     unawaited(sync.dispose());
+    // The lazy sync profile may create the poster cache during disposal.
+    // Close its listeners before disposing their shared network policy.
+    _posterCache?.close();
+    thirdPartyNetwork.dispose();
     _librarySnapshotReader?.dispose();
     _continueWatchingReader?.dispose();
     unawaited(_directoryMetadataWorker?.close());
     _directoryRecognitionCancel?.cancel();
-    _metadataTimer?.cancel();
     _metadataCancel.cancel();
     _automaticReady?.complete();
     _automaticReady = null;
@@ -3383,6 +3968,25 @@ class AppModel extends ChangeNotifier {
     await _metadataCheckpointWrite;
     await _localStateWorker?.close();
   }
+}
+
+class _MissingPreviewRepair {
+  final String id, path;
+  final Map<String, dynamic> expected;
+  final int cacheRevision;
+  final (String, String, int, String)? contentIdentity;
+  final String? source;
+  final done = Completer<bool>();
+  CancelToken? cancel;
+  bool running = false;
+  _MissingPreviewRepair(
+    this.id,
+    this.path,
+    this.expected,
+    this.cacheRevision,
+    this.contentIdentity,
+    this.source,
+  );
 }
 
 // Metadata contains small JSON maps/lists. Compare values rather than map/list

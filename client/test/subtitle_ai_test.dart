@@ -360,6 +360,7 @@ void main() {
           SubtitleAiConfig(
             origin: 'http://unresolvable.invalid/v1',
             model: 'test',
+            token: 'test-key',
           ),
           {'model': 'test'},
           CancelToken(),
@@ -371,6 +372,7 @@ void main() {
           SubtitleAiConfig(
             origin: 'http://unresolvable.invalid/v1',
             model: 'test',
+            token: 'test-key',
           ),
           CancelToken(),
         ),

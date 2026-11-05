@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/library_catalog.dart';
+import 'package:aiplayer/data/directory_preview_context.dart';
 import 'package:aiplayer/data/poster_cache.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
@@ -76,6 +77,7 @@ class _Model extends AppModel {
   final gates = <String, Completer<List<SourceEntry>>>{};
   final requests = <String>[];
   int activeRequests = 0, maxActiveRequests = 0;
+  int completedCollections = 0;
 
   @override
   LibraryCatalog get catalog => _catalog;
@@ -91,6 +93,25 @@ class _Model extends AppModel {
 
   @override
   Future<SourceAdapter> adapter(String id) async => _Connection(this);
+
+  @override
+  Future<DirectoryCollection> synchronizeCollectionInBackground(
+    String sourceId,
+    DirectoryCollection value, {
+    bool? importMissing,
+    String? anchorId,
+    CancelToken? cancel,
+  }) async {
+    final result = await super.synchronizeCollectionInBackground(
+      sourceId,
+      value,
+      importMissing: importMissing,
+      anchorId: anchorId,
+      cancel: cancel,
+    );
+    completedCollections++;
+    return result;
+  }
 
   @override
   void dispose() {
@@ -156,13 +177,56 @@ Widget _browser(_Model model) => MaterialApp(
   ),
 );
 
-Future<void> _refresh(WidgetTester tester) async {
+Future<void> _settle(WidgetTester tester, bool Function() complete) async {
+  // Folder summaries run on the directory worker; no pending Flutter frame
+  // does not mean that the real isolate has returned its result yet.
+  for (var attempt = 0; attempt < 250; attempt++) {
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 10)),
+    );
+    await tester.pump();
+    if (complete()) return;
+  }
+  fail('Source listing and its background folder counts did not settle.');
+}
+
+Future<void> _refresh(WidgetTester tester, bool Function() complete) async {
   final refresh = tester
       .widget<RefreshIndicator>(find.byType(RefreshIndicator))
       .onRefresh();
-  await tester.pumpAndSettle();
+  await _settle(tester, complete);
   await refresh;
   await tester.pumpAndSettle();
+}
+
+Future<void> _seedRecognizedPreview(_Model model, String path) async {
+  final context = directoryPreviewContext(
+    source: null,
+    strategy: model.preferences.metadataStrategy,
+    aiContext: '',
+  );
+  final prepared = prepareDirectoryInspection(
+    'nas',
+    path,
+    context,
+    _episodes(path, 3),
+  );
+  persistDirectoryPreview(
+    model.store,
+    'nas',
+    path,
+    DirectoryPreview(
+      collection: prepared.collection!.withMetadata(
+        _CatalogTransport.subject,
+        const {},
+      ),
+      context: context,
+      fingerprint: prepared.fingerprint,
+      updatedAt: DateTime.now().millisecondsSinceEpoch,
+      modified: 100,
+    ),
+  );
+  model.catalog.reloadSyncedDirectoryPreviews();
 }
 
 void main() {
@@ -185,7 +249,7 @@ void main() {
         );
         model.counts['Series'] = 4;
         await tester.pumpWidget(_browser(model));
-        await tester.pumpAndSettle();
+        await _settle(tester, () => find.text('4 集').evaluate().length == 1);
         expect(find.text('4 集'), findsOneWidget);
         expect(model.requests.where((path) => path == 'Series'), hasLength(1));
         expect(model.media, isEmpty);
@@ -193,7 +257,10 @@ void main() {
         for (final count in [2, 5]) {
           model.counts['Series'] = count;
           final before = model.requests.length;
-          await _refresh(tester);
+          await _refresh(
+            tester,
+            () => find.text('$count 集').evaluate().length == 1,
+          );
           expect(find.text('$count 集'), findsOneWidget);
           expect(model.requests.skip(before), ['', 'Series']);
           expect(model.media, isEmpty);
@@ -222,8 +289,14 @@ void main() {
     final model = _Model(store, root);
     final pending = Completer<List<SourceEntry>>();
     try {
+      await _seedRecognizedPreview(model, 'Series');
       await tester.pumpWidget(_browser(model));
-      await tester.pumpAndSettle();
+      await _settle(
+        tester,
+        () =>
+            model.completedCollections >= 1 &&
+            find.text('3 集').evaluate().length == 1,
+      );
       expect(find.text('3 集'), findsOneWidget);
       model.gates[''] = pending;
       model.counts['Series'] = 4;
@@ -244,7 +317,7 @@ void main() {
           modified: 100,
         ),
       ]);
-      await tester.pumpAndSettle();
+      await _settle(tester, () => find.text('4 集').evaluate().length == 1);
       await first;
       expect(find.text('4 集'), findsOneWidget);
       expect(model.requests.skip(before), ['', 'Series']);
@@ -266,18 +339,40 @@ void main() {
         ..setLocal('settings', {'metadataStrategy': 'off'});
       final model = _Model(store, root);
       try {
+        await _seedRecognizedPreview(model, 'Series');
         await tester.pumpWidget(_browser(model));
-        await tester.pumpAndSettle();
+        await _settle(
+          tester,
+          () =>
+              model.completedCollections >= 1 &&
+              find.text('3 集').evaluate().length == 1,
+        );
         await tester.tap(find.byKey(const ValueKey('Series')));
-        await tester.pumpAndSettle();
+        await _settle(
+          tester,
+          () =>
+              model.media.length == 3 &&
+              find.textContaining('已收录 3 集').evaluate().length == 1,
+        );
         expect(model.media, hasLength(3));
         expect(find.textContaining('已收录 3 集'), findsOneWidget);
+        final beforeReturn = model.completedCollections;
         await tester.tap(find.byTooltip('返回'));
-        await tester.pumpAndSettle();
+        await _settle(
+          tester,
+          () =>
+              model.completedCollections > beforeReturn &&
+              find.text('3 集').evaluate().length == 1,
+        );
         expect(find.text('3 集'), findsOneWidget);
 
         model.counts['Series'] = 0;
-        await _refresh(tester);
+        await _refresh(
+          tester,
+          () =>
+              find.text('3 集').evaluate().isEmpty &&
+              find.text('Series').evaluate().length == 1,
+        );
         expect(find.text('3 集'), findsNothing);
         expect(find.text('Series'), findsOneWidget);
 
@@ -294,7 +389,7 @@ void main() {
         expect(find.text('Series'), findsOneWidget);
 
         model.counts['Series'] = 4;
-        await _refresh(tester);
+        await _refresh(tester, () => find.text('4 集').evaluate().length == 1);
         expect(find.text('4 集'), findsOneWidget);
         expect(model.media, hasLength(3));
         expect(tester.takeException(), isNull);
@@ -327,14 +422,22 @@ void main() {
           path: Completer<List<SourceEntry>>(),
       };
       try {
+        for (final path in model.counts.keys) {
+          await _seedRecognizedPreview(model, path);
+        }
         await tester.pumpWidget(_browser(model));
-        await tester.pumpAndSettle();
+        await _settle(
+          tester,
+          () =>
+              model.completedCollections >= 8 &&
+              find.text('3 集').evaluate().length == 8,
+        );
         expect(find.text('3 集'), findsNWidgets(8));
         model.gates.addAll(pending);
         final refresh = tester
             .widget<RefreshIndicator>(find.byType(RefreshIndicator))
             .onRefresh();
-        await tester.pumpAndSettle();
+        await _settle(tester, () => model.activeRequests == 4);
         expect(model.activeRequests, 4);
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
         await tester.idle();
@@ -353,7 +456,7 @@ void main() {
         tester.binding.handleAppLifecycleStateChanged(
           AppLifecycleState.resumed,
         );
-        await tester.pumpAndSettle();
+        await _settle(tester, () => find.text('4 集').evaluate().length == 8);
         expect(find.text('4 集'), findsNWidgets(8));
         expect(find.text('9 集'), findsNothing);
         expect(model.maxActiveRequests, lessThanOrEqualTo(4));

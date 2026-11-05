@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
+
 import 'package:aiplayer_smb/aiplayer_smb.dart';
 import 'package:path/path.dart' as p;
 import 'package:xml/xml.dart';
+
 import '../core/network.dart';
 import '../core/logger.dart';
 import '../core/system_proxy_stub.dart'
@@ -113,6 +115,7 @@ class HttpSource extends SourceAdapter {
   final Uri base;
   final bool webdav;
   final String user, password, displayName;
+  final int? maxListingBytes, maxListingEntries;
   final _client = HttpClient()..connectionTimeout = const Duration(seconds: 25);
   final _cancel = CancelToken();
   final SystemProxyLookup proxyResolver;
@@ -122,6 +125,8 @@ class HttpSource extends SourceAdapter {
     this.user = '',
     this.password = '',
     this.displayName = '',
+    this.maxListingBytes,
+    this.maxListingEntries,
     this.proxyResolver = resolveSystemProxy,
   }) : base = Uri.parse(address) {
     if (!['http', 'https'].contains(base.scheme) ||
@@ -168,7 +173,19 @@ class HttpSource extends SourceAdapter {
   }
 
   @override
-  Future<List<SourceEntry>> list(String path) async {
+  Future<List<SourceEntry>> list(String path) => listWithLimits(
+    path,
+    maxBytes: maxListingBytes,
+    maxEntries: maxListingEntries,
+  );
+
+  /// Limits both bytes before XML parsing and returned entries. Existing
+  /// callers keep their original list API; album previews use a tighter budget.
+  Future<List<SourceEntry>> listWithLimits(
+    String path, {
+    int? maxBytes,
+    int? maxEntries,
+  }) async {
     if (!webdav) throw const AppFailure('HTTP 直链不支持目录浏览。');
     final requested = url(path);
     // Browser entries retain WebDAV collection slashes, whereas an existing
@@ -181,8 +198,7 @@ class HttpSource extends SourceAdapter {
       'PROPFIND',
       uri,
       headers: {'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8'},
-      body:
-          '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:ishidden/></d:prop></d:propfind>',
+      body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:ishidden/></d:prop></d:propfind>',
     );
     if (response.statusCode != 207) {
       // An error body may be unbounded or stalled. The status is sufficient;
@@ -191,10 +207,25 @@ class HttpSource extends SourceAdapter {
       throw sourceHttpFailure(response.statusCode, webdav: true);
     }
     try {
-      final text = await utf8.decoder
-          .bind(response.timeout(const Duration(seconds: 25)))
-          .join();
-      return await _decodeWebDavListing(text, uri, base);
+      if (maxBytes != null && response.contentLength > maxBytes) {
+        await response.listen((_) {}).cancel();
+        throw const AppFailure('目录响应超出读取预算，请选择更小的文件夹。');
+      }
+      var received = 0;
+      Stream<List<int>> bounded() async* {
+        await for (final bytes in response.timeout(
+          const Duration(seconds: 25),
+        )) {
+          received += bytes.length;
+          if (maxBytes != null && received > maxBytes) {
+            throw const AppFailure('目录响应超出读取预算，请选择更小的文件夹。');
+          }
+          yield bytes;
+        }
+      }
+
+      final text = await utf8.decoder.bind(bounded()).join();
+      return await _decodeWebDavListing(text, uri, base, maxEntries);
     } on FormatException {
       throw const AppFailure('服务器返回了无效的 WebDAV 目录数据，请确认目录路径。');
     } on XmlException {
@@ -287,15 +318,50 @@ class HttpSource extends SourceAdapter {
   }
 }
 
+/// Immutable connection facts can cross an isolate boundary without capturing
+/// a live native connection or a caller's reconnect closure.
+class SmbSourceConfiguration {
+  final String host, share, user, password, domain, security;
+  const SmbSourceConfiguration({
+    required this.host,
+    this.share = '',
+    this.user = '',
+    this.password = '',
+    this.domain = '',
+    this.security = 'auto',
+  });
+
+  Future<SmbConnection> _connect(String share) => SmbConnection.connect(
+    host: host,
+    share: share,
+    user: user,
+    password: password,
+    domain: domain,
+    security: security,
+  );
+
+  Future<SourceAdapter> open() async {
+    if (share.isEmpty) {
+      return SmbServerSource(_connect, configuration: this);
+    }
+    return SmbSource(
+      await _connect(share),
+      reconnect: () => _connect(share),
+      configuration: this,
+    );
+  }
+}
+
 /// Server-level SMB source. The root enumerates disk shares over IPC$; each
 /// visited share gets its own connection, so share names never become mandatory.
 class SmbServerSource extends SourceAdapter {
   final Future<SmbConnection> Function(String share) connect;
+  final SmbSourceConfiguration? configuration;
   final Map<String, Future<SmbSource>> _shares = {};
   SmbConnection? _ipc;
   Future<void>? _initializing;
   bool _closed = false;
-  SmbServerSource(this.connect);
+  SmbServerSource(this.connect, {this.configuration});
   int get dialect => _ipc?.dialect ?? 0;
   Future<void> initialize() async {
     if (_closed) throw const AppFailure('来源已关闭。');
@@ -428,9 +494,10 @@ class SmbServerSource extends SourceAdapter {
 class SmbSource extends SourceAdapter {
   SmbConnection connection;
   final Future<SmbConnection> Function()? reconnect;
+  final SmbSourceConfiguration? configuration;
   Future<SmbConnection>? _reconnecting;
   bool _closed = false;
-  SmbSource(this.connection, {this.reconnect});
+  SmbSource(this.connection, {this.reconnect, this.configuration});
 
   Future<T> _readWithRetry<T>(Future<T> Function(SmbConnection) action) async {
     if (_closed) throw const AppFailure('SMB 来源已关闭。');
@@ -520,8 +587,9 @@ Future<List<SourceEntry>> _decodeWebDavListing(
   String text,
   Uri requested,
   Uri base,
+  int? maxEntries,
 ) {
-  final input = (text, requested, base);
+  final input = (text, requested, base, maxEntries);
   // Keep tiny folders inexpensive while moving large XML trees and all their
   // path/property parsing away from the isolate forwarding playback bytes.
   return text.length < 64 * 1024
@@ -529,8 +597,8 @@ Future<List<SourceEntry>> _decodeWebDavListing(
       : Isolate.run(() => _parseWebDavListing(input));
 }
 
-List<SourceEntry> _parseWebDavListing((String, Uri, Uri) input) {
-  final (text, requested, base) = input;
+List<SourceEntry> _parseWebDavListing((String, Uri, Uri, int?) input) {
+  final (text, requested, base, maxEntries) = input;
   final document = XmlDocument.parse(text);
   final result = <SourceEntry>[];
   final basePath = base.path.endsWith('/') ? base.path : '${base.path}/';
@@ -574,6 +642,9 @@ List<SourceEntry> _parseWebDavListing((String, Uri, Uri) input) {
         ].contains((fields['ishidden'] ?? '').toLowerCase()),
       ),
     );
+    if (maxEntries != null && result.length > maxEntries) {
+      throw AppFailure('此目录超过 $maxEntries 项，请选择更小的文件夹。');
+    }
   }
   return result;
 }

@@ -1,8 +1,12 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:aiplayer/data/poster_cache.dart';
+import 'package:aiplayer/core/third_party_network.dart';
+import 'package:aiplayer/core/system_proxy.dart';
+import 'package:aiplayer/data/app_model.dart';
+import 'package:aiplayer/data/store.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as images;
 
@@ -89,6 +93,217 @@ void main() {
       cache.changes.removeListener(changed);
     }
   }
+
+  test(
+    'third-party master off permits disk covers without creating a client',
+    () async {
+      final policy = ThirdPartyNetworkPolicy(enabled: false);
+      addTearDown(policy.dispose);
+      cache.close();
+      var clients = 0;
+      cache = PosterCache(
+        directory: directory,
+        networkPolicy: policy,
+        createClient: () {
+          clients++;
+          return _client();
+        },
+      );
+      final saved = url('saved'), cold = url('cold');
+      await cache.cachedFile(saved).writeAsBytes(png);
+      final held = (await cache.loadVisible(saved))!;
+      expect(await held.readAsBytes(), png);
+      expect(await cache.loadVisible(cold), isNull);
+      expect(cache.hasFailed(cold), isFalse);
+      expect(cache.needsSourceUpgrade(saved), isFalse);
+      expect(clients, 0);
+      expect(requests, 0);
+      policy.setEnabled(true);
+      expect(cache.resolvedFile(saved), same(held));
+      expect((await cache.loadVisible(cold))!, isNotNull);
+      expect(requests, 1);
+    },
+  );
+
+  test('turning third-party networking off aborts body without a frame and does not refill', () async {
+    final policy = ThirdPartyNetworkPolicy();
+    addTearDown(policy.dispose);
+    final origin = _ControlledOrigin();
+    cache.close();
+    cache = PosterCache(
+      directory: directory,
+      createClient: origin.client,
+      networkPolicy: policy,
+    );
+    final address = url('privacy-stream');
+    final pending = cache.loadVisible(address)!;
+    final request = await origin.request(0);
+    await request.closing.future;
+    final response = _ControlledResponse();
+    request.response.complete(response);
+    await response.listening.future;
+    response.body.add(png.take(20).toList());
+    policy.setEnabled(false);
+    expect(request.aborted, isTrue);
+    expect(origin.clients.single.closed, isTrue);
+    await response.cancelled.future;
+    expect(await pending, isNull);
+    expect(await cache.loadVisible(url('privacy-next')), isNull);
+    expect(origin.requests, hasLength(1));
+    expect(cache.hasFailed(address), isFalse);
+    policy.setEnabled(true);
+    final retry = cache.loadVisible(address)!;
+    final next = await origin.request(1);
+    next.respond(png);
+    expect(await retry, isNotNull);
+    expect(origin.requests, hasLength(2));
+  });
+
+  test('missing TMDB credential blocks client creation and credential revision allows retry', () async {
+    final revision = ValueNotifier(0);
+    addTearDown(revision.dispose);
+    final origin = _ControlledOrigin();
+    var keyConfigured = false;
+    final checked = <Uri>[];
+    cache.close();
+    cache = PosterCache(
+      directory: directory,
+      createClient: origin.client,
+      configurationChanges: revision,
+      configurationRevision: () => revision.value,
+      canFetch: (uri) {
+        checked.add(uri);
+        return uri.host != 'image.tmdb.org' || keyConfigured;
+      },
+    );
+    const address = 'https://image.tmdb.org/t/p/w500/credential-test.png';
+    expect(await cache.loadVisible(address), isNull);
+    expect(origin.clients, isEmpty);
+    expect(cache.hasFailed(address), isFalse);
+    for (var i = 0; i < 5; i++) {
+      expect(await cache.loadVisible(address), isNull);
+    }
+    expect(checked, hasLength(1));
+    keyConfigured = true;
+    revision.value++;
+    final retry = cache.loadVisible(address)!;
+    (await origin.request(0)).respond(png);
+    expect(await retry, isNotNull);
+    expect(checked.last.path, '/t/p/w780/credential-test.png');
+  });
+
+  test('a redirect to credential-protected artwork is checked before opening that host', () async {
+    final origin = _ControlledOrigin();
+    cache.close();
+    cache = PosterCache(
+      directory: directory,
+      createClient: origin.client,
+      canFetch: (uri) => uri.host != 'image.tmdb.org',
+    );
+    final pending = cache.loadVisible(url('public-redirect'))!;
+    final request = await origin.request(0);
+    request.response.complete(
+      _ControlledResponse(
+        redirectLocation: 'https://image.tmdb.org/t/p/original/no-key.png',
+      ),
+    );
+    expect(await pending, isNull);
+    expect(origin.requests, hasLength(1));
+    expect(cache.hasFailed(url('public-redirect')), isFalse);
+  });
+
+  test('model poster transfers ignore unrelated worker commits but observe credential stamps', () async {
+    final store = AppStore('${directory.path}/model.db');
+    final worker = AppStore.openExisting(store.path);
+    final model = AppModel(store, directory, backgroundWork: false);
+    final origin = _ControlledOrigin();
+    overrideSystemProxyPlatformForTesting('test');
+    cache.close();
+    cache = model.posterCache;
+    var retries = 0;
+    cache.changes.addListener(() {
+      if (cache.changes.value?.retryOnly == true) retries++;
+    });
+    try {
+      await HttpOverrides.runZoned(() async {
+        model.notifyListeners();
+        final address = url('model-transfer');
+        final pending = cache.loadVisible(address)!;
+        final first = await origin.request(0);
+        await first.closing.future;
+        final keyRevision = store.localKeyRevision(
+          'metadataCredentialsRevision',
+        );
+        worker.setLocal('syncCursor', 1);
+        model.notifyListeners();
+        worker.setLocal('worker-preview-checkpoint', 1);
+        model.notifyListeners();
+        expect(
+          store.localKeyRevision('metadataCredentialsRevision'),
+          greaterThan(keyRevision),
+        );
+        expect(first.aborted, isFalse);
+        expect(origin.clients.single.closed, isFalse);
+        expect(retries, 0);
+        first.respond(png);
+        final held = (await pending)!;
+        worker.setLocal('worker-preview-checkpoint', 2);
+        model.notifyListeners();
+        expect(await cache.loadVisible(address), same(held));
+        expect(retries, 0);
+        expect(origin.requests, hasLength(1));
+
+        final cold = cache.loadVisible(url('credential-replaced'))!;
+        final old = await origin.request(1);
+        await old.closing.future;
+        worker.markLocalModified(
+          'secret:tmdb.apiKey',
+          at: '2026-11-04T12:00:00Z',
+        );
+        model.notifyListeners();
+        expect(old.aborted, isTrue);
+        expect(origin.clients.first.closed, isTrue);
+        expect(retries, 1);
+        expect(cache.resolvedFile(address), same(held));
+        old.respond(png);
+        (await origin.request(2)).respond(png);
+        expect(await cold, isNotNull);
+      }, createHttpClient: (_) => origin.client());
+    } finally {
+      model.dispose();
+      worker.dispose();
+      store.dispose();
+      overrideSystemProxyPlatformForTesting(Platform.operatingSystem);
+    }
+  });
+
+  test(
+    'off while credential lookup awaits prevents late HTTP client creation',
+    () async {
+      final policy = ThirdPartyNetworkPolicy();
+      addTearDown(policy.dispose);
+      final credential = Completer<bool>(), entered = Completer<void>();
+      final origin = _ControlledOrigin();
+      cache.close();
+      cache = PosterCache(
+        directory: directory,
+        networkPolicy: policy,
+        createClient: origin.client,
+        canFetch: (_) {
+          entered.complete();
+          return credential.future;
+        },
+      );
+      final pending = cache.loadVisible(url('awaiting-key'))!;
+      await entered.future;
+      policy.setEnabled(false);
+      credential.complete(true);
+      expect(await pending, isNull);
+      expect(origin.clients, isEmpty);
+      expect(origin.requests, isEmpty);
+      expect(cache.hasFailed(url('awaiting-key')), isFalse);
+    },
+  );
 
   test(
     'visible portable covers upgrade once without losing offline bytes',
@@ -406,39 +621,36 @@ void main() {
     },
   );
 
-  test(
-    'background pause cancels transfers without frames and resumes the same work',
-    () async {
-      responseGate = Completer<void>();
-      final running = [
-        for (var i = 0; i < 4; i++) cache.loadVisible(url('running-$i'))!,
-      ];
-      await waitForRequests(4);
-      final waiting = cache.loadVisible(url('waiting'))!;
-      var completed = false;
-      waiting.then((_) => completed = true);
-      cache.setActive(false);
-      cache.setActive(false);
-      responseGate!.complete();
-      await Future<void>.delayed(const Duration(milliseconds: 40));
-      expect(requests, 4);
-      expect(completed, isFalse);
-      expect(await directory.list().toList(), isEmpty);
-      for (var i = 0; i < 4; i++) {
-        expect(cache.loadVisible(url('running-$i')), same(running[i]));
-        expect(cache.hasFailed(url('running-$i')), isFalse);
-      }
-      expect(cache.loadVisible(url('waiting')), same(waiting));
+  test('background pause cancels transfers without frames and resumes the same work', () async {
+    responseGate = Completer<void>();
+    final running = [
+      for (var i = 0; i < 4; i++) cache.loadVisible(url('running-$i'))!,
+    ];
+    await waitForRequests(4);
+    final waiting = cache.loadVisible(url('waiting'))!;
+    var completed = false;
+    waiting.then((_) => completed = true);
+    cache.setActive(false);
+    cache.setActive(false);
+    responseGate!.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    expect(requests, 4);
+    expect(completed, isFalse);
+    expect(await directory.list().toList(), isEmpty);
+    for (var i = 0; i < 4; i++) {
+      expect(cache.loadVisible(url('running-$i')), same(running[i]));
+      expect(cache.hasFailed(url('running-$i')), isFalse);
+    }
+    expect(cache.loadVisible(url('waiting')), same(waiting));
 
-      cache.setActive(true);
-      cache.setActive(true);
-      expect(await waiting.timeout(const Duration(seconds: 2)), isNotNull);
-      expect(await Future.wait(running), everyElement(isNotNull));
-      expect(paths.where((path) => path == '/waiting'), hasLength(1));
-      expect(requests, 9);
-      expect(peak, lessThanOrEqualTo(4));
-    },
-  );
+    cache.setActive(true);
+    cache.setActive(true);
+    expect(await waiting.timeout(const Duration(seconds: 2)), isNotNull);
+    expect(await Future.wait(running), everyElement(isNotNull));
+    expect(paths.where((path) => path == '/waiting'), hasLength(1));
+    expect(requests, 9);
+    expect(peak, lessThanOrEqualTo(4));
+  });
 
   test(
     'closing while suspended releases pending futures without transfers',
@@ -474,38 +686,65 @@ void main() {
     () async {
       cache.close();
       final origin = _ControlledOrigin();
-      cache = PosterCache(
-        directory: directory,
-        timeout: const Duration(milliseconds: 40),
-        createClient: origin.client,
-      );
-      final address = url('streaming-pause');
-      final pending = cache.loadVisible(address)!;
-      final request = await origin.request(0);
-      final response = _ControlledResponse();
-      request.response.complete(response);
-      await response.listening.future;
-      response.body.add(png.sublist(0, 10));
-      cache.setActive(false);
-      expect(request.aborted, isTrue);
-      expect(origin.clients.single.closed, isTrue);
-      await response.cancelled.future;
-      var completed = false;
-      pending.then((_) => completed = true);
-      // No pump: cancelling the request also removes its pending timeout.
-      await Future<void>.delayed(const Duration(milliseconds: 70));
-      expect(completed, isFalse);
-      expect(origin.requests, hasLength(1));
-      expect(cache.hasFailed(address), isFalse);
-      expect(await directory.list().toList(), isEmpty);
+      const deadline = Duration(milliseconds: 40);
+      final timers = <_ControlledDeadline>[];
+      await runZoned(
+        () async {
+          cache = PosterCache(
+            directory: directory,
+            timeout: deadline,
+            createClient: origin.client,
+          );
+          final address = url('streaming-pause');
+          final pending = cache.loadVisible(address)!;
+          final request = await origin.request(0);
+          final response = _ControlledResponse();
+          request.response.complete(response);
+          await response.listening.future;
+          expect(timers, hasLength(1));
+          expect(timers.single.isActive, isTrue);
+          response.body.add(png.sublist(0, 10));
+          cache.setActive(false);
+          // No pump or elapsed-time assumption: suspension must cancel the
+          // exact attempt timer synchronously, before the stream unwinds.
+          expect(timers.single.isActive, isFalse);
+          expect(request.aborted, isTrue);
+          expect(origin.clients.single.closed, isTrue);
+          await response.cancelled.future;
+          var completed = false;
+          pending.then((_) => completed = true);
+          timers.single.elapse();
+          expect(timers.single.tick, 0);
+          expect(await directory.list().toList(), isEmpty);
+          expect(timers, hasLength(1));
+          expect(completed, isFalse);
+          expect(origin.requests, hasLength(1));
+          expect(cache.hasFailed(address), isFalse);
 
-      cache.setActive(true);
-      final retried = await origin.request(1);
-      expect(cache.loadVisible(address), same(pending));
-      retried.respond(png);
-      expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
-      expect(cache.hasFailed(address), isFalse);
-      expect(origin.clients, hasLength(2));
+          cache.setActive(true);
+          final retried = await origin.request(1);
+          expect(cache.loadVisible(address), same(pending));
+          expect(timers, hasLength(2));
+          expect(timers.last.isActive, isTrue);
+          // Real validation and disk I/O still run. Their wall-clock cost is
+          // independent of this test's manually controlled attempt deadline.
+          retried.respond(png);
+          expect(await pending.timeout(const Duration(seconds: 2)), isNotNull);
+          expect(timers.last.isActive, isFalse);
+          expect(cache.hasFailed(address), isFalse);
+          expect(origin.clients, hasLength(2));
+        },
+        zoneSpecification: ZoneSpecification(
+          createTimer: (self, parent, zone, duration, callback) {
+            if (duration != deadline) {
+              return parent.createTimer(zone, duration, callback);
+            }
+            final timer = _ControlledDeadline(() => zone.run(callback));
+            timers.add(timer);
+            return timer;
+          },
+        ),
+      );
     },
   );
 
@@ -649,6 +888,7 @@ void main() {
     'pause lets an issued file write settle without starting its rename',
     () async {
       final started = Completer<void>(), release = Completer<void>();
+      final deleted = Completer<void>();
       final outerZone = Zone.current;
       var intercepted = false, renames = 0;
       await IOOverrides.runZoned(
@@ -658,7 +898,9 @@ void main() {
           await started.future;
           cache.setActive(false);
           release.complete();
-          await Future<void>.delayed(const Duration(milliseconds: 40));
+          // An already issued write must flush before its cleanup can delete
+          // the temporary file. Wait for that real event, not elapsed time.
+          await deleted.future.timeout(const Duration(seconds: 2));
           expect(renames, 0);
           expect(await directory.list().toList(), isEmpty);
           expect(cache.hasFailed(address), isFalse);
@@ -672,7 +914,13 @@ void main() {
           final original = outerZone.run(() => File(path));
           if (intercepted || !path.endsWith('.part')) return original;
           intercepted = true;
-          return _DelayedWriteFile(original, started, release, () => renames++);
+          return _DelayedWriteFile(
+            original,
+            started,
+            release,
+            deleted,
+            () => renames++,
+          );
         },
       );
     },
@@ -733,42 +981,33 @@ void main() {
     },
   );
 
-  test(
-    'stale nearby waiters are dropped and visible promotion survives',
-    () async {
-      responseGate = Completer<void>();
-      final foreground = [
-        for (var i = 0; i < 4; i++) cache.loadVisible(url('busy-$i'))!,
-      ];
-      await waitForRequests(4);
-      var nearby = true;
-      final staleAddress = url('stale-nearby');
-      final stale = cache.loadNearby(staleAddress, canStart: () => nearby)!;
-      final promoted = cache.loadNearby(
-        url('promoted'),
-        canStart: () => nearby,
-      )!;
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      nearby = false;
-      expect(cache.loadVisible(url('promoted')), same(promoted));
-      final replacement = cache.loadNearby(
-        url('next-row'),
-        canStart: () => true,
-      );
-      expect(replacement, isNotNull);
-      expect(await stale.timeout(const Duration(seconds: 1)), isNull);
-      expect(paths, isNot(contains('/stale-nearby')));
-      responseGate!.complete();
-      expect(await promoted, isNotNull);
-      expect(await replacement, isNotNull);
-      await Future.wait(foreground);
-      expect(paths[4], '/promoted');
-      // Cancellation is not a failure, so returning to this cover can retry now.
-      expect(await cache.loadVisible(staleAddress), isNotNull);
-      expect(paths.where((path) => path == '/stale-nearby'), hasLength(1));
-      expect(peak, lessThanOrEqualTo(4));
-    },
-  );
+  test('stale nearby waiters are dropped and visible promotion survives', () async {
+    responseGate = Completer<void>();
+    final foreground = [
+      for (var i = 0; i < 4; i++) cache.loadVisible(url('busy-$i'))!,
+    ];
+    await waitForRequests(4);
+    var nearby = true;
+    final staleAddress = url('stale-nearby');
+    final stale = cache.loadNearby(staleAddress, canStart: () => nearby)!;
+    final promoted = cache.loadNearby(url('promoted'), canStart: () => nearby)!;
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    nearby = false;
+    expect(cache.loadVisible(url('promoted')), same(promoted));
+    final replacement = cache.loadNearby(url('next-row'), canStart: () => true);
+    expect(replacement, isNotNull);
+    expect(await stale.timeout(const Duration(seconds: 1)), isNull);
+    expect(paths, isNot(contains('/stale-nearby')));
+    responseGate!.complete();
+    expect(await promoted, isNotNull);
+    expect(await replacement, isNotNull);
+    await Future.wait(foreground);
+    expect(paths[4], '/promoted');
+    // Cancellation is not a failure, so returning to this cover can retry now.
+    expect(await cache.loadVisible(staleAddress), isNotNull);
+    expect(paths.where((path) => path == '/stale-nearby'), hasLength(1));
+    expect(peak, lessThanOrEqualTo(4));
+  });
 
   test(
     'nearby cancellation before disk lookup never starts a transfer',
@@ -971,9 +1210,8 @@ void main() {
     ];
     await waitForRequests(4);
     cache.close();
-    final results = await Future.wait(
-      downloads,
-    ).timeout(const Duration(seconds: 2));
+    final results = await Future.wait(downloads)
+        .timeout(const Duration(seconds: 2));
     expect(results, everyElement(isNull));
     expect(requests, 4);
     expect(await cache.load(url('after-close')), isNull);
@@ -1138,21 +1376,18 @@ void main() {
     },
   );
 
-  test(
-    'new covers have bounded parallel requests and invalid content is not cached or retried on rebuild',
-    () async {
-      final files = await Future.wait(
-        List.generate(9, (i) => cache.load(url('poster-$i'))),
-      );
-      expect(files.whereType<File>(), hasLength(9));
-      expect(peak, lessThanOrEqualTo(4));
-      expect(await cache.load(url('broken')), isNull);
-      final before = requests;
-      expect(await cache.load(url('broken')), isNull);
-      expect(requests, before);
-      expect(directory.listSync().whereType<File>(), hasLength(9));
-    },
-  );
+  test('new covers have bounded parallel requests and invalid content is not cached or retried on rebuild', () async {
+    final files = await Future.wait(
+      List.generate(9, (i) => cache.load(url('poster-$i'))),
+    );
+    expect(files.whereType<File>(), hasLength(9));
+    expect(peak, lessThanOrEqualTo(4));
+    expect(await cache.load(url('broken')), isNull);
+    final before = requests;
+    expect(await cache.load(url('broken')), isNull);
+    expect(requests, before);
+    expect(directory.listSync().whereType<File>(), hasLength(9));
+  });
 
   test('old covers remain offline beyond the former disk size limit', () async {
     cache.close();
@@ -1180,23 +1415,20 @@ void main() {
     expect(requests, before);
   });
 
-  test(
-    'revisiting a loaded cover resolves synchronously without disk or network waits',
-    () async {
-      final address = url('revisit');
-      final file = await cache.load(address);
-      final before = requests;
-      var synchronous = false;
-      cache.load(address).then((value) {
-        expect(value, same(file));
-        synchronous = true;
-      });
-      expect(synchronous, isTrue);
-      expect(requests, before);
-      await cache.invalidate(address);
-      expect(cache.resolvedFile(address), isNull);
-    },
-  );
+  test('revisiting a loaded cover resolves synchronously without disk or network waits', () async {
+    final address = url('revisit');
+    final file = await cache.load(address);
+    final before = requests;
+    var synchronous = false;
+    cache.load(address).then((value) {
+      expect(value, same(file));
+      synchronous = true;
+    });
+    expect(synchronous, isTrue);
+    expect(requests, before);
+    await cache.invalidate(address);
+    expect(cache.resolvedFile(address), isNull);
+  });
 }
 
 class _DelayedRenameFile implements File {
@@ -1282,10 +1514,16 @@ class _PauseOnCreateDirectory implements Directory {
 
 class _DelayedWriteFile implements File {
   final File delegate;
-  final Completer<void> started, release;
+  final Completer<void> started, release, deleted;
   final void Function() onRename;
 
-  _DelayedWriteFile(this.delegate, this.started, this.release, this.onRename);
+  _DelayedWriteFile(
+    this.delegate,
+    this.started,
+    this.release,
+    this.deleted,
+    this.onRename,
+  );
 
   @override
   String get path => delegate.path;
@@ -1308,11 +1546,38 @@ class _DelayedWriteFile implements File {
   }
 
   @override
-  Future<FileSystemEntity> delete({bool recursive = false}) =>
-      delegate.delete(recursive: recursive);
+  Future<FileSystemEntity> delete({bool recursive = false}) async {
+    final removed = await delegate.delete(recursive: recursive);
+    deleted.complete();
+    return removed;
+  }
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _ControlledDeadline implements Timer {
+  final void Function() callback;
+  bool _active = true;
+  int _tick = 0;
+
+  _ControlledDeadline(this.callback);
+
+  @override
+  bool get isActive => _active;
+
+  @override
+  int get tick => _tick;
+
+  @override
+  void cancel() => _active = false;
+
+  void elapse() {
+    if (!_active) return;
+    _active = false;
+    _tick++;
+    callback();
+  }
 }
 
 class _ControlledOrigin {
@@ -1391,6 +1656,8 @@ class _ControlledRequest implements HttpClientRequest {
 
 class _ControlledResponse extends Stream<List<int>>
     implements HttpClientResponse {
+  final String? redirectLocation;
+  _ControlledResponse({this.redirectLocation});
   final listening = Completer<void>();
   final cancelled = Completer<void>();
   late final body = StreamController<List<int>>(
@@ -1402,10 +1669,14 @@ class _ControlledResponse extends Stream<List<int>>
   int get contentLength => -1;
 
   @override
-  int get statusCode => HttpStatus.ok;
+  int get statusCode =>
+      redirectLocation == null ? HttpStatus.ok : HttpStatus.found;
 
   @override
-  bool get isRedirect => false;
+  bool get isRedirect => redirectLocation != null;
+
+  @override
+  HttpHeaders get headers => _ControlledHeaders(redirectLocation);
 
   @override
   StreamSubscription<List<int>> listen(
@@ -1422,4 +1693,14 @@ class _ControlledResponse extends Stream<List<int>>
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _ControlledHeaders implements HttpHeaders {
+  final String? redirect;
+  _ControlledHeaders(this.redirect);
+  @override
+  String? value(String name) =>
+      name == HttpHeaders.locationHeader ? redirect : null;
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
 }

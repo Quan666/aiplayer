@@ -27,171 +27,172 @@ import 'package:integration_test/integration_test.dart';
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized()
     ..framePolicy = LiveTestWidgetsFlutterBindingFramePolicy.fullyLive;
-  testWidgets('profile actual detail and folder list covers in both directions', (
-    tester,
-  ) async {
-    FlutterSecureStorage.setMockInitialValues({});
-    final reports = <Map<String, Object?>>[];
-    for (final scenario in [
-      'library-details',
-      'source-details',
-      'folders',
-      'local-files',
-    ]) {
-      final root = await Directory.systemTemp.createTemp(
-        'list-artwork-profile-',
-      );
-      final path = root.path;
-      await _seedInBackground(path, scenario);
-      final store = AppStore.openExisting('$path/library.db');
-      final model = _Model(store, root, scenario);
-      try {
-        PaintingBinding.instance.imageCache
-          ..clear()
-          ..clearLiveImages();
-        final child = switch (scenario) {
-          'library-details' => LibraryPage(model: model),
-          'local-files' => SourcesPage(
-            model: model,
-            onImport: () async {},
-            onPlay: (_) async {},
-          ),
-          _ => SourceBrowser(
-            model: model,
-            source: const {'id': 'nas', 'kind': 'webdav', 'label': 'NAS'},
-            initialPath: scenario == 'source-details' ? 'Example' : null,
-          ),
-        };
-        await tester.pumpWidget(
-          MaterialApp(
-            theme: GlassPalette.theme(),
-            home: Scaffold(body: GlassBackground(child: child)),
-          ),
+  testWidgets(
+    'profile actual detail and folder list covers in both directions',
+    (tester) async {
+      FlutterSecureStorage.setMockInitialValues({});
+      final reports = <Map<String, Object?>>[];
+      for (final scenario in [
+        'library-details',
+        'source-details',
+        'folders',
+        'local-files',
+      ]) {
+        final root = await Directory.systemTemp.createTemp(
+          'list-artwork-profile-',
         );
-        await tester.pumpAndSettle();
-        if (scenario == 'library-details') {
-          await _wait(
-            () => find
-                .byKey(const ValueKey('details:0001'))
-                .evaluate()
-                .isNotEmpty,
+        final path = root.path;
+        await _seedInBackground(path, scenario);
+        final store = AppStore.openExisting('$path/library.db');
+        final model = _Model(store, root, scenario);
+        try {
+          PaintingBinding.instance.imageCache
+            ..clear()
+            ..clearLiveImages();
+          final child = switch (scenario) {
+            'library-details' => LibraryPage(model: model),
+            'local-files' => SourcesPage(
+              model: model,
+              onImport: () async {},
+              onPlay: (_) async {},
+            ),
+            _ => SourceBrowser(
+              model: model,
+              source: const {'id': 'nas', 'kind': 'webdav', 'label': 'NAS'},
+              initialPath: scenario == 'source-details' ? 'Example' : null,
+            ),
+          };
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: GlassPalette.theme(),
+              home: Scaffold(body: GlassBackground(child: child)),
+            ),
           );
-          await tester.tap(find.byKey(const ValueKey('details:0001')));
-        } else if (scenario == 'local-files') {
-          await tester.tap(find.text('本地视频').first);
-        }
-        await tester.pumpAndSettle();
-        final list = scenario == 'library-details'
-            ? find.byKey(const ValueKey('series-details-list'))
-            : find.byType(ListView);
-        await _wait(() {
-          final visible = _visible(list);
-          return visible.isNotEmpty && visible.values.every((ready) => ready);
-        });
-        await Future<void>.delayed(const Duration(milliseconds: 300));
-        final position = tester
-            .state<ScrollableState>(
-              find
-                  .descendant(of: list, matching: find.byType(Scrollable))
-                  .first,
-            )
-            .position;
-        for (final direction in ['forward', 'reverse']) {
-          final initial = _visible(list).keys.toSet();
-          final observations = <String, ({int first, int? ready})>{};
-          final frames = <ui.FrameTiming>[];
-          final watch = Stopwatch()..start();
-          var observing = true;
-          void sample(Duration _) {
-            if (!observing) return;
-            final now = watch.elapsedMicroseconds;
-            for (final entry in _visible(list).entries) {
-              if (initial.contains(entry.key)) continue;
-              final previous = observations[entry.key];
-              observations[entry.key] = (
-                first: previous?.first ?? now,
-                ready: previous?.ready ?? (entry.value ? now : null),
-              );
-            }
-            WidgetsBinding.instance.addPostFrameCallback(sample);
+          await tester.pumpAndSettle();
+          if (scenario == 'library-details') {
+            await _wait(
+              () => find
+                  .byKey(const ValueKey('details:0001'))
+                  .evaluate()
+                  .isNotEmpty,
+            );
+            await tester.tap(find.byKey(const ValueKey('details:0001')));
+          } else if (scenario == 'local-files') {
+            await tester.tap(find.text('本地视频').first);
           }
-
-          void collect(List<ui.FrameTiming> values) => frames.addAll(values);
-          await Future<void>.delayed(const Duration(milliseconds: 1100));
-          WidgetsBinding.instance.addTimingsCallback(collect);
-          WidgetsBinding.instance.addPostFrameCallback(sample);
-          await position.animateTo(
-            direction == 'forward' ? 6000 : 0,
-            duration: const Duration(seconds: 10),
-            curve: Curves.linear,
-          );
-          await tester.pump();
-          observing = false;
-          watch.stop();
-          await Future<void>.delayed(const Duration(milliseconds: 1100));
-          WidgetsBinding.instance.removeTimingsCallback(collect);
-          expect(observations.length, greaterThan(50));
-          expect(frames, isNotEmpty);
-          reports.add({
-            'scenario': scenario,
-            'direction': direction,
-            'entries': 240,
-            'newVisibleCovers': observations.length,
-            'readyOnFirstVisibleFrame': observations.values
-                .where((v) => v.ready == v.first)
-                .length,
-            'unresolved': observations.values
-                .where((v) => v.ready == null)
-                .length,
-            'visibleToPixelsMs': _distribution(
-              observations.values
-                  .where((v) => v.ready != null)
-                  .map((v) => (v.ready! - v.first) / 1000),
-            ),
-            'frameBuildMs': _distribution(
-              frames.map((f) => f.buildDuration.inMicroseconds / 1000),
-            ),
-            'frameRasterMs': _distribution(
-              frames.map((f) => f.rasterDuration.inMicroseconds / 1000),
-            ),
+          await tester.pumpAndSettle();
+          final list = scenario == 'library-details'
+              ? find.byKey(const ValueKey('series-details-list'))
+              : find.byType(ListView);
+          await _wait(() {
+            final visible = _visible(list);
+            return visible.isNotEmpty && visible.values.every((ready) => ready);
           });
-          debugPrint('LIST PROFILE ${reports.last}');
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          final position = tester
+              .state<ScrollableState>(
+                find
+                    .descendant(of: list, matching: find.byType(Scrollable))
+                    .first,
+              )
+              .position;
+          for (final direction in ['forward', 'reverse']) {
+            final initial = _visible(list).keys.toSet();
+            final observations = <String, ({int first, int? ready})>{};
+            final frames = <ui.FrameTiming>[];
+            final watch = Stopwatch()..start();
+            var observing = true;
+            void sample(Duration _) {
+              if (!observing) return;
+              final now = watch.elapsedMicroseconds;
+              for (final entry in _visible(list).entries) {
+                if (initial.contains(entry.key)) continue;
+                final previous = observations[entry.key];
+                observations[entry.key] = (
+                  first: previous?.first ?? now,
+                  ready: previous?.ready ?? (entry.value ? now : null),
+                );
+              }
+              WidgetsBinding.instance.addPostFrameCallback(sample);
+            }
+
+            void collect(List<ui.FrameTiming> values) => frames.addAll(values);
+            await Future<void>.delayed(const Duration(milliseconds: 1100));
+            WidgetsBinding.instance.addTimingsCallback(collect);
+            WidgetsBinding.instance.addPostFrameCallback(sample);
+            await position.animateTo(
+              direction == 'forward' ? 6000 : 0,
+              duration: const Duration(seconds: 10),
+              curve: Curves.linear,
+            );
+            await tester.pump();
+            observing = false;
+            watch.stop();
+            await Future<void>.delayed(const Duration(milliseconds: 1100));
+            WidgetsBinding.instance.removeTimingsCallback(collect);
+            expect(observations.length, greaterThan(50));
+            expect(frames, isNotEmpty);
+            reports.add({
+              'scenario': scenario,
+              'direction': direction,
+              'entries': 240,
+              'newVisibleCovers': observations.length,
+              'readyOnFirstVisibleFrame': observations.values
+                  .where((v) => v.ready == v.first)
+                  .length,
+              'unresolved': observations.values
+                  .where((v) => v.ready == null)
+                  .length,
+              'visibleToPixelsMs': _distribution(
+                observations.values
+                    .where((v) => v.ready != null)
+                    .map((v) => (v.ready! - v.first) / 1000),
+              ),
+              'frameBuildMs': _distribution(
+                frames.map((f) => f.buildDuration.inMicroseconds / 1000),
+              ),
+              'frameRasterMs': _distribution(
+                frames.map((f) => f.rasterDuration.inMicroseconds / 1000),
+              ),
+            });
+            debugPrint('LIST PROFILE ${reports.last}');
+          }
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox());
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          model.dispose();
+          await model.sync.dispose();
+          store.dispose();
+          await root.delete(recursive: true);
         }
-        expect(tester.takeException(), isNull);
-      } finally {
-        await tester.pumpWidget(const SizedBox());
-        await Future<void>.delayed(const Duration(milliseconds: 100));
-        model.dispose();
-        await model.sync.dispose();
-        store.dispose();
-        await root.delete(recursive: true);
       }
-    }
-    final report = {
-      'mode': kProfileMode ? 'profile' : 'debug',
-      'scope':
-          'Actual LibraryPage detail sheet, SourceBrowser episode/folder lists, SourcesPage local list; 240 unique 320x180 JPEG disk files; separate-isolate fixture creation; 600 pixels/second continuous scroll 10 seconds each direction. Fixture source adapters and preview capture callbacks; Linux Xvfb software rendering, not device FPS or NAS/WAN throughput.',
-      'latencyDefinition':
-          'First frame with any cover area visible to first RawImage pixels; initially visible covers excluded. 0ms means prepared before entry, not zero IO/decode time.',
-      'viewport': {
-        'width': tester.view.physicalSize.width / tester.view.devicePixelRatio,
-        'height': tester.view.physicalSize.height / tester.view.devicePixelRatio,
-        'devicePixelRatio': tester.view.devicePixelRatio,
-      },
-      'scenarios': reports,
-    };
-    final output = Directory(
-      const String.fromEnvironment(
-        'LIST_ARTWORK_ARTIFACT_DIR',
-        defaultValue: '../artifacts/list-artwork',
-      ),
-    );
-    await output.create(recursive: true);
-    await File(
-      '${output.path}/list-artwork-performance.json',
-    ).writeAsString(const JsonEncoder.withIndent('  ').convert(report));
-    binding.reportData = report;
-  }, timeout: const Timeout(Duration(minutes: 5)));
+      final report = {
+        'mode': kProfileMode ? 'profile' : 'debug',
+        'scope': 'Actual LibraryPage detail sheet, SourceBrowser episode/folder lists, SourcesPage local list; 240 unique 320x180 JPEG disk files; separate-isolate fixture creation; 600 pixels/second continuous scroll 10 seconds each direction. Fixture source adapters and preview capture callbacks; Linux Xvfb software rendering, not device FPS or NAS/WAN throughput.',
+        'latencyDefinition': 'First frame with any cover area visible to first RawImage pixels; initially visible covers excluded. 0ms means prepared before entry, not zero IO/decode time.',
+        'viewport': {
+          'width':
+              tester.view.physicalSize.width / tester.view.devicePixelRatio,
+          'height':
+              tester.view.physicalSize.height / tester.view.devicePixelRatio,
+          'devicePixelRatio': tester.view.devicePixelRatio,
+        },
+        'scenarios': reports,
+      };
+      final output = Directory(
+        const String.fromEnvironment(
+          'LIST_ARTWORK_ARTIFACT_DIR',
+          defaultValue: '../artifacts/list-artwork',
+        ),
+      );
+      await output.create(recursive: true);
+      await File('${output.path}/list-artwork-performance.json')
+          .writeAsString(const JsonEncoder.withIndent('  ').convert(report));
+      binding.reportData = report;
+    },
+    timeout: const Timeout(Duration(minutes: 5)),
+  );
 }
 
 Future<void> _wait(bool Function() ready) async {
@@ -311,7 +312,7 @@ class _Model extends AppModel {
   String? thumbnailPath(String id) =>
       scenario == 'folders' ? null : '${documents.path}/$id.jpg';
   @override
-  void ensureMediaPreview(String id) {}
+  bool ensureMediaPreview(String id) => true;
   @override
   Future<bool> needsMediaPreview(String id) async => false;
   @override

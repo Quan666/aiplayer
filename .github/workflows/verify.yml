@@ -4,28 +4,32 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'
+      - name: Check supply chain pins and verification policy
+        run: python3 scripts/check_supply_chain.py
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang cmake libsqlite3-dev libmpv-dev libgtk-3-dev libsecret-1-dev ninja-build ffmpeg xvfb
       - name: Test packaging safeguards and native SMB builds
         run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           flutter-version: '3.47.7'
           cache: true
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: '1.27.3'
           cache-dependency-path: server/go.sum
       - run: go test -race ./...
         working-directory: server
-      - run: flutter pub get
+      - run: flutter pub get --enforce-lockfile
         working-directory: client
       - run: flutter analyze
         working-directory: client
@@ -42,7 +46,7 @@ jobs:
       - run: xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 flutter test integration_test/glass_gallery_test.dart -d linux
         working-directory: client
       # Keep CI downloads limited to the macOS app and Android APKs.
-      # - uses: actions/upload-artifact@v6
+      # - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       #   with:
       #     name: interface-previews
       #     path: artifacts/*.png

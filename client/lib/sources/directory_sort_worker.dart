@@ -58,6 +58,19 @@ class DirectorySortWorker {
     return request.result.future;
   }
 
+  /// Summarize a prepared, visibility-filtered listing on this same worker.
+  /// Directories never count, even when their name has a video suffix.
+  Future<SourceEntry?> singleVideo(List<SourceEntry> entries) {
+    if (_closed) return Future.error(const DirectorySortCancelled());
+    final request = _SortRequest.singleVideo(entries);
+    if (_queue.length == 8) {
+      _queue.removeAt(0).result.completeError(const DirectorySortCancelled());
+    }
+    _queue.add(request);
+    unawaited(_drain());
+    return request.result.future.then((entries) => entries.singleOrNull);
+  }
+
   void cancelSearch() {
     _queue.removeWhere((request) {
       if (request.query == null) return false;
@@ -110,6 +123,7 @@ class DirectorySortWorker {
             request.query,
             reuseSearch ? const <String, SyncRecord>{} : request.records,
             reuseSearch ? const <String, String>{} : request.titles,
+            request.summarizeVideo,
           ));
           if (!await _responses!.moveNext()) {
             throw const DirectorySortCancelled();
@@ -155,16 +169,27 @@ class _SortRequest {
   final String? query;
   final Map<String, SyncRecord> records;
   final Map<String, String> titles;
+  final bool summarizeVideo;
   final result = Completer<List<SourceEntry>>();
 
   _SortRequest(this.entries, this.order, this.hideHiddenFiles)
     : query = null,
       records = const {},
-      titles = const {};
+      titles = const {},
+      summarizeVideo = false;
 
   _SortRequest.search(this.entries, this.query, this.records, this.titles)
     : order = null,
-      hideHiddenFiles = false;
+      hideHiddenFiles = false,
+      summarizeVideo = false;
+
+  _SortRequest.singleVideo(this.entries)
+    : order = null,
+      hideHiddenFiles = false,
+      query = null,
+      records = const {},
+      titles = const {},
+      summarizeVideo = true;
 }
 
 List<SourceEntry> searchDirectoryEntries(
@@ -214,6 +239,7 @@ void _sortDirectory(SendPort replies) {
       query,
       records,
       titles,
+      summarizeVideo,
     ) = message
         as (
           List<SourceEntry>?,
@@ -224,10 +250,22 @@ void _sortDirectory(SendPort replies) {
           String?,
           Map<String, SyncRecord>,
           Map<String, String>,
+          bool,
         );
     try {
       final List<SourceEntry> sorted;
-      if (field == null) {
+      if (summarizeVideo) {
+        SourceEntry? video;
+        for (final entry in entries!) {
+          if (entry.directory || !isVideo(entry.name)) continue;
+          if (video != null) {
+            video = null;
+            break;
+          }
+          video = entry;
+        }
+        sorted = [?video];
+      } else if (field == null) {
         if (entries != null) {
           searchEntries = entries;
           searchText = [

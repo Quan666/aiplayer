@@ -1,6 +1,7 @@
 import 'dart:isolate';
 
 import 'package:path/path.dart' as paths;
+
 import '../data/app_model.dart';
 import '../data/media_presentation.dart';
 import '../data/media_episodes.dart';
@@ -18,21 +19,23 @@ List<SyncRecord> playbackPlaylist(AppModel model, SyncRecord media) =>
 Future<(SyncRecord?, SyncRecord?)> playbackNeighbors(
   String databasePath,
   SyncRecord media,
-) => Isolate.run(() {
-  final store = AppStore.openExisting(databasePath);
-  try {
-    store.db.execute('BEGIN');
-    final items = _PlaylistIndex().playlist(store, media);
-    final index = items.indexWhere((item) => item.id == media.id);
-    return (
-      index > 0 ? items[index - 1] : null,
-      index >= 0 && index + 1 < items.length ? items[index + 1] : null,
-    );
-  } finally {
-    store.db.execute('ROLLBACK');
-    store.dispose();
-  }
-});
+) => media.data['personalMedia'] == true
+    ? Future.value((null, null))
+    : Isolate.run(() {
+        final store = AppStore.openExisting(databasePath);
+        try {
+          store.db.execute('BEGIN');
+          final items = _PlaylistIndex().playlist(store, media);
+          final index = items.indexWhere((item) => item.id == media.id);
+          return (
+            index > 0 ? items[index - 1] : null,
+            index >= 0 && index + 1 < items.length ? items[index + 1] : null,
+          );
+        } finally {
+          store.db.execute('ROLLBACK');
+          store.dispose();
+        }
+      });
 
 class _PlaylistIndex {
   int? _mediaRevision, _locationRevision;
@@ -43,6 +46,7 @@ class _PlaylistIndex {
   final _selectedVersions = <(String, String, String), List<SyncRecord>>{};
 
   List<SyncRecord> playlist(AppStore store, SyncRecord media) {
+    if (media.data['personalMedia'] == true) return List.unmodifiable([media]);
     final mediaRevision = store.recordsRevision('media');
     final locationRevision = store.locationRevision;
     if (_mediaRevision != mediaRevision ||
@@ -56,6 +60,7 @@ class _PlaylistIndex {
       _sorted.clear();
       _selectedVersions.clear();
       for (final item in _media.values) {
+        if (item.data['personalMedia'] == true) continue;
         final location = _locations['location:${item.id}'];
         if (location is! Map) continue;
         final series = mediaSeriesKey(item);

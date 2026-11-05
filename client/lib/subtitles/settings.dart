@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
 import '../ui/glass.dart';
+import '../ui/secret_text_field.dart';
 import 'ai.dart';
 
 class AiSubtitleSettings extends StatefulWidget {
@@ -19,7 +21,7 @@ class _AiSubtitleSettingsState extends State<AiSubtitleSettings> {
       modelName = TextEditingController(),
       target = TextEditingController(),
       prompt = TextEditingController();
-  bool loading = true, saving = false, loadingModels = false, reveal = false;
+  bool loading = true, saving = false, loadingModels = false;
   String result = '';
   List<String> models = [];
   CancelToken? _cancel;
@@ -116,8 +118,10 @@ class _AiSubtitleSettingsState extends State<AiSubtitleSettings> {
         model: '',
       );
       AppLog.instance.rememberSecret(config.token);
-      final available = await (widget.transport ?? IoSubtitleAiTransport())
-          .models(config, cancel);
+      final available = await PolicySubtitleAiTransport(
+        widget.model.thirdPartyNetwork,
+        transport: widget.transport,
+      ).models(config, cancel);
       if (!mounted || cancel.cancelled) return;
       setState(() {
         models = available.toSet().toList()..sort();
@@ -174,23 +178,9 @@ class _AiSubtitleSettingsState extends State<AiSubtitleSettings> {
           ),
         ),
         const SizedBox(height: 10),
-        TextField(
+        SecretTextField(
           controller: token,
-          obscureText: !reveal,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: InputDecoration(
-            labelText: 'API Key',
-            suffixIcon: IconButton(
-              tooltip: reveal ? '隐藏' : '显示',
-              onPressed: () => setState(() => reveal = !reveal),
-              icon: Icon(
-                reveal
-                    ? Icons.visibility_off_outlined
-                    : Icons.visibility_outlined,
-              ),
-            ),
-          ),
+          decoration: const InputDecoration(labelText: 'API Key'),
         ),
         const SizedBox(height: 10),
         TextField(

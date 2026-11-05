@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Code-native banner reuses the existing play mark and brand blue. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp" android:height="180dp"
+    android:viewportWidth="320" android:viewportHeight="180">
+    <path android:fillColor="#176BE8" android:pathData="M0,0H320V180H0Z"/>
+    <group android:translateX="10" android:translateY="28"
+        android:scaleX="0.12" android:scaleY="0.12">
+        <path android:fillColor="#FFFFFF" android:fillType="evenOdd"
+            android:pathData="M312 268H712Q824 268 824 380V644Q824 756 712 756H312Q200 756 200 644V380Q200 268 312 268Z M312 312H712Q780 312 780 380V644Q780 712 712 712H312Q244 712 244 644V380Q244 312 312 312Z M450 405Q450 389 464 398L626 498Q648 512 626 526L464 626Q450 635 450 619Z"/>
+    </group>
+    <path android:strokeColor="#FFFFFF" android:strokeWidth="3"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M130,103L138,77L146,103M133,94H143 M155,77V103 M170,103V77H178Q187,77 187,85Q187,92 178,92H170 M196,77V103H210 M218,103L226,77L234,103M221,94H231 M241,77L249,90L257,77M249,90V103 M280,77H266V103H280M266,90H277 M289,103V77H296Q304,77 304,85Q304,92 296,92H289M296,92L305,103"/>
+</vector>

@@ -52,6 +52,7 @@ class _ScanModel extends AppModel {
     SourceEntry entry, {
     String? associateId,
     bool notify = true,
+    bool personalMedia = false,
   }) {
     if (++imports == failAt) throw StateError('failed import');
     return super.addMedia(
@@ -59,6 +60,7 @@ class _ScanModel extends AppModel {
       entry,
       associateId: associateId,
       notify: notify,
+      personalMedia: personalMedia,
     );
   }
 }
@@ -81,8 +83,7 @@ void main() {
   setUp(() {
     FlutterSecureStorage.setMockInitialValues({});
     directory = Directory.systemTemp.createTempSync('scan-performance-');
-    store = _CountingStore()
-      ..setLocal('settings', {'metadataStrategy': 'off'});
+    store = _CountingStore()..setLocal('settings', {'metadataStrategy': 'off'});
     model = _ScanModel(store, directory);
     store.save('media', 'donor', {
       'title': 'Show S01E01.mkv',
@@ -128,20 +129,26 @@ void main() {
     },
   );
 
-  test('scan sees a conflicting manual match between committed batches', () async {
-    var edited = false;
-    model.addListener(() {
-      if (!edited && model.status.startsWith('已发现')) {
-        edited = true;
-        final donor = store.get('media', 'donor')!;
-        store.save('media', donor.id, {...donor.data, 'bangumiId': '456'});
-      }
-    });
-    await model.scan('nas', '');
-    expect(model.mediaReads, 2);
-    expect(store.all('media').where((r) => r.data['bangumiId'] == null), hasLength(36));
-    expect(store.local('syncProfile:remoteMedia'), hasLength(60));
-  });
+  test(
+    'scan sees a conflicting manual match between committed batches',
+    () async {
+      var edited = false;
+      model.addListener(() {
+        if (!edited && model.status.startsWith('已发现')) {
+          edited = true;
+          final donor = store.get('media', 'donor')!;
+          store.save('media', donor.id, {...donor.data, 'bangumiId': '456'});
+        }
+      });
+      await model.scan('nas', '');
+      expect(model.mediaReads, 2);
+      expect(
+        store.all('media').where((r) => r.data['bangumiId'] == null),
+        hasLength(36),
+      );
+      expect(store.local('syncProfile:remoteMedia'), hasLength(60));
+    },
+  );
 
   test(
     'cancel between batches preserves committed files and closes source',

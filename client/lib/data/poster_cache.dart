@@ -7,8 +7,10 @@ import 'dart:ui' as ui;
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+
 import '../core/network.dart';
 import '../core/system_proxy.dart';
+import '../core/third_party_network.dart';
 import 'poster_url.dart';
 
 // Weak file handles carry the content generation into Flutter's decoded cache.
@@ -22,10 +24,17 @@ int posterFileRevision(File file) => _posterFileRevisions[file] ?? 0;
 class PosterCacheChange {
   final String url;
   final File? file;
+  final bool retryOnly;
 
-  const PosterCacheChange(this.url, this.file);
+  const PosterCacheChange(this.url, this.file) : retryOnly = false;
 
-  const PosterCacheChange.cleared() : url = '', file = null;
+  const PosterCacheChange.cleared() : url = '', file = null, retryOnly = false;
+
+  /// A policy/credential change permits another request, without invalidating
+  /// a portable file or the decoded image currently visible on screen.
+  const PosterCacheChange.retry([this.url = ''])
+    : file = null,
+      retryOnly = true;
 
   bool get all => url.isEmpty;
 }
@@ -39,6 +48,14 @@ class PosterCache {
   final Duration timeout;
   final HttpClient Function() createClient;
   final SystemProxyLookup? proxyResolver;
+  final ThirdPartyNetworkPolicy? networkPolicy;
+  final FutureOr<bool> Function(Uri)? canFetch;
+  final Listenable? configurationChanges;
+  final Object? Function()? configurationRevision;
+  Object? _configurationRevision;
+  int _networkRevision = 0;
+  final _networkDeferred = <String>{};
+  final _resumePending = <String>{};
   final _pending = <String, Future<File?>>{};
   final _invalidating = <String, Future<void>>{};
   final _resolved = <String, File>{};
@@ -79,9 +96,61 @@ class PosterCache {
     this.timeout = const Duration(seconds: 15),
     HttpClient Function()? createClient,
     SystemProxyLookup? proxyResolver,
+    this.networkPolicy,
+    this.canFetch,
+    this.configurationChanges,
+    this.configurationRevision,
   }) : createClient = createClient ?? HttpClient.new,
        proxyResolver =
-           proxyResolver ?? (createClient == null ? resolveSystemProxy : null);
+           proxyResolver ?? (createClient == null ? resolveSystemProxy : null) {
+    _configurationRevision = configurationRevision?.call();
+    networkPolicy?.addListener(_networkPolicyChanged);
+    configurationChanges?.addListener(_networkConfigurationChanged);
+  }
+
+  bool get _networkEnabled => networkPolicy?.enabled != false;
+
+  void _deferNetwork(String url) {
+    _networkDeferred.add(url);
+    if (_networkDeferred.length > 512) {
+      _networkDeferred.remove(_networkDeferred.first);
+    }
+  }
+
+  void _networkPolicyChanged() {
+    if (_closed) return;
+    _networkRevision++;
+    if (!_networkEnabled) {
+      _resumePending.clear();
+      _cancelTransfers();
+      for (final waiting in _waiting) {
+        _deferNetwork(waiting.url);
+        waiting.ready.complete(false);
+      }
+      _waiting.clear();
+      return;
+    }
+    _retryNetwork();
+  }
+
+  void _networkConfigurationChanged() {
+    if (_closed) return;
+    final revision = configurationRevision?.call();
+    if (revision == _configurationRevision) return;
+    _configurationRevision = revision;
+    _networkRevision++;
+    _cancelTransfers();
+    if (_networkEnabled) _retryNetwork();
+  }
+
+  void _retryNetwork() {
+    _networkDeferred.clear();
+    _resumePending.addAll(_pending.keys);
+    _changes.value = PosterCacheChange.retry();
+    _capacity.value++;
+    _dispatchWaiting();
+    _dispatchUpgrades();
+  }
 
   /// A single notification wakes visible covers deferred by a full queue.
   Listenable get capacity => _capacity;
@@ -119,7 +188,9 @@ class PosterCache {
   }
 
   void _dispatchWaiting() {
-    if (_closed || _clearing != null || _resume != null) return;
+    if (_closed || _clearing != null || _resume != null || !_networkEnabled) {
+      return;
+    }
     while (_active < 4 && _waiting.isNotEmpty) {
       _active++;
       _waiting.removeAt(0).ready.complete(true);
@@ -203,6 +274,8 @@ class PosterCache {
   void _upgradeVisible(String url, File file, {bool Function()? canStart}) {
     final fileEpoch = _posterFileEpochs[file];
     if (_closed ||
+        !_networkEnabled ||
+        _networkDeferred.contains(url) ||
         _clearing != null ||
         (fileEpoch != null && !identical(fileEpoch, _epoch)) ||
         _isSource(file) ||
@@ -229,7 +302,9 @@ class PosterCache {
   }
 
   void _dispatchUpgrades() {
-    if (_closed || _clearing != null || _resume != null) return;
+    if (_closed || _clearing != null || _resume != null || !_networkEnabled) {
+      return;
+    }
     while (_pending.length < maxPending && _upgradeWaiting.isNotEmpty) {
       final url = _upgradeWaiting.keys.first;
       final (file, upgrade) = _upgradeWaiting.remove(url)!;
@@ -312,6 +387,8 @@ class PosterCache {
   /// This only reads path handles; no disk lookup or maintenance timer is used.
   bool needsSourceUpgrade(String url) {
     if (_closed ||
+        !_networkEnabled ||
+        _networkDeferred.contains(url) ||
         _clearing != null ||
         _pending.containsKey(url) ||
         (_failedUntil[url]?.isAfter(DateTime.now()) ?? false)) {
@@ -472,6 +549,9 @@ class PosterCache {
             _upgrades.remove(url);
           }
           if (!_closed && _clearing == null) _capacity.value++;
+          if (_resumePending.remove(url) && !_closed && _networkEnabled) {
+            _changes.value = PosterCacheChange.retry(url);
+          }
           _dispatchUpgrades();
         });
     _pending[url] = result;
@@ -520,6 +600,10 @@ class PosterCache {
             nearby?.allowed == false) {
           return null;
         }
+        if (!_networkEnabled || _networkDeferred.contains(url)) {
+          _deferNetwork(url);
+          return null;
+        }
         if (!await _checkpoint(epoch)) return null;
         if (_active >= 4) {
           final waiting = _PosterWaiter(url);
@@ -534,22 +618,24 @@ class PosterCache {
         } else {
           _active++;
         }
-        final attempt = _PosterAttempt();
-        if (_resume != null) attempt.cancel();
+        final attempt = _PosterAttempt(_networkRevision);
+        if (_resume != null || !_networkEnabled) attempt.cancel();
         _attempts.add(attempt);
         // Keep the slot until the underlying native decode/file operation has
         // settled, even if its deadline has already returned to the caller.
         final work = _track(
-          _download(uri, file, epoch, nearby, attempt).whenComplete(() async {
-            attempt.stopDeadline();
-            try {
-              await attempt.cancelChunks();
-            } finally {
-              _attempts.remove(attempt);
-              _active--;
-              _dispatchWaiting();
-            }
-          }),
+          _download(url, uri, file, epoch, nearby, attempt).whenComplete(
+            () async {
+              attempt.stopDeadline();
+              try {
+                await attempt.cancelChunks();
+              } finally {
+                _attempts.remove(attempt);
+                _active--;
+                _dispatchWaiting();
+              }
+            },
+          ),
         );
         try {
           final result = await attempt.withDeadline(work, timeout);
@@ -573,6 +659,7 @@ class PosterCache {
   }
 
   Future<File?> _download(
+    String url,
     Uri uri,
     File file,
     _PosterEpoch epoch,
@@ -583,10 +670,23 @@ class PosterCache {
     if (!await _checkpoint(epoch) || nearby?.allowed == false) return null;
     bool canContinue() =>
         _current(epoch) &&
+        _networkEnabled &&
+        attempt.networkRevision == _networkRevision &&
         _resume == null &&
         !attempt.stopped &&
         nearby?.allowed != false;
     if (!canContinue()) return null;
+    Future<bool> allowed(Uri address) async {
+      if (!canContinue()) return false;
+      final allowed = canFetch == null || await canFetch!(address);
+      if (!canContinue()) return false;
+      if (!allowed) _deferNetwork(url);
+      return allowed;
+    }
+
+    // Credential reads are bounded by the same four request slots. Recheck the
+    // policy after the await and before even allocating an HTTP client.
+    if (!await allowed(uri) || !canContinue()) return null;
     // One pool reuses HTTP/TLS connections across covers. An individual
     // timeout aborts only its own request; lifecycle suspension closes all.
     final client = _client ??= createClient()
@@ -595,6 +695,7 @@ class PosterCache {
       ..maxConnectionsPerHost = 4;
     late HttpClientResponse response;
     for (var redirects = 0; ; redirects++) {
+      if (!canContinue() || (redirects > 0 && !await allowed(uri))) return null;
       final opened = attempt.request = await openProxyAwareRequest(
         client,
         'GET',
@@ -801,6 +902,8 @@ class PosterCache {
     _nearby.clear();
     _upgradeWaiting.clear();
     _upgrades.clear();
+    _networkDeferred.clear();
+    _resumePending.clear();
     unawaited(_clear(completed));
     return completed.future;
   }
@@ -836,6 +939,8 @@ class PosterCache {
   void close() {
     if (_closed) return;
     _closed = true;
+    networkPolicy?.removeListener(_networkPolicyChanged);
+    configurationChanges?.removeListener(_networkConfigurationChanged);
     _resume?.complete();
     _resume = null;
     _resolved.clear();
@@ -845,6 +950,8 @@ class PosterCache {
     _nearby.clear();
     _upgradeWaiting.clear();
     _upgrades.clear();
+    _networkDeferred.clear();
+    _resumePending.clear();
     _cancelTransfers();
     for (final waiting in _waiting) {
       waiting.ready.complete(false);
@@ -886,6 +993,8 @@ class _PosterWaiter {
 /// A single foreground attempt. Cancellation survives quick lifecycle changes;
 /// decoding and asynchronous file I/O retain their slot until they settle.
 class _PosterAttempt {
+  final int networkRevision;
+  _PosterAttempt(this.networkRevision);
   final networkCancel = CancelToken();
   HttpClientRequest? request;
   StreamIterator<List<int>>? chunks;

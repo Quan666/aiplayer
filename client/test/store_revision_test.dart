@@ -119,59 +119,271 @@ void main() {
     },
   );
 
-  test(
-    'version two stores replace local triggers once for settings isolation',
-    () {
-      final directory = Directory.systemTemp.createTempSync(
-        'settings-migration-',
+  test('version two stores replace local triggers once for settings isolation', () {
+    final directory = Directory.systemTemp.createTempSync(
+      'settings-migration-',
+    );
+    final path = '${directory.path}/app.db';
+    final legacy = AppStore(path);
+    legacy.setLocal('settings', {'volume': 70});
+    for (final event in ['INSERT', 'UPDATE', 'DELETE']) {
+      final row = event == 'DELETE' ? 'OLD' : 'NEW';
+      legacy.db.execute(
+        'DROP TRIGGER store_change_local_${event.toLowerCase()}',
       );
-      final path = '${directory.path}/app.db';
-      final legacy = AppStore(path);
-      legacy.setLocal('settings', {'volume': 70});
-      for (final event in ['INSERT', 'UPDATE', 'DELETE']) {
-        final row = event == 'DELETE' ? 'OLD' : 'NEW';
-        legacy.db.execute(
-          'DROP TRIGGER store_change_local_${event.toLowerCase()}',
-        );
-        legacy.db.execute(
-          'CREATE TRIGGER store_change_local_${event.toLowerCase()} AFTER $event ON local BEGIN '
-          'INSERT INTO store_change_counters(scope,value) VALUES('
-          "CASE WHEN ($row.key='lastSync' OR substr($row.key,1,4)='sync')"
-          '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
-          " THEN 'sync' ELSE 'other' END,1) "
-          'ON CONFLICT(scope) DO UPDATE SET value=value+1; END',
-        );
+      legacy.db.execute(
+        'CREATE TRIGGER store_change_local_${event.toLowerCase()} AFTER $event ON local BEGIN '
+        'INSERT INTO store_change_counters(scope,value) VALUES('
+        "CASE WHEN ($row.key='lastSync' OR substr($row.key,1,4)='sync')"
+        '${event == 'UPDATE' ? ' AND OLD.key=NEW.key' : ''}'
+        " THEN 'sync' ELSE 'other' END,1) "
+        'ON CONFLICT(scope) DO UPDATE SET value=value+1; END',
+      );
+    }
+    legacy.db.execute('PRAGMA user_version=2');
+    legacy.dispose();
+    final migrated = AppStore(path);
+    final worker = AppStore.openExisting(path);
+    addTearDown(() {
+      worker.dispose();
+      migrated.dispose();
+      directory.deleteSync(recursive: true);
+    });
+    expect(migrated.db.select('PRAGMA user_version').single['user_version'], 6);
+    expect(migrated.local('settings'), {'volume': 70});
+    final media = migrated.recordsRevision('media');
+    final settings = migrated.localKeyRevision('settings');
+    worker.setLocal('settings', {'volume': 25});
+    expect(migrated.localKeyRevision('settings'), greaterThan(settings));
+    expect(migrated.recordsRevision('media'), media);
+    final schema = migrated.db
+        .select('PRAGMA schema_version')
+        .single['schema_version'];
+    final reopened = AppStore(path);
+    expect(
+      reopened.db.select('PRAGMA schema_version').single['schema_version'],
+      schema,
+    );
+    reopened.dispose();
+  });
+
+  group('precise source configuration revisions', () {
+    late Directory directory;
+    late AppStore store, worker;
+
+    setUp(() {
+      directory = Directory.systemTemp.createTempSync('source-revision-');
+      store = AppStore('${directory.path}/app.db');
+      worker = AppStore.openExisting(store.path);
+    });
+
+    tearDown(() {
+      worker.dispose();
+      store.dispose();
+      directory.deleteSync(recursive: true);
+    });
+
+    test('preview commits do not invalidate sources, including mixed SQL', () {
+      store.setLocal('sources', [
+        {'id': 'nas', 'host': 'first'},
+      ]);
+      final sources = store.sourceConfigurationRevision;
+      // This is the same broad "other" scope used by persisted native covers.
+      for (var index = 0; index < 8; index++) {
+        worker.transaction(() {
+          worker.setLocal('preview:video-$index', {'path': '$index.jpg'});
+          worker.setLocal('browse:video-$index', {'path': '$index.mp4'});
+          worker.cache('probe:$index', {'duration': 10});
+        });
+        expect(store.sourceConfigurationRevision, sources);
       }
-      legacy.db.execute('PRAGMA user_version=2');
-      legacy.dispose();
-      final migrated = AppStore(path);
-      final worker = AppStore.openExisting(path);
-      addTearDown(() {
-        worker.dispose();
-        migrated.dispose();
-        directory.deleteSync(recursive: true);
+      store.setLocal('preview:local', {'path': 'local.jpg'});
+      expect(store.sourceConfigurationRevision, sources);
+      store.setLocal('sources', [
+        {'id': 'nas', 'host': 'first'},
+      ]);
+      expect(store.sourceConfigurationRevision, sources);
+      worker.transaction(() {
+        worker.setLocal('preview:video', {'path': 'replacement.jpg'});
+        worker.db.execute("UPDATE local SET value='[]' WHERE key='sources'");
       });
-      expect(
-        migrated.db.select('PRAGMA user_version').single['user_version'],
-        5,
+      expect(store.sourceConfigurationRevision, greaterThan(sources));
+    });
+
+    test('managed and SQL source writes cover both source key families', () {
+      for (final connection in [store, worker]) {
+        for (final key in ['sources', 'externalSource:temporary']) {
+          final initial = store.sourceConfigurationRevision;
+          connection.setLocal(key, key == 'sources' ? [] : {'host': 'first'});
+          final inserted = store.sourceConfigurationRevision;
+          expect(inserted, greaterThan(initial));
+          connection.db.execute('UPDATE local SET value=? WHERE key=?', [
+            key == 'sources' ? '[{"id":"nas"}]' : '{"host":"second"}',
+            key,
+          ]);
+          final updated = store.sourceConfigurationRevision;
+          expect(updated, greaterThan(inserted));
+          connection.removeLocal(key);
+          final removed = store.sourceConfigurationRevision;
+          expect(removed, greaterThan(updated));
+          connection.db.execute('INSERT INTO local(key,value) VALUES(?,?)', [
+            key,
+            key == 'sources' ? '[]' : '{}',
+          ]);
+          final sqlInserted = store.sourceConfigurationRevision;
+          expect(sqlInserted, greaterThan(removed));
+          connection.db.execute('DELETE FROM local WHERE key=?', [key]);
+          expect(store.sourceConfigurationRevision, greaterThan(sqlInserted));
+        }
+      }
+    });
+
+    test('SQL key renames track old and new scopes conservatively', () {
+      worker.setLocal('settings', {'host': 'first'});
+      for (final (from, to) in [
+        ('settings', 'sources'),
+        ('sources', 'location:video'),
+        ('location:video', 'externalSource:temporary'),
+        ('externalSource:temporary', 'settings'),
+      ]) {
+        final source = store.sourceConfigurationRevision;
+        final settings = store.localKeyRevision('settings');
+        final locations = store.locationRevision;
+        worker.db.execute('UPDATE local SET key=? WHERE key=?', [to, from]);
+        expect(store.sourceConfigurationRevision, greaterThan(source));
+        expect(store.localKeyRevision('settings'), greaterThan(settings));
+        expect(store.locationRevision, greaterThan(locations));
+      }
+    });
+
+    test(
+      'rollback and repeated durable counters never reuse local revisions',
+      () {
+        for (final managed in [true, false]) {
+          worker.setLocal('externalSource:temporary', {'host': 'first'});
+          final remote = store.sourceConfigurationRevision;
+          late int uncommitted, uncommittedCounter;
+          void writeAndRead() {
+            worker.setLocal('externalSource:temporary', {'host': 'temporary'});
+            uncommitted = worker.sourceConfigurationRevision;
+            uncommittedCounter =
+                worker.db
+                        .select(
+                          "SELECT value FROM store_change_counters WHERE scope='sourceConfig'",
+                        )
+                        .single['value']
+                    as int;
+            expect(store.sourceConfigurationRevision, remote);
+          }
+
+          if (managed) {
+            expect(
+              () => worker.transaction(() {
+                writeAndRead();
+                throw StateError('rollback');
+              }),
+              throwsStateError,
+            );
+          } else {
+            worker.db.execute('BEGIN IMMEDIATE');
+            writeAndRead();
+            worker.db.execute('ROLLBACK');
+          }
+          final rolledBack = worker.sourceConfigurationRevision;
+          expect(rolledBack, greaterThan(uncommitted));
+          expect(store.sourceConfigurationRevision, remote);
+          expect(worker.local('externalSource:temporary'), {'host': 'first'});
+          worker.setLocal('externalSource:temporary', {'host': 'committed'});
+          expect(
+            worker.db
+                .select(
+                  "SELECT value FROM store_change_counters WHERE scope='sourceConfig'",
+                )
+                .single['value'],
+            uncommittedCounter,
+          );
+          expect(worker.sourceConfigurationRevision, greaterThan(rolledBack));
+          expect(store.sourceConfigurationRevision, greaterThan(remote));
+        }
+      },
+    );
+
+    test('raw SQL rollback restores a source revision read in the transaction', () {
+      store.setLocal('sources', []);
+      final initial = store.sourceConfigurationRevision;
+      store.db.execute('BEGIN IMMEDIATE');
+      store.db.execute(
+        "UPDATE local SET value='[{\"id\":\"temporary\"}]' WHERE key='sources'",
       );
-      expect(migrated.local('settings'), {'volume': 70});
-      final media = migrated.recordsRevision('media');
-      final settings = migrated.localKeyRevision('settings');
-      worker.setLocal('settings', {'volume': 25});
-      expect(migrated.localKeyRevision('settings'), greaterThan(settings));
-      expect(migrated.recordsRevision('media'), media);
-      final schema = migrated.db
-          .select('PRAGMA schema_version')
-          .single['schema_version'];
-      final reopened = AppStore(path);
+      final uncommitted = store.sourceConfigurationRevision;
+      expect(uncommitted, greaterThan(initial));
+      store.db.execute('ROLLBACK');
+      // A known write after ROLLBACK must not hide the transaction boundary.
+      store.setLocal('preview:after-rollback', {'path': 'cover.jpg'});
+      expect(store.sourceConfigurationRevision, greaterThan(uncommitted));
+      expect(store.local('sources'), isEmpty);
+      final restored = store.sourceConfigurationRevision;
+      store.transaction(() {
+        store.setLocal('preview:video', {'path': 'new.jpg'});
+        expect(store.sourceConfigurationRevision, restored);
+      });
+      expect(store.sourceConfigurationRevision, restored);
+    });
+  });
+
+  test('version five migrates source counters once and preserves saved sources', () {
+    final directory = Directory.systemTemp.createTempSync('source-migration-');
+    final path = '${directory.path}/app.db';
+    final legacy = AppStore(path);
+    legacy.setLocal('sources', [
+      {'id': 'nas'},
+    ]);
+    legacy.setLocal('externalSource:temporary', {'host': 'first'});
+    for (final event in ['INSERT', 'UPDATE', 'DELETE']) {
+      legacy.db.execute(
+        'DROP TRIGGER store_change_local_${event.toLowerCase()}',
+      );
+      legacy.db.execute(
+        'CREATE TRIGGER store_change_local_${event.toLowerCase()} AFTER $event ON local BEGIN '
+        "INSERT INTO store_change_counters(scope,value) VALUES('other',1) "
+        'ON CONFLICT(scope) DO UPDATE SET value=value+1; END',
+      );
+    }
+    legacy.db.execute(
+      "DELETE FROM store_change_counters WHERE scope='sourceConfig'",
+    );
+    legacy.db.execute('PRAGMA user_version=5');
+    legacy.dispose();
+    final migrated = AppStore(path);
+    final worker = AppStore.openExisting(path);
+    addTearDown(() {
+      worker.dispose();
+      migrated.dispose();
+      directory.deleteSync(recursive: true);
+    });
+    expect(migrated.db.select('PRAGMA user_version').single['user_version'], 6);
+    expect(migrated.local('sources'), [
+      {'id': 'nas'},
+    ]);
+    expect(migrated.local('externalSource:temporary'), {'host': 'first'});
+    final sources = migrated.sourceConfigurationRevision;
+    worker.setLocal('preview:video', {'path': 'cover.jpg'});
+    expect(migrated.sourceConfigurationRevision, sources);
+    worker.removeLocal('externalSource:temporary');
+    expect(migrated.sourceConfigurationRevision, greaterThan(sources));
+    final schema = migrated.db
+        .select('PRAGMA schema_version')
+        .single['schema_version'];
+    final reopened = AppStore(path);
+    try {
       expect(
         reopened.db.select('PRAGMA schema_version').single['schema_version'],
         schema,
       );
+    } finally {
       reopened.dispose();
-    },
-  );
+    }
+  });
 
   test(
     'prefix revisions isolate writes and detect direct SQL and rollback',

@@ -68,8 +68,10 @@ class MediaFileProbeResult {
        metadata = Map.unmodifiable(metadata);
 }
 
-typedef MediaFileProbe =
-    Future<MediaFileProbeResult> Function(String uri, CancelToken cancel);
+typedef MediaFileProbe = Future<MediaFileProbeResult> Function(
+  String uri,
+  CancelToken cancel,
+);
 
 /// One inspection at a time, with no pending queue or persistent player.
 /// Each request owns its source connection; cancelling never touches playback.
@@ -725,3 +727,107 @@ String _safeText(String value) => value
           .first;
     })
     .trim();
+
+/// Normalize familiar camera values without exposing EXIF rational notation.
+/// Called only for the small fixed set of visible fields in an open sheet.
+String formatCameraParameter(String label, String raw) {
+  final text = raw.trim();
+  double? number(String value) {
+    final rational = RegExp(
+      r'^([+-]?\d+(?:\.\d+)?)\s*/\s*([+-]?\d+(?:\.\d+)?)$',
+    ).firstMatch(value);
+    if (rational != null) {
+      final denominator = double.tryParse(rational[2]!);
+      if (denominator == null || denominator == 0) return null;
+      final result = double.parse(rational[1]!) / denominator;
+      return result.isFinite ? result : null;
+    }
+    final result = double.tryParse(value);
+    return result != null && result.isFinite ? result : null;
+  }
+
+  String decimal(double value, {int digits = 2}) =>
+      value.toStringAsFixed(digits).replaceFirst(RegExp(r'\.?0+$'), '');
+
+  switch (label) {
+    case '光圈':
+      final value = number(text.replaceFirst(RegExp(r'^[fF]\s*/?\s*'), ''));
+      if (value == null || value <= 0) return text;
+      final display = decimal(value);
+      return 'F${display.contains('.') ? display : '$display.0'}';
+    case '焦距':
+    case '35mm 等效焦距':
+      final value = number(
+        text.replaceFirst(RegExp(r'\s*mm$', caseSensitive: false), ''),
+      );
+      return value == null || value <= 0 ? text : '${decimal(value)}mm';
+    case '曝光时间':
+      final value = number(
+        text.replaceFirst(RegExp(r'\s*s$', caseSensitive: false), ''),
+      );
+      if (value == null || value <= 0) return text;
+      if (value < 1) {
+        final denominator = 1 / value;
+        if ((denominator - denominator.round()).abs() < .02) {
+          return '1/${denominator.round()} s';
+        }
+      }
+      return '${decimal(value, digits: 4)} s';
+    case '曝光补偿':
+      final value = number(
+        text.replaceFirst(RegExp(r'\s*EV$', caseSensitive: false), ''),
+      );
+      return value == null
+          ? text
+          : '${value > 0 ? '+' : ''}${decimal(value)} EV';
+    case 'ISO':
+      final value = number(
+        text.replaceFirst(RegExp(r'^ISO\s*', caseSensitive: false), ''),
+      );
+      return value == null || value <= 0 ? text : '${value.round()}';
+    case '白平衡':
+      return switch (number(text)) {
+        0 => '自动',
+        1 => '手动',
+        _ => text,
+      };
+    case '曝光模式':
+      return switch (number(text)) {
+        0 => '自动曝光',
+        1 => '手动曝光',
+        2 => '包围曝光',
+        _ => text,
+      };
+    case '曝光程序':
+      return switch (number(text)) {
+        1 => '手动',
+        2 => '程序自动',
+        3 => '光圈优先',
+        4 => '快门优先',
+        5 => '景深优先',
+        6 => '运动模式',
+        7 => '人像模式',
+        8 => '风景模式',
+        _ => text,
+      };
+    case '测光模式':
+      return switch (number(text)) {
+        1 => '平均测光',
+        2 => '中央重点',
+        3 => '点测光',
+        4 => '多点测光',
+        5 => '评价测光',
+        6 => '局部测光',
+        _ => text,
+      };
+    case '色彩空间':
+      return switch (number(text)) {
+        1 => 'sRGB',
+        2 => 'Adobe RGB',
+        65535 => '未标定',
+        _ => text,
+      };
+    default:
+      return text;
+  }
+}

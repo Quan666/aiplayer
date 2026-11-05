@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/media_previews.dart';
@@ -47,6 +48,13 @@ void main() {
           expect(captured, inInclusiveRange(12.7, 14.0));
         }
         expect(await encodeUsablePreviewImage(preview.bytes), isNotNull);
+        final codecImage = await ui.instantiateImageCodec(preview.bytes);
+        final frame = (await codecImage.getNextFrame()).image;
+        final encodedWidth = frame.width, encodedHeight = frame.height;
+        frame.dispose();
+        codecImage.dispose();
+        expect(encodedWidth, lessThanOrEqualTo(480));
+        expect(encodedHeight, lessThanOrEqualTo(480));
         final file = 'preview-051-$codec-${request.$1}.jpg';
         await File('${artifacts.path}/$file').writeAsBytes(preview.bytes);
         results.add({
@@ -56,6 +64,8 @@ void main() {
           'capturedPosition': captured,
           'elapsedMs': DateTime.now().difference(started).inMilliseconds,
           'bytes': preview.bytes.length,
+          'encodedWidth': encodedWidth,
+          'encodedHeight': encodedHeight,
           'file': file,
         });
       }
@@ -77,8 +87,7 @@ void main() {
       captureMediaPreview('$fixtureDirectory/h264.mkv', cancelled),
       throwsA(isA<Cancelled>()),
     );
-    await File(
-      '${artifacts.path}/preview-quality-051.json',
-    ).writeAsString(const JsonEncoder.withIndent('  ').convert(results));
+    await File('${artifacts.path}/preview-quality-051.json')
+        .writeAsString(const JsonEncoder.withIndent('  ').convert(results));
   }, timeout: const Timeout(Duration(minutes: 4)));
 }

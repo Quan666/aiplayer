@@ -8,6 +8,7 @@ class AppPreferences {
     : _values = Map.unmodifiable(values);
 
   static const defaults = <String, dynamic>{
+    'thirdPartyNetworkingEnabled': true,
     'autoPlay': true,
     'autoNextEpisode': true,
     'enterFullscreen': true,
@@ -27,6 +28,13 @@ class AppPreferences {
     'videoFit': 'contain',
     'seekStepSeconds': 10,
     'controlsHideSeconds': 2,
+    'albumSlideshowSeconds': 5,
+    'albumSlideshowTransition': 'random',
+    'albumThumbnailCacheMiB': 512,
+    'albumOriginalCacheMiB': 1024,
+    'albumMetadataCacheMiB': 16,
+    'decodedImageCacheMiB': 100,
+    'externalFileCacheMiB': 512,
     'subtitlesEnabled': true,
     'autoLoadExternalSubtitles': true,
     'subtitleLanguage': 'zh-Hans',
@@ -64,6 +72,7 @@ class AppPreferences {
     'hideHiddenFiles': true,
     'metadataProvider': 'bangumi',
     'metadataStrategy': 'conservative',
+    'autoIdentifyOnFolderOpen': false,
     'aiMetadataEnabled': false,
     'tmdbNameAssist': true,
     'librarySortField': 'recent',
@@ -109,6 +118,12 @@ class AppPreferences {
     'seekStepSeconds': (5, 120),
     'gestureSeekSeconds': (1, 3600),
     'controlsHideSeconds': (0, 15),
+    'albumSlideshowSeconds': (2, 60),
+    'albumThumbnailCacheMiB': (256, 8192),
+    'albumOriginalCacheMiB': (512, 16384),
+    'albumMetadataCacheMiB': (4, 256),
+    'decodedImageCacheMiB': (32, 512),
+    'externalFileCacheMiB': (256, 8192),
     'subtitleScale': (.5, 3),
     'subtitleDelay': (-60, 60),
     'subtitlePosition': (0, 100),
@@ -131,6 +146,7 @@ class AppPreferences {
     'none',
   ];
   static const _enums = <String, List<String>>{
+    'albumSlideshowTransition': ['random', 'slide', 'fade', 'none'],
     'librarySortField': LibrarySort.fields,
     'metadataProvider': ['bangumi', 'tmdb'],
     'metadataStrategy': ['off', 'conservative', 'balanced'],
@@ -164,6 +180,7 @@ class AppPreferences {
   bool get edgeDoubleTapSeek => _bool('edgeDoubleTapSeek');
   bool get subtitleSimplify => _bool('subtitleSimplify');
   bool get enterFullscreen => _bool('enterFullscreen');
+  bool get thirdPartyNetworkingEnabled => _bool('thirdPartyNetworkingEnabled');
   bool get highRefreshRate => _bool('highRefreshRate');
   bool get hideNavigationOnScroll => true;
   bool get resumePlayback => _bool('resumePlayback');
@@ -176,6 +193,18 @@ class AppPreferences {
   String get videoFit => _choice('videoFit');
   int get seekStepSeconds => _number('seekStepSeconds').round();
   int get controlsHideSeconds => _number('controlsHideSeconds').round();
+  int get albumSlideshowSeconds => _number('albumSlideshowSeconds').round();
+  String get albumSlideshowTransition => _choice('albumSlideshowTransition');
+  int get albumThumbnailCacheMiB => _number('albumThumbnailCacheMiB').round();
+  int get albumOriginalCacheMiB => _number('albumOriginalCacheMiB').round();
+  int get albumThumbnailCacheBytes => albumThumbnailCacheMiB * 1024 * 1024;
+  int get albumOriginalCacheBytes => albumOriginalCacheMiB * 1024 * 1024;
+  int get albumMetadataCacheMiB => _number('albumMetadataCacheMiB').round();
+  int get albumMetadataCacheBytes => albumMetadataCacheMiB * 1024 * 1024;
+  int get decodedImageCacheMiB => _number('decodedImageCacheMiB').round();
+  int get decodedImageCacheBytes => decodedImageCacheMiB * 1024 * 1024;
+  int get externalFileCacheMiB => _number('externalFileCacheMiB').round();
+  int get externalFileCacheBytes => externalFileCacheMiB * 1024 * 1024;
   bool get subtitlesEnabled => _bool('subtitlesEnabled');
   bool get autoLoadExternalSubtitles => _bool('autoLoadExternalSubtitles');
   String get subtitleLanguage => _choice('subtitleLanguage');
@@ -247,6 +276,9 @@ class AppPreferences {
   bool get tmdbNameAssist => _bool('tmdbNameAssist');
   String get metadataProvider => _choice('metadataProvider');
   String get metadataStrategy => _choice('metadataStrategy');
+
+  /// Device-local opt-in. Old matching strategies never imply consent.
+  bool get autoIdentifyOnFolderOpen => _bool('autoIdentifyOnFolderOpen');
   bool get aiMetadataEnabled => _bool('aiMetadataEnabled');
   String get librarySortField => _choice('librarySortField');
   bool get librarySortDescending => _bool('librarySortDescending');
@@ -338,6 +370,12 @@ class AppPreferences {
             value < range.$1 ||
             value > range.$2 ||
             (key == 'gestureSeekSeconds' && value != value.round()) ||
+            ((key == 'albumThumbnailCacheMiB' ||
+                    key == 'albumOriginalCacheMiB' ||
+                    key == 'albumMetadataCacheMiB' ||
+                    key == 'decodedImageCacheMiB' ||
+                    key == 'externalFileCacheMiB') &&
+                value != value.round()) ||
             (key == 'refreshInterval' && value != 0 && value < 30)) {
           throw ArgumentError('设置值超出范围');
         }

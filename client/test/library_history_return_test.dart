@@ -16,7 +16,7 @@ class _HistoryReturnModel extends AppModel {
     : super(backgroundWork: false, enableThumbnails: false);
 
   @override
-  Future<void> ensureMediaPreview(String id) async {}
+  bool ensureMediaPreview(String id) => true;
 }
 
 void main() {
@@ -103,11 +103,10 @@ void main() {
     image.dispose();
     final directory = Directory(artifactDirectory);
     await directory.create(recursive: true);
-    await File(
-      '${directory.path}/${mobile.currentValue!.name}-$stage.png',
-    ).writeAsBytes(
-      bytes!.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes),
-    );
+    await File('${directory.path}/${mobile.currentValue!.name}-$stage.png')
+        .writeAsBytes(
+          bytes!.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes),
+        );
   }
 
   void expectLibraryLayout(WidgetTester tester, Rect initialHeader) {

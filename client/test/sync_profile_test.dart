@@ -19,6 +19,40 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   test(
+    'automatic folder recognition stays device-local across synchronization',
+    () async {
+      final server = _SyncServer();
+      final first = _Device(server), second = _Device(server);
+      first.settings({
+        'autoIdentifyOnFolderOpen': true,
+        'metadataStrategy': 'balanced',
+      });
+      await first.sync();
+      await second.sync();
+      final settings = Map<String, dynamic>.from(
+        second.store.local('settings') ?? {},
+      );
+      expect(settings['metadataStrategy'], 'balanced');
+      expect(AppPreferences(settings).autoIdentifyOnFolderOpen, isFalse);
+      expect(
+        server.records.containsKey('vault:setting:autoIdentifyOnFolderOpen'),
+        isFalse,
+      );
+      second.settings({
+        'autoIdentifyOnFolderOpen': false,
+        'metadataStrategy': 'conservative',
+      });
+      await second.sync();
+      await first.sync();
+      expect(
+        AppPreferences(Map<String, dynamic>.from(first.store.local('settings')))
+            .autoIdentifyOnFolderOpen,
+        isTrue,
+      );
+    },
+  );
+
+  test(
     'all-video sorting syncs, changes and resets with scalar preferences',
     () async {
       final server = _SyncServer();
@@ -76,121 +110,106 @@ void main() {
     },
   );
 
-  test(
-    'local catalogue edits and deletions converge without sharing files or progress',
-    () async {
-      final server = _SyncServer();
-      final first = _Device(server)..seedLocal('local-catalogue');
-      final second = _Device(server);
-      final original = first.store.get('media', 'local-catalogue')!;
-      first.store.save('media', original.id, {
-        ...original.data,
-        'fileName': 'Episode.mkv',
-        'size': 12,
-        'poster': 'https://images.example/poster.jpg',
-        'path': '/device/private/should-never-sync.mkv',
-        'accessToken': 'private-file-token',
-      });
-      final location = first.store.local('location:${original.id}');
-      await first.sync();
-      await second.sync();
-      final received = second.store.get('media', original.id)!;
-      expect(received.data['title'], original.data['title']);
-      expect(received.data['poster'], 'https://images.example/poster.jpg');
-      expect(second.store.local('location:${original.id}'), isNull);
-      expect(second.store.all('progress'), isEmpty);
-      expect(second.store.all('watched'), isEmpty);
-      final wire = jsonEncode(
-        server.records.values.map((r) => r.toJson()).toList(),
-      );
-      expect(wire, isNot(contains('/device/private')));
-      expect(wire, isNot(contains('private-file-token')));
-      expect(wire, isNot(contains('localOnly')));
+  test('local catalogue edits and deletions converge without sharing files or progress', () async {
+    final server = _SyncServer();
+    final first = _Device(server)..seedLocal('local-catalogue');
+    final second = _Device(server);
+    final original = first.store.get('media', 'local-catalogue')!;
+    first.store.save('media', original.id, {
+      ...original.data,
+      'fileName': 'Episode.mkv',
+      'size': 12,
+      'poster': 'https://images.example/poster.jpg',
+      'path': '/device/private/should-never-sync.mkv',
+      'accessToken': 'private-file-token',
+    });
+    final location = first.store.local('location:${original.id}');
+    await first.sync();
+    await second.sync();
+    final received = second.store.get('media', original.id)!;
+    expect(received.data['title'], original.data['title']);
+    expect(received.data['poster'], 'https://images.example/poster.jpg');
+    expect(second.store.local('location:${original.id}'), isNull);
+    expect(second.store.all('progress'), isEmpty);
+    expect(second.store.all('watched'), isEmpty);
+    final wire = jsonEncode(
+      server.records.values.map((r) => r.toJson()).toList(),
+    );
+    expect(wire, isNot(contains('/device/private')));
+    expect(wire, isNot(contains('private-file-token')));
+    expect(wire, isNot(contains('localOnly')));
 
-      second.store.save('media', received.id, {
-        ...received.data,
-        'title': '改名',
-      });
-      await second.sync();
-      await first.sync();
-      expect(first.store.get('media', original.id)!.data['title'], '改名');
-      expect(first.store.local('location:${original.id}'), location);
-      expect(
-        first.store.get('progress', '${original.id}:12')!.data['position'],
-        10,
-      );
+    second.store.save('media', received.id, {...received.data, 'title': '改名'});
+    await second.sync();
+    await first.sync();
+    expect(first.store.get('media', original.id)!.data['title'], '改名');
+    expect(first.store.local('location:${original.id}'), location);
+    expect(
+      first.store.get('progress', '${original.id}:12')!.data['position'],
+      10,
+    );
 
-      second.store.save('media', received.id, received.data, deleted: true);
-      await second.sync();
-      await first.sync();
-      expect(first.store.get('media', original.id)!.deleted, true);
-      expect(first.store.local('location:${original.id}'), location);
-      final puts = server.puts;
-      await first.sync();
-      await second.sync();
-      expect(server.puts, puts);
-    },
-  );
+    second.store.save('media', received.id, received.data, deleted: true);
+    await second.sync();
+    await first.sync();
+    expect(first.store.get('media', original.id)!.deleted, true);
+    expect(first.store.local('location:${original.id}'), location);
+    final puts = server.puts;
+    await first.sync();
+    await second.sync();
+    expect(server.puts, puts);
+  });
 
-  test(
-    'removing a local catalogue file on its original device synchronizes the removal',
-    () async {
-      final server = _SyncServer();
-      final first = _Device(server)..seedLocal('local-catalogue');
-      final second = _Device(server);
-      await first.sync();
-      await second.sync();
-      first.store.save('media', 'local-catalogue', {}, deleted: true);
-      first.store.removeLocal('location:local-catalogue');
-      await first.sync();
-      await second.sync();
-      expect(second.store.get('media', 'local-catalogue')!.deleted, true);
-      expect(server.records['media:local-catalogue']!.deleted, true);
-    },
-  );
+  test('removing a local catalogue file on its original device synchronizes the removal', () async {
+    final server = _SyncServer();
+    final first = _Device(server)..seedLocal('local-catalogue');
+    final second = _Device(server);
+    await first.sync();
+    await second.sync();
+    first.store.save('media', 'local-catalogue', {}, deleted: true);
+    first.store.removeLocal('location:local-catalogue');
+    await first.sync();
+    await second.sync();
+    expect(second.store.get('media', 'local-catalogue')!.deleted, true);
+    expect(server.records['media:local-catalogue']!.deleted, true);
+  });
 
-  test(
-    'a downloaded catalogue can use a different local file and still synchronize edits',
-    () async {
-      final server = _SyncServer();
-      final first = _Device(server)..seedLocal('local-catalogue');
-      final second = _Device(server);
-      await first.sync();
-      await second.sync();
-      final record = second.store.get('media', 'local-catalogue')!;
-      second.store.setLocal('location:${record.id}', {
-        'id': record.id,
-        'source': 'local',
-        'path': '/other-device/linked.mkv',
-        'size': 12,
-      });
-      second.profile.rememberLocalMedia(record.id);
-      second.store.save('media', record.id, {
-        ...record.data,
-        'title': '本机关联后改名',
-      });
-      await second.sync();
-      await first.sync();
-      expect(first.store.get('media', record.id)!.data['title'], '本机关联后改名');
-      expect(
-        second.store.local('location:${record.id}')['path'],
-        '/other-device/linked.mkv',
-      );
-      expect(
-        first.store.local('location:${record.id}')['path'],
-        '/device/private/${record.id}.mkv',
-      );
-      second.store.save('media', record.id, record.data, deleted: true);
-      second.store.removeLocal('location:${record.id}');
-      await second.sync();
-      await first.sync();
-      expect(first.store.get('media', record.id)!.deleted, true);
-      expect(
-        jsonEncode(server.records.values.map((r) => r.toJson()).toList()),
-        isNot(contains('/other-device')),
-      );
-    },
-  );
+  test('a downloaded catalogue can use a different local file and still synchronize edits', () async {
+    final server = _SyncServer();
+    final first = _Device(server)..seedLocal('local-catalogue');
+    final second = _Device(server);
+    await first.sync();
+    await second.sync();
+    final record = second.store.get('media', 'local-catalogue')!;
+    second.store.setLocal('location:${record.id}', {
+      'id': record.id,
+      'source': 'local',
+      'path': '/other-device/linked.mkv',
+      'size': 12,
+    });
+    second.profile.rememberLocalMedia(record.id);
+    second.store.save('media', record.id, {...record.data, 'title': '本机关联后改名'});
+    await second.sync();
+    await first.sync();
+    expect(first.store.get('media', record.id)!.data['title'], '本机关联后改名');
+    expect(
+      second.store.local('location:${record.id}')['path'],
+      '/other-device/linked.mkv',
+    );
+    expect(
+      first.store.local('location:${record.id}')['path'],
+      '/device/private/${record.id}.mkv',
+    );
+    second.store.save('media', record.id, record.data, deleted: true);
+    second.store.removeLocal('location:${record.id}');
+    await second.sync();
+    await first.sync();
+    expect(first.store.get('media', record.id)!.deleted, true);
+    expect(
+      jsonEncode(server.records.values.map((r) => r.toJson()).toList()),
+      isNot(contains('/other-device')),
+    );
+  });
 
   test(
     'external link sessions never publish their source, binding or media',
@@ -615,9 +634,10 @@ void main() {
       expect(second.store.get('media', 'second-local'), isNotNull);
       expect(SourceFavorites(second.store).contains('nas', 'Shows/'), true);
       expect(
-        SourceFavorites(
-          second.store,
-        ).all.where((f) => f.sourceId == 'local').single.path,
+        SourceFavorites(second.store).all
+            .where((f) => f.sourceId == 'local')
+            .single
+            .path,
         'second-local/',
       );
 
@@ -840,146 +860,135 @@ void main() {
     },
   );
 
-  test(
-    'relinking a synchronized video locally never deletes another device binding',
-    () async {
-      final server = _SyncServer();
-      final first = _Device(server), second = _Device(server);
-      first.seedRemote();
-      await first.sync();
-      await second.sync();
-      final uploaded = server.puts;
-      second.seedLocal('remote-video');
-      await second.sync();
-      expect(server.puts, uploaded);
-      second.store.save('media', 'remote-video', {}, deleted: true);
-      second.store.removeLocal('location:remote-video');
-      await second.sync();
-      expect(server.puts, uploaded);
-      final fresh = _Device(server);
-      await fresh.sync();
-      expect(fresh.store.get('media', 'remote-video')!.deleted, false);
-      expect(
-        (fresh.store.local('location:remote-video') as Map)['source'],
-        'nas',
-      );
-      expect(fresh.store.local('episodeTitle:remote-video'), '相逢');
-      expect(second.store.conflicts, isEmpty);
-    },
-  );
+  test('relinking a synchronized video locally never deletes another device binding', () async {
+    final server = _SyncServer();
+    final first = _Device(server), second = _Device(server);
+    first.seedRemote();
+    await first.sync();
+    await second.sync();
+    final uploaded = server.puts;
+    second.seedLocal('remote-video');
+    await second.sync();
+    expect(server.puts, uploaded);
+    second.store.save('media', 'remote-video', {}, deleted: true);
+    second.store.removeLocal('location:remote-video');
+    await second.sync();
+    expect(server.puts, uploaded);
+    final fresh = _Device(server);
+    await fresh.sync();
+    expect(fresh.store.get('media', 'remote-video')!.deleted, false);
+    expect(
+      (fresh.store.local('location:remote-video') as Map)['source'],
+      'nas',
+    );
+    expect(fresh.store.local('episodeTitle:remote-video'), '相逢');
+    expect(second.store.conflicts, isEmpty);
+  });
 
-  test(
-    'resetting association migrates local configuration to a new origin and token',
-    () async {
-      final oldServer = _SyncServer(), newServer = _SyncServer(pageSize: 2);
-      final first = _Device(oldServer);
-      first.seedRemote();
-      first.seedLocal('device-file');
-      await first.sync();
-      final settings = first.store.local('settings');
-      final sources = first.store.local('sources');
-      final oldUploads = oldServer.puts;
-      first.client.resetAssociation();
-      expect(first.store.local('settings'), settings);
-      expect(first.store.local('sources'), sources);
-      expect(first.secrets.values['aiSubtitleToken'], 'ai-private-key');
-      expect(first.secrets.values['source:nas'], 'nas-password');
-      expect(first.store.local('syncOrigin'), isNull);
-      expect(first.store.local('syncCursor:$_origin'), isNull);
-      expect(first.store.local('syncProfile:baseline'), isNull);
-      expect(first.store.localEntries('syncProfile:applied:'), isEmpty);
-      expect(first.store.records('vault'), isEmpty);
-      const newOrigin = 'https://replacement-sync.example.com';
-      const newToken = 'new-service-token-with-at-least-24-characters';
-      final migrated = SyncClient(
-        first.store,
-        profile: first.profile,
-        transport: newServer,
-      );
-      await migrated.synchronize(newOrigin, newToken);
-      expect(first.store.local('syncOrigin'), newOrigin);
-      expect(first.store.conflicts, isEmpty);
-      expect(oldServer.puts, oldUploads);
-      final fresh = _Device(newServer);
-      await fresh.sync(address: newOrigin, token: newToken);
-      expect(
-        (fresh.store.local('settings') as Map)['aiSubtitleModel'],
-        'translation-model',
-      );
-      expect(fresh.store.local('sources'), sources);
-      expect(fresh.secrets.values['source:nas'], 'nas-password');
-      expect(fresh.secrets.values['aiSubtitleToken'], 'ai-private-key');
-      expect(
-        (fresh.store.local('location:remote-video') as Map)['source'],
-        'nas',
-      );
-      expect(fresh.store.local('episodeTitle:remote-video'), '相逢');
-      expect(fresh.store.get('media', 'device-file')!.data['title'], '本地文件');
-      expect(fresh.store.local('location:device-file'), isNull);
-      fresh.settings({'aiSubtitleModel': 'model-on-new-service'});
-      await fresh.sync(address: newOrigin, token: newToken);
-      await migrated.synchronize(newOrigin, newToken);
-      expect(
-        (first.store.local('settings') as Map)['aiSubtitleModel'],
-        'model-on-new-service',
-      );
-      expect(first.store.conflicts, isEmpty);
-      expect(fresh.store.conflicts, isEmpty);
-    },
-  );
+  test('resetting association migrates local configuration to a new origin and token', () async {
+    final oldServer = _SyncServer(), newServer = _SyncServer(pageSize: 2);
+    final first = _Device(oldServer);
+    first.seedRemote();
+    first.seedLocal('device-file');
+    await first.sync();
+    final settings = first.store.local('settings');
+    final sources = first.store.local('sources');
+    final oldUploads = oldServer.puts;
+    first.client.resetAssociation();
+    expect(first.store.local('settings'), settings);
+    expect(first.store.local('sources'), sources);
+    expect(first.secrets.values['aiSubtitleToken'], 'ai-private-key');
+    expect(first.secrets.values['source:nas'], 'nas-password');
+    expect(first.store.local('syncOrigin'), isNull);
+    expect(first.store.local('syncCursor:$_origin'), isNull);
+    expect(first.store.local('syncProfile:baseline'), isNull);
+    expect(first.store.localEntries('syncProfile:applied:'), isEmpty);
+    expect(first.store.records('vault'), isEmpty);
+    const newOrigin = 'https://replacement-sync.example.com';
+    const newToken = 'new-service-token-with-at-least-24-characters';
+    final migrated = SyncClient(
+      first.store,
+      profile: first.profile,
+      transport: newServer,
+    );
+    await migrated.synchronize(newOrigin, newToken);
+    expect(first.store.local('syncOrigin'), newOrigin);
+    expect(first.store.conflicts, isEmpty);
+    expect(oldServer.puts, oldUploads);
+    final fresh = _Device(newServer);
+    await fresh.sync(address: newOrigin, token: newToken);
+    expect(
+      (fresh.store.local('settings') as Map)['aiSubtitleModel'],
+      'translation-model',
+    );
+    expect(fresh.store.local('sources'), sources);
+    expect(fresh.secrets.values['source:nas'], 'nas-password');
+    expect(fresh.secrets.values['aiSubtitleToken'], 'ai-private-key');
+    expect(
+      (fresh.store.local('location:remote-video') as Map)['source'],
+      'nas',
+    );
+    expect(fresh.store.local('episodeTitle:remote-video'), '相逢');
+    expect(fresh.store.get('media', 'device-file')!.data['title'], '本地文件');
+    expect(fresh.store.local('location:device-file'), isNull);
+    fresh.settings({'aiSubtitleModel': 'model-on-new-service'});
+    await fresh.sync(address: newOrigin, token: newToken);
+    await migrated.synchronize(newOrigin, newToken);
+    expect(
+      (first.store.local('settings') as Map)['aiSubtitleModel'],
+      'model-on-new-service',
+    );
+    expect(first.store.conflicts, isEmpty);
+    expect(fresh.store.conflicts, isEmpty);
+  });
 
-  test(
-    'token rotation preserves the remote binding after a device relinks locally',
-    () async {
-      final server = _SyncServer(pageSize: 1);
-      final first = _Device(server), second = _Device(server);
-      first.seedRemote();
-      await first.sync();
-      await second.sync();
-      second.seedLocal('remote-video');
-      const replacement =
-          'relinked-device-rotated-token-at-least-24-characters';
-      await second.sync(token: replacement);
-      expect(
-        (second.store.local('location:remote-video') as Map)['source'],
-        'local',
-      );
-      expect(second.store.get('media', 'remote-video')!.data['title'], '本地文件');
-      final binding = server.records.values.singleWhere(
-        (r) => r.kind == 'vault' && r.id.startsWith('binding:'),
-      );
-      expect(binding.deleted, false);
-      final decoded = await SyncVault(
-        await SyncVault.derive(replacement),
-      ).open(binding);
-      expect(decoded['value']['location']['source'], 'nas');
-      expect(decoded['value']['location']['path'], 'Shows/E01.mkv');
-      final fresh = _Device(server);
-      await fresh.sync(token: replacement);
-      expect(
-        (fresh.store.local('location:remote-video') as Map)['source'],
-        'nas',
-      );
-      expect(fresh.store.get('media', 'remote-video')!.data['title'], '示例第一集');
-      expect(fresh.store.local('episodeTitle:remote-video'), '相逢');
-      expect(fresh.secrets.values['source:nas'], 'nas-password');
-      expect(fresh.store.local('syncCursor:$_origin'), server.changes.length);
-      expect(second.store.conflicts, isEmpty);
-      expect(fresh.store.conflicts, isEmpty);
-      final uploaded = server.puts;
-      await second.sync(token: replacement);
-      expect(server.puts, uploaded);
-      await fresh.sync(token: replacement);
-      expect(
-        (fresh.store.local('location:remote-video') as Map)['source'],
-        'nas',
-      );
-      expect(
-        server.records.values.singleWhere((r) => r.id == binding.id).deleted,
-        false,
-      );
-    },
-  );
+  test('token rotation preserves the remote binding after a device relinks locally', () async {
+    final server = _SyncServer(pageSize: 1);
+    final first = _Device(server), second = _Device(server);
+    first.seedRemote();
+    await first.sync();
+    await second.sync();
+    second.seedLocal('remote-video');
+    const replacement = 'relinked-device-rotated-token-at-least-24-characters';
+    await second.sync(token: replacement);
+    expect(
+      (second.store.local('location:remote-video') as Map)['source'],
+      'local',
+    );
+    expect(second.store.get('media', 'remote-video')!.data['title'], '本地文件');
+    final binding = server.records.values.singleWhere(
+      (r) => r.kind == 'vault' && r.id.startsWith('binding:'),
+    );
+    expect(binding.deleted, false);
+    final decoded = await SyncVault(await SyncVault.derive(replacement))
+        .open(binding);
+    expect(decoded['value']['location']['source'], 'nas');
+    expect(decoded['value']['location']['path'], 'Shows/E01.mkv');
+    final fresh = _Device(server);
+    await fresh.sync(token: replacement);
+    expect(
+      (fresh.store.local('location:remote-video') as Map)['source'],
+      'nas',
+    );
+    expect(fresh.store.get('media', 'remote-video')!.data['title'], '示例第一集');
+    expect(fresh.store.local('episodeTitle:remote-video'), '相逢');
+    expect(fresh.secrets.values['source:nas'], 'nas-password');
+    expect(fresh.store.local('syncCursor:$_origin'), server.changes.length);
+    expect(second.store.conflicts, isEmpty);
+    expect(fresh.store.conflicts, isEmpty);
+    final uploaded = server.puts;
+    await second.sync(token: replacement);
+    expect(server.puts, uploaded);
+    await fresh.sync(token: replacement);
+    expect(
+      (fresh.store.local('location:remote-video') as Map)['source'],
+      'nas',
+    );
+    expect(
+      server.records.values.singleWhere((r) => r.id == binding.id).deleted,
+      false,
+    );
+  });
 
   test(
     'invalid vault content does not apply settings and remains retryable',
@@ -1150,65 +1159,56 @@ void main() {
     },
   );
 
-  test(
-    'replacing credential storage restores vault values without uploading removals',
-    () async {
-      final server = _SyncServer();
-      final first = _Device(server, recoverMissingCredentials: true);
-      first.seedRemote();
-      await first.sync();
-      final uploaded = server.puts;
-      final oldDigest = first.secrets.values['sync.digestKey'];
-      first.secrets.values.clear();
+  test('replacing credential storage restores vault values without uploading removals', () async {
+    final server = _SyncServer();
+    final first = _Device(server, recoverMissingCredentials: true);
+    first.seedRemote();
+    await first.sync();
+    final uploaded = server.puts;
+    final oldDigest = first.secrets.values['sync.digestKey'];
+    first.secrets.values.clear();
 
-      await first.sync();
-      expect(first.secrets.values['sync.digestKey'], isNot(oldDigest));
-      expect(first.secrets.values['aiSubtitleToken'], 'ai-private-key');
-      expect(first.secrets.values['tmdb.apiKey'], 'tmdb-private-key');
-      expect(first.secrets.values['danmuToken'], 'danmu-private-key');
-      expect(first.secrets.values['source:nas'], 'nas-password');
-      expect(server.puts, uploaded);
-      expect(first.store.conflicts, isEmpty);
+    await first.sync();
+    expect(first.secrets.values['sync.digestKey'], isNot(oldDigest));
+    expect(first.secrets.values['aiSubtitleToken'], 'ai-private-key');
+    expect(first.secrets.values['tmdb.apiKey'], 'tmdb-private-key');
+    expect(first.secrets.values['danmuToken'], 'danmu-private-key');
+    expect(first.secrets.values['source:nas'], 'nas-password');
+    expect(server.puts, uploaded);
+    expect(first.store.conflicts, isEmpty);
 
-      // Only recovery is special; deliberate later removals still propagate.
-      first.secrets.values.remove('aiSubtitleToken');
-      first.secrets.values['source:nas'] = '';
-      await first.sync();
-      final fresh = _Device(server);
-      await fresh.sync();
-      expect(fresh.secrets.values['aiSubtitleToken'], isNull);
-      expect(fresh.secrets.values['source:nas'], '');
-    },
-  );
+    // Only recovery is special; deliberate later removals still propagate.
+    first.secrets.values.remove('aiSubtitleToken');
+    first.secrets.values['source:nas'] = '';
+    await first.sync();
+    final fresh = _Device(server);
+    await fresh.sync();
+    expect(fresh.secrets.values['aiSubtitleToken'], isNull);
+    expect(fresh.secrets.values['source:nas'], '');
+  });
 
-  test(
-    'credential recovery preserves manually reentered values and offline settings',
-    () async {
-      final server = _SyncServer();
-      final first = _Device(server, recoverMissingCredentials: true);
-      first.seedRemote();
-      await first.sync();
-      first.secrets.values
-        ..clear()
-        ..['aiSubtitleToken'] = 'manually-reentered-token'
-        ..['source:nas'] = '';
-      first.settings({'metadataStrategy': 'conservative'});
+  test('credential recovery preserves manually reentered values and offline settings', () async {
+    final server = _SyncServer();
+    final first = _Device(server, recoverMissingCredentials: true);
+    first.seedRemote();
+    await first.sync();
+    first.secrets.values
+      ..clear()
+      ..['aiSubtitleToken'] = 'manually-reentered-token'
+      ..['source:nas'] = '';
+    first.settings({'metadataStrategy': 'conservative'});
 
-      await first.sync();
-      final fresh = _Device(server);
-      await fresh.sync();
-      expect(
-        fresh.secrets.values['aiSubtitleToken'],
-        'manually-reentered-token',
-      );
-      expect(fresh.secrets.values['source:nas'], '');
-      expect(
-        (fresh.store.local('settings') as Map)['metadataStrategy'],
-        'conservative',
-      );
-      expect(first.store.conflicts, isEmpty);
-    },
-  );
+    await first.sync();
+    final fresh = _Device(server);
+    await fresh.sync();
+    expect(fresh.secrets.values['aiSubtitleToken'], 'manually-reentered-token');
+    expect(fresh.secrets.values['source:nas'], '');
+    expect(
+      (fresh.store.local('settings') as Map)['metadataStrategy'],
+      'conservative',
+    );
+    expect(first.store.conflicts, isEmpty);
+  });
 
   test(
     'interrupted credential restoration retries after the digest was recreated',
@@ -1476,9 +1476,8 @@ class _Device {
     });
     store.save('progress', '$id:12', {'position': 10, 'duration': 12});
     store.save('watched', '$id:1:1', {'watched': true});
-    SourceFavorites(
-      store,
-    ).toggle(SourceFavorite(sourceId: 'local', path: '$id/', name: '本机文件夹'));
+    SourceFavorites(store)
+        .toggle(SourceFavorite(sourceId: 'local', path: '$id/', name: '本机文件夹'));
     store.setLocal('directorySort:local:imports', {'descending': true});
   }
 }

@@ -9,6 +9,8 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
   private var originalCollectionBehavior: NSWindow.CollectionBehavior = []
   private var originalHidesOnDeactivate = false
   private var fileChannel: FlutterMethodChannel?
+  private var externalFileChannel: FlutterMethodChannel?
+  private var externalFileGeneration = 0
   private var discoveryChannel: FlutterMethodChannel?
   private var systemProxy: SystemProxyHandler?
   private var mediaControls: MediaControlsHandler?
@@ -66,6 +68,42 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
     mediaControls?.close()
     mediaControls = MediaControlsHandler(messenger: flutterViewController.engine.binaryMessenger)
     ExternalVideoInbox.shared.bind(flutterViewController.engine.binaryMessenger)
+    externalFileChannel = FlutterMethodChannel(name: "app.aiplayer/file_open",
+      binaryMessenger: flutterViewController.engine.binaryMessenger)
+    externalFileChannel?.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else { result(nil); return }
+      if call.method == "cancel" {
+        self.externalFileGeneration += 1
+        result(nil)
+        return
+      }
+      guard call.method == "open" else { result(FlutterMethodNotImplemented); return }
+      guard let path = call.arguments as? String, !path.isEmpty else {
+        result(FlutterError(code: "invalid_file", message: "文件位置无效。", details: nil)); return
+      }
+      let request = self.externalFileGeneration
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let readable = FileManager.default.isReadableFile(atPath: path)
+        DispatchQueue.main.async {
+          guard let self = self, request == self.externalFileGeneration else {
+            result(FlutterError(code: "cancelled", message: "文件打开已取消。", details: nil)); return
+          }
+          guard readable else {
+            result(FlutterError(code: "unreadable_file", message: "文件不可访问，请刷新后重试。", details: nil)); return
+          }
+          NSWorkspace.shared.open(URL(fileURLWithPath: path),
+            configuration: NSWorkspace.OpenConfiguration()) { application, error in
+            DispatchQueue.main.async {
+              if error != nil || application == nil {
+                result(FlutterError(code: "open_failed", message: "无法打开文件，请确认已安装支持此文件类型的应用。", details: nil))
+              } else {
+                result(nil)
+              }
+            }
+          }
+        }
+      }
+    }
     delegate = self
     desktopPlayerChannel = FlutterMethodChannel(name: "app.aiplayer/desktop_player",
       binaryMessenger: flutterViewController.engine.binaryMessenger)

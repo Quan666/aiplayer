@@ -34,14 +34,11 @@ class MetadataTask extends ChangeNotifier {
     this._records, {
     required this.ai,
     required this.manual,
-    Map<String, dynamic>? selection,
-    String selectionSeason = '',
-    AiMediaIdentity? identity,
-    MetadataTask? parentTask,
-  }) : _selection = selection,
-       _selectionSeason = selectionSeason,
-       _identity = identity,
-       _parentTask = parentTask;
+    this._selection,
+    this._selectionSeason = '',
+    this._identity,
+    this._parentTask,
+  });
   late final List<SyncRecord> records = UnmodifiableListView(_records);
   bool get removed => _removed;
   bool get isSelection => _selection != null;
@@ -183,7 +180,7 @@ extension MetadataBackgroundTasks on AppModel {
     }
     final unique = {
       for (final r in records)
-        if (!r.deleted) r.id: r,
+        if (!r.deleted && (manual || r.data['personalMedia'] != true)) r.id: r,
     }.values.toList();
     final ids = unique.map((r) => r.id).toSet();
     final existing = _metadataTasks
@@ -214,6 +211,14 @@ extension MetadataBackgroundTasks on AppModel {
       identity: identity,
       parentTask: parentTask,
     );
+    if (!manual && !automaticMetadataEnabled) {
+      task.cancelled = true;
+      task.running = false;
+      task.status = '自动识别已关闭';
+      task._cancel.cancel();
+      task._done.complete();
+      return task;
+    }
     _metadataTasks.add(task);
     if (parentTask != null) {
       // A new explicit choice supersedes the previous automatic attempt's
@@ -393,6 +398,7 @@ extension MetadataBackgroundTasks on AppModel {
     final saved = store.local('metadata:pending-tasks');
     if (saved is! List || saved.isEmpty || _metadataTasks.isNotEmpty) return;
     for (final row in saved.whereType<Map>()) {
+      if (row['manual'] != true) continue;
       final records = <SyncRecord>[];
       final recordIds = <String>{};
       final pendingNames = <String, (SyncRecord, Map<String, dynamic>)>{};
@@ -422,7 +428,7 @@ extension MetadataBackgroundTasks on AppModel {
         }
       }
       if (records.isEmpty ||
-          (row['manual'] != true && preferences.metadataStrategy == 'off')) {
+          (row['manual'] != true && !automaticMetadataEnabled)) {
         continue;
       }
       _metadataTasks.add(
@@ -522,7 +528,8 @@ extension MetadataBackgroundTasks on AppModel {
       return false;
     }
     return task.manual ||
-        (preferences.metadataStrategy != 'off' &&
+        (automaticMetadataEnabled &&
+            current.data['personalMedia'] != true &&
             store.local('manualMetadata:${record.id}') != true &&
             current.data['bangumiId'] == null &&
             current.data['tmdbId'] == null);
@@ -531,7 +538,9 @@ extension MetadataBackgroundTasks on AppModel {
   void _checkTaskReady(MetadataTask task) {
     if (_disposed) throw const Cancelled();
     task._cancel.check();
-    if (_clearingCaches ||
+    if (!task.manual && !automaticMetadataEnabled) throw const Cancelled();
+    if (!thirdPartyNetwork.enabled ||
+        _clearingCaches ||
         (!task.manual && (!_foreground || activePlaybackMediaId != null))) {
       throw const _MetadataPaused();
     }
@@ -554,17 +563,25 @@ extension MetadataBackgroundTasks on AppModel {
   }
 
   Future<void> _drainMetadataTasks() async {
-    if (_disposed || _clearingCaches || _metadataWorkerRunning) return;
+    if (_disposed ||
+        !thirdPartyNetwork.enabled ||
+        _clearingCaches ||
+        _metadataWorkerRunning) {
+      return;
+    }
     _metadataWorkerRunning = true;
     try {
-      while (!_disposed && !_clearingCaches) {
+      while (!_disposed && thirdPartyNetwork.enabled && !_clearingCaches) {
         final task = _metadataTasks
             .where(
               (t) =>
                   t.running &&
                   !t._external &&
                   !t._started &&
-                  (t.manual || (_foreground && activePlaybackMediaId == null)),
+                  (t.manual ||
+                      (automaticMetadataEnabled &&
+                          _foreground &&
+                          activePlaybackMediaId == null)),
             )
             .firstOrNull;
         if (task == null) break;
@@ -764,7 +781,7 @@ extension MetadataBackgroundTasks on AppModel {
     final useAi =
         task.ai ||
         (preferences.aiMetadataEnabled &&
-            (task.manual || preferences.metadataStrategy != 'off'));
+            (task.manual || automaticMetadataEnabled));
     if (!useAi) {
       for (final record in remaining) {
         _taskCompleteRecord(task, record, false);

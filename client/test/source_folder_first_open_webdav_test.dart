@@ -80,7 +80,7 @@ Future<void> _wait(WidgetTester tester, bool Function() finished) async {
 }
 
 void main() {
-  for (final (label, subfolder, names, expected) in [
+  for (final (label, subfolder, names, _) in [
     (
       'standard named episodes',
       '',
@@ -107,7 +107,7 @@ void main() {
       2,
     ),
   ]) {
-    testWidgets('first open from an empty library shows details: $label', (
+    testWidgets('metadata OFF first open preserves raw filenames: $label', (
       tester,
     ) async {
       FlutterSecureStorage.setMockInitialValues({});
@@ -167,79 +167,28 @@ void main() {
           await tester.tap(child);
         }
         await _wait(tester, () => (model.completedListings[target] ?? 0) > 0);
-        if (model.parsedListings[target] != null) {
-          await _wait(
-            tester,
-            () => find.byType(MediaDetailsOverview).evaluate().isNotEmpty,
-          );
-        }
         await tester.pumpAndSettle();
         expect(plays, 0);
         expect(store.records('progress'), isEmpty);
+        expect(find.byType(MediaDetailsOverview), findsNothing);
+        expect(find.textContaining('已收录'), findsNothing);
         expect(
-          find.byType(MediaDetailsOverview),
-          findsOneWidget,
-          reason:
-              'target=$target; parsed=${model.parsedListings[target]?.title}; '
-              'stored=${store.all('media').length}; requests=$requests',
+          store.all('media'),
+          isEmpty,
+          reason: 'Parser guesses must not import an unrecognized directory while automatic metadata is disabled.',
         );
-        expect(store.all('media'), hasLength(expected));
-        expect(
-          store
-              .all('media')
-              .every((record) => record.data['series'] == 'Series'),
-          isTrue,
-        );
-        if (subfolder == 'Season 2') {
-          expect(
-            store.all('media').every((record) => record.data['season'] == '2'),
-            isTrue,
-          );
-        }
-        if (names.length == 1 && names.single == 'Series.mkv') {
-          expect(
-            '${store.all('media').single.data['episode'] ?? ''}',
-            isEmpty,
-            reason:
-                'Opening a single named video must not fabricate episode 1.',
-          );
-        } else if (names.length > expected) {
-          // An unrecognized extra keeps membership partial, so the header
-          // reports every listed video without counting the trailer as an
-          // episode or importing it into the library.
-          expect(
-            find.descendant(
-              of: find.byType(MediaDetailsOverview),
-              matching: find.text('${names.length} 个视频'),
-            ),
-            findsOneWidget,
-          );
-          expect(find.textContaining('已收录'), findsNothing);
-          expect(model.sourceMedia('nas', '${target}trailer.mkv'), isNull);
-          expect(
-            store.all('media').map((record) => record.data['episode']).toSet(),
-            {'1', '2'},
-          );
-        } else {
-          expect(find.textContaining('已收录 $expected 集'), findsOneWidget);
-        }
-        if (subfolder == '已改名目录') {
-          expect(
-            store.all('media').map((record) => record.data['episode']).toSet(),
-            {'1', '2', '3', '4'},
-          );
-          final lastEpisode = find.byKey(ValueKey('$target${names.last}'));
+        expect(requests, contains('/dav/$target'));
+        for (final name in names) {
+          final tile = find.byKey(ValueKey('$target$name'));
           await tester.scrollUntilVisible(
-            lastEpisode,
-            200,
+            tile,
+            160,
             scrollable: find.byType(Scrollable).last,
           );
+          expect(tile, findsOneWidget);
           expect(
-            tester
-                .widget<MediaDetailsEpisodeTile>(lastEpisode)
-                .item
-                .data['episode'],
-            '4',
+            find.descendant(of: tile, matching: find.text(name)),
+            findsOneWidget,
           );
         }
         expect(tester.takeException(), isNull);
@@ -255,7 +204,7 @@ void main() {
     });
   }
 
-  for (final (label, basePath, title, season) in [
+  for (final (label, basePath, _, _) in [
     ('named series source root', '/Series/', 'Series', '1'),
     ('season source root', '/Series/S02/', 'Series', '2'),
     ('unnamed season source root', '/S01/', null, '1'),
@@ -307,42 +256,19 @@ void main() {
         expect(requests, isEmpty);
         await tester.tap(find.text('NAS'));
         await _wait(tester, () => (model.completedListings[''] ?? 0) > 0);
-        if (title != null) {
-          await _wait(
-            tester,
-            () => find.byType(MediaDetailsOverview).evaluate().isNotEmpty,
-          );
-        }
         await tester.pumpAndSettle();
         expect(plays, 0);
         expect(store.records('progress'), isEmpty);
         expect(requests, [basePath]);
-        final records = store.all('media');
-        if (title == null) {
-          expect(find.byType(MediaDetailsOverview), findsNothing);
-          expect(
-            records,
-            isEmpty,
-            reason:
-                'S01 without a named parent must not become a guessed series.',
-          );
-        } else {
-          expect(find.byType(MediaDetailsOverview), findsOneWidget);
-          expect(records, hasLength(2));
-          expect(
-            records.every((record) => record.data['series'] == title),
-            isTrue,
-          );
-          expect(
-            records.every(
-              (record) => '${record.data['season'] ?? ''}'.isEmpty
-                  ? season == '1'
-                  : record.data['season'] == season,
-            ),
-            isTrue,
-          );
-          expect(find.textContaining('已收录 2 集'), findsOneWidget);
-        }
+        expect(find.byType(MediaDetailsOverview), findsNothing);
+        expect(find.textContaining('已收录'), findsNothing);
+        expect(
+          store.all('media'),
+          isEmpty,
+          reason: 'A source name or season-like path is not verified metadata.',
+        );
+        expect(find.text('01.mkv'), findsOneWidget);
+        expect(find.text('02.mkv'), findsOneWidget);
         expect(tester.takeException(), isNull);
       } finally {
         await tester.pumpWidget(const SizedBox());

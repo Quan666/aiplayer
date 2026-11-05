@@ -1,7 +1,104 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show FlutterView;
 
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+
+/// Holds the player route over the destination while an asynchronous native
+/// rotation returns to the shape in which the player was opened. A channel
+/// reply only acknowledges the request, not the resulting viewport change.
+/// Multi-window and rotation-lock modes may decline the request, so this wait
+/// is bounded and stops directly on background/disposal without another frame.
+class PlayerViewportRestore with WidgetsBindingObserver {
+  final FlutterView view;
+  final bool landscape;
+  final Duration timeout;
+  Completer<void>? _waiting;
+  Timer? _deadline;
+  bool _disposed = false;
+
+  PlayerViewportRestore(
+    this.view, {
+    this.timeout = const Duration(milliseconds: 750),
+  }) : landscape = view.physicalSize.width >= view.physicalSize.height;
+
+  bool get _matches =>
+      (view.physicalSize.width >= view.physicalSize.height) == landscape;
+
+  Future<void> restore(Future<void> Function() request) async {
+    if (_disposed) return;
+    assert(_waiting == null);
+    final waiting = _waiting = Completer<void>();
+    final binding = WidgetsBinding.instance;
+    binding.addObserver(this);
+    // The platform reply may itself stall. Keep the entire restoration bounded
+    // and release it directly on lifecycle/disposal, without awaiting that reply.
+    _deadline = Timer(timeout, _finish);
+    try {
+      unawaited(
+        Future<void>.sync(request).then<void>(
+          (_) {
+            // A late reply belongs only to this attempt. It cannot complete a
+            // later restoration or restart any presentation work.
+            if (!identical(_waiting, waiting)) return;
+            if (_disposed ||
+                _matches ||
+                _backgrounded(binding.lifecycleState)) {
+              _finish();
+            }
+          },
+          onError: (Object error, StackTrace stack) {
+            // Keep a handler attached after timeout/disposal so a late native
+            // failure cannot become an unhandled asynchronous error.
+            if (identical(_waiting, waiting) && !waiting.isCompleted) {
+              waiting.completeError(error, stack);
+            }
+          },
+        ),
+      );
+      if (_disposed || _backgrounded(binding.lifecycleState)) {
+        _finish();
+      }
+      await waiting.future;
+    } finally {
+      _deadline?.cancel();
+      _deadline = null;
+      _waiting = null;
+      binding.removeObserver(this);
+    }
+  }
+
+  static bool _backgrounded(AppLifecycleState? state) => switch (state) {
+    AppLifecycleState.hidden ||
+    AppLifecycleState.paused ||
+    AppLifecycleState.detached => true,
+    _ => false,
+  };
+
+  @override
+  void didChangeMetrics() {
+    if (_matches) _finish();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_backgrounded(state)) _finish();
+  }
+
+  void _finish() {
+    _deadline?.cancel();
+    _deadline = null;
+    final waiting = _waiting;
+    if (waiting != null && !waiting.isCompleted) waiting.complete();
+  }
+
+  void dispose() {
+    _disposed = true;
+    _finish();
+  }
+}
 
 /// Temporary display brightness while a mobile player is in the foreground.
 /// Native code retains and restores the previous value, including on app pause.

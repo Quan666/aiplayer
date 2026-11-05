@@ -32,7 +32,10 @@ class _ListModel extends AppModel {
   Future<bool> needsMediaPreview(String id) async => true;
 
   @override
-  void ensureMediaPreview(String id) => previews.add(id);
+  bool ensureMediaPreview(String id) {
+    previews.add(id);
+    return true;
+  }
 
   @override
   String ensureSourceMediaPreview(String sourceId, SourceEntry entry) {
@@ -439,8 +442,7 @@ void main() {
       expect(
         _decoded(_artwork(first)),
         isTrue,
-        reason:
-            'Reverse scrolling reuses the resident decoded cover on its first frame.',
+        reason: 'Reverse scrolling reuses the resident decoded cover on its first frame.',
       );
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());

@@ -171,10 +171,8 @@ void main() {
       expect(tester.takeException(), isNull);
       final report = <String, Object?>{
         'mode': kProfileMode ? 'profile' : 'debug',
-        'scope':
-            'Full AIPlayerApp with 1200 media records, 60 history records and 10 carousel cards; unique 640x360 JPEG disk paths; fixture image encoding/file IO/SQLite writes on a background isolate; 600 pixels/second continuous forward/reverse scroll; bounded independent-connection progress writer and 9 tab switches. Linux Xvfb software rendering, controlled thumbnails, no network downloads or video capture; not mobile/device FPS and no before-change comparison.',
-        'latencyDefinition':
-            'First frame with any cover area visible to first RawImage pixels; initially visible covers excluded. 0ms means prepared before entry, not zero IO/decode time. Flutter decoded cache cleared initially; OS filesystem cache not cleared.',
+        'scope': 'Full AIPlayerApp with 1200 media records, 60 history records and 10 carousel cards; unique 640x360 JPEG disk paths; fixture image encoding/file IO/SQLite writes on a background isolate; 600 pixels/second continuous forward/reverse scroll; bounded independent-connection progress writer and 9 tab switches. Linux Xvfb software rendering, controlled thumbnails, no network downloads or video capture; not mobile/device FPS and no before-change comparison.',
+        'latencyDefinition': 'First frame with any cover area visible to first RawImage pixels; initially visible covers excluded. 0ms means prepared before entry, not zero IO/decode time. Flutter decoded cache cleared initially; OS filesystem cache not cleared.',
         'viewport': {
           'width':
               tester.view.physicalSize.width / tester.view.devicePixelRatio,
@@ -316,7 +314,7 @@ void _seed(String path) {
 class _Model extends AppModel {
   _Model(super.store, super.documents) : super(backgroundWork: false);
   @override
-  void ensureMediaPreview(String id) {}
+  bool ensureMediaPreview(String id) => true;
 }
 
 class _BackgroundWriter {
@@ -408,9 +406,8 @@ Future<void> _writeReportInBackground(
   Map<String, Object?> report,
 ) => Isolate.run(() {
   Directory(path).createSync(recursive: true);
-  File(
-    '$path/continue-artwork-performance.json',
-  ).writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
+  File('$path/continue-artwork-performance.json')
+      .writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
 });
 
 Map<String, Object> _distribution(Iterable<double> values) {

@@ -1,11 +1,12 @@
 # 第三方组件
 
 - Flutter：BSD-3-Clause；客户端 SDK 固定为 3.47.7。
-- media_kit：MIT；使用其发布的 mpv / FFmpeg 原生构建。分发这些二进制时须保留其随包许可证与对应源码信息；不能将包的 MIT 许可证视为底层所有组件的许可证。
+- media_kit：MIT；Android 原生播放器由 `scripts/build_android_native.py` 从已校验源码构建，版本、来源和补丁摘要见 `packages/media_kit_libs_android_video/native/sources.lock.json`。其他平台使用对应原生包或系统媒体库。分发二进制时须保留其随包许可证与对应源码信息；不能将包的 MIT 许可证视为底层所有组件的许可证。
 - libsmb2：LGPL-2.1-or-later，源码以 `57fea04fd29403e3978000179339c8e13ce46b5c` 为基线，包含共享枚举时保留 SMB 错误状态的本地修正，位于 `packages/aiplayer_smb/src/vendor/libsmb2`，许可证随上游源码保留。FFI 桥接仅提供读取操作，关闭了 Kerberos、DCE/RPC、QUIC 和 RDMA 可选组件。
 - Noto Sans SC：SIL Open Font License 1.1，字体及许可证位于 `client/assets/fonts`。
 - OpenCC 1.1.9：Apache License 2.0。繁简转换使用上游 `ver.1.1.9`（提交 `556ed22496d650bd0b13b6c163be9814637970ae`）的 `TSCharacters.txt` / `TSPhrases.txt` 字典，来源 [BYVoid/OpenCC](https://github.com/BYVoid/OpenCC)。原始许可证、词典及来源校验信息位于 `client/assets/opencc`，未修改词典内容。
 - SQLite 与 Go SQLite 驱动：见依赖锁定文件及对应上游许可证。
+- SQLite 和 Linux / Windows 媒体插件的本地下载校验补丁保留上游许可证；各包的 `UPSTREAM.md` 记录官方 Pub 归档校验值。安全维护及平台验证范围见 `docs/DEPENDENCY_SECURITY.md`。
 - danmu_api 请求、名称识别、匹配、缓存及刷新行为参照本机 `openlist-enhancer` 插件；Dart 实现不依赖浏览器扩展环境。
 - 弹幕屏蔽预设完整导入用户指定的 `openlist-enhancer/src/data/danmaku-filter-preset.json`（2026-10-12，2251 个关键词、1 条正则），原始来源为用户提供的 `FilterSettings.xml`。来源校验值保存在 `client/lib/danmaku/filter_preset.dart`；预设默认启用，可独立关闭，自定义屏蔽词另行保留。
 

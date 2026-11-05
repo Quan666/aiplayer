@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -9,6 +10,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+
 import '../danmaku/overlay.dart';
 import '../data/app_model.dart';
 import '../data/playback_source.dart';
@@ -36,6 +38,7 @@ import 'player_theme.dart';
 import 'glass.dart';
 import 'library_page.dart';
 import 'media_artwork.dart';
+import 'television_input.dart';
 
 String clockText(Duration value) {
   final total = value.inSeconds.clamp(0, 1 << 40);
@@ -88,6 +91,10 @@ class PlayerPage extends StatefulWidget {
   final PlayerPageController? controller;
   final Future<void> Function()? onClose;
 
+  /// An already paused album session. This route assumes its disposal ownership.
+  final PlaybackSession? initialSession;
+  final bool? initialPlay;
+
   /// Exercise mobile lifecycle policy with a real decoder on a desktop test host.
   @visibleForTesting
   final bool? mobilePlaybackLifecycle;
@@ -99,6 +106,8 @@ class PlayerPage extends StatefulWidget {
     this.expectedBinding,
     this.controller,
     this.onClose,
+    this.initialSession,
+    this.initialPlay,
     this.mobilePlaybackLifecycle,
   });
   @override
@@ -106,16 +115,21 @@ class PlayerPage extends StatefulWidget {
 }
 
 class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
-  late PlaybackSession session = PlaybackSession(
-    widget.model,
-    widget.media,
-    sourcePreference: widget.sourcePreference,
-    expectedBinding: widget.expectedBinding,
-  );
+  late PlaybackSession session =
+      widget.initialSession ??
+      PlaybackSession(
+        widget.model,
+        widget.media,
+        sourcePreference: widget.sourcePreference,
+        expectedBinding: widget.expectedBinding,
+      );
   bool _switchingMedia = false;
   int _handledCompletionRevision = 0;
   bool? _fullscreenLandscape;
   bool _leaving = false, _nativeFullscreen = false, _disposed = false;
+  bool _displayRestoredForLeave = false;
+  bool _readyToLeave = false;
+  PlayerViewportRestore? _returnViewport;
   bool _backgrounded = false;
   final _fullscreenTransitions = FullscreenTransition();
   final _mediaTransitions = FullscreenTransition();
@@ -153,6 +167,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       WidgetsBinding.instance.lifecycleState,
     );
     _syncBackgroundPlayback();
+    session.setDanmakuPresentationActive(true);
     session.addListener(_changed);
     windowMode.bindSession(session);
     windowMode.addListener(_windowChanged);
@@ -169,6 +184,14 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Capture before the queued fullscreen request changes the view. The
+    // library may itself be landscape; never force a portrait-only policy.
+    _returnViewport ??= PlayerViewportRestore(View.of(context));
+  }
+
+  @override
   void didUpdateWidget(PlayerPage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.controller != widget.controller) {
@@ -178,13 +201,49 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   Future<void> _openSession() async {
+    final owner = session;
+    final pauseRevision = owner.backgroundPauseRevision;
+    final intentRevision = owner.playbackIntentRevision;
+    bool current() =>
+        !_disposed && !_leaving && identical(owner, session) && !owner.closed;
+    final foregroundStart = !playbackIsBackgrounded(
+      WidgetsBinding.instance.lifecycleState,
+    );
     if (PlayerDisplay.supported && widget.model.preferences.enterFullscreen) {
-      session.autoFullscreenAttempted = true;
+      owner.autoFullscreenAttempted = true;
       // Issue system-bar/orientation changes before decoding can expose a
       // first frame at the old viewport size.
       await _enterFullscreen();
     }
-    if (!_disposed && !_leaving) await session.open();
+    if (current()) {
+      var play =
+          foregroundStart && pauseRevision == owner.backgroundPauseRevision
+          ? widget.initialPlay
+          : false;
+      if (widget.initialSession != null) {
+        try {
+          if (intentRevision != owner.playbackIntentRevision) {
+            _presentFirstFrame();
+            return;
+          }
+          if (play != false && owner.player.state.completed) {
+            await owner.seek(Duration.zero);
+            if (!current()) return;
+            if (intentRevision != owner.playbackIntentRevision) {
+              _presentFirstFrame();
+              return;
+            }
+            if (pauseRevision != owner.backgroundPauseRevision) play = false;
+          }
+          await owner.setPlaying(play ?? true);
+          if (current()) _presentFirstFrame();
+        } catch (error) {
+          if (mounted && current()) showFailure(context, error);
+        }
+      } else {
+        await owner.open(play: play);
+      }
+    }
   }
 
   double? get _videoAspectRatio {
@@ -235,7 +294,11 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     if (_configuredMediaId != session.media.id) _refreshMediaControls();
     _presentFirstFrame();
     _scheduleNextEpisode();
-    if (_nativeFullscreen && !windowMode.active && !session.closed) {
+    if (!_disposed &&
+        !_leaving &&
+        _nativeFullscreen &&
+        !windowMode.active &&
+        !session.closed) {
       unawaited(_fullscreenTransitions.run(_syncVideoOrientation));
     }
     // Controls already listen to the session. Volume, buffering and subtitle
@@ -274,10 +337,13 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   void _refreshControls() {
+    if (_disposed || _leaving) return;
     unawaited(
       display.watchOrientation(widget.model.preferences.autoRotateFullscreen),
     );
-    if (_nativeFullscreen &&
+    if (!_disposed &&
+        !_leaving &&
+        _nativeFullscreen &&
         !windowMode.active &&
         !_switchingMedia &&
         !session.closed) {
@@ -419,7 +485,13 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   Future<void> _syncVideoOrientation() async {
-    if (!PlayerDisplay.supported || !_nativeFullscreen) return;
+    if (_disposed ||
+        _leaving ||
+        session.closed ||
+        !PlayerDisplay.supported ||
+        !_nativeFullscreen) {
+      return;
+    }
     final params = session.player.state.videoParams;
     final landscape =
         videoIsLandscape(
@@ -531,6 +603,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       () async {
         // An explicit fullscreen toggle keeps the video's orientation. Once
         // playback leaves, release it even if fullscreen was already off.
+        if (_displayRestoredForLeave) return;
         if (_nativeFullscreen) {
           await _exitFullscreen();
         } else if (PlayerDisplay.supported) {
@@ -592,6 +665,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _disposed = true;
+    _returnViewport?.dispose();
     unawaited(mediaControls.close());
     widget.controller?._select = null;
     _orientationDeadline?.cancel();
@@ -612,6 +686,36 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     if (!session.closed) {
       unawaited(session.setPlaying(false).catchError((Object _) {}));
     }
+    ++_fullscreenRevision;
+    _orientationDeadline?.cancel();
+    try {
+      await _fullscreenTransitions.run(() async {
+        if (_disposed) return;
+        if (PlayerDisplay.supported) {
+          await display.watchOrientation(false);
+          if (_disposed) return;
+          final viewport = _returnViewport;
+          if (viewport == null) {
+            await PlayerDisplay.restoreSystemUi();
+          } else {
+            await viewport.restore(PlayerDisplay.restoreSystemUi);
+          }
+        } else if (_nativeFullscreen) {
+          await _restoreFullscreen();
+        }
+        _nativeFullscreen = false;
+        _displayRestoredForLeave = true;
+      });
+    } catch (error) {
+      AppLog.instance.warning(
+        '播放器',
+        safeFailure(error, action: '恢复显示失败').message,
+      );
+    }
+    if (!mounted || _disposed) return;
+    // Keep the opaque player above the list until rotation has updated its
+    // viewport, rather than exposing the list in the video's orientation.
+    setState(() => _readyToLeave = true);
     if (widget.onClose != null) {
       await widget.onClose!();
     } else if (mounted) {
@@ -1100,7 +1204,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) => _playerSurface(
     PopScope(
-      canPop: _leaving,
+      canPop: _readyToLeave,
       onPopInvokedWithResult: (didPop, result) {
         if (!didPop) leave();
       },
@@ -1125,6 +1229,20 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                   child: IgnorePointer(
                     child: MediaArtwork(
                       thumbnail: path,
+                      thumbnailRevision: widget.model.mediaPreviewImageRevision(
+                        session.media.id,
+                      ),
+                      thumbnailChanges: widget.model,
+                      thumbnailRevisionOf: () => widget.model
+                          .mediaPreviewImageRevision(session.media.id),
+                      onThumbnailError: (path, error) =>
+                          widget.model.retryMissingMediaPreview(
+                            session.media.id,
+                            path,
+                            error,
+                          ),
+                      onThumbnailReady: (path) => widget.model
+                          .mediaPreviewReady(session.media.id, path),
                       fit: switch (widget.model.preferences.videoFit) {
                         'cover' => BoxFit.cover,
                         'fill' => BoxFit.fill,
@@ -1271,6 +1389,7 @@ class _PlayerControlsState extends State<_PlayerControls>
   });
   bool _closing = false, _rotating = false, _preparingPip = false;
   final _playlistAnchor = GlobalKey();
+  final _televisionPlayFocus = FocusNode(debugLabel: 'television-play-pause');
   final Map<int, Offset> _touches = {};
   int? _mousePointer;
   double? _pinchDistance;
@@ -1873,6 +1992,31 @@ class _PlayerControlsState extends State<_PlayerControls>
         focus?.findAncestorWidgetOfExactType<EditableText>() != null) {
       return KeyEventResult.ignored;
     }
+    if (TelevisionMode.read(context) && !locked) {
+      final remote = televisionPlaybackAction(event, controlsVisible: show);
+      if (remote == 'traverse') {
+        hideTimer.arm();
+        return KeyEventResult.ignored;
+      }
+      if (remote == 'consume') return KeyEventResult.handled;
+      if (remote == 'showControls') {
+        _revealTelevisionControls();
+        return KeyEventResult.handled;
+      }
+      if (remote != null) {
+        _action(remote, revealControls: false);
+        return KeyEventResult.handled;
+      }
+      if (event is KeyDownEvent &&
+          (event.logicalKey == LogicalKeyboardKey.select ||
+              event.logicalKey == LogicalKeyboardKey.enter ||
+              event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+              event.logicalKey == LogicalKeyboardKey.gameButtonA) &&
+          focus?.findAncestorStateOfType<_PlayerControlsState>() != this) {
+        _revealTelevisionControls();
+        return KeyEventResult.handled;
+      }
+    }
     // Handle player keys before a focused slider or button consumes arrows
     // and Space. Modal routes and text fields retain their own keyboard input.
     if (!mobile &&
@@ -1900,6 +2044,21 @@ class _PlayerControlsState extends State<_PlayerControls>
     }
     _action(action, revealControls: false);
     return KeyEventResult.handled;
+  }
+
+  void _revealTelevisionControls() {
+    setState(reveal);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          _closing ||
+          !show ||
+          s.closed ||
+          playbackIsBackgrounded(WidgetsBinding.instance.lifecycleState) ||
+          ModalRoute.of(context)?.isCurrent != true) {
+        return;
+      }
+      _televisionPlayFocus.requestFocus();
+    });
   }
 
   void _setControlsVisible(bool visible) {
@@ -1993,6 +2152,7 @@ class _PlayerControlsState extends State<_PlayerControls>
   @override
   void dispose() {
     _cancelSurfaceTaps(rebuild: false);
+    _televisionPlayFocus.dispose();
     FocusManager.instance.removeEarlyKeyEventHandler(_keyEvent);
     if (!mobile) {
       GestureBinding.instance.pointerRouter.removeGlobalRoute(_desktopPointer);
@@ -2063,9 +2223,8 @@ class _PlayerControlsState extends State<_PlayerControls>
                               synchronouslyLoaded || frameNumber != null
                               ? child
                               : ColoredBox(
-                                  color: PlayerTheme.of(
-                                    context,
-                                  ).previewLoadingColor,
+                                  color: PlayerTheme.of(context)
+                                      .previewLoadingColor,
                                 ),
                       errorBuilder: (_, _, _) => unavailable(),
                     )
@@ -2211,9 +2370,8 @@ class _PlayerControlsState extends State<_PlayerControls>
                 title(media),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: PlayerTheme.of(
-                  context,
-                ).playlistItemStyle(selected: media.id == s.media.id),
+                style: PlayerTheme.of(context)
+                    .playlistItemStyle(selected: media.id == s.media.id),
               ),
               subtitle: _playlistProgress(media),
               selected: media.id == s.media.id,
@@ -2740,6 +2898,7 @@ class _PlayerControlsState extends State<_PlayerControls>
                                   ),
                                   const SizedBox(width: 34),
                                   _PlayerButton(
+                                    focusNode: _televisionPlayFocus,
                                     tooltip: st.playing ? '暂停' : '播放',
                                     icon: loading
                                         ? null
@@ -2975,17 +3134,20 @@ class _PlayerButton extends StatelessWidget {
   final String tooltip;
   final IconData? icon;
   final VoidCallback? onPressed;
+  final FocusNode? focusNode;
   final double iconSize, size;
   const _PlayerButton({
     super.key,
     required this.tooltip,
     required this.icon,
     required this.onPressed,
+    this.focusNode,
     this.iconSize = 22,
     this.size = 44,
   });
   @override
   Widget build(BuildContext context) => IconButton(
+    focusNode: focusNode,
     tooltip: tooltip,
     onPressed: onPressed,
     style: PlayerTheme.of(context).controlButtonStyle(size),

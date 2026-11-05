@@ -60,6 +60,7 @@ extension _OfflineFolderWork on _OfflineWorker {
       'remotePath': path,
       'downloadRoot': path,
       'name': input['name'] as String? ?? '文件夹',
+      'personalMedia': input['personalMedia'] == true,
       'isDirectory': true,
       // An explicit folder selection may restore older library removals, but
       // must never undo deletions made while this task is queued or paused.
@@ -203,7 +204,7 @@ extension _OfflineFolderWork on _OfflineWorker {
                   'INSERT OR IGNORE INTO download_folder_paths(task,path) VALUES(?,?)',
                   [id, child],
                 );
-              } else if (isVideo(entry.name)) {
+              } else {
                 final location = store?.locationFor(
                   row['sourceId'] as String,
                   child,
@@ -231,7 +232,7 @@ extension _OfflineFolderWork on _OfflineWorker {
             if (_folderCount('download_folder_paths', id) >
                     _folderDirectoryLimit ||
                 _folderCount('download_folder_files', id) > _downloadCapacity) {
-              throw const AppFailure('文件夹最多包含 2000 个视频、4096 个目录，请选择更小的子文件夹。');
+              throw const AppFailure('文件夹最多包含 2000 个文件、4096 个目录，请选择更小的子文件夹。');
             }
             db!.execute('COMMIT');
           } catch (_) {
@@ -336,11 +337,12 @@ extension _OfflineFolderWork on _OfflineWorker {
       'FROM download_folder_files WHERE task=? ORDER BY rowid',
       [id],
     );
-    if (discovered.isEmpty) throw const AppFailure('文件夹中没有可下载的视频。');
+    if (discovered.isEmpty) throw const AppFailure('文件夹中没有可下载的文件。');
     // Library guards and registration run under one write transaction, so a
     // paused scan cannot restore a subsequently deleted or rebound media item.
     // Metadata edits keep the current record and are not overwritten.
     final library = store ??= AppStore(':memory:');
+    final mediaRevision = library.recordsRevision('media');
     final admitted = <Map<String, dynamic>>[];
     var skipped = 0, bound = 0, added = 0, retried = 0, existingFiles = 0;
     db!.execute('BEGIN IMMEDIATE');
@@ -397,6 +399,8 @@ extension _OfflineFolderWork on _OfflineWorker {
           entries: files,
           inTransaction: true,
           restoreExcluded: false,
+          includeAllFiles: true,
+          personalMedia: folder['personalMedia'] == true,
         );
         bound = bindings.length;
         for (final (media, location) in bindings) {
@@ -415,7 +419,7 @@ extension _OfflineFolderWork on _OfflineWorker {
                 location['path'] as String,
               )];
           if (old != null) {
-            if (old['mediaId'] != media.id ||
+            if ((old['mediaId'] != media.id && old['downloadOnly'] != true) ||
                 (old['bindingRevision'] ?? '') !=
                     (location['previewRevision'] ?? '')) {
               throw const AppFailure('已有下载来自旧视频位置，请删除旧下载后重试。');
@@ -449,8 +453,8 @@ extension _OfflineFolderWork on _OfflineWorker {
               ),
             },
             'bindingRevision': location['previewRevision'] as String? ?? '',
-            'name':
-                media.data['fileName'] ?? media.data['title'] ?? 'video.mp4',
+            if (location['downloadOnly'] == true) 'downloadOnly': true,
+            'name': media.data['fileName'] ?? media.data['title'] ?? 'download',
             'total': location['size'] ?? media.data['size'] ?? 0,
             'received': 0,
             'checkpointBytes': 0,
@@ -493,6 +497,7 @@ extension _OfflineFolderWork on _OfflineWorker {
           'retried': retried,
           'existing': existingFiles,
           'skipped': skipped,
+          'libraryChanged': library.recordsRevision('media') != mediaRevision,
         },
       ]);
     }

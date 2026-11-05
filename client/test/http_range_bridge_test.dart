@@ -11,6 +11,56 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test(
+    'overlapping stalled seeks have a bounded upstream read budget',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final stalled = <HttpRequest>[];
+      final admitted = Completer<void>();
+      server.listen((request) async {
+        request.response.headers.set('Accept-Ranges', 'bytes');
+        request.response.contentLength = 1024;
+        if (request.method == 'HEAD') {
+          await request.response.close();
+        } else {
+          stalled.add(request);
+          if (stalled.length == 4) admitted.complete();
+        }
+      });
+      final source = HttpSource('http://127.0.0.1:${server.port}/video.mkv');
+      final client = HttpClient();
+      final pending = <Future<void>>[];
+      RangeBridge? bridge;
+      try {
+        bridge = await RangeBridge.open(source, '');
+        for (var i = 0; i < 4; i++) {
+          pending.add(() async {
+            try {
+              final response = await (await client.getUrl(bridge!.uri)).close();
+              await response.drain<void>();
+            } catch (_) {
+              /* closed with the test bridge */
+            }
+          }());
+        }
+        await admitted.future.timeout(const Duration(seconds: 5));
+        final excess = await (await client.getUrl(bridge.uri)).close();
+        expect(excess.statusCode, HttpStatus.serviceUnavailable);
+        expect(excess.headers.value('Retry-After'), '1');
+        await excess.drain<void>();
+        expect(stalled, hasLength(4));
+        await bridge.close();
+        await Future.wait(pending).timeout(const Duration(seconds: 3));
+        expect(stalled, hasLength(4));
+      } finally {
+        client.close(force: true);
+        await bridge?.close();
+        await source.close();
+        await server.close(force: true);
+      }
+    },
+  );
+
+  test(
     'HTTP bridge reuses its probe connection for the first video bytes',
     () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -181,53 +231,50 @@ void main() {
     },
   );
 
-  test(
-    'closing the HTTP worker cancels stalled playback without waiting for upstream',
-    () async {
-      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      final upstreamReading = Completer<void>();
-      server.listen((request) async {
-        try {
-          request.response.headers.set('Accept-Ranges', 'bytes');
-          request.response.contentLength = 1024;
-          if (request.method == 'HEAD') {
-            await request.response.close();
-            return;
-          }
-          request.response.statusCode = 206;
-          request.response.headers.set('Content-Range', 'bytes 0-1023/1024');
-          request.response.add([1, 2, 3]);
-          await request.response.flush();
-          upstreamReading.complete();
-        } on SocketException {
-          // The bridge is expected to abandon this incomplete stream.
-        }
-      });
-      final source = HttpSource('http://127.0.0.1:${server.port}/video.mkv');
-      final client = HttpClient();
-      final bridge = await RangeBridge.open(source, '');
+  test('closing the HTTP worker cancels stalled playback without waiting for upstream', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final upstreamReading = Completer<void>();
+    server.listen((request) async {
       try {
-        final downloading = () async {
-          try {
-            final response = await (await client.getUrl(bridge.uri)).close();
-            await response.drain<void>();
-          } on HttpException {
-            // Closing a bridge can interrupt headers or a partial response.
-          } on SocketException {
-            // A pending connection is also cancelled by shutdown.
-          }
-        }();
-        await upstreamReading.future.timeout(const Duration(seconds: 3));
-        await bridge.close().timeout(const Duration(seconds: 3));
-        await downloading.timeout(const Duration(seconds: 3));
-      } finally {
-        client.close(force: true);
-        await bridge.close();
-        await source.close();
-        await server.close(force: true);
+        request.response.headers.set('Accept-Ranges', 'bytes');
+        request.response.contentLength = 1024;
+        if (request.method == 'HEAD') {
+          await request.response.close();
+          return;
+        }
+        request.response.statusCode = 206;
+        request.response.headers.set('Content-Range', 'bytes 0-1023/1024');
+        request.response.add([1, 2, 3]);
+        await request.response.flush();
+        upstreamReading.complete();
+      } on SocketException {
+        // The bridge is expected to abandon this incomplete stream.
       }
-    },
-  );
+    });
+    final source = HttpSource('http://127.0.0.1:${server.port}/video.mkv');
+    final client = HttpClient();
+    final bridge = await RangeBridge.open(source, '');
+    try {
+      final downloading = () async {
+        try {
+          final response = await (await client.getUrl(bridge.uri)).close();
+          await response.drain<void>();
+        } on HttpException {
+          // Closing a bridge can interrupt headers or a partial response.
+        } on SocketException {
+          // A pending connection is also cancelled by shutdown.
+        }
+      }();
+      await upstreamReading.future.timeout(const Duration(seconds: 3));
+      await bridge.close().timeout(const Duration(seconds: 3));
+      await downloading.timeout(const Duration(seconds: 3));
+    } finally {
+      client.close(force: true);
+      await bridge.close();
+      await source.close();
+      await server.close(force: true);
+    }
+  });
 
   test(
     'cancelling HTTP bridge startup aborts a stalled HEAD worker immediately',
@@ -264,40 +311,37 @@ void main() {
     },
   );
 
-  test(
-    'HTTP video forwarding continues while the UI isolate is blocked',
-    () async {
-      final messages = ReceivePort();
-      final stream = StreamIterator<dynamic>(messages);
-      final fixture = await Isolate.spawn(_trafficFixture, messages.sendPort);
-      HttpSource? source;
-      RangeBridge? bridge;
-      try {
-        await stream.moveNext();
-        final (int port, SendPort commands) = stream.current as (int, SendPort);
-        source = HttpSource('http://127.0.0.1:$port/video.mkv');
-        bridge = await RangeBridge.open(source, '');
-        commands.send(bridge.uri.toString());
-        await stream.moveNext();
-        expect(stream.current, 'reading');
-        // Both the upstream fixture and consumer are separate from the main
-        // isolate. A bridge on this isolate cannot forward their remaining bytes.
-        final blocked = Stopwatch()..start();
-        while (blocked.elapsedMilliseconds < 900) {}
-        final unblockedAt = DateTime.now().millisecondsSinceEpoch;
-        await stream.moveNext();
-        final (int completedAt, int count) = stream.current as (int, int);
-        expect(count, 32768);
-        expect(completedAt, lessThan(unblockedAt - 100));
-      } finally {
-        await bridge?.close();
-        await source?.close();
-        fixture.kill(priority: Isolate.immediate);
-        await stream.cancel();
-        messages.close();
-      }
-    },
-  );
+  test('HTTP video forwarding continues while the UI isolate is blocked', () async {
+    final messages = ReceivePort();
+    final stream = StreamIterator<dynamic>(messages);
+    final fixture = await Isolate.spawn(_trafficFixture, messages.sendPort);
+    HttpSource? source;
+    RangeBridge? bridge;
+    try {
+      await stream.moveNext();
+      final (int port, SendPort commands) = stream.current as (int, SendPort);
+      source = HttpSource('http://127.0.0.1:$port/video.mkv');
+      bridge = await RangeBridge.open(source, '');
+      commands.send(bridge.uri.toString());
+      await stream.moveNext();
+      expect(stream.current, 'reading');
+      // Both the upstream fixture and consumer are separate from the main
+      // isolate. A bridge on this isolate cannot forward their remaining bytes.
+      final blocked = Stopwatch()..start();
+      while (blocked.elapsedMilliseconds < 900) {}
+      final unblockedAt = DateTime.now().millisecondsSinceEpoch;
+      await stream.moveNext();
+      final (int completedAt, int count) = stream.current as (int, int);
+      expect(count, 32768);
+      expect(completedAt, lessThan(unblockedAt - 100));
+    } finally {
+      await bridge?.close();
+      await source?.close();
+      fixture.kill(priority: Isolate.immediate);
+      await stream.cancel();
+      messages.close();
+    }
+  });
 }
 
 Future<void> _trafficFixture(SendPort reply) async {

@@ -1,5 +1,3 @@
-import 'package:aiplayer_smb/aiplayer_smb.dart';
-
 import '../core/network.dart';
 import 'source.dart';
 
@@ -122,6 +120,8 @@ Map<String, dynamic> buildSourceConfiguration({
 Future<SourceAdapter> connectSource(
   Map<String, dynamic> source, {
   String password = '',
+  int? maxListingBytes,
+  int? maxListingEntries,
 }) async {
   final value = sourceFormValues(source);
   switch (value['kind']) {
@@ -129,21 +129,14 @@ Future<SourceAdapter> connectSource(
       final host = value['host'] as String? ?? '';
       final port = int.tryParse('${value['port']}') ?? 445;
       final endpoint = Uri(host: host, port: port).authority;
-      Future<SmbConnection> connect(String share) => SmbConnection.connect(
+      return SmbSourceConfiguration(
         host: endpoint,
-        share: share,
+        share: value['share'] as String? ?? '',
         user: value['user'] as String? ?? '',
         password: password,
         domain: value['domain'] as String? ?? '',
         security: value['smbSecurity'] as String? ?? 'auto',
-      );
-      final share = value['share'] as String? ?? '';
-      if (share.isEmpty) {
-        // A known video path already names its share. Only root browsing needs
-        // IPC$ discovery; avoid a second authentication before opening a video.
-        return SmbServerSource(connect);
-      }
-      return SmbSource(await connect(share), reconnect: () => connect(share));
+      ).open();
     case 'webdav':
     case 'http':
       return HttpSource(
@@ -152,6 +145,8 @@ Future<SourceAdapter> connectSource(
         user: value['user'] as String? ?? '',
         password: password,
         displayName: value['label'] as String? ?? '',
+        maxListingBytes: maxListingBytes,
+        maxListingEntries: maxListingEntries,
       );
     default:
       throw const AppFailure('不支持此来源类型。');

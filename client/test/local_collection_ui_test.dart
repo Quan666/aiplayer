@@ -55,7 +55,9 @@ void main() {
       await fixture.directory.delete(recursive: true);
     });
     await tester.runAsync(() async {
-      final file = fixture.model.posterCache.cachedFile(_poster);
+      // A downloaded original is authoritative offline. cachedFile stores a
+      // portable sync copy, which deliberately requests a visible upgrade.
+      final file = fixture.model.posterCache.sourceFile(_poster);
       await file.parent.create(recursive: true);
       await file.writeAsBytes(
         await File('assets/branding/app_icon.png').readAsBytes(),
@@ -263,7 +265,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(fixture.selected, hasLength(1));
 
-      await tester.tap(find.byTooltip('搜索'));
+      await _folderAction(tester, '搜索');
       await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const ValueKey('folder-search-field')),
@@ -539,9 +541,8 @@ class _Fixture {
           source: null,
           strategy: '${settings['metadataStrategy']}',
           aiContext: jsonEncode([
-            AppPreferences(
-              Map<String, dynamic>.from(settings),
-            ).aiMetadataEnabled,
+            AppPreferences(Map<String, dynamic>.from(settings))
+                .aiMetadataEnabled,
             settings['aiSubtitleOrigin'],
             settings['aiSubtitleModel'],
             store.local('metadataCredentialsRevision'),
@@ -630,4 +631,21 @@ class _Downloads extends ChangeNotifier implements OfflineDownloads {
   OfflineDownload? entryFor(String mediaId) => entries[mediaId];
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+Future<void> _folderAction(WidgetTester tester, String label) async {
+  final direct = find.byTooltip(label);
+  if (direct.evaluate().isNotEmpty) {
+    await tester.tap(direct.first);
+    return;
+  }
+  final folder = find.byKey(const ValueKey('source-folder-menu'));
+  await tester.tap(
+    folder.evaluate().isNotEmpty
+        ? folder
+        : find.byKey(const ValueKey('local-folder-menu')),
+  );
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
 }

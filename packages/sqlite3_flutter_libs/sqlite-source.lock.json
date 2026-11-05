@@ -1,0 +1,12 @@
+{
+  "version": "3.54.1",
+  "source_id": "2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76",
+  "archive_url": "https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz",
+  "archive_sha256": "926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e",
+  "official_release_url": "https://www.sqlite.org/releaselog/3_54_1.html",
+  "sqlite3_c_sha3_256": "e2b869d3003b33c942b7dd7063604fbc53553e1b66609570df39b9b7b558ee81",
+  "files": {
+    "darwin/sqlite3_flutter_libs/Sources/CSQLite/sqlite3.c": "0c657666d819f261cc4007526ad57e1669de9949df7a8ea847aa284a2bf0ee52",
+    "darwin/sqlite3_flutter_libs/Sources/CSQLite/include/sqlite3.h": "d6c84557261893439b341d2e6c35187ae3ea24fbfd843ad94616f72d89242b8c"
+  }
+}

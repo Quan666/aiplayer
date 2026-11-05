@@ -38,7 +38,7 @@ void main() {
         );
         await tester.pumpAndSettle();
         final reads = model.listReads;
-        await tester.tap(find.byTooltip('搜索'));
+        await _folderAction(tester, '搜索');
         await tester.pumpAndSettle();
         final input = find.byKey(const ValueKey('folder-search-field'));
         await tester.enterText(input, 'alpha');
@@ -101,7 +101,7 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        await tester.tap(find.byTooltip('搜索'));
+        await _folderAction(tester, '搜索');
         await tester.pumpAndSettle();
         final field = tester.widget<TextField>(
           find.byKey(const ValueKey('folder-search-field')),
@@ -188,7 +188,7 @@ void main() {
       expect(find.text('2 个视频'), findsOneWidget);
       await tester.tap(find.text('本地视频'));
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('搜索'));
+      await _folderAction(tester, '搜索');
       await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const ValueKey('folder-search-field')),
@@ -203,11 +203,11 @@ void main() {
       expect(find.textContaining('beta'), findsOneWidget);
       expect(find.textContaining('.hidden'), findsNothing);
       expect(find.textContaining('captions'), findsNothing);
-      await tester.tap(find.byTooltip('搜索'));
+      await _folderAction(tester, '搜索');
       await tester.pumpAndSettle();
       // Selecting a video before the open-search frame arrives must cancel
       // that queued focus request, even if the play callback does not push.
-      await tester.tap(find.byTooltip('搜索'));
+      await _folderAction(tester, '搜索');
       await tester.tap(find.text('中文片名'));
       await tester.pumpAndSettle();
       expect(
@@ -267,4 +267,21 @@ class _SearchAdapter extends SourceAdapter {
   @override
   Stream<List<int>> read(String path, int start, int end) =>
       const Stream.empty();
+}
+
+Future<void> _folderAction(WidgetTester tester, String label) async {
+  final direct = find.byTooltip(label);
+  if (direct.evaluate().isNotEmpty) {
+    await tester.tap(direct.first);
+    return;
+  }
+  final folder = find.byKey(const ValueKey('source-folder-menu'));
+  await tester.tap(
+    folder.evaluate().isNotEmpty
+        ? folder
+        : find.byKey(const ValueKey('local-folder-menu')),
+  );
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
 }

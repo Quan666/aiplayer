@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
+
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../core/system_proxy.dart';
@@ -41,8 +42,9 @@ class RangeBridge {
   final HttpServer? _server;
   final String _token;
   final int _port;
-  final _HttpBridgeWorker? _worker;
+  final _SourceBridgeWorker? _worker;
   bool _closed = false;
+  int _activeReads = 0;
   Future<void>? _closing;
   RangeBridge._(
     this.source,
@@ -61,8 +63,19 @@ class RangeBridge {
     CancelToken? cancel,
   }) async {
     cancel?.check();
-    if (source is HttpSource) {
-      final worker = await _HttpBridgeWorker.open(source, path, entry, cancel);
+    final smb = switch (source) {
+      SmbSource(:final configuration) => configuration,
+      SmbServerSource(:final configuration) => configuration,
+      _ => null,
+    };
+    if (source is HttpSource || smb != null) {
+      final worker = await _SourceBridgeWorker.open(
+        source,
+        smb,
+        path,
+        entry,
+        cancel,
+      );
       return RangeBridge._(
         source,
         path,
@@ -98,9 +111,8 @@ class RangeBridge {
       path,
       entry,
       server,
-      base64UrlEncode(
-        List.generate(32, (_) => random.nextInt(256)),
-      ).replaceAll('=', ''),
+      base64UrlEncode(List.generate(32, (_) => random.nextInt(256)))
+          .replaceAll('=', ''),
       server.port,
     );
     server.listen(bridge._serve);
@@ -115,6 +127,7 @@ class RangeBridge {
   );
   Future<void> _serve(HttpRequest request) async {
     final response = request.response;
+    var reading = false;
     try {
       if (_closed || request.uri.pathSegments.firstOrNull != _token) {
         response.statusCode = 404;
@@ -133,6 +146,18 @@ class RangeBridge {
         response.headers.set('Content-Range', 'bytes */${entry.size}');
         await response.close();
         return;
+      }
+      if (request.method == 'GET') {
+        // Abandoned/overlapping seeks must not build an unbounded native SMB
+        // request queue while one blocking read is still returning.
+        if (_activeReads >= 4) {
+          response.statusCode = HttpStatus.serviceUnavailable;
+          response.headers.set('Retry-After', '1');
+          await response.close();
+          return;
+        }
+        reading = true;
+        _activeReads++;
       }
       response.statusCode = header == null ? 200 : 206;
       response.headers.set('Accept-Ranges', entry.seekable ? 'bytes' : 'none');
@@ -156,6 +181,8 @@ class RangeBridge {
       } catch (_) {
         /* player abandoned the seek */
       }
+    } finally {
+      if (reading) _activeReads--;
     }
   }
 
@@ -172,8 +199,32 @@ class RangeBridge {
 }
 
 /// Only connection configuration and lifecycle messages cross this boundary.
-/// The worker owns both HTTP sockets, so video bytes never visit the UI isolate.
-class _HttpBridgeWorker {
+/// The worker owns the source connection and serving socket; video bytes never
+/// visit the UI isolate, including materialized native SMB read buffers.
+class _SourceBridgeWorker {
+  // A cancelled native connect must finish its own cleanup. Bound those late
+  // supervisors as well as current playback so rapid selection cannot start
+  // an unbounded number of native authentication attempts.
+  static final _nativeWorkers = <Completer<void>>{};
+  static Future<Completer<void>> _reserveNative(CancelToken? cancel) async {
+    while (_nativeWorkers.length >= 2) {
+      await Future.any<void>([
+        for (final worker in _nativeWorkers) worker.future,
+        if (cancel != null) cancel.whenCancelled,
+      ]);
+      cancel?.check();
+    }
+    cancel?.check();
+    final lease = Completer<void>();
+    _nativeWorkers.add(lease);
+    return lease;
+  }
+
+  static void _releaseNative(Completer<void>? lease) {
+    if (lease == null || !_nativeWorkers.remove(lease)) return;
+    lease.complete();
+  }
+
   final Isolate _isolate;
   final ReceivePort _messages;
   final StreamSubscription<dynamic> _subscription;
@@ -181,8 +232,9 @@ class _HttpBridgeWorker {
   final Future<void> _exited;
   final SourceEntry entry;
   final Uri uri;
+  final bool _nativeCleanup;
 
-  _HttpBridgeWorker(
+  _SourceBridgeWorker(
     this._isolate,
     this._messages,
     this._subscription,
@@ -190,14 +242,17 @@ class _HttpBridgeWorker {
     this._exited,
     this.entry,
     this.uri,
+    this._nativeCleanup,
   );
 
-  static Future<_HttpBridgeWorker> open(
-    HttpSource source,
+  static Future<_SourceBridgeWorker> open(
+    SourceAdapter source,
+    SmbSourceConfiguration? smb,
     String path,
     SourceEntry? entry,
     CancelToken? cancel,
   ) async {
+    final nativeLease = smb == null ? null : await _reserveNative(cancel);
     final messages = ReceivePort();
     final ready = Completer<(SendPort, String, SourceEntry)>();
     final controls = Completer<SendPort>();
@@ -217,6 +272,7 @@ class _HttpBridgeWorker {
           ready.completeError(AppFailure(message, status));
         }
       } else if (message == null) {
+        _releaseNative(nativeLease);
         if (!exited.isCompleted) exited.complete();
         if (!ready.isCompleted) {
           ready.completeError(const AppFailure('视频读取服务已停止，请重试。'));
@@ -231,21 +287,22 @@ class _HttpBridgeWorker {
     Timer? timeout;
     try {
       isolate = await Isolate.spawn(
-        _serveHttpBridge,
-        _HttpBridgeConfiguration(
+        _serveSourceBridge,
+        _SourceBridgeConfiguration(
           messages.sendPort,
-          source.base.toString(),
-          source.webdav,
-          source.user,
-          source.password,
-          source.displayName,
+          source is HttpSource ? source.base.toString() : '',
+          source is HttpSource && source.webdav,
+          source is HttpSource ? source.user : '',
+          source is HttpSource ? source.password : '',
+          source is HttpSource ? source.displayName : '',
+          smb,
           path,
           entry,
           SystemProxyWorkerConfiguration.capture(),
         ),
         onError: messages.sendPort,
         onExit: messages.sendPort,
-        debugName: 'video-http-bridge',
+        debugName: smb == null ? 'video-http-bridge' : 'video-smb-bridge',
       );
       timeout = Timer(const Duration(seconds: 60), () {
         if (!ready.isCompleted) {
@@ -260,7 +317,7 @@ class _HttpBridgeWorker {
           ),
       ]);
       cancel?.check();
-      return _HttpBridgeWorker(
+      return _SourceBridgeWorker(
         isolate,
         messages,
         subscription,
@@ -268,8 +325,25 @@ class _HttpBridgeWorker {
         exited.future,
         actualEntry,
         Uri.parse(uri),
+        smb != null,
       );
     } catch (_) {
+      if (isolate == null) _releaseNative(nativeLease);
+      if (smb != null && isolate != null) {
+        // Keep the control listener until startup publishes its port, even if
+        // cancellation wins the isolate-spawn race. Do not retain the caller.
+        unawaited(() async {
+          final commands = await Future.any<SendPort?>([
+            controls.future,
+            exited.future.then((_) => null),
+          ]);
+          commands?.send('close');
+          await exited.future;
+          await subscription.cancel();
+          messages.close();
+        }());
+        rethrow;
+      }
       if (isolate != null) {
         // Closing HttpClient releases its sockets immediately; killing an
         // isolate alone can leave native socket cleanup waiting for GC.
@@ -294,58 +368,82 @@ class _HttpBridgeWorker {
 
   Future<void> close() async {
     _commands.send('close');
+    var deferred = false;
     try {
       await _exited.timeout(const Duration(seconds: 2));
     } on TimeoutException {
       // A hung upstream socket must not keep an abandoned decoder alive.
-      _isolate.kill(priority: Isolate.immediate);
+      if (_nativeCleanup) {
+        deferred = true;
+        unawaited(
+          _exited.then((_) async {
+            await _subscription.cancel();
+            _messages.close();
+          }),
+        );
+      } else {
+        _isolate.kill(priority: Isolate.immediate);
+      }
     } finally {
-      await _subscription.cancel();
-      _messages.close();
+      if (!deferred) {
+        await _subscription.cancel();
+        _messages.close();
+      }
     }
   }
 }
 
-class _HttpBridgeConfiguration {
+class _SourceBridgeConfiguration {
   final SendPort reply;
   final String address, user, password, displayName, path;
   final bool webdav;
+  final SmbSourceConfiguration? smb;
   final SourceEntry? entry;
   final SystemProxyWorkerConfiguration systemProxy;
-  const _HttpBridgeConfiguration(
+  const _SourceBridgeConfiguration(
     this.reply,
     this.address,
     this.webdav,
     this.user,
     this.password,
     this.displayName,
+    this.smb,
     this.path,
     this.entry,
     this.systemProxy,
   );
 }
 
-Future<void> _serveHttpBridge(_HttpBridgeConfiguration configuration) async {
-  initializeSystemProxyWorker(configuration.systemProxy);
+Future<void> _serveSourceBridge(
+  _SourceBridgeConfiguration configuration,
+) async {
+  if (configuration.smb == null) {
+    initializeSystemProxyWorker(configuration.systemProxy);
+  }
   final commands = ReceivePort();
   final stopped = Completer<void>();
-  HttpSource? source;
+  SourceAdapter? source;
   RangeBridge? bridge;
   commands.listen((_) {
     if (!stopped.isCompleted) stopped.complete();
     // This listener is live during the initial stat request as well as reads.
     // It must not wait for the stalled request before closing its HTTP client.
-    unawaited(source?.close());
+    unawaited(bridge?.close());
+    unawaited(source?.close().catchError((Object _) {}));
   });
   try {
-    source = HttpSource(
-      configuration.address,
-      webdav: configuration.webdav,
-      user: configuration.user,
-      password: configuration.password,
-      displayName: configuration.displayName,
-    );
+    // Publish cancellation before either SMB authentication or HTTP probing.
     configuration.reply.send(('starting', commands.sendPort));
+    source = configuration.smb != null
+        ? await configuration.smb!.open()
+        : HttpSource(
+            configuration.address,
+            webdav: configuration.webdav,
+            user: configuration.user,
+            password: configuration.password,
+            displayName: configuration.displayName,
+          );
+    if (stopped.isCompleted) return;
     bridge = await RangeBridge._openServer(
       source,
       configuration.path,
@@ -368,6 +466,8 @@ Future<void> _serveHttpBridge(_HttpBridgeConfiguration configuration) async {
     await source?.close();
     // Native proxy lookup initializes a messenger with its own ReceivePort.
     // Release the worker after sockets close, without waiting for a force kill.
-    Isolate.exit();
+    // SMB's native supervisor owns late-connect cleanup after a timeout. Let
+    // its ports finish naturally; forcing exit would abandon the native handle.
+    if (configuration.smb == null) Isolate.exit();
   }
 }

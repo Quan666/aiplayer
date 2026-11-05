@@ -40,6 +40,29 @@ Future<void> _drainRetirement() async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('camera parameters use familiar units and rational values', () {
+    expect(formatCameraParameter('光圈', '20/10'), 'F2.0');
+    expect(formatCameraParameter('光圈', 'f/2.8'), 'F2.8');
+    expect(formatCameraParameter('光圈', 'F4.0'), 'F4.0');
+    expect(formatCameraParameter('焦距', '350/10'), '35mm');
+    expect(formatCameraParameter('35mm 等效焦距', '50'), '50mm');
+    expect(formatCameraParameter('焦距', '35mm'), '35mm');
+    expect(formatCameraParameter('曝光时间', '1/250'), '1/250 s');
+    expect(formatCameraParameter('曝光时间', '0.004'), '1/250 s');
+    expect(formatCameraParameter('曝光时间', '5/2'), '2.5 s');
+    expect(formatCameraParameter('曝光补偿', '1/3'), '+0.33 EV');
+    expect(formatCameraParameter('曝光补偿', '-2/3'), '-0.67 EV');
+    expect(formatCameraParameter('ISO', 'ISO 400'), '400');
+    expect(formatCameraParameter('白平衡', '0'), '自动');
+    expect(formatCameraParameter('曝光程序', '3'), '光圈优先');
+    expect(formatCameraParameter('测光模式', '5'), '评价测光');
+    expect(formatCameraParameter('色彩空间', '1'), 'sRGB');
+    expect(formatCameraParameter('光圈', '1/0'), '1/0');
+    expect(formatCameraParameter('光圈', 'unknown'), 'unknown');
+    expect(formatCameraParameter('焦距', '0'), '0');
+    expect(formatCameraParameter('软件', 'Camera App'), 'Camera App');
+  });
+
   test(
     'inspections read current size and never reuse a cached snapshot',
     () async {

@@ -50,7 +50,10 @@ class _EpisodeModel extends AppModel {
   }
 
   @override
-  void ensureMediaPreview(String id) => requests.add(id);
+  bool ensureMediaPreview(String id) {
+    requests.add(id);
+    return true;
+  }
 
   @override
   String ensureSourceMediaPreview(String sourceId, SourceEntry entry) {
@@ -216,10 +219,7 @@ void main() {
       );
       expect(tester.getRect(thumbs.at(0)).size, const Size(64, 44));
       expect(tester.getRect(thumbs.at(1)).size, const Size(64, 44));
-      expect(
-        tester.getRect(actions.at(0)).left,
-        tester.getRect(actions.at(1)).left,
-      );
+      expect(actions, findsNothing);
       expect(model.requests, containsAll([first, second]));
       for (final row in rows.evaluate()) {
         final artwork = tester.widget<MediaArtwork>(
@@ -272,7 +272,8 @@ void main() {
       await tester.tap(find.byKey(ValueKey(model.entries.first.path)));
       await tester.pumpAndSettle();
       expect(played, first);
-      await tester.tap(find.byTooltip('视频选项').first);
+      expect(find.byTooltip('视频选项'), findsNothing);
+      await tester.longPress(rows.first);
       await tester.pumpAndSettle();
       expect(find.text('手动搜索影视资料'), findsOneWidget);
       Navigator.of(tester.element(find.byType(BottomSheet))).pop();

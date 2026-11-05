@@ -22,10 +22,23 @@ import 'directory_metadata_worker.dart' show prepareOfflineMediaBindings;
 part 'offline_download_worker.dart';
 part 'offline_download_folders.dart';
 part 'offline_local_directory_removal.dart';
+part 'offline_download_batches.dart';
 
 enum OfflineDownloadStatus { queued, downloading, paused, completed, failed }
 
-/// A device-local download. Remote identity and metadata remain in the library.
+enum OfflineDownloadBatchAction { pause, resume, delete }
+
+/// Membership is prepared by the worker. New or recreated tasks cannot enter
+/// an existing selection, even when their media ID is reused.
+@immutable
+class OfflineDownloadSelection {
+  final String token;
+  final List<String> ids;
+  OfflineDownloadSelection({required this.token, required List<String> ids})
+    : ids = List.unmodifiable(ids);
+}
+
+/// A device-local download. Generic files need no film-library record.
 @immutable
 class OfflineDownload {
   final String mediaId, sourceId, remotePath, localPath, name, error;
@@ -34,7 +47,7 @@ class OfflineDownload {
   /// New folder downloads retain their selected root separately from the
   /// remote binding; absent fields preserve legacy storage and navigation.
   final String? downloadRoot, downloadRelativePath;
-  final bool userPaused, isDirectory;
+  final bool userPaused, isDirectory, downloadOnly;
   final int discoveredFiles, scannedFolders;
   final OfflineDownloadStatus status;
   final int received, total;
@@ -54,6 +67,7 @@ class OfflineDownload {
     this.downloadRelativePath,
     this.userPaused = false,
     this.isDirectory = false,
+    this.downloadOnly = false,
     this.discoveredFiles = 0,
     this.scannedFolders = 0,
   });
@@ -80,6 +94,7 @@ class OfflineDownload {
     downloadRelativePath: map['downloadRelativePath'] as String?,
     userPaused: map['userPaused'] == true,
     isDirectory: map['isDirectory'] == true,
+    downloadOnly: map['downloadOnly'] == true,
     discoveredFiles: map['discoveredFiles'] as int? ?? 0,
     scannedFolders: map['scannedFolders'] as int? ?? 0,
   );
@@ -93,11 +108,12 @@ class OfflineDownloads extends ChangeNotifier {
   final Future<Map<String, dynamic>?> Function(String sourceId)
   sourceConfiguration;
   final _entries = <String, OfflineDownload>{};
+  final _bySourcePath = <String, String>{};
   late final Map<String, OfflineDownload> entries = UnmodifiableMapView(
     _entries,
   );
-  final _taskIds = <String>[];
-  late final List<String> taskIds = UnmodifiableListView(_taskIds);
+  List<String> _taskIds = <String>[];
+  List<String> get taskIds => UnmodifiableListView(_taskIds);
   int tasksRevision = 0;
   int _activeCount = 0, _pausedCount = 0, _failedCount = 0, _completedCount = 0;
   int get activeCount => _activeCount;
@@ -123,12 +139,14 @@ class OfflineDownloads extends ChangeNotifier {
     required this.directory,
     required this.storePath,
     required this.sourceConfiguration,
-    bool active = true,
-  }) : _active = active;
+    this._active = true,
+  });
 
   bool get initialized => _commands != null && _ready?.isCompleted == true;
 
   OfflineDownload? entryFor(String mediaId) => _entries[mediaId];
+  OfflineDownload? entryForSource(String sourceId, String path) =>
+      _entries[_bySourcePath[_downloadBindingKey(sourceId, path)]];
 
   Future<void> initialize() {
     if (_closing) return Future.error(const Cancelled());
@@ -190,6 +208,20 @@ class OfflineDownloads extends ChangeNotifier {
       case 'removed':
         _removeEntry(row[1] as String);
         if (!_disposed && !_closing) notifyListeners();
+      case 'batchChanged':
+        for (final entry in row[1] as List<OfflineDownload>) {
+          _updateEntry(entry);
+        }
+        if (!_disposed && !_closing) notifyListeners();
+      case 'batchRemoved':
+        for (final id in row[1] as List<String>) {
+          _removeEntry(id, updateIds: false);
+        }
+        if (!_disposed && !_closing) notifyListeners();
+      case 'taskIds':
+        _taskIds = row[1] as List<String>;
+        tasksRevision++;
+        if (!_disposed && !_closing) notifyListeners();
       case 'directoryRemoved':
         for (final id in row[1] as List) {
           _removeEntry(id as String);
@@ -205,7 +237,7 @@ class OfflineDownloads extends ChangeNotifier {
         AppLog.instance.info(
           '文件夹下载',
           '扫描完成：${counts['folders']} 个目录，'
-              '发现 ${counts['discovered']} 个视频，'
+              '发现 ${counts['discovered']} 个文件，'
               '绑定 ${counts['bound']} 个，'
               '新增 ${counts['added']} 个任务，'
               '重试 ${counts['retried']} 个，'
@@ -214,7 +246,7 @@ class OfflineDownloads extends ChangeNotifier {
         );
         // Folder admission registered media bindings on the worker connection.
         // Publish one catalogue refresh before the first file completes.
-        libraryRevision++;
+        if (counts['libraryChanged'] == true) libraryRevision++;
         if (!_disposed && !_closing) notifyListeners();
       case 'configuration':
         unawaited(_provideConfiguration(row[1] as int, row[2] as String));
@@ -231,12 +263,17 @@ class OfflineDownloads extends ChangeNotifier {
     }
   }
 
-  void _removeEntry(String id) {
+  void _removeEntry(String id, {bool updateIds = true}) {
     final removed = _entries.remove(id);
     if (removed != null) {
+      _bySourcePath.remove(
+        _downloadBindingKey(removed.sourceId, removed.remotePath),
+      );
       _count(removed.status, -1);
-      _taskIds.remove(id);
-      tasksRevision++;
+      if (updateIds) {
+        _taskIds.remove(id);
+        tasksRevision++;
+      }
       if (removed.isComplete) completedRevision++;
     }
     _completedLocations.remove(id);
@@ -266,6 +303,10 @@ class OfflineDownloads extends ChangeNotifier {
     }
     _count(entry.status, 1);
     _entries[entry.mediaId] = entry;
+    if (!entry.isDirectory) {
+      _bySourcePath[_downloadBindingKey(entry.sourceId, entry.remotePath)] =
+          entry.mediaId;
+    }
     _updateCompletedLocation(entry);
   }
 
@@ -350,16 +391,18 @@ class OfflineDownloads extends ChangeNotifier {
       'sourceId': location['source'],
       'remotePath': location['path'],
       'bindingRevision': location['previewRevision'] as String? ?? '',
-      'name': media.data['fileName'] ?? media.data['title'] ?? 'video.mp4',
+      if (location['downloadOnly'] == true) 'downloadOnly': true,
+      'name': media.data['fileName'] ?? media.data['title'] ?? 'download',
       'total': location['size'] ?? media.data['size'] ?? 0,
     });
   }
 
-  /// Recursively discover a bounded folder before admitting its video files.
+  /// Recursively discover a bounded folder before admitting all its files.
   /// Cancelling this scan leaves no newly queued child downloads behind.
   Future<void> enqueueFolder({
     required String sourceId,
     required SourceEntry entry,
+    bool personalMedia = false,
   }) async {
     if (sourceId == 'local' || !entry.directory) {
       throw const AppFailure('请选择远程文件夹下载。');
@@ -368,6 +411,7 @@ class OfflineDownloads extends ChangeNotifier {
       'sourceId': sourceId,
       'remotePath': entry.path,
       'name': entry.name,
+      'personalMedia': personalMedia,
     });
   }
 
@@ -382,6 +426,26 @@ class OfflineDownloads extends ChangeNotifier {
   Future<void> resumeAll() async => _call('resumeAll');
   Future<void> retry(String mediaId) async => _call('retry', mediaId);
   Future<void> delete(String mediaId) async => _call('delete', mediaId);
+
+  Future<OfflineDownloadSelection> captureSelection() async =>
+      await _call('captureSelection') as OfflineDownloadSelection;
+
+  Future<void> releaseSelection(OfflineDownloadSelection selection) async =>
+      _call('releaseSelection', selection.token);
+
+  /// With [all] true, [ids] are exclusions; otherwise they are inclusions.
+  /// Selection resolution, status checks and mutations run on the worker.
+  Future<void> applyBatch(
+    OfflineDownloadSelection selection,
+    OfflineDownloadBatchAction action, {
+    bool all = false,
+    Set<String> ids = const {},
+  }) async => _call('batch', {
+    'token': selection.token,
+    'action': action.name,
+    'all': all,
+    'ids': ids,
+  });
   Future<LocalDirectoryRemovalPlan> prepareLocalDirectoryRemoval(
     String path,
     String documents, {

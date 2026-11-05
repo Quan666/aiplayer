@@ -31,7 +31,7 @@ class _SearchModel extends AppModel {
   }
 
   @override
-  Future<void> ensureMediaPreview(String id) async {}
+  bool ensureMediaPreview(String id) => true;
 }
 
 void main() {

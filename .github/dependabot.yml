@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: pub
+    directory: /client
+    schedule:
+      interval: weekly
+  - package-ecosystem: gradle
+    directory: /client/android
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /server
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /server
+    schedule:
+      interval: weekly

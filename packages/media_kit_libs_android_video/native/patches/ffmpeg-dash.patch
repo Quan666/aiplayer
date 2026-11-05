@@ -1,0 +1,33 @@
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -779,7 +779,13 @@
+     }
+     root_url = (av_strcasecmp(baseurl, "")) ? baseurl : path;
+     if (node) {
+-        xmlNodeSetContent(node, root_url);
++        xmlChar *encoded_root = xmlEncodeSpecialChars(NULL, root_url);
++        if (!encoded_root) {
++            updated = AVERROR(ENOMEM);
++            goto end;
++        }
++        xmlNodeSetContent(node, encoded_root);
++        xmlFree(encoded_root);
+         updated = 1;
+     }
+ 
+@@ -813,7 +819,14 @@
+                 memset(p + 1, 0, strlen(p));
+             }
+             av_strlcat(tmp_str, text + start, tmp_max_url_size);
+-            xmlNodeSetContent(baseurl_nodes[i], tmp_str);
++            xmlChar *encoded_path = xmlEncodeSpecialChars(NULL, tmp_str);
++            if (!encoded_path) {
++                xmlFree(text);
++                updated = AVERROR(ENOMEM);
++                goto end;
++            }
++            xmlNodeSetContent(baseurl_nodes[i], encoded_path);
++            xmlFree(encoded_path);
+             updated = 1;
+             xmlFree(text);
+         }

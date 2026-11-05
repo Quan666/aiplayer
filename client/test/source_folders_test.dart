@@ -39,6 +39,22 @@ void main() {
             ),
           ),
         );
+        // Both view restoration and local enumeration use real workers. The
+        // circular indicator ends before the listing's linear indicator does.
+        for (
+          var i = 0;
+          i < 250 &&
+              (find.byType(CircularProgressIndicator).evaluate().isNotEmpty ||
+                  find.byType(LinearProgressIndicator).evaluate().isNotEmpty);
+          i++
+        ) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 10)),
+          );
+          await tester.pump();
+        }
+        expect(find.byType(CircularProgressIndicator), findsNothing);
+        expect(find.byType(LinearProgressIndicator), findsNothing);
         await tester.pumpAndSettle();
         await tester.tap(find.byTooltip('文件夹选项'));
         await tester.pumpAndSettle();
@@ -121,8 +137,9 @@ void main() {
         await tester.pumpAndSettle();
         await tester.tap(find.text('第一季'));
         await tester.pumpAndSettle();
-        final remote = model.sourceMedia('one', 'Season1/01.mkv')!;
-        await tester.longPress(find.text(model.displayTitle(remote)));
+        // Automatic recognition is off: the row keeps the actual filename.
+        expect(find.text('第01集.mkv'), findsOneWidget);
+        await tester.longPress(find.byKey(const ValueKey('Season1/01.mkv')));
         await tester.pumpAndSettle();
         expect(find.text('重新识别影视资料'), findsOneWidget);
         expect(find.text('手动搜索影视资料'), findsOneWidget);
@@ -196,6 +213,13 @@ void main() {
           model.addMedia('one', entry),
       ];
       for (var index = 0; index < ids.length; index++) {
+        // Progress/resume is tested against a genuinely identified collection;
+        // parsed filenames alone no longer produce a details header.
+        store.save('media', ids[index], {
+          ...store.get('media', ids[index])!.data,
+          'bangumiId': 123,
+          'metadataTitle': '示例动画',
+        });
         store.save(
           'progress',
           model.progressKey(store.get('media', ids[index])!),
@@ -213,6 +237,11 @@ void main() {
           path: '其他目录/示例动画 S01E03.mkv',
         ),
       );
+      store.save('media', elsewhere, {
+        ...store.get('media', elsewhere)!.data,
+        'bangumiId': 123,
+        'metadataTitle': '示例动画',
+      });
       store.save(
         'progress',
         model.progressKey(store.get('media', elsewhere)!),
@@ -266,7 +295,8 @@ void main() {
           (model.progressFor(store.get('media', ids.first)!)?['position']),
           20,
         );
-        await tester.tap(find.byTooltip('视频选项').first);
+        expect(find.byTooltip('视频选项'), findsNothing);
+        await tester.longPress(find.byType(MediaDetailsEpisodeTile).first);
         await tester.pumpAndSettle();
         expect(find.text('重新识别影视资料'), findsOneWidget);
         expect(find.text('手动搜索影视资料'), findsOneWidget);
@@ -562,16 +592,13 @@ void main() {
     },
   );
 
-  test(
-    'file icons distinguish supported media, subtitles, images and unknown files',
-    () {
-      expect(sourceFileIcon('video.mkv'), Icons.movie_outlined);
-      expect(sourceFileIcon('zh-Hans.ass'), Icons.subtitles_outlined);
-      expect(sourceFileIcon('poster.jpg'), Icons.image_outlined);
-      expect(sourceFileIcon('audio.flac'), Icons.audio_file_outlined);
-      expect(sourceFileIcon('unknown.bin'), Icons.insert_drive_file_outlined);
-    },
-  );
+  test('file icons distinguish supported media, subtitles, images and unknown files', () {
+    expect(sourceFileIcon('video.mkv'), Icons.movie_outlined);
+    expect(sourceFileIcon('zh-Hans.ass'), Icons.subtitles_outlined);
+    expect(sourceFileIcon('poster.jpg'), Icons.image_outlined);
+    expect(sourceFileIcon('audio.flac'), Icons.audio_file_outlined);
+    expect(sourceFileIcon('unknown.bin'), Icons.insert_drive_file_outlined);
+  });
   testWidgets(
     'returning to a directory restores scroll and keeps its own sort preferences',
     (tester) async {
@@ -692,6 +719,17 @@ void main() {
           'saved-password',
         );
         expect(tester.widget<TextField>(field('密码（可选）')).obscureText, true);
+        final password = field('密码（可选）');
+        await tester.ensureVisible(password);
+        await tester.tap(
+          find.descendant(of: password, matching: find.byTooltip('显示')),
+        );
+        await tester.pump();
+        expect(tester.widget<TextField>(password).obscureText, false);
+        expect(
+          tester.widget<TextField>(password).controller!.text,
+          'saved-password',
+        );
         await tester.ensureVisible(field('服务器地址'));
         await tester.enterText(field('服务器地址'), 'new-nas.local');
         final save = find.widgetWithText(TextButton, '保存');

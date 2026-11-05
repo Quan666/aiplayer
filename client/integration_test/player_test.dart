@@ -537,8 +537,15 @@ void main() {
       }
 
       await capturePlayer('player_playlist.png');
-      await tester.tapAt(const Offset(8, 8));
-      await tester.pump(const Duration(milliseconds: 300));
+      // Keep the dismiss tap on the video, below desktop window chrome.
+      await tester.tapAt(background);
+      // Start the reverse route animation before waiting for it. Live native
+      // rendering can leave its modal barrier mounted after a single pump.
+      await tester.pump();
+      for (var i = 0; i < 20 && popup.evaluate().isNotEmpty; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(popup, findsNothing);
       expect(find.byType(AlertDialog), findsNothing);
       await pagePlayback.player.pause();
       await tester.pump(const Duration(milliseconds: 100));
@@ -618,7 +625,7 @@ void main() {
       final selectedAudio = find.widgetWithText(PlayerChoiceTile, '关闭音轨');
       expect(
         tester.getSize(selectedAudio).height,
-        PlayerTheme.choiceTrackRowHeight,
+        PlayerTheme.choiceRowHeight,
       );
       expectChoiceTextAlignment(
         tester,

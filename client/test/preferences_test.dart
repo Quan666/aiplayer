@@ -10,6 +10,29 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test(
+    'folder automatic recognition requires a new explicit device opt-in',
+    () {
+      for (final strategy in ['off', 'conservative', 'balanced']) {
+        expect(
+          AppPreferences({'metadataStrategy': strategy})
+              .autoIdentifyOnFolderOpen,
+          isFalse,
+        );
+      }
+      expect(
+        AppPreferences({'autoIdentifyOnFolderOpen': 'true'})
+            .autoIdentifyOnFolderOpen,
+        isFalse,
+      );
+      expect(
+        AppPreferences({'autoIdentifyOnFolderOpen': true})
+            .autoIdentifyOnFolderOpen,
+        isTrue,
+      );
+    },
+  );
+
   test('damaged stored values fall back or clamp to usable controls', () {
     final preferences = AppPreferences({
       'autoPlay': 'false',
@@ -57,6 +80,94 @@ void main() {
     expect(preferences.librarySortDescending, isTrue);
     expect(AppPreferences({'refreshInterval': 0}).refreshInterval, 0);
     expect(AppPreferences({'refreshInterval': 99999}).refreshInterval, 3600);
+  });
+
+  test('slideshow preferences validate duration and transition values', () {
+    final defaults = AppPreferences({});
+    expect(defaults.albumSlideshowSeconds, 5);
+    expect(defaults.albumSlideshowTransition, 'random');
+    expect(
+      AppPreferences({'albumSlideshowSeconds': 0}).albumSlideshowSeconds,
+      2,
+    );
+    expect(
+      AppPreferences({'albumSlideshowSeconds': 1000}).albumSlideshowSeconds,
+      60,
+    );
+    expect(
+      AppPreferences({'albumSlideshowSeconds': double.nan})
+          .albumSlideshowSeconds,
+      5,
+    );
+    expect(
+      AppPreferences({'albumSlideshowTransition': 'broken'})
+          .albumSlideshowTransition,
+      'random',
+    );
+    expect(
+      defaults.checkedPatch({
+        'albumSlideshowSeconds': 10,
+        'albumSlideshowTransition': 'fade',
+      }),
+      {'albumSlideshowSeconds': 10, 'albumSlideshowTransition': 'fade'},
+    );
+    for (final value in [0, 61, double.infinity]) {
+      expect(
+        () => defaults.checkedPatch({'albumSlideshowSeconds': value}),
+        throwsArgumentError,
+      );
+    }
+    expect(
+      () => defaults.checkedPatch({'albumSlideshowTransition': 'broken'}),
+      throwsArgumentError,
+    );
+  });
+
+  test('cache capacities use bounded integer MiB settings', () {
+    final defaults = AppPreferences({});
+    expect(defaults.albumThumbnailCacheMiB, 512);
+    expect(defaults.albumOriginalCacheMiB, 1024);
+    expect(defaults.albumThumbnailCacheBytes, 512 * 1024 * 1024);
+    expect(defaults.albumOriginalCacheBytes, 1024 * 1024 * 1024);
+    expect(
+      AppPreferences({'albumThumbnailCacheMiB': -1}).albumThumbnailCacheMiB,
+      256,
+    );
+    expect(
+      AppPreferences({'albumOriginalCacheMiB': double.nan})
+          .albumOriginalCacheMiB,
+      1024,
+    );
+    expect(
+      AppPreferences({'albumOriginalCacheMiB': 999999}).albumOriginalCacheMiB,
+      16384,
+    );
+    expect(
+      defaults.checkedPatch({
+        'albumThumbnailCacheMiB': 768,
+        'albumOriginalCacheMiB': 4096,
+      }),
+      {'albumThumbnailCacheMiB': 768, 'albumOriginalCacheMiB': 4096},
+    );
+    for (final patch in [
+      {'albumThumbnailCacheMiB': 255},
+      {'albumThumbnailCacheMiB': 8193},
+      {'albumThumbnailCacheMiB': 512.5},
+      {'albumOriginalCacheMiB': 511},
+      {'albumOriginalCacheMiB': 16385},
+      {'albumOriginalCacheMiB': double.infinity},
+      {'decodedImageCacheMiB': 31},
+      {'decodedImageCacheMiB': 513},
+      {'decodedImageCacheMiB': 100.5},
+      {'albumMetadataCacheMiB': 3},
+      {'albumMetadataCacheMiB': 257},
+      {'albumMetadataCacheMiB': 16.5},
+      {'externalFileCacheMiB': 255},
+      {'externalFileCacheMiB': 8193},
+      {'externalFileCacheMiB': 512.5},
+    ]) {
+      expect(() => defaults.checkedPatch(patch), throwsArgumentError);
+    }
   });
 
   test('invalid writes fail instead of silently storing unusable settings', () {
@@ -205,109 +316,106 @@ void main() {
     expect(swapped['fullscreen'], 'J');
   });
 
-  test(
-    'preferences survive restart; reset preserves credentials, sources and library',
-    () async {
-      FlutterSecureStorage.setMockInitialValues({});
-      final directory = Directory.systemTemp.createTempSync(
-        'aiplayer-preferences-',
+  test('preferences survive restart; reset preserves credentials, sources and library', () async {
+    FlutterSecureStorage.setMockInitialValues({});
+    final directory = Directory.systemTemp.createTempSync(
+      'aiplayer-preferences-',
+    );
+    final path = '${directory.path}/library.db';
+    AppStore? store = AppStore(path);
+    AppModel? model = AppModel(store, directory);
+    try {
+      await model.setSettings(
+        {
+          'danmuOrigin': 'https://danmu.example',
+          'syncOrigin': 'https://sync.example',
+        },
+        danmuToken: 'danmu-secret',
+        syncToken: 'sync-secret-longer-than-24-characters',
       );
-      final path = '${directory.path}/library.db';
-      AppStore? store = AppStore(path);
-      AppModel? model = AppModel(store, directory);
-      try {
-        await model.setSettings(
-          {
-            'danmuOrigin': 'https://danmu.example',
-            'syncOrigin': 'https://sync.example',
-          },
-          danmuToken: 'danmu-secret',
-          syncToken: 'sync-secret-longer-than-24-characters',
-        );
-        await model.saveSource({
-          'id': 'nas',
-          'kind': 'smb',
-          'label': 'NAS',
-          'host': '192.168.1.2',
-          'share': 'media',
-          'user': 'alice',
-        }, 'source-secret');
-        model.setThemeMode(ThemeMode.dark);
-        var changes = 0;
-        model.addListener(() => changes++);
-        await model.updatePreferences({
-          'autoDiscover': false,
-          'aiMetadataEnabled': true,
-          'playbackRate': 1.5,
-          'volume': 65,
-          'subtitleScale': 1.25,
-          'shortcuts': {'playPause': 'Shift+Ctrl+K'},
-        });
-        expect(changes, 1);
-        expect(store.pending, isEmpty);
-        await expectLater(
-          model.updatePreferences({'volume': 20, 'unknown': true}),
-          throwsArgumentError,
-        );
-        expect(model.preferences.volume, 65);
-        expect(changes, 1);
-        store.save('media', 'film', {'title': 'Film', 'fileName': 'Film.mkv'});
-        store.save('progress', 'film:version1', {
-          'position': 125,
-          'duration': 1440,
-        });
-        store.setLocal('location:film', {
-          'source': 'nas',
-          'path': 'Anime/Film.mkv',
-        });
-        final pendingBefore = store.pending
-            .map((record) => record.toJson())
-            .toList();
+      await model.saveSource({
+        'id': 'nas',
+        'kind': 'smb',
+        'label': 'NAS',
+        'host': '192.168.1.2',
+        'share': 'media',
+        'user': 'alice',
+      }, 'source-secret');
+      model.setThemeMode(ThemeMode.dark);
+      var changes = 0;
+      model.addListener(() => changes++);
+      await model.updatePreferences({
+        'autoDiscover': false,
+        'aiMetadataEnabled': true,
+        'playbackRate': 1.5,
+        'volume': 65,
+        'subtitleScale': 1.25,
+        'shortcuts': {'playPause': 'Shift+Ctrl+K'},
+      });
+      expect(changes, 1);
+      expect(store.pending, isEmpty);
+      await expectLater(
+        model.updatePreferences({'volume': 20, 'unknown': true}),
+        throwsArgumentError,
+      );
+      expect(model.preferences.volume, 65);
+      expect(changes, 1);
+      store.save('media', 'film', {'title': 'Film', 'fileName': 'Film.mkv'});
+      store.save('progress', 'film:version1', {
+        'position': 125,
+        'duration': 1440,
+      });
+      store.setLocal('location:film', {
+        'source': 'nas',
+        'path': 'Anime/Film.mkv',
+      });
+      final pendingBefore = store.pending
+          .map((record) => record.toJson())
+          .toList();
 
-        model.dispose();
-        model = null;
-        store.dispose();
-        store = AppStore(path);
-        model = AppModel(store, directory);
-        expect(model.preferences.autoDiscover, isFalse);
-        expect(model.preferences.aiMetadataEnabled, isTrue);
-        expect(model.preferences.playbackRate, 1.5);
-        expect(model.preferences.volume, 65);
-        expect(model.preferences.subtitleScale, 1.25);
-        expect(model.preferences.shortcuts['playPause'], 'Ctrl+Shift+K');
-        expect(model.themeMode, ThemeMode.dark);
-        await model.resetPreferences();
-        expect(model.preferences.autoDiscover, isFalse);
-        expect(model.preferences.aiMetadataEnabled, isFalse);
-        expect(model.preferences.playbackRate, 1);
-        expect(model.preferences.volume, 100);
-        expect(model.preferences.subtitleScale, 1);
-        expect(model.preferences.shortcuts, AppPreferences.defaultShortcuts);
-        expect(model.themeMode, ThemeMode.dark);
-        expect(model.sources.single['id'], 'nas');
-        expect(model.settings['danmuOrigin'], 'https://danmu.example');
-        expect(model.settings['syncOrigin'], 'https://sync.example');
-        expect(await model.secrets.read(key: 'danmuToken'), 'danmu-secret');
-        expect(
-          await model.secrets.read(key: 'syncToken'),
-          'sync-secret-longer-than-24-characters',
-        );
-        expect(await model.secrets.read(key: 'source:nas'), 'source-secret');
-        expect(store.get('media', 'film')?.data['title'], 'Film');
-        expect(store.get('progress', 'film:version1')?.data['position'], 125);
-        expect(store.local('location:film'), {
-          'source': 'nas',
-          'path': 'Anime/Film.mkv',
-        });
-        expect(
-          store.pending.map((record) => record.toJson()).toList(),
-          pendingBefore,
-        );
-      } finally {
-        model?.dispose();
-        store?.dispose();
-        directory.deleteSync(recursive: true);
-      }
-    },
-  );
+      model.dispose();
+      model = null;
+      store.dispose();
+      store = AppStore(path);
+      model = AppModel(store, directory);
+      expect(model.preferences.autoDiscover, isFalse);
+      expect(model.preferences.aiMetadataEnabled, isTrue);
+      expect(model.preferences.playbackRate, 1.5);
+      expect(model.preferences.volume, 65);
+      expect(model.preferences.subtitleScale, 1.25);
+      expect(model.preferences.shortcuts['playPause'], 'Ctrl+Shift+K');
+      expect(model.themeMode, ThemeMode.dark);
+      await model.resetPreferences();
+      expect(model.preferences.autoDiscover, isFalse);
+      expect(model.preferences.aiMetadataEnabled, isFalse);
+      expect(model.preferences.playbackRate, 1);
+      expect(model.preferences.volume, 100);
+      expect(model.preferences.subtitleScale, 1);
+      expect(model.preferences.shortcuts, AppPreferences.defaultShortcuts);
+      expect(model.themeMode, ThemeMode.dark);
+      expect(model.sources.single['id'], 'nas');
+      expect(model.settings['danmuOrigin'], 'https://danmu.example');
+      expect(model.settings['syncOrigin'], 'https://sync.example');
+      expect(await model.secrets.read(key: 'danmuToken'), 'danmu-secret');
+      expect(
+        await model.secrets.read(key: 'syncToken'),
+        'sync-secret-longer-than-24-characters',
+      );
+      expect(await model.secrets.read(key: 'source:nas'), 'source-secret');
+      expect(store.get('media', 'film')?.data['title'], 'Film');
+      expect(store.get('progress', 'film:version1')?.data['position'], 125);
+      expect(store.local('location:film'), {
+        'source': 'nas',
+        'path': 'Anime/Film.mkv',
+      });
+      expect(
+        store.pending.map((record) => record.toJson()).toList(),
+        pendingBefore,
+      );
+    } finally {
+      model?.dispose();
+      store?.dispose();
+      directory.deleteSync(recursive: true);
+    }
+  });
 }

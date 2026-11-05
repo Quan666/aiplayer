@@ -96,7 +96,8 @@ void main() {
   late _Model model;
   setUp(() async {
     root = await Directory.systemTemp.createTemp('series-auto-metadata-');
-    store = AppStore('${root.path}/library.db');
+    store = AppStore('${root.path}/library.db')
+      ..setLocal('settings', {'autoIdentifyOnFolderOpen': true});
     model = _Model(store, root);
   });
   tearDown(() async {
@@ -146,33 +147,27 @@ void main() {
     );
   }
 
-  test(
-    'each explicit series load lists its shared source directory once and recovers new episodes',
-    () async {
-      store.setLocal('settings', {'metadataStrategy': 'off'});
-      seed();
-      final anchor = store.get('media', 'first')!;
-      for (var attempt = 0; attempt < 3; attempt++) {
-        final before = model.listingRequests;
-        expect(await model.loadSeriesEpisodes(anchor), hasLength(3));
-        expect(model.listingRequests, before + 1);
-      }
-      model.listingFails = true;
+  test('each explicit series load lists its shared source directory once and recovers new episodes', () async {
+    store.setLocal('settings', {'metadataStrategy': 'off'});
+    seed();
+    final anchor = store.get('media', 'first')!;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final before = model.listingRequests;
       expect(await model.loadSeriesEpisodes(anchor), hasLength(3));
-      expect(model.listingRequests, 4);
-      model.listingFails = false;
-      model.entries = [
-        ..._entries,
-        const SourceEntry(
-          name: 'Series E04.mkv',
-          path: 'Series/Series E04.mkv',
-        ),
-      ];
-      final updated = await model.loadSeriesEpisodes(anchor);
-      expect(updated, hasLength(4));
-      expect(model.listingRequests, 5);
-    },
-  );
+      expect(model.listingRequests, before + 1);
+    }
+    model.listingFails = true;
+    expect(await model.loadSeriesEpisodes(anchor), hasLength(3));
+    expect(model.listingRequests, 4);
+    model.listingFails = false;
+    model.entries = [
+      ..._entries,
+      const SourceEntry(name: 'Series E04.mkv', path: 'Series/Series E04.mkv'),
+    ];
+    final updated = await model.loadSeriesEpisodes(anchor);
+    expect(updated, hasLength(4));
+    expect(model.listingRequests, 5);
+  });
 
   for (final movie in [false, true]) {
     test(
@@ -195,29 +190,22 @@ void main() {
     );
   }
 
-  test(
-    'episode name failure retains matched series and is retried on next detail load',
-    () async {
-      seed();
-      model.testCatalog.failNames = true;
-      final partial = await model.loadSeriesEpisodes(
-        store.get('media', 'first')!,
-      );
-      expect(partial, hasLength(3));
-      expect(partial.every((r) => r.data['bangumiId'] == '42'), isTrue);
-      model.testCatalog.failNames = false;
-      final completed = await model.loadSeriesEpisodes(
-        store.get('media', 'first')!,
-      );
-      expect(completed.map((r) => r.data['episodeTitle']), [
-        '初遇',
-        '再会',
-        '新的旅程',
-      ]);
-      expect(model.testCatalog.resolves, 1);
-      expect(model.testCatalog.nameLoads, 2);
-    },
-  );
+  test('episode name failure retains matched series and is retried on next detail load', () async {
+    seed();
+    model.testCatalog.failNames = true;
+    final partial = await model.loadSeriesEpisodes(
+      store.get('media', 'first')!,
+    );
+    expect(partial, hasLength(3));
+    expect(partial.every((r) => r.data['bangumiId'] == '42'), isTrue);
+    model.testCatalog.failNames = false;
+    final completed = await model.loadSeriesEpisodes(
+      store.get('media', 'first')!,
+    );
+    expect(completed.map((r) => r.data['episodeTitle']), ['初遇', '再会', '新的旅程']);
+    expect(model.testCatalog.resolves, 1);
+    expect(model.testCatalog.nameLoads, 2);
+  });
 
   test(
     'cancelling metadata preserves imported episodes and resume enriches them',

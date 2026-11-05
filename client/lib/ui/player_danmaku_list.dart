@@ -37,6 +37,8 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
     with WidgetsBindingObserver {
   ScrollController? _scroll;
   final _centerKey = GlobalKey();
+  final _compactKeys = List.generate(8, (_) => GlobalKey());
+  bool get _compact => widget.comments.length <= _compactKeys.length;
   bool _foreground = true, _visible = false, _listening = false;
   bool _centerPending = false, _jumping = false;
   bool _following = true;
@@ -211,6 +213,17 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
     final position = (_scroll?.hasClients ?? false) ? _scroll!.position : null;
     // Manual browsing owns its scroll offset until explicitly resumed.
     if (position?.isScrollingNotifier.value ?? false) return;
+    if (_compact) {
+      final rowContext = _compactKeys[math.max(0, _current.$1)].currentContext;
+      if (rowContext == null) return;
+      _jumping = true;
+      try {
+        Scrollable.ensureVisible(rowContext, alignment: .3);
+      } finally {
+        _jumping = false;
+      }
+      return;
+    }
     final anchor = math.max(0, _current.$1);
     if (_anchorIndex != anchor) setState(() => _anchorIndex = anchor);
     if (position == null || position.pixels.abs() < .5) return;
@@ -259,6 +272,23 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
     _scroll?.dispose();
     super.dispose();
   }
+
+  Widget _followButton() => Positioned(
+    right: 8,
+    bottom: 8,
+    child: FilledButton.tonalIcon(
+      key: const ValueKey('danmaku-follow-current'),
+      onPressed: _followCurrent,
+      style: FilledButton.styleFrom(
+        minimumSize: const Size(0, 28),
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        textStyle: const TextStyle(fontSize: 12),
+      ),
+      icon: const Icon(Icons.my_location, size: 14),
+      label: const Text('回到当前'),
+    ),
+  );
 
   @override
   Widget build(BuildContext context) {
@@ -334,6 +364,45 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
             ? math.min(.3, anchor * minimumHeight / height)
             : 0.0;
         _scroll ??= ScrollController(keepScrollOffset: false);
+        if (_compact) {
+          // Only this capped group is measured. A handful of comments can size
+          // the sheet naturally, including wrapped text; large timelines keep
+          // their centered lazy slivers below.
+          _scheduleCenter();
+          return Stack(
+            children: [
+              NotificationListener<ScrollMetricsNotification>(
+                onNotification: (_) {
+                  _scheduleCenter();
+                  return false;
+                },
+                child: NotificationListener<ScrollNotification>(
+                  onNotification: _scrollChanged,
+                  child: SingleChildScrollView(
+                    key: const ValueKey('danmaku-time-list'),
+                    controller: _scroll,
+                    primary: false,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (
+                          var index = 0;
+                          index < widget.comments.length;
+                          index++
+                        )
+                          KeyedSubtree(
+                            key: _compactKeys[index],
+                            child: row(context, index),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              if (!_following) _followButton(),
+            ],
+          );
+        }
         return SizedBox(
           height: height,
           child: Stack(
@@ -372,23 +441,7 @@ class _PlayerDanmakuListState extends State<PlayerDanmakuList>
                   ),
                 ),
               ),
-              if (!_following)
-                Positioned(
-                  right: 8,
-                  bottom: 8,
-                  child: FilledButton.tonalIcon(
-                    key: const ValueKey('danmaku-follow-current'),
-                    onPressed: _followCurrent,
-                    style: FilledButton.styleFrom(
-                      minimumSize: const Size(0, 28),
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      textStyle: const TextStyle(fontSize: 12),
-                    ),
-                    icon: const Icon(Icons.my_location, size: 14),
-                    label: const Text('回到当前'),
-                  ),
-                ),
+              if (!_following) _followButton(),
             ],
           ),
         );

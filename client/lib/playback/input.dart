@@ -1,8 +1,37 @@
 import 'dart:math';
 import 'dart:async';
+
 import 'package:flutter/services.dart';
 
 enum PlaybackTapRegion { left, center, right }
+
+/// TV directions navigate visible controls; only hidden controls permit direct
+/// left/right seeking. Remote OK never becomes a repeated toggle.
+String? televisionPlaybackAction(
+  KeyEvent event, {
+  required bool controlsVisible,
+}) {
+  if (event is! KeyDownEvent && event is! KeyRepeatEvent) return null;
+  final key = event.logicalKey;
+  final activate =
+      key == LogicalKeyboardKey.select ||
+      key == LogicalKeyboardKey.enter ||
+      key == LogicalKeyboardKey.numpadEnter ||
+      key == LogicalKeyboardKey.gameButtonA;
+  if (activate && event is KeyRepeatEvent) return 'consume';
+  final direction =
+      key == LogicalKeyboardKey.arrowLeft ||
+      key == LogicalKeyboardKey.arrowRight ||
+      key == LogicalKeyboardKey.arrowUp ||
+      key == LogicalKeyboardKey.arrowDown;
+  if (controlsVisible) return direction ? 'traverse' : null;
+  if (key == LogicalKeyboardKey.arrowLeft) return 'seekBackward';
+  if (key == LogicalKeyboardKey.arrowRight) return 'seekForward';
+  if (activate || direction) {
+    return event is KeyRepeatEvent ? 'consume' : 'showControls';
+  }
+  return null;
+}
 
 /// Gesture regions follow the visible player's three equal-width columns.
 PlaybackTapRegion playbackTapRegion({

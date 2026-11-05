@@ -40,7 +40,7 @@ class _Model extends AppModel {
   }
 
   @override
-  Future<void> ensureMediaPreview(String id) async {}
+  bool ensureMediaPreview(String id) => true;
 }
 
 void main() {
@@ -157,18 +157,14 @@ void main() {
     (tester) async {
       await openHistory(tester);
       final reads = model.reads.length;
-      tester.binding.handleAppLifecycleStateChanged(
-        AppLifecycleState.paused,
-      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
       await tester.pump();
       for (var i = 20; i < 40; i++) {
         progress(i);
       }
       await tester.pump();
       expect(model.reads, hasLength(reads));
-      tester.binding.handleAppLifecycleStateChanged(
-        AppLifecycleState.resumed,
-      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pumpAndSettle();
       expect(model.reads, hasLength(reads + 1));
       await tester.pumpWidget(const SizedBox());

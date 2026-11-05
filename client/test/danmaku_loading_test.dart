@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:aiplayer/core/network.dart';
+import 'package:aiplayer/core/third_party_network.dart';
 import 'package:aiplayer/danmaku/api.dart';
 import 'package:aiplayer/danmaku/release_name.dart';
 import 'package:aiplayer/danmaku/session.dart';
@@ -53,6 +54,60 @@ Map<String, dynamic> matchedResult(String id) => {
 };
 
 void main() {
+  test(
+    'third-party switch cancels in-flight danmaku and timers without frames',
+    () {
+      fakeAsync((clock) {
+        final store = AppStore(':memory:');
+        final policy = ThirdPartyNetworkPolicy();
+        Completer<Map<String, dynamic>>? pending;
+        final transport = LoadingTransport(
+          (_) async => pending == null ? snapshot : pending.future,
+        );
+        final session = DanmakuSession(
+          store,
+          DanmuApiClient(
+            DanmuApiClient.defaultOrigin,
+            'fixture',
+            transport: transport,
+          ),
+          'video',
+          networkPolicy: policy,
+        );
+        session.configure(isPlaying: true, seconds: 30);
+        session.select(const EpisodeMatch('1', '作品', '第一集', 0));
+        clock.flushMicrotasks();
+        expect(session.comments, hasLength(1));
+        pending = Completer();
+        clock.elapse(const Duration(seconds: 30));
+        clock.flushMicrotasks();
+        final calls = transport.paths.length;
+        expect(calls, 2);
+        policy.setEnabled(false);
+        expect(transport.cancellations.last!.cancelled, isTrue);
+        clock.elapse(const Duration(minutes: 10));
+        clock.flushMicrotasks();
+        expect(transport.paths, hasLength(calls));
+        expect(clock.nonPeriodicTimerCount, 0);
+        pending.complete({
+          'comments': [
+            {'time': 2, 'text': 'late'},
+          ],
+        });
+        clock.flushMicrotasks();
+        expect(session.comments.single.text, 'ready');
+        pending = null;
+        policy.setEnabled(true);
+        clock.elapse(Duration.zero);
+        clock.flushMicrotasks();
+        expect(transport.paths, hasLength(calls + 1));
+        session.dispose();
+        policy.dispose();
+        store.dispose();
+      });
+    },
+  );
+
   test(
     'candidate counts preserve search metadata when matches omit it',
     () async {

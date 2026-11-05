@@ -12,6 +12,7 @@ extension AppModelDirectoryRecognition on AppModel {
     String? label,
   }) async {
     if (_disposed || recognizingDirectory) return;
+    thirdPartyNetwork.check();
     final folderName = p.posix.basename(root.replaceAll('\\', '/'));
     final task =
         MetadataTask._(
@@ -55,50 +56,65 @@ extension AppModelDirectoryRecognition on AppModel {
       final worker = _directoryMetadataWorker ??= DirectoryMetadataWorker(
         store.path,
       );
-      final result = await worker.recognize(
-        sourceId,
-        root,
-        source: source,
-        password: password,
-        tmdbCredential: credential,
-        hideHidden: preferences.hideHiddenFiles,
-        strategy: preferences.metadataStrategy,
-        aiConfig: aiConfig,
-        cancel: ownCancel,
-        onProgress: (value) {
-          if (_disposed || ownCancel.cancelled) return;
-          final previous = directoryRecognitionProgress;
-          if (previous.folders == value.folders &&
-              previous.videos == value.videos &&
-              previous.matched == value.matched &&
-              previous.failed == value.failed) {
-            return;
+      final result = await thirdPartyNetwork.run((request) async {
+        final currentTmdb = await secrets.read(key: 'tmdb.apiKey') ?? '';
+        request.check();
+        if (currentTmdb.trim() != credential.trim()) {
+          throw const AppFailure('TMDB 服务配置已变更，请重新发起请求。');
+        }
+        if (aiConfig != null) {
+          final currentAi = await secrets.read(key: 'aiSubtitleToken') ?? '';
+          request.check();
+          if (currentAi.trim().isEmpty ||
+              currentAi.trim() != aiConfig.token.trim()) {
+            throw const AppFailure('AI 服务配置已变更，请重新发起请求。');
           }
-          directoryRecognitionProgress = value;
-          if (value.error.isNotEmpty) task.error = value.error;
-          task._appendRecords(value.records);
-          for (final entry in value.aiResults.entries) {
-            final match = entry.value;
-            task.results[entry.key] = AiMetadataMatch(
-              match.identity,
-              match.candidates,
-              match.subject,
-            );
-          }
-          for (final record in value.records) {
-            if (!task._completedIds.add(record.id)) continue;
-            if (value.matchedIds.contains(record.id)) {
-              task._matchedIds.add(record.id);
-              task.matched++;
-            } else {
-              task.failed++;
+        }
+        return worker.recognize(
+          sourceId,
+          root,
+          source: source,
+          password: password,
+          tmdbCredential: credential,
+          hideHidden: preferences.hideHiddenFiles,
+          strategy: preferences.metadataStrategy,
+          aiConfig: aiConfig,
+          cancel: request,
+          onProgress: (value) {
+            if (_disposed || ownCancel.cancelled) return;
+            final previous = directoryRecognitionProgress;
+            if (previous.folders == value.folders &&
+                previous.videos == value.videos &&
+                previous.matched == value.matched &&
+                previous.failed == value.failed) {
+              return;
             }
-          }
-          status = '已识别 ${value.matched} / ${value.videos} 个视频';
-          task.status = status;
-          _taskChanged(task);
-        },
-      );
+            directoryRecognitionProgress = value;
+            if (value.error.isNotEmpty) task.error = value.error;
+            task._appendRecords(value.records);
+            for (final entry in value.aiResults.entries) {
+              final match = entry.value;
+              task.results[entry.key] = AiMetadataMatch(
+                match.identity,
+                match.candidates,
+                match.subject,
+              );
+            }
+            for (final record in value.records) {
+              if (!task._completedIds.add(record.id)) continue;
+              if (value.matchedIds.contains(record.id)) {
+                task._matchedIds.add(record.id);
+                task.matched++;
+              } else {
+                task.failed++;
+              }
+            }
+            status = '已识别 ${value.matched} / ${value.videos} 个视频';
+            task.status = status;
+            _taskChanged(task);
+          },
+        );
+      }, cancel: ownCancel);
       if (_disposed) return;
       ownCancel.check();
       directoryRecognitionProgress = result;

@@ -91,9 +91,9 @@ Future<MediaPlaybackChoice?> showMediaSourceSelection(
     return await showGlassBottomSheet<MediaPlaybackChoice>(
       context: context,
       builder: (sheet) => SafeArea(
-        child: SizedBox(
-          height: MediaQuery.sizeOf(sheet).height * .55,
+        child: GlassSheetBody(
           child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 4, 4, 4),
@@ -108,10 +108,11 @@ Future<MediaPlaybackChoice?> showMediaSourceSelection(
                   ],
                 ),
               ),
-              Expanded(
+              Flexible(
                 child: options.isEmpty
                     ? const Center(child: Text('没有可用的视频文件'))
                     : ListView.builder(
+                        shrinkWrap: true,
                         key: const ValueKey('media-source-selection'),
                         itemCount: options.length,
                         itemBuilder: (_, index) {
@@ -189,9 +190,8 @@ Future<MediaPlaybackChoice?> showMediaSourceSelection(
     return null;
   } catch (error) {
     if (context.mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(safeFailure(error).message)));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(safeFailure(error).message)));
     }
     return null;
   }

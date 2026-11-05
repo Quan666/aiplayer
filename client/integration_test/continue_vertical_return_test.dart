@@ -228,10 +228,8 @@ void main() {
       }
       final report = <String, Object?>{
         'mode': kProfileMode ? 'profile' : 'debug',
-        'scope':
-            'Actual AIPlayerApp/LibraryPage; 1200 media records with unique on-disk 640x360 JPEG previews and valid fingerprints, 60 progress records, bounded 10-card carousel, three vertical 4200px departures/returns with nonzero horizontal positions; 8-entry/6-MiB decoded LRU cache pressure. Fixture encoding/file IO/SQL seeding and concurrent progress writes use separate isolates. Automatic video capture is disabled and callbacks counted; no network requests or video decoding. Linux/Xvfb software rendering, not Android/device FPS.',
-        'latencyDefinition':
-            'First painted frame with any card area visible to first RawImage pixels, keyed by history card IDs even when the thumbnail has not arrived. Zero means the previously viewed decoded image was retained, not zero IO/decode time. Each return is observed while vertical scrolling remains active.',
+        'scope': 'Actual AIPlayerApp/LibraryPage; 1200 media records with unique on-disk 640x360 JPEG previews and valid fingerprints, 60 progress records, bounded 10-card carousel, three vertical 4200px departures/returns with nonzero horizontal positions; 8-entry/6-MiB decoded LRU cache pressure. Fixture encoding/file IO/SQL seeding and concurrent progress writes use separate isolates. Automatic video capture is disabled and callbacks counted; no network requests or video decoding. Linux/Xvfb software rendering, not Android/device FPS.',
+        'latencyDefinition': 'First painted frame with any card area visible to first RawImage pixels, keyed by history card IDs even when the thumbnail has not arrived. Zero means the previously viewed decoded image was retained, not zero IO/decode time. Each return is observed while vertical scrolling remains active.',
         'viewport': {
           'width':
               tester.view.physicalSize.width / tester.view.devicePixelRatio,
@@ -460,8 +458,9 @@ class _Model extends AppModel {
   }
 
   @override
-  void ensureMediaPreview(String id) {
+  bool ensureMediaPreview(String id) {
     previews++;
+    return true;
   }
 }
 
@@ -554,9 +553,8 @@ Future<void> _writeReportInBackground(
   Map<String, Object?> report,
 ) => Isolate.run(() {
   Directory(path).createSync(recursive: true);
-  File(
-    '$path/continue-vertical-return.json',
-  ).writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
+  File('$path/continue-vertical-return.json')
+      .writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
 });
 
 Map<String, Object> _distribution(Iterable<double> values) {

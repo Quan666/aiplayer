@@ -26,6 +26,9 @@ CORE_LIBRARIES = {
     "libapp.so", "libflutter.so", "libaiplayer_smb.so", "libmpv.so",
     "libsqlite3.so", "libdartjni.so", "libmediakitandroidhelper.so",
 }
+LEGACY_ABIS = ("arm64-v8a", "armeabi-v7a")
+# The compatibility checkout uses path_provider's pre-JNI implementation.
+LEGACY_CORE_LIBRARIES = CORE_LIBRARIES - {"libdartjni.so"}
 
 
 def sdk_root() -> Path:
@@ -172,7 +175,11 @@ def require_pgs_decoder(data: bytes, name: str) -> None:
     raise RuntimeError(f"Missing PGS subtitle decoder in {name}: no defined ff_pgssub_decoder symbol")
 
 
-def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None = None, require_all_signatures: bool = True) -> dict:
+def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None = None, require_all_signatures: bool = True, android_legacy: bool = False) -> dict:
+    if abi not in ("auto", "universal", "arm64"):
+        raise ValueError(f"Unsupported APK ABI variant: {abi}")
+    if android_legacy and abi == "arm64":
+        raise ValueError("Android 6 compatibility APKs must include both ARM32 and ARM64")
     path = path.resolve()
     native = {}
     with zipfile.ZipFile(path) as archive:
@@ -200,11 +207,11 @@ def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None 
                     require_pgs_decoder(data, name)
                     library["pgs_decoder_symbol"] = "ff_pgssub_decoder"
                 native.setdefault(parts[1], {})[parts[2]] = library
-        expected_abis = sorted(ABI_MACHINES) if abi == "universal" else (["arm64-v8a"] if abi == "arm64" else sorted(native))
+        expected_abis = list(LEGACY_ABIS) if android_legacy else (sorted(ABI_MACHINES) if abi == "universal" else (["arm64-v8a"] if abi == "arm64" else sorted(native)))
         if not native or sorted(native) != expected_abis:
             raise RuntimeError(f"Expected ABIs {expected_abis}, found {sorted(native)}")
         for architecture, libraries in native.items():
-            missing = CORE_LIBRARIES.difference(libraries)
+            missing = (LEGACY_CORE_LIBRARIES if android_legacy else CORE_LIBRARIES).difference(libraries)
             if missing:
                 raise RuntimeError(f"Incomplete {architecture} playback libraries: {sorted(missing)}")
     badging = run([str(sdk_tool("aapt")), "dump", "badging", str(path)])
@@ -214,8 +221,9 @@ def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None 
     package, version_code, version_name = match.groups()
     minimum = int(re.search(r"sdkVersion:'(\d+)'", badging).group(1))
     target = int(re.search(r"targetSdkVersion:'(\d+)'", badging).group(1))
-    if minimum != 24:
-        raise RuntimeError(f"Unexpected minimum SDK {minimum}; this release promises Android 7+")
+    expected_minimum = 23 if android_legacy else 24
+    if minimum != expected_minimum:
+        raise RuntimeError(f"Unexpected minimum SDK {minimum}; expected API {expected_minimum} for this release variant")
     if "application-debuggable" in badging:
         raise RuntimeError("Refusing to publish a debuggable APK as release")
     if "launchable-activity: name='app.aiplayer.aiplayer.MainActivity'" not in badging:
@@ -236,6 +244,8 @@ def validate_apk(path: Path, *, abi: str = "auto", expected_version: str | None 
         signatures[scheme] = bool(re.search(rf"Verified using {scheme} scheme .*: true", signature_output))
     if require_all_signatures and not all(signatures.values()):
         raise RuntimeError(f"Installer compatibility signing requires v1 + v2 + v3: {signatures}")
+    if android_legacy and not signatures["v1"]:
+        raise RuntimeError("Android 6 compatibility APKs must have a valid v1 signature")
     if not signatures["v2"]:
         raise RuntimeError("APK must have a valid v2 signature for Android 7+")
     certificate = signing_certificate_sha256(signature_output)
@@ -254,11 +264,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("apk", type=Path)
     parser.add_argument("--abi", choices=["auto", "universal", "arm64"], default="auto")
+    parser.add_argument("--android-legacy", action="store_true", help="Require API 23, both ARM ABIs, and a valid v1 signature")
     parser.add_argument("--expected-version")
     parser.add_argument("--allow-legacy-signing", action="store_true")
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()
-    report = validate_apk(arguments.apk, abi=arguments.abi, expected_version=arguments.expected_version, require_all_signatures=not arguments.allow_legacy_signing)
+    report = validate_apk(arguments.apk, abi=arguments.abi, expected_version=arguments.expected_version, require_all_signatures=not arguments.allow_legacy_signing, android_legacy=arguments.android_legacy)
     text = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if arguments.output:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)

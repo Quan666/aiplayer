@@ -1,18 +1,55 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/logger.dart';
 import '../data/app_model.dart';
 import '../data/offline_downloads.dart';
 import '../data/store.dart';
+import '../data/text_document.dart';
 import '../sources/source.dart';
 import 'artwork_lifecycle.dart';
 import 'glass.dart';
+import 'text_file_page.dart';
 
 void _downloadFailure(BuildContext context, Object error) {
   if (!context.mounted) return;
-  ScaffoldMessenger.of(
-    context,
-  ).showSnackBar(SnackBar(content: Text(safeFailure(error).message)));
+  ScaffoldMessenger.of(context)
+      .showSnackBar(SnackBar(content: Text(safeFailure(error).message)));
+}
+
+/// Folder selections include their descendants and always require an explicit
+/// confirmation. Dismissal/back never starts a scan or queues a file.
+Future<bool> confirmFolderDownload(
+  BuildContext context, {
+  required int folderCount,
+  int fileCount = 0,
+  String? folderName,
+}) async {
+  if (folderCount <= 0) return true;
+  final description = folderCount == 1 && folderName != null
+      ? '“$folderName”'
+      : '$folderCount 个文件夹';
+  return await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('下载文件夹？'),
+          content: Text(
+            '将下载$description及所有子目录中的文件'
+            '${fileCount > 0 ? '，以及选中的 $fileCount 个文件' : ''}。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('下载'),
+            ),
+          ],
+        ),
+      ) ??
+      false;
 }
 
 /// A small, independently updated action shared by source and library rows.
@@ -132,7 +169,17 @@ class _OfflineDownloadButtonState extends State<OfflineDownloadButton> {
       _bindingDirty = false;
       _bindingRevision = _currentBindingRevision;
     }
-    _entry = model.downloads.entryFor(_id);
+    _entry =
+        model.downloads.entryFor(_id) ??
+        (widget.sourceId != null && widget.sourceEntry != null
+            ? model.downloads.entryForSource(
+                widget.sourceId!,
+                widget.sourceEntry!.path,
+              )
+            : null);
+    if (_entry != null) {
+      _registeredId = _entry!.mediaId;
+    }
     _stale = _entry != null && !_matchesDownloadBinding(_entry!, _binding);
     _revision = (
       _id,
@@ -372,8 +419,9 @@ Future<void> showSourceDownloadSelection(
   BuildContext context,
   AppModel model,
   String sourceId,
-  List<SourceEntry> entries,
-) async {
+  List<SourceEntry> entries, {
+  bool personalMedia = false,
+}) async {
   try {
     if (model.store.path != ':memory:' && !model.downloads.initialized) {
       await model.downloads.initialize();
@@ -389,7 +437,7 @@ Future<void> showSourceDownloadSelection(
       count: entries.length,
       nameAt: (index) => entries[index].name,
       directoryAt: (index) => entries[index].directory,
-      hint: entries.any((entry) => entry.directory) ? '文件夹包含所有子目录中的视频。' : null,
+      hint: entries.any((entry) => entry.directory) ? '包含所有子目录中的文件。' : null,
       availabilityAt: (index) {
         final entry = entries[index];
         if (entry.directory) {
@@ -399,7 +447,8 @@ Future<void> showSourceDownloadSelection(
         }
         final record = known[entry.path.replaceAll('\\', '/')];
         return _downloadAvailability(
-          record == null ? null : model.downloads.entryFor(record.id),
+          (record == null ? null : model.downloads.entryFor(record.id)) ??
+              model.downloads.entryForSource(sourceId, entry.path),
           available: sourceId != 'local',
           binding: (
             sourceId,
@@ -412,12 +461,163 @@ Future<void> showSourceDownloadSelection(
       },
       submit: (indices) => model.downloadSourceEntries(sourceId, [
         for (final index in indices) entries[index],
-      ]),
+      ], personalMedia: personalMedia),
     );
   } catch (error) {
     if (context.mounted) _downloadFailure(context, error);
   }
 }
+
+/// File actions use the download manager's prepared index, without creating a
+/// film-library record or doing filesystem work on the interface isolate.
+Future<void> showSourceFileDownloadMenu(
+  BuildContext context,
+  AppModel model,
+  String sourceId,
+  SourceEntry entry, {
+  bool personalMedia = false,
+  Map<String, dynamic>? source,
+}) async {
+  try {
+    if (sourceId != 'local' &&
+        model.store.path != ':memory:' &&
+        !model.downloads.initialized) {
+      await model.downloads.initialize();
+    }
+    if (!context.mounted || !(ModalRoute.of(context)?.isCurrent ?? true)) {
+      return;
+    }
+    final task = model.downloads.entryForSource(sourceId, entry.path);
+    final action = await showGlassBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            ListTile(
+              title: Text(
+                entry.name,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (!entry.directory && isTextFile(entry.name))
+              ListTile(
+                leading: const Icon(Icons.description_outlined),
+                title: const Text('查看文本'),
+                onTap: () => Navigator.pop(context, 'text'),
+              ),
+            if (!entry.directory)
+              ListTile(
+                leading: const Icon(Icons.open_in_new_rounded),
+                title: const Text('用其他应用打开'),
+                onTap: () => Navigator.pop(context, 'external'),
+              ),
+            if (sourceId == 'local')
+              const ListTile(
+                leading: Icon(Icons.check_rounded),
+                title: Text('已在本地'),
+              )
+            else if (task == null)
+              ListTile(
+                leading: const Icon(Icons.download_outlined),
+                title: Text(entry.directory ? '下载文件夹' : '下载文件'),
+                onTap: () => Navigator.pop(context, 'download'),
+              )
+            else if (task.status == OfflineDownloadStatus.queued ||
+                task.status == OfflineDownloadStatus.downloading)
+              ListTile(
+                leading: const Icon(Icons.pause_rounded),
+                title: const Text('暂停下载'),
+                onTap: () => Navigator.pop(context, 'pause'),
+              )
+            else if (!task.isComplete)
+              ListTile(
+                leading: const Icon(Icons.play_arrow_rounded),
+                title: Text(
+                  task.status == OfflineDownloadStatus.failed ? '重试下载' : '继续下载',
+                ),
+                onTap: () => Navigator.pop(context, 'resume'),
+              ),
+            if (sourceId == 'local' || task?.isComplete == true)
+              ListTile(
+                leading: const Icon(Icons.folder_open_outlined),
+                title: const Text('保存位置'),
+                onTap: () => Navigator.pop(context, 'path'),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !context.mounted) return;
+    switch (action) {
+      case 'text':
+      case 'external':
+        await openSourceDocument(
+          context,
+          model: model,
+          sourceId: sourceId,
+          source: source,
+          entry: entry,
+          external: action == 'external',
+        );
+      case 'download':
+        if (entry.directory &&
+            !await confirmFolderDownload(
+              context,
+              folderCount: 1,
+              folderName: entry.name,
+            )) {
+          return;
+        }
+        if (!context.mounted ||
+            !(ModalRoute.of(context)?.isCurrent ?? true) ||
+            !ArtworkLifecycle.instance.value) {
+          return;
+        }
+        await model.downloadSourceEntries(sourceId, [
+          entry,
+        ], personalMedia: personalMedia);
+      case 'pause':
+        await model.downloads.pause(task!.mediaId);
+      case 'resume':
+        if (task!.status == OfflineDownloadStatus.failed) {
+          await model.downloads.retry(task.mediaId);
+        } else {
+          await model.downloads.resume(task.mediaId);
+        }
+      case 'path':
+        await showDownloadedFileLocation(
+          context,
+          sourceId == 'local' ? entry.path : task!.localPath,
+        );
+    }
+  } catch (error) {
+    if (context.mounted) _downloadFailure(context, error);
+  }
+}
+
+Future<void> showDownloadedFileLocation(BuildContext context, String path) =>
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('保存位置'),
+        content: SelectableText(path),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: path));
+              if (context.mounted) Navigator.pop(context);
+            },
+            child: const Text('复制路径'),
+          ),
+        ],
+      ),
+    );
 
 enum _DownloadAvailability { available, completed, busy, unavailable, stale }
 
@@ -556,6 +756,27 @@ class _DownloadSelectionState extends State<_DownloadSelection> {
     });
     try {
       final selected = _selected.where(_available).toSet();
+      final owner = widget.downloads;
+      final folders = widget.directoryAt == null
+          ? const <int>[]
+          : selected.where(widget.directoryAt!).toList();
+      if (folders.isNotEmpty &&
+          !await confirmFolderDownload(
+            context,
+            folderCount: folders.length,
+            fileCount: selected.length - folders.length,
+            folderName: folders.length == 1
+                ? widget.nameAt(folders.single)
+                : null,
+          )) {
+        return;
+      }
+      if (!mounted ||
+          owner != widget.downloads ||
+          !(ModalRoute.of(context)?.isCurrent ?? true) ||
+          !ArtworkLifecycle.instance.value) {
+        return;
+      }
       if (selected.isNotEmpty) await widget.submit(Set.unmodifiable(selected));
       if (mounted) Navigator.pop(context);
     } catch (error) {
@@ -570,9 +791,9 @@ class _DownloadSelectionState extends State<_DownloadSelection> {
 
   @override
   Widget build(BuildContext context) => SafeArea(
-    child: SizedBox(
-      height: MediaQuery.sizeOf(context).height * .65,
+    child: GlassSheetBody(
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 8, 0),
@@ -620,8 +841,9 @@ class _DownloadSelectionState extends State<_DownloadSelection> {
                 child: Text(widget.hint!, style: AppStyles.of(context).caption),
               ),
             ),
-          Expanded(
+          Flexible(
             child: ListView.builder(
+              shrinkWrap: true,
               key: const ValueKey('download-selection-list'),
               itemCount: widget.count,
               itemBuilder: (_, index) {

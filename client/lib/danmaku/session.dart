@@ -1,7 +1,10 @@
 import 'dart:async';
+
 import 'package:flutter/foundation.dart';
+
 import '../core/logger.dart';
 import '../core/network.dart';
+import '../core/third_party_network.dart';
 import '../data/store.dart';
 import 'api.dart';
 import '../data/media_identity.dart';
@@ -10,6 +13,7 @@ class DanmakuSession extends ChangeNotifier {
   final AppStore store;
   final DanmuApiClient api;
   final String mediaId;
+  final ThirdPartyNetworkPolicy? networkPolicy;
   // Replace immutable snapshots; workers cache them by identity.
   List<DanmakuComment> comments = const [];
   List<DanmakuComment>? _cachedComments;
@@ -23,14 +27,32 @@ class DanmakuSession extends ChangeNotifier {
   CancelToken? _request, _refreshRequest;
   Timer? _timer;
   DateTime? _retryAfter;
-  DanmakuSession(this.store, this.api, this.mediaId);
+  DanmakuSession(this.store, this.api, this.mediaId, {this.networkPolicy}) {
+    networkPolicy?.addListener(_networkChanged);
+  }
+  bool get _networkAllowed => networkPolicy?.enabled != false;
   bool get active =>
       !_disposed &&
+      _networkAllowed &&
       _presentationActive &&
       visible &&
       playing &&
       episodeId != null &&
       interval > 0;
+
+  void _networkChanged() {
+    if (_disposed) return;
+    if (!_networkAllowed) {
+      _generation++;
+      _request?.cancel();
+      _request = null;
+      busy = false;
+      _stopRefresh();
+    } else {
+      _schedule(immediate: true);
+    }
+    _notify();
+  }
 
   int? candidateCommentCount(EpisodeMatch match) =>
       match.episodeId == episodeId ? comments.length : match.commentCount;
@@ -79,6 +101,7 @@ class DanmakuSession extends ChangeNotifier {
   }
 
   Future<void> identify(ReleaseName guess, {bool restore = true}) async {
+    if (!_networkAllowed || _disposed) return;
     final cancel = _begin(), generation = _generation;
     try {
       final missingIds = <String>{};
@@ -181,6 +204,7 @@ class DanmakuSession extends ChangeNotifier {
   }
 
   Future<void> search(String anime, String episode) async {
+    if (!_networkAllowed || _disposed) return;
     final cancel = _begin(), generation = _generation;
     try {
       final found = await api.search(anime, episode: episode, cancel: cancel);
@@ -202,6 +226,7 @@ class DanmakuSession extends ChangeNotifier {
   }
 
   Future<void> select(EpisodeMatch match, {String? savedLabel}) async {
+    if (!_networkAllowed || _disposed) return;
     final cancel = _begin(), generation = _generation;
     try {
       await _load(match, cancel, generation, savedLabel: savedLabel);
@@ -372,6 +397,7 @@ class DanmakuSession extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    networkPolicy?.removeListener(_networkChanged);
     _generation++;
     _request?.cancel();
     _stopRefresh();

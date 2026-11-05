@@ -1,16 +1,20 @@
 import 'dart:async';
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+
 import 'data/app_model.dart';
 import 'data/store.dart';
+import 'data/text_document.dart';
 import 'ui/library_page.dart';
 import 'ui/glass.dart';
 import 'ui/desktop_window_frame.dart';
+import 'ui/television_input.dart';
 import 'sources/apple_access.dart';
 import 'core/logger.dart';
 import 'playback/display.dart';
@@ -45,7 +49,21 @@ Future<void> main(List<String> arguments) async {
       enableThumbnails: true,
       deferBackgroundWork: true,
     );
+    final cacheCleanupCutoff = DateTime.now();
     runApp(AIPlayerApp(model: model, arguments: arguments));
+    unawaited(
+      getTemporaryDirectory()
+          .then(
+            (directory) => cleanupExternalFileCache(
+              p.join(directory.path, 'aiplayer-external-files-v1'),
+              removeIncomplete: true,
+              incompleteBefore: cacheCleanupCutoff,
+            ),
+          )
+          .catchError((Object error) {
+            AppLog.instance.warning('临时文件清理', safeFailure(error).message);
+          }),
+    );
     unawaited(
       preparePlaybackFonts(documents).catchError((Object error) {
         AppLog.instance.warning('字幕字体', safeFailure(error).message);
@@ -271,6 +289,13 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
 
   void _displayPreferences() {
     final preferences = model.preferences;
+    final images = PaintingBinding.instance.imageCache;
+    final imageBudget = preferences.decodedImageCacheBytes;
+    if (images.maximumSizeBytes != imageBudget) {
+      // Resize only the reusable cache; mounted images and retained streams
+      // keep their own pixels. Settings changes never clear live images.
+      images.maximumSizeBytes = imageBudget;
+    }
     // Cover and metadata updates must not recreate MaterialApp and its themes.
     _appearance.value = (
       themeMode: model.themeMode,
@@ -337,16 +362,18 @@ class _AIPlayerAppState extends State<AIPlayerApp> with WidgetsBindingObserver {
           themeAnimationDuration: appearance.animations
               ? const Duration(milliseconds: 200)
               : Duration.zero,
-          builder: (context, child) => ValueListenableBuilder<bool>(
-            valueListenable: _presentationVisible,
-            child: child,
-            builder: (context, visible, child) => TickerMode(
-              enabled: visible && !_closing,
-              child: MotionScope(
-                enabled: appearance.animations,
-                child: AbsorbPointer(
-                  absorbing: _closing,
-                  child: DesktopWindowFrame(child: child ?? const SizedBox()),
+          builder: (context, child) => TelevisionInputScope(
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _presentationVisible,
+              child: child,
+              builder: (context, visible, child) => TickerMode(
+                enabled: visible && !_closing,
+                child: MotionScope(
+                  enabled: appearance.animations,
+                  child: AbsorbPointer(
+                    absorbing: _closing,
+                    child: DesktopWindowFrame(child: child ?? const SizedBox()),
+                  ),
                 ),
               ),
             ),

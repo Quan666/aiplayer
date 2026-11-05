@@ -3,7 +3,7 @@ description: 四端动漫播放器与个人影视库
 publish_to: none
 version: 0.5.26+32
 environment:
-  sdk: '>=3.9.0 <4.0.0'
+  sdk: '>=3.13.0 <4.0.0'
 dependencies:
   flutter:
     sdk: flutter
@@ -19,12 +19,20 @@ dependencies:
   crypto: ^3.0.6
   image: 4.12.0
   uuid: ^4.5.1
+  qr: 4.0.1
   xml: ^6.6.1
   desktop_drop: ^0.7.0
   aiplayer_smb:
     path: ../packages/aiplayer_smb
   cryptography: ^2.9.0
 dependency_overrides:
+  # Keep native build downloads verified outside the Pub package archive.
+  sqlite3_flutter_libs:
+    path: ../packages/sqlite3_flutter_libs
+  media_kit_libs_linux:
+    path: ../packages/media_kit_libs_linux
+  media_kit_libs_windows_video:
+    path: ../packages/media_kit_libs_windows_video
   # The default Android native library omits the Blu-ray PGS decoder.
   media_kit_libs_android_video:
     path: ../packages/media_kit_libs_android_video

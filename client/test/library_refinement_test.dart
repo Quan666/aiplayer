@@ -1,4 +1,5 @@
 import 'dart:io';
+
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/main.dart';
@@ -54,7 +55,7 @@ void main() {
         expect(find.textContaining('00:30 / 02:00 · 25%'), findsOneWidget);
         expect(
           find.descendant(
-            of: find.byType(DraggableScrollableSheet),
+            of: find.byKey(const ValueKey('series-details-list')),
             matching: find.textContaining('01:00 / 02:00 · 50%'),
           ),
           findsOneWidget,

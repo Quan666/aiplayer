@@ -194,33 +194,33 @@ void main() {
     },
   );
 
-  test('clearing resumes recognition queued before its debounce', () async {
-    final root = await Directory.systemTemp.createTemp('pending-cache-clear-');
-    final store = AppStore('${root.path}/library.db');
-    final model = _Model(store, root);
-    try {
-      final id = model.addMedia(
-        'nas',
-        const SourceEntry(
-          name: 'Series E01.mkv',
-          path: 'Series/Series E01.mkv',
-        ),
+  test(
+    'clearing never schedules automatic recognition for an import',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'pending-cache-clear-',
       );
-      await model.clearCaches();
-      for (
-        var i = 0;
-        i < 100 && store.get('media', id)!.data['bangumiId'] == null;
-        i++
-      ) {
-        await Future<void>.delayed(const Duration(milliseconds: 10));
+      final store = AppStore('${root.path}/library.db');
+      final model = _Model(store, root);
+      try {
+        final id = model.addMedia(
+          'nas',
+          const SourceEntry(
+            name: 'Series E01.mkv',
+            path: 'Series/Series E01.mkv',
+          ),
+        );
+        await model.clearCaches();
+        await Future<void>.delayed(Duration.zero);
+        expect(store.get('media', id)!.data['bangumiId'], isNull);
+        expect(model._trackedCatalog.resolves, 0);
+      } finally {
+        model.dispose();
+        store.dispose();
+        await root.delete(recursive: true);
       }
-      expect(store.get('media', id)!.data['bangumiId'], '42');
-    } finally {
-      model.dispose();
-      store.dispose();
-      await root.delete(recursive: true);
-    }
-  });
+    },
+  );
 
   test(
     'disposal during a pending preview drain cannot update the model',
@@ -249,7 +249,8 @@ void main() {
     final root = (await tester.runAsync(
       () => Directory.systemTemp.createTemp('source-cache-clear-'),
     ))!;
-    final store = AppStore('${root.path}/library.db');
+    final store = AppStore('${root.path}/library.db')
+      ..setLocal('settings', {'autoIdentifyOnFolderOpen': true});
     final model = _Model(store, root);
     final active = ValueNotifier(true);
     var cleared = false;
@@ -276,6 +277,7 @@ void main() {
         tester,
         () =>
             model._trackedCatalog.resolves > 0 &&
+            store.records('media').length == 2 &&
             store.records('media').every((r) => r.data['bangumiId'] == '42'),
       );
       await tester.pumpAndSettle();

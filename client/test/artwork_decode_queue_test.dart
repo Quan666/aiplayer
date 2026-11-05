@@ -78,6 +78,52 @@ void main() {
     await tester.pump();
   });
 
+  testWidgets(
+    'cancelling a completed decode releases its listener without a frame',
+    (tester) async {
+      final queue = ArtworkDecodeQueue();
+      addTearDown(queue.dispose);
+      final image = (await tester.runAsync(
+        () => createTestImage(cache: false),
+      ))!;
+      addTearDown(image.dispose);
+      final cache = PaintingBinding.instance.imageCache;
+      final previousLimit = cache.maximumSizeBytes;
+      addTearDown(() => cache.maximumSizeBytes = previousLimit);
+      cache.maximumSizeBytes = 0;
+      final provider = _ControlledProvider();
+      final request = queue.request(
+        provider,
+        canStart: () => true,
+        onStart: () {},
+        onError: (_, _) {},
+      )!;
+      await tester.pump();
+      provider.completer.complete(image);
+      expect(provider.completer.hasListeners, isTrue);
+      request.cancel();
+      // No pump or lifecycle transition is needed to release this request.
+      expect(provider.completer.hasListeners, isFalse);
+      expect(queue.activeCount, 0);
+
+      cache.maximumSizeBytes = previousLimit;
+      final warm = _ControlledProvider();
+      final cachedRequest = queue.request(
+        warm,
+        canStart: () => true,
+        onStart: () {},
+        onError: (_, _) {},
+      )!;
+      await tester.pump();
+      warm.completer.complete(image);
+      expect(cache.statusForKey(warm).keepAlive, isTrue);
+      cachedRequest.cancel();
+      expect(cache.statusForKey(warm).keepAlive, isTrue);
+      expect(warm.loads, 1);
+      await tester.pump();
+    },
+  );
+
   testWidgets('starts after layout and bounds outstanding native decodes', (
     tester,
   ) async {

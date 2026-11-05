@@ -51,6 +51,7 @@ class _OfflineWorker {
   final deleting = <String>{};
   final removalPlans = <String, _LocalRemovalPlan>{};
   final operations = <int, CancelToken>{};
+  final selections = <String, Map<String, int>>{};
   Database? db;
   AppStore? store;
   bool active, closing = false;
@@ -141,6 +142,7 @@ class _OfflineWorker {
           token.cancel();
         }
         removalPlans.clear();
+        selections.clear();
         _setActive(false);
         unawaited(_close());
       } else {
@@ -259,6 +261,12 @@ class _OfflineWorker {
       dynamic result;
       final payload = message[2];
       switch (message[0]) {
+        case 'captureSelection':
+          result = _captureSelection();
+        case 'releaseSelection':
+          selections.remove(payload as String);
+        case 'batch':
+          await _applyBatch(Map<String, dynamic>.from(payload as Map));
         case 'prepareLocalDirectoryRemoval':
           result = await _prepareLocalDirectoryRemoval(
             payload[0] as String,
@@ -281,10 +289,21 @@ class _OfflineWorker {
           final path = input['remotePath'] as String;
           _checkedSegments(path); // Reject traversal before admitting a task.
           if (sourceId == 'local' || sourceId.isEmpty) {
-            throw const AppFailure('请选择远程视频下载。');
+            throw const AppFailure('请选择远程文件下载。');
           }
           await _ensureDatabase();
-          final existing = rows[id];
+          final existing =
+              rows[id] ??
+              rows.values
+                  .where(
+                    (row) =>
+                        row['downloadOnly'] == true &&
+                        row['sourceId'] == sourceId &&
+                        row['remotePath'] == path &&
+                        (row['bindingRevision'] ?? '') ==
+                            (input['bindingRevision'] ?? ''),
+                  )
+                  .firstOrNull;
           if (existing != null) {
             if (existing['sourceId'] != sourceId ||
                 existing['remotePath'] != path ||
@@ -490,6 +509,10 @@ class _OfflineWorker {
   }
 
   void _validateLocation(Map<String, dynamic> row) {
+    if (row['downloadOnly'] == true) {
+      _validateFolderSource(row);
+      return;
+    }
     final library = store;
     if (library == null || storePath == ':memory:') return;
     final id = row['mediaId'] as String;
@@ -575,8 +598,8 @@ class _OfflineWorker {
       attempt.source = source;
       _validateLocation(row);
       final stat = await _wait(source.stat(remote), attempt);
-      if (stat.directory || stat.size <= 0) {
-        throw const AppFailure('不能下载空文件或目录。');
+      if (stat.directory || stat.size < 0) {
+        throw const AppFailure('文件大小不可用，或所选项目为目录。');
       }
       _validateLocation(row);
       var offset = await _partialOffset(row);
@@ -589,7 +612,7 @@ class _OfflineWorker {
         }
         // A full checkpoint still needs an origin validation before promotion.
         // Re-reading its final byte verifies If-Range without fetching the prefix.
-        if (offset == stat.size) offset = stat.size - 1;
+        if (stat.size > 0 && offset == stat.size) offset = stat.size - 1;
         transfer = await _openHttpTransfer(
           source,
           remote,
@@ -655,7 +678,7 @@ class _OfflineWorker {
           clock.reset();
         }
       }
-      if (received != transfer.total) throw const AppFailure('视频读取提前结束，请重试。');
+      if (received != transfer.total) throw const AppFailure('文件读取提前结束，请重试。');
       if (source is! HttpSource && stat.modified > 0) {
         final latest = await _wait(source.stat(remote), attempt);
         if (latest.size != stat.size || latest.modified != stat.modified) {
@@ -745,9 +768,9 @@ class _OfflineWorker {
     final dated = response.headers.value('date');
     if (modified != null && modified.length < 128 && dated != null) {
       try {
-        if (HttpDate.parse(
-              dated,
-            ).difference(HttpDate.parse(modified)).inSeconds >=
+        if (HttpDate.parse(dated)
+                .difference(HttpDate.parse(modified))
+                .inSeconds >=
             60) {
           return ('last-modified', modified);
         }
@@ -786,7 +809,9 @@ class _OfflineWorker {
           ),
           attempt,
         );
-        request.headers.set('Range', 'bytes=$start-${total - 1}');
+        if (total > 0) {
+          request.headers.set('Range', 'bytes=$start-${total - 1}');
+        }
         request.headers.set('Accept-Encoding', 'identity');
         if (start > 0) request.headers.set('If-Range', row['httpValidator']);
         if (source.user.isNotEmpty) {
@@ -813,9 +838,8 @@ class _OfflineWorker {
             throw const AppFailure('下载期间远程文件大小发生变化，请重试。');
           }
         } else if (response.statusCode == 206) {
-          final range = RegExp(
-            r'^bytes (\d+)-(\d+)/(\d+)$',
-          ).firstMatch(response.headers.value('content-range') ?? '');
+          final range = RegExp(r'^bytes (\d+)-(\d+)/(\d+)$')
+              .firstMatch(response.headers.value('content-range') ?? '');
           final matchingRange =
               range != null &&
               int.tryParse(range[1]!) == start &&
@@ -833,7 +857,7 @@ class _OfflineWorker {
             if (start > 0) {
               restart = true;
             } else {
-              throw const AppFailure('来源返回了不完整或已改变的视频范围，请重试。');
+              throw const AppFailure('来源返回了不完整或已改变的文件范围，请重试。');
             }
           }
         } else if (response.statusCode == 416 && start > 0) {
@@ -844,8 +868,8 @@ class _OfflineWorker {
         if (restart) {
           client.close(force: true);
           final latest = await _wait(source.stat(path), attempt);
-          if (latest.directory || latest.size <= 0) {
-            throw const AppFailure('远程视频不可用。');
+          if (latest.directory || latest.size < 0) {
+            throw const AppFailure('远程文件不可用。');
           }
           total = latest.size;
           start = 0;
@@ -868,10 +892,10 @@ class _OfflineWorker {
         }
       }
     }
-    throw const AppFailure('视频发生变化，请重试下载。');
+    throw const AppFailure('文件发生变化，请重试下载。');
   }
 
-  Future<void> _remove(String id) async {
+  Future<void> _remove(String id, {bool notify = true}) async {
     final row = rows[id];
     if (row == null) return;
     deleting.add(id);
@@ -892,7 +916,7 @@ class _OfflineWorker {
       _deleteFolderState(id);
       db!.execute('DELETE FROM downloads WHERE id=?', [id]);
       rows.remove(id);
-      if (!closing) reply.send(['removed', id]);
+      if (notify && !closing) reply.send(['removed', id]);
     } finally {
       deleting.remove(id);
       _pump();
@@ -966,7 +990,7 @@ List<String> _checkedSegments(String path) {
   if (parts.any(
     (part) => part == '.' || part == '..' || part.contains('\u0000'),
   )) {
-    throw const AppFailure('视频路径无效。');
+    throw const AppFailure('文件路径无效。');
   }
   return parts;
 }
@@ -1028,8 +1052,9 @@ String _downloadPath(
   } else if (configuration['kind'] == 'http') {
     final url = Uri.parse(configuration['url'] as String);
     parts = _checkedSegments(Uri.decodeComponent(url.path));
-    if (parts.isEmpty || !isVideo(parts.last)) {
-      parts.add(isVideo(name) ? name : 'video.mp4');
+    if (parts.isEmpty ||
+        (p.posix.extension(parts.last).isEmpty && name != parts.last)) {
+      parts.add(name.isNotEmpty ? name : 'download');
     }
   }
   if (parts.isEmpty) parts = [name];

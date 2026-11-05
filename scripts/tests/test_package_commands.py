@@ -27,7 +27,7 @@ class PackageCommandTest(unittest.TestCase):
                 lookup.assert_called_once_with("flutter")
                 launch.assert_called_once_with(
                     [str(executable.resolve()), "build", "windows", "--release"],
-                    cwd=Path(directory), check=True, text=True, stdout=subprocess.PIPE,
+                    cwd=Path(directory), check=True, text=True, stdout=subprocess.PIPE, env=None,
                 )
                 self.assertEqual(command[0], "flutter")
 

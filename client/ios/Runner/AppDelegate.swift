@@ -11,6 +11,7 @@ import AVKit
   private var discoveryChannel: FlutterMethodChannel?
   private var systemProxy: SystemProxyHandler?
   private var mediaControls: MediaControlsHandler?
+  private var externalFiles: ExternalFileOpenHandler?
   private let discovery = LocalServiceDiscovery()
   private let pictureInPicture = PlayerPictureInPicture()
   private var originalBrightness: CGFloat?
@@ -51,6 +52,7 @@ import AVKit
     self.mediaControls = mediaControls
     pictureInPicture.mediaControls = mediaControls
     ExternalVideoInbox.shared.bind(engineBridge.applicationRegistrar.messenger())
+    externalFiles = ExternalFileOpenHandler(messenger: engineBridge.applicationRegistrar.messenger())
     pictureInPicture.bind(engineBridge.applicationRegistrar.messenger())
     let deviceInfo = FlutterMethodChannel(
       name: "app.aiplayer/device_info",
@@ -150,6 +152,59 @@ import AVKit
     systemProxy?.close()
     for observer in displayObservers {
       NotificationCenter.default.removeObserver(observer)
+    }
+  }
+}
+
+/// Retain one document controller while UIKit presents the system Open In menu.
+private final class ExternalFileOpenHandler: NSObject, UIDocumentInteractionControllerDelegate {
+  private let channel: FlutterMethodChannel
+  private var document: UIDocumentInteractionController?
+  private var generation = 0
+
+  init(messenger: FlutterBinaryMessenger) {
+    channel = FlutterMethodChannel(name: "app.aiplayer/file_open", binaryMessenger: messenger)
+    super.init()
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else { result(nil); return }
+      if call.method == "cancel" {
+        self.generation += 1
+        result(nil)
+        return
+      }
+      guard call.method == "open" else { result(FlutterMethodNotImplemented); return }
+      guard let path = call.arguments as? String, !path.isEmpty else {
+        result(FlutterError(code: "invalid_file", message: "文件位置无效。", details: nil)); return
+      }
+      let request = self.generation
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let readable = FileManager.default.isReadableFile(atPath: path)
+        DispatchQueue.main.async {
+          guard let self = self, request == self.generation else {
+            result(FlutterError(code: "cancelled", message: "文件打开已取消。", details: nil)); return
+          }
+          guard readable else {
+            result(FlutterError(code: "unreadable_file", message: "文件不可访问，请刷新后重试。", details: nil)); return
+          }
+          let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+          guard let window = scene?.windows.first(where: { $0.isKeyWindow }),
+                let view = window.rootViewController?.view else {
+            result(FlutterError(code: "cancelled", message: "请返回应用后重试。", details: nil)); return
+          }
+          self.document?.dismissMenu(animated: false)
+          let document = UIDocumentInteractionController(url: URL(fileURLWithPath: path))
+          document.delegate = self
+          self.document = document
+          let rect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+          if document.presentOpenInMenu(from: rect, in: view, animated: true) {
+            result(nil)
+          } else {
+            self.document = nil
+            result(FlutterError(code: "no_handler", message: "没有可打开此文件的应用。", details: nil))
+          }
+        }
+      }
     }
   }
 }

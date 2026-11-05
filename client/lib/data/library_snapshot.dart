@@ -298,17 +298,7 @@ class _LocalDirectoryIndex {
     };
     final recognized = <String>{
       for (final group in displaySeries.entries)
-        if (group.value.any(
-          (record) =>
-              _LibrarySeriesIndex._verified(record) ||
-              [
-                'metadataTitle',
-                'poster',
-                'summary',
-                'metadataProvider',
-              ].any((key) => '${record.data[key] ?? ''}'.trim().isNotEmpty),
-        ))
-          group.key,
+        if (group.value.any(hasRecognizedMediaMetadata)) group.key,
     };
     final membership =
         <String, ({String? key, bool mixed, List<SyncRecord> records})>{};
@@ -1540,7 +1530,10 @@ class _SnapshotData {
     final media = List<SyncRecord>.unmodifiable(
       records
           .where(
-            (record) => !record.deleted && record.data['transient'] != true,
+            (record) =>
+                !record.deleted &&
+                record.data['transient'] != true &&
+                record.data['personalMedia'] != true,
           )
           .map(_freezeRecord),
     );

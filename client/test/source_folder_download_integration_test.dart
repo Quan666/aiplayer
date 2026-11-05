@@ -58,6 +58,17 @@ void main() {
         expect(find.text('下载文件夹'), findsOneWidget);
         await tester.tap(find.text('下载文件夹'));
         await tester.pumpAndSettle();
+        expect(find.text('下载文件夹？'), findsOneWidget);
+        expect(fixture.model.downloads.entries, isEmpty);
+        await tester.tap(find.text('取消'));
+        await tester.pumpAndSettle();
+        expect(fixture.model.downloads.entries, isEmpty);
+        await tester.tap(menu);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('下载文件夹'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('下载'));
+        await tester.pumpAndSettle();
         await _wait(
           tester,
           fixture,
@@ -80,7 +91,7 @@ void main() {
             .where((entry) => entry.scope == '文件夹下载')
             .toList();
         expect(summaries, hasLength(1));
-        expect(summaries.single.message, contains('发现 4 个视频'));
+        expect(summaries.single.message, contains('发现 4 个文件'));
         expect(summaries.single.message, contains('绑定 4 个'));
         expect(summaries.single.message, contains('新增 4 个任务'));
         expect(summaries.single.message, isNot(contains(_Fixture.title)));

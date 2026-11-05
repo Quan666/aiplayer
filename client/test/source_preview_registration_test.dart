@@ -17,9 +17,10 @@ class _PreviewModel extends AppModel {
   int expected = 1;
 
   @override
-  void ensureMediaPreview(String id) {
+  bool ensureMediaPreview(String id) {
     scheduled.add(id);
     if (scheduled.length == expected && !ready.isCompleted) ready.complete();
+    return true;
   }
 }
 
@@ -172,48 +173,45 @@ void main() {
     },
   );
 
-  test(
-    'failed registrations release capacity without spinning on cancelled replies',
-    () async {
-      final preview = _PreviewModel(store, directory);
-      model = preview;
-      // The UI connection remains usable, but a new worker cannot open this file.
-      await File(store.path).rename('${store.path}.unavailable');
-      final failed = Completer<void>();
-      void logged() {
-        if (AppLog.instance.entries.last.scope == '封面' && !failed.isCompleted) {
-          failed.complete();
-        }
+  test('failed registrations release capacity without spinning on cancelled replies', () async {
+    final preview = _PreviewModel(store, directory);
+    model = preview;
+    // The UI connection remains usable, but a new worker cannot open this file.
+    await File(store.path).rename('${store.path}.unavailable');
+    final failed = Completer<void>();
+    void logged() {
+      if (AppLog.instance.entries.last.scope == '封面' && !failed.isCompleted) {
+        failed.complete();
       }
+    }
 
-      var admitted = false;
-      void capacityChanged() {
-        if (admitted) return;
-        admitted = preview.tryEnsureSourceMediaPreview('nas', _entry(64));
-        if (admitted) {
-          preview.sourcePreviewCapacity.removeListener(capacityChanged);
-        }
-      }
-
-      AppLog.instance.addListener(logged);
-      try {
-        for (var i = 0; i < 64; i++) {
-          expect(preview.tryEnsureSourceMediaPreview('nas', _entry(i)), isTrue);
-        }
-        expect(preview.tryEnsureSourceMediaPreview('nas', _entry(64)), isFalse);
-        preview.sourcePreviewCapacity.addListener(capacityChanged);
-        await failed.future.timeout(const Duration(seconds: 5));
-        // The first request reports the worker failure; subsequent requests see
-        // Cancelled. They must finish instead of starving this event-loop turn.
-        await Future<void>.delayed(Duration.zero);
-        expect(admitted, isTrue);
-        expect(preview.scheduled, isEmpty);
-      } finally {
-        AppLog.instance.removeListener(logged);
+    var admitted = false;
+    void capacityChanged() {
+      if (admitted) return;
+      admitted = preview.tryEnsureSourceMediaPreview('nas', _entry(64));
+      if (admitted) {
         preview.sourcePreviewCapacity.removeListener(capacityChanged);
       }
-    },
-  );
+    }
+
+    AppLog.instance.addListener(logged);
+    try {
+      for (var i = 0; i < 64; i++) {
+        expect(preview.tryEnsureSourceMediaPreview('nas', _entry(i)), isTrue);
+      }
+      expect(preview.tryEnsureSourceMediaPreview('nas', _entry(64)), isFalse);
+      preview.sourcePreviewCapacity.addListener(capacityChanged);
+      await failed.future.timeout(const Duration(seconds: 5));
+      // The first request reports the worker failure; subsequent requests see
+      // Cancelled. They must finish instead of starving this event-loop turn.
+      await Future<void>.delayed(Duration.zero);
+      expect(admitted, isTrue);
+      expect(preview.scheduled, isEmpty);
+    } finally {
+      AppLog.instance.removeListener(logged);
+      preview.sourcePreviewCapacity.removeListener(capacityChanged);
+    }
+  });
 
   test(
     'disposing pending browse registration cannot launch previews',

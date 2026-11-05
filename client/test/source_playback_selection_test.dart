@@ -21,6 +21,7 @@ void main() {
     bool known = true,
     bool downloaded = true,
     bool alternate = false,
+    bool recognizedFolder = false,
     List<SourceEntry>? entries,
     String? initialPath,
   }) async {
@@ -29,6 +30,7 @@ void main() {
       known: known,
       downloaded: downloaded,
       alternate: alternate,
+      recognizedFolder: recognizedFolder,
       entries: entries,
     );
     addTearDown(() async {
@@ -207,6 +209,7 @@ void main() {
         known: false,
         downloaded: false,
         entries: [low, high],
+        recognizedFolder: true,
         initialPath: 'Show',
       );
       final first = fixture.model.sourceMedia('dav', low.path);
@@ -262,46 +265,43 @@ void main() {
     },
   );
 
-  test(
-    'playback file preparation registers remote and local files without downloads',
-    () async {
-      FlutterSecureStorage.setMockInitialValues({});
-      final directory = await Directory.systemTemp.createTemp(
-        'playback-file-worker-',
+  test('playback file preparation registers remote and local files without downloads', () async {
+    FlutterSecureStorage.setMockInitialValues({});
+    final directory = await Directory.systemTemp.createTemp(
+      'playback-file-worker-',
+    );
+    final store = await AppStore.open('${directory.path}/app.sqlite');
+    store.setLocal('settings', {
+      'metadataStrategy': 'off',
+      'autoDiscover': false,
+    });
+    store.setLocal('sources', [_Fixture.source]);
+    final model = AppModel(store, directory, backgroundWork: false);
+    try {
+      const remote = SourceEntry(
+        name: 'Show E16.mp4',
+        path: 'folder/Show E16.mp4',
       );
-      final store = await AppStore.open('${directory.path}/app.sqlite');
-      store.setLocal('settings', {
-        'metadataStrategy': 'off',
-        'autoDiscover': false,
-      });
-      store.setLocal('sources', [_Fixture.source]);
-      final model = AppModel(store, directory, backgroundWork: false);
-      try {
-        const remote = SourceEntry(
-          name: 'Show E16.mp4',
-          path: 'folder/Show E16.mp4',
-        );
-        final first = await model.prepareSourceMediaForPlayback('dav', remote);
-        final again = await model.prepareSourceMediaForPlayback('dav', remote);
-        expect(again.id, first.id);
-        expect(store.local('location:${first.id}')['path'], remote.path);
-        final local = await model.prepareSourceMediaForPlayback(
-          'local',
-          SourceEntry(name: 'clip.mkv', path: '${directory.path}/clip.mkv'),
-        );
-        expect(local.data['localOnly'], isTrue);
-        expect(store.local('location:${local.id}')['source'], 'local');
-        expect(store.all('media'), hasLength(2));
-        expect(model.downloads.initialized, isFalse);
-        expect(model.downloads.entries, isEmpty);
-      } finally {
-        await model.downloads.close();
-        model.dispose();
-        store.dispose();
-        await directory.delete(recursive: true);
-      }
-    },
-  );
+      final first = await model.prepareSourceMediaForPlayback('dav', remote);
+      final again = await model.prepareSourceMediaForPlayback('dav', remote);
+      expect(again.id, first.id);
+      expect(store.local('location:${first.id}')['path'], remote.path);
+      final local = await model.prepareSourceMediaForPlayback(
+        'local',
+        SourceEntry(name: 'clip.mkv', path: '${directory.path}/clip.mkv'),
+      );
+      expect(local.data['localOnly'], isTrue);
+      expect(store.local('location:${local.id}')['source'], 'local');
+      expect(store.all('media'), hasLength(2));
+      expect(model.downloads.initialized, isFalse);
+      expect(model.downloads.entries, isEmpty);
+    } finally {
+      await model.downloads.close();
+      model.dispose();
+      store.dispose();
+      await directory.delete(recursive: true);
+    }
+  });
 }
 
 class _Fixture {
@@ -318,6 +318,7 @@ class _Fixture {
     required bool known,
     bool downloaded = true,
     bool alternate = false,
+    bool recognizedFolder = false,
     List<SourceEntry>? entries,
   }) : entries =
            entries ??
@@ -327,6 +328,23 @@ class _Fixture {
       'autoDiscover': false,
     });
     store.setLocal('sources', [source]);
+    if (recognizedFolder) {
+      final entry = this.entries.first;
+      store.save('media', 'recognized-first', {
+        'title': entry.name,
+        'fileName': entry.name,
+        'series': 'Show',
+        'season': '1',
+        'episode': '1',
+        'bangumiId': '7',
+      });
+      store.setLocal('location:recognized-first', {
+        'id': 'recognized-first',
+        'source': 'dav',
+        'path': entry.path,
+        'size': entry.size,
+      });
+    }
     if (known) {
       store.save('media', 'known', {
         'title': 'clip.mkv',
@@ -449,6 +467,11 @@ class _Downloads extends ChangeNotifier implements OfflineDownloads {
   @override
   OfflineDownload? entryFor(String mediaId) =>
       completed?.mediaId == mediaId ? completed : null;
+  @override
+  OfflineDownload? entryForSource(String sourceId, String path) =>
+      completed?.sourceId == sourceId && completed?.remotePath == path
+      ? completed
+      : null;
 
   @override
   Map<String, Map<String, dynamic>> get completedLocations {

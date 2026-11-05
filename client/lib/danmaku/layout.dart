@@ -168,9 +168,8 @@ class DanmakuSchedule {
   DanmakuSchedule(
     List<ScheduledComment> prepared, {
     double speed = 1,
-    List<ScheduledComment> retained = const [],
+    this._retained = const [],
   }) : _items = prepared,
-       _retained = retained,
        _placements = const [],
        _source = const [],
        _visible = null,
@@ -180,9 +179,8 @@ class DanmakuSchedule {
     this._placements,
     this._source, {
     double speed = 1,
-    List<ScheduledComment> retained = const [],
+    this._retained = const [],
   }) : _items = const [],
-       _retained = retained,
        _visible = {},
        _maxDuration = 8 / speed.clamp(.25, 4.0);
 

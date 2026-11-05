@@ -13,52 +13,193 @@ void main() {
   setUp(() => overrideSystemProxyPlatformForTesting('test'));
 
   test(
-    'manual pause continues a validated HTTP prefix and remains paused across lifecycle',
+    'batch captures exclude later and recreated tasks and honor exclusions',
     () async {
-      final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
-      final downloads = fixture.manager();
+      final fixture = await _Fixture.create();
+      final downloads = fixture.manager(active: false);
       try {
+        for (final id in ['one', 'two']) {
+          await downloads.enqueue(media: _media(id), location: _location(id));
+        }
+        final selection = await downloads.captureSelection();
+        expect(selection.ids, ['one', 'two']);
+        expect(() => selection.ids.add('bad'), throwsUnsupportedError);
+        await downloads.enqueue(
+          media: _media('late'),
+          location: _location('late'),
+        );
+        await downloads.applyBatch(
+          selection,
+          OfflineDownloadBatchAction.pause,
+          all: true,
+        );
+        expect(downloads.entryFor('one')!.userPaused, true);
+        expect(downloads.entryFor('two')!.userPaused, true);
+        expect(downloads.entryFor('late')!.userPaused, false);
+        await downloads.applyBatch(
+          selection,
+          OfflineDownloadBatchAction.resume,
+          ids: {'one'},
+        );
+        expect(downloads.entryFor('one')!.userPaused, false);
+        expect(downloads.entryFor('two')!.userPaused, true);
+        await downloads.delete('one');
         await downloads.enqueue(
           media: _media('one'),
           location: _location('one'),
         );
-        await _untilPartial(downloads, 'one');
-        await downloads.pause('one');
-        final paused = downloads.entryFor('one')!;
-        expect(paused.userPaused, true);
-        expect(paused.status, OfflineDownloadStatus.paused);
-        expect(paused.received, 1000);
-        expect(
-          await File('${paused.localPath}.part').length(),
-          paused.received,
+        await downloads.applyBatch(
+          selection,
+          OfflineDownloadBatchAction.delete,
+          all: true,
+          ids: {'two'},
         );
-        expect(downloads.activeCount, 0);
-        expect(downloads.pausedCount, 1);
-        expect(downloads.taskIds, ['one']);
-        expect(() => downloads.taskIds.add('bad'), throwsUnsupportedError);
-        final revision = downloads.tasksRevision;
-        downloads.setActive(false);
-        downloads.setActive(true);
-        fixture.release();
-        await Future<void>.delayed(const Duration(milliseconds: 80));
-        expect(fixture.gets, hasLength(1));
-        await downloads.resume('one');
-        await _until(() => downloads.entryFor('one')?.isComplete == true);
-        expect(fixture.ranges, ['bytes=0-191999', 'bytes=1000-191999']);
-        expect(fixture.ifRanges, [null, '"version-1"']);
-        expect(await File(paused.localPath).readAsBytes(), fixture.bytes);
-        expect(downloads.tasksRevision, revision);
-        expect(downloads.completedCount, 1);
-        expect(downloads.pausedCount, 0);
-        expect(downloads.activeCount, 0);
+        expect(downloads.entries.keys, unorderedEquals(['one', 'two', 'late']));
+        await downloads.applyBatch(
+          selection,
+          OfflineDownloadBatchAction.delete,
+          all: true,
+        );
+        expect(downloads.entries.keys, unorderedEquals(['one', 'late']));
+        expect(downloads.taskIds, ['late', 'one']);
+        expect(fixture.gets, isEmpty);
+        await downloads.releaseSelection(selection);
+        await expectLater(
+          downloads.applyBatch(
+            selection,
+            OfflineDownloadBatchAction.pause,
+            all: true,
+          ),
+          throwsA(anything),
+        );
       } finally {
-        fixture.release();
         await downloads.close();
         downloads.dispose();
         await fixture.close();
       }
     },
   );
+
+  test('mixed batch retries failed tasks and deletes complete partial and queued files without refilling slots', () async {
+    final fixture = (await _Fixture.create())..etag = '"batch-version"';
+    final downloads = fixture.manager();
+    try {
+      await downloads.enqueue(
+        media: _media('done'),
+        location: _location('done'),
+      );
+      await _until(() => downloads.entryFor('done')?.isComplete == true);
+      final completedPath = downloads.entryFor('done')!.localPath;
+      fixture.failAfterPrefix = true;
+      await downloads.enqueue(
+        media: _media('failed'),
+        location: _location('failed'),
+      );
+      await _until(
+        () =>
+            downloads.entryFor('failed')?.status ==
+            OfflineDownloadStatus.failed,
+      );
+      fixture.failAfterPrefix = false;
+      fixture.gate = Completer<void>();
+      for (final id in ['one', 'two', 'queued']) {
+        await downloads.enqueue(media: _media(id), location: _location(id));
+      }
+      await _untilPartial(downloads, 'one');
+      await _untilPartial(downloads, 'two');
+      final selection = await downloads.captureSelection();
+      await downloads.applyBatch(
+        selection,
+        OfflineDownloadBatchAction.pause,
+        all: true,
+      );
+      expect(downloads.entryFor('done')!.isComplete, true);
+      expect(
+        downloads.entryFor('failed')!.status,
+        OfflineDownloadStatus.failed,
+      );
+      expect(downloads.pausedCount, 3);
+      final partialPath = '${downloads.entryFor('one')!.localPath}.part';
+      expect(await File(partialPath).exists(), true);
+      final requests = fixture.gets.length;
+      downloads.setActive(false);
+      await downloads.applyBatch(
+        selection,
+        OfflineDownloadBatchAction.resume,
+        all: true,
+      );
+      expect(downloads.failedCount, 0);
+      expect(downloads.pausedCount, 4);
+      expect(downloads.entries.values.any((entry) => entry.userPaused), false);
+      expect(fixture.gets, hasLength(requests));
+      downloads.setActive(true);
+      await _until(() => downloads.activeCount > 0);
+      await downloads.applyBatch(
+        selection,
+        OfflineDownloadBatchAction.delete,
+        all: true,
+      );
+      final afterDeletion = fixture.gets.length;
+      fixture.release();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(fixture.gets, hasLength(afterDeletion));
+      expect(downloads.taskIds, isEmpty);
+      expect(downloads.entries, isEmpty);
+      expect(await File(completedPath).exists(), false);
+      expect(await File(partialPath).exists(), false);
+      expect(
+        await fixture.directory
+            .list(recursive: true)
+            .where((entry) => entry.path.endsWith('.part'))
+            .toList(),
+        isEmpty,
+      );
+    } finally {
+      fixture.release();
+      await downloads.close();
+      downloads.dispose();
+      await fixture.close();
+    }
+  });
+
+  test('manual pause continues a validated HTTP prefix and remains paused across lifecycle', () async {
+    final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
+    final downloads = fixture.manager();
+    try {
+      await downloads.enqueue(media: _media('one'), location: _location('one'));
+      await _untilPartial(downloads, 'one');
+      await downloads.pause('one');
+      final paused = downloads.entryFor('one')!;
+      expect(paused.userPaused, true);
+      expect(paused.status, OfflineDownloadStatus.paused);
+      expect(paused.received, 1000);
+      expect(await File('${paused.localPath}.part').length(), paused.received);
+      expect(downloads.activeCount, 0);
+      expect(downloads.pausedCount, 1);
+      expect(downloads.taskIds, ['one']);
+      expect(() => downloads.taskIds.add('bad'), throwsUnsupportedError);
+      final revision = downloads.tasksRevision;
+      downloads.setActive(false);
+      downloads.setActive(true);
+      fixture.release();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(fixture.gets, hasLength(1));
+      await downloads.resume('one');
+      await _until(() => downloads.entryFor('one')?.isComplete == true);
+      expect(fixture.ranges, ['bytes=0-191999', 'bytes=1000-191999']);
+      expect(fixture.ifRanges, [null, '"version-1"']);
+      expect(await File(paused.localPath).readAsBytes(), fixture.bytes);
+      expect(downloads.tasksRevision, revision);
+      expect(downloads.completedCount, 1);
+      expect(downloads.pausedCount, 0);
+      expect(downloads.activeCount, 0);
+    } finally {
+      fixture.release();
+      await downloads.close();
+      downloads.dispose();
+      await fixture.close();
+    }
+  });
 
   test(
     'immediate pause then resume serializes checkpoint before the next range',
@@ -90,90 +231,81 @@ void main() {
     },
   );
 
-  test(
-    'manual pause survives restart and resume in background waits for visibility',
-    () async {
-      final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
-      var downloads = fixture.manager();
-      try {
-        await downloads.enqueue(
-          media: _media('one'),
-          location: _location('one'),
-        );
-        await _untilPartial(downloads, 'one');
-        await downloads.pause('one');
-        await downloads.close();
-        downloads.dispose();
-        downloads = fixture.manager();
-        await downloads.initialize();
-        expect(downloads.entryFor('one')?.userPaused, true);
-        expect(downloads.entryFor('one')?.received, 1000);
-        expect(downloads.entryFor('one')?.status, OfflineDownloadStatus.paused);
-        downloads.setActive(false);
-        await downloads.resume('one');
-        expect(downloads.entryFor('one')?.userPaused, false);
-        expect(downloads.entryFor('one')?.status, OfflineDownloadStatus.paused);
-        fixture.release();
-        await Future<void>.delayed(const Duration(milliseconds: 80));
-        expect(fixture.gets, hasLength(1));
-        downloads.setActive(true);
-        await _until(() => downloads.entryFor('one')?.isComplete == true);
-        expect(fixture.ranges.last, 'bytes=1000-191999');
-      } finally {
-        fixture.release();
-        await downloads.close();
-        downloads.dispose();
-        await fixture.close();
-      }
-    },
-  );
+  test('manual pause survives restart and resume in background waits for visibility', () async {
+    final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
+    var downloads = fixture.manager();
+    try {
+      await downloads.enqueue(media: _media('one'), location: _location('one'));
+      await _untilPartial(downloads, 'one');
+      await downloads.pause('one');
+      await downloads.close();
+      downloads.dispose();
+      downloads = fixture.manager();
+      await downloads.initialize();
+      expect(downloads.entryFor('one')?.userPaused, true);
+      expect(downloads.entryFor('one')?.received, 1000);
+      expect(downloads.entryFor('one')?.status, OfflineDownloadStatus.paused);
+      downloads.setActive(false);
+      await downloads.resume('one');
+      expect(downloads.entryFor('one')?.userPaused, false);
+      expect(downloads.entryFor('one')?.status, OfflineDownloadStatus.paused);
+      fixture.release();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(fixture.gets, hasLength(1));
+      downloads.setActive(true);
+      await _until(() => downloads.entryFor('one')?.isComplete == true);
+      expect(fixture.ranges.last, 'bytes=1000-191999');
+    } finally {
+      fixture.release();
+      await downloads.close();
+      downloads.dispose();
+      await fixture.close();
+    }
+  });
 
-  test(
-    'global pause stops running and queued tasks without frames then resumes them',
-    () async {
-      final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
-      final downloads = fixture.manager();
-      try {
-        for (final id in ['one', 'two', 'three', 'four']) {
-          await downloads.enqueue(media: _media(id), location: _location(id));
-        }
-        await _untilPartial(downloads, 'one');
-        await _untilPartial(downloads, 'two');
-        await downloads.pauseAll();
-        expect(downloads.activeCount, 0);
-        expect(downloads.pausedCount, 4);
-        expect(downloads.entries.values.every((e) => e.userPaused), true);
-        expect(downloads.entryFor('three')?.received, 0);
-        final revision = downloads.tasksRevision;
-        fixture.release();
-        downloads.setActive(false);
-        downloads.setActive(true);
-        await Future<void>.delayed(const Duration(milliseconds: 80));
-        expect(fixture.gets, hasLength(2));
-        await downloads.resumeAll();
-        await _until(() => downloads.completedCount == 4);
-        expect(downloads.tasksRevision, revision);
-        expect(
-          downloads.activeCount + downloads.pausedCount + downloads.failedCount,
-          0,
-        );
-        expect(fixture.gets, hasLength(6));
-        expect(
-          fixture.ranges.where((r) => r == 'bytes=1000-191999'),
-          hasLength(2),
-        );
-        await downloads.delete('one');
-        expect(downloads.completedCount, 3);
-        expect(downloads.tasksRevision, revision + 1);
-        expect(downloads.taskIds, ['two', 'three', 'four']);
-      } finally {
-        fixture.release();
-        await downloads.close();
-        downloads.dispose();
-        await fixture.close();
+  test('global pause stops running and queued tasks without frames then resumes them', () async {
+    final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
+    final downloads = fixture.manager();
+    try {
+      for (final id in ['one', 'two', 'three', 'four']) {
+        await downloads.enqueue(media: _media(id), location: _location(id));
       }
-    },
-  );
+      await _untilPartial(downloads, 'one');
+      await _untilPartial(downloads, 'two');
+      await downloads.pauseAll();
+      expect(downloads.activeCount, 0);
+      expect(downloads.pausedCount, 4);
+      expect(downloads.entries.values.every((e) => e.userPaused), true);
+      expect(downloads.entryFor('three')?.received, 0);
+      final revision = downloads.tasksRevision;
+      fixture.release();
+      downloads.setActive(false);
+      downloads.setActive(true);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(fixture.gets, hasLength(2));
+      await downloads.resumeAll();
+      await _until(() => downloads.completedCount == 4);
+      expect(downloads.tasksRevision, revision);
+      expect(
+        downloads.activeCount + downloads.pausedCount + downloads.failedCount,
+        0,
+      );
+      expect(fixture.gets, hasLength(6));
+      expect(
+        fixture.ranges.where((r) => r == 'bytes=1000-191999'),
+        hasLength(2),
+      );
+      await downloads.delete('one');
+      expect(downloads.completedCount, 3);
+      expect(downloads.tasksRevision, revision + 1);
+      expect(downloads.taskIds, ['two', 'three', 'four']);
+    } finally {
+      fixture.release();
+      await downloads.close();
+      downloads.dispose();
+      await fixture.close();
+    }
+  });
 
   test('task insertion order survives state updates and restart', () async {
     final fixture = await _Fixture.create();
@@ -374,41 +506,35 @@ void main() {
     },
   );
 
-  test(
-    'close checkpoints partial bytes and restart discards an uncheckpointed tail',
-    () async {
-      final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
-      var downloads = fixture.manager();
-      try {
-        await downloads.enqueue(
-          media: _media('one'),
-          location: _location('one'),
-        );
-        await _untilPartial(downloads, 'one');
-        final path = downloads.entryFor('one')!.localPath;
-        downloads.setActive(false);
-        await downloads.close();
-        downloads.dispose();
-        final part = File('$path.part');
-        expect(await part.length(), 1000);
-        await part.writeAsBytes([9, 9, 9, 9], mode: FileMode.append);
-        downloads = fixture.manager(active: false);
-        await downloads.initialize();
-        expect(downloads.entryFor('one')?.received, 1000);
-        expect(downloads.entryFor('one')?.userPaused, false);
-        fixture.release();
-        downloads.setActive(true);
-        await _until(() => downloads.entryFor('one')?.isComplete == true);
-        expect(fixture.ranges.last, 'bytes=1000-191999');
-        expect(await File(path).readAsBytes(), fixture.bytes);
-      } finally {
-        fixture.release();
-        await downloads.close();
-        downloads.dispose();
-        await fixture.close();
-      }
-    },
-  );
+  test('close checkpoints partial bytes and restart discards an uncheckpointed tail', () async {
+    final fixture = (await _Fixture.create(hold: true))..etag = '"version-1"';
+    var downloads = fixture.manager();
+    try {
+      await downloads.enqueue(media: _media('one'), location: _location('one'));
+      await _untilPartial(downloads, 'one');
+      final path = downloads.entryFor('one')!.localPath;
+      downloads.setActive(false);
+      await downloads.close();
+      downloads.dispose();
+      final part = File('$path.part');
+      expect(await part.length(), 1000);
+      await part.writeAsBytes([9, 9, 9, 9], mode: FileMode.append);
+      downloads = fixture.manager(active: false);
+      await downloads.initialize();
+      expect(downloads.entryFor('one')?.received, 1000);
+      expect(downloads.entryFor('one')?.userPaused, false);
+      fixture.release();
+      downloads.setActive(true);
+      await _until(() => downloads.entryFor('one')?.isComplete == true);
+      expect(fixture.ranges.last, 'bytes=1000-191999');
+      expect(await File(path).readAsBytes(), fixture.bytes);
+    } finally {
+      fixture.release();
+      await downloads.close();
+      downloads.dispose();
+      await fixture.close();
+    }
+  });
 
   test(
     'an empty catalogue initializes without creating a directory or database',
@@ -868,9 +994,8 @@ class _Fixture {
               ifRange != null &&
               ifRange != (etag ?? lastModified));
       final requested = int.parse(
-        RegExp(
-          r'bytes=(\d+)-',
-        ).firstMatch(request.headers.value('range') ?? 'bytes=0-')![1]!,
+        RegExp(r'bytes=(\d+)-')
+            .firstMatch(request.headers.value('range') ?? 'bytes=0-')![1]!,
       );
       final start = full ? 0 : requested;
       response.statusCode = full ? 200 : 206;

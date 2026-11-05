@@ -200,11 +200,11 @@ class _Model extends AppModel {
   int reads = 0;
   int previewRequests = 0;
   @override
-  void ensureMediaPreview(String id) {
+  bool ensureMediaPreview(String id) {
     // Continue-watching covers intentionally prefer a progress screenshot.
     // Count only poster cards without a playback position to capture.
     if ((int.tryParse(id) ?? 0) >= 100) previewRequests++;
-    super.ensureMediaPreview(id);
+    return super.ensureMediaPreview(id);
   }
 
   @override
@@ -240,9 +240,8 @@ Future<void> _seed(String path) => Isolate.run(() {
       color: images.ColorRgb8(220, 180 - i * 8, 80),
     );
     final name = sha256.convert(utf8.encode('https://artwork.invalid/$i.jpg'));
-    File(
-      '${posters.path}/$name.image',
-    ).writeAsBytesSync(images.encodeJpg(image));
+    File('${posters.path}/$name.image')
+        .writeAsBytesSync(images.encodeJpg(image));
   }
   final store = AppStore('$path/library.db');
   try {
@@ -278,9 +277,8 @@ Future<void> _writeReport(Map<String, Object?> report) => Isolate.run(() {
     defaultValue: '../artifacts/energy-20261023',
   );
   Directory(path).createSync(recursive: true);
-  File(
-    '$path/energy-lifecycle-profile.json',
-  ).writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
+  File('$path/energy-lifecycle-profile.json')
+      .writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
 });
 
 Map<String, Object> _distribution(Iterable<double> samples) {

@@ -91,6 +91,74 @@ class ApkDecoderTest(unittest.TestCase):
                         sdk_tool.assert_not_called()
 
 
+class ApkCompatibilityTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="aiplayer-legacy-validation-")
+        self.addCleanup(temporary.cleanup)
+        self.apk = Path(temporary.name) / "fixture.apk"
+
+    def create(self, abis=validation.LEGACY_ABIS, *, omit=(), modern=False):
+        libraries = validation.CORE_LIBRARIES if modern else validation.LEGACY_CORE_LIBRARIES
+        with zipfile.ZipFile(self.apk, "w") as archive:
+            for name in ("AndroidManifest.xml", "resources.arsc", "classes.dex"):
+                archive.writestr(name, b"fixture")
+            for abi in abis:
+                for library in sorted(libraries - set(omit)):
+                    archive.writestr(f"lib/{abi}/{library}", native_library(abi))
+
+    def validate(self, *, minimum=23, signatures=("v1", "v2", "v3"), **kwargs):
+        badging = (
+            "package: name='app.aiplayer.aiplayer' versionCode='32' versionName='0.5.26'\n"
+            f"sdkVersion:'{minimum}'\ntargetSdkVersion:'35'\n"
+            "launchable-activity: name='app.aiplayer.aiplayer.MainActivity'\n"
+        )
+        signature_output = "\n".join(
+            f"Verified using {scheme} scheme (fixture): {'true' if scheme in signatures else 'false'}"
+            for scheme in ("v1", "v2", "v3")
+        ) + "\nSigner #1 certificate SHA-256 digest: " + "a1" * 32
+        with patch.object(validation, "sdk_tool", side_effect=lambda name: Path("/sdk") / name), \
+             patch.object(validation, "run", side_effect=[badging, signature_output, "Verified"]):
+            return validation.validate_apk(self.apk, **kwargs)
+
+    def test_legacy_requires_both_arm_abis_and_api23_without_unused_jni(self):
+        self.create()
+        report = self.validate(android_legacy=True, expected_version="0.5.26+32")
+        self.assertEqual(report["min_sdk"], 23)
+        self.assertEqual(report["abis"], list(validation.LEGACY_ABIS))
+        self.assertTrue(all(report["signature_schemes"].values()))
+
+    def test_release_minimum_is_strict_for_each_variant(self):
+        for legacy, minimum in ((True, 24), (True, 22), (False, 23)):
+            with self.subTest(legacy=legacy, minimum=minimum):
+                self.create(modern=not legacy)
+                with self.assertRaisesRegex(RuntimeError, "Unexpected minimum SDK"):
+                    self.validate(minimum=minimum, android_legacy=legacy)
+
+    def test_legacy_rejects_arm64_only_and_unexpected_x86(self):
+        for abis in (("arm64-v8a",), (*validation.LEGACY_ABIS, "x86_64")):
+            with self.subTest(abis=abis):
+                self.create(abis)
+                with self.assertRaisesRegex(RuntimeError, "Expected ABIs"):
+                    self.validate(android_legacy=True)
+
+    def test_legacy_still_requires_every_playback_library(self):
+        for missing in validation.LEGACY_CORE_LIBRARIES:
+            with self.subTest(missing=missing):
+                self.create(omit=(missing,))
+                with self.assertRaisesRegex(RuntimeError, "Incomplete.*playback libraries"):
+                    self.validate(android_legacy=True)
+
+    def test_modern_package_still_requires_jni(self):
+        self.create()
+        with self.assertRaisesRegex(RuntimeError, "libdartjni.so"):
+            self.validate(minimum=24)
+
+    def test_legacy_v1_signature_cannot_be_disabled_for_diagnostics(self):
+        self.create()
+        with self.assertRaisesRegex(RuntimeError, "valid v1 signature"):
+            self.validate(android_legacy=True, signatures=("v2", "v3"), require_all_signatures=False)
+
+
 class ApkCertificateTest(unittest.TestCase):
     certificate = "a592970dfc937c0ec752db77c01bf4b5bf877802dd2fe9f8cf2b40ba8fbf4f60"
     other_certificate = "b" * 64

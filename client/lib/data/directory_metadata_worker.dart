@@ -40,8 +40,11 @@ List<OfflineMediaBinding> prepareOfflineMediaBindings(
   bool inTransaction = false,
   bool restoreExcluded = true,
   bool allowLocal = false,
+  bool includeAllFiles = false,
+  bool personalMedia = false,
 }) {
   final selected = <String>{...ids};
+  final files = <String, OfflineMediaBinding>{};
   if (sourceId != null && (sourceId != 'local' || allowLocal)) {
     final configured =
         (store.local('sources') as List? ?? const [])
@@ -52,7 +55,10 @@ List<OfflineMediaBinding> prepareOfflineMediaBindings(
     final direct = configured?['kind'] == 'http';
     final folders = <String, List<SourceEntry>>{};
     for (final entry in entries) {
-      if (entry.directory || (!direct && !isVideo(entry.name))) continue;
+      if (entry.directory ||
+          (!includeAllFiles && !direct && !isVideo(entry.name))) {
+        continue;
+      }
       if (!restoreExcluded &&
           store.local(_exclusionKey(sourceId, entry.path)) == true) {
         continue;
@@ -60,6 +66,36 @@ List<OfflineMediaBinding> prepareOfflineMediaBindings(
       final existing = _sourceRecord(store, sourceId, entry.path);
       if (existing != null) {
         selected.add(existing.id);
+        continue;
+      }
+      // Preserve opaque direct-video links, whose legacy source label has no
+      // extension. Album callers explicitly mark personal media.
+      final opaqueDirect = direct && p.extension(entry.name).isEmpty;
+      if (includeAllFiles &&
+          (personalMedia || (!isVideo(entry.name) && !opaqueDirect))) {
+        final path = entry.path.replaceAll('\\', '/');
+        final id =
+            'file:${sha256.convert(utf8.encode(jsonEncode([sourceId, path])))}';
+        files[id] = (
+          SyncRecord(
+            id: id,
+            kind: 'file',
+            data: Map.unmodifiable({
+              'fileName': entry.name,
+              'title': entry.name,
+              'size': entry.size,
+              'downloadOnly': true,
+            }),
+          ),
+          Map.unmodifiable({
+            'id': id,
+            'source': sourceId,
+            'path': entry.path,
+            'size': entry.size,
+            'modified': entry.modified,
+            'downloadOnly': true,
+          }),
+        );
         continue;
       }
       (folders[p.posix.dirname(entry.path.replaceAll('\\', '/'))] ??= []).add(
@@ -112,6 +148,7 @@ List<OfflineMediaBinding> prepareOfflineMediaBindings(
     }
   }
   return List.unmodifiable([
+    ...files.values,
     for (final id in selected)
       if (store.get('media', id) case final record?)
         if (!record.deleted)
@@ -616,7 +653,13 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
     final ids = <String>[];
     final imported = <String>[];
     for (final entry in resolved.videos) {
-      var record = _sourceRecord(store, sourceId, entry.path);
+      // Reuse the binding for orphan recovery below. Missing media must not
+      // require a second indexed location lookup for every imported file.
+      final existingLocation = store.locationFor(sourceId, entry.path);
+      final boundRecord = existingLocation == null
+          ? null
+          : store.get('media', existingLocation['id']);
+      var record = boundRecord?.deleted == false ? boundRecord : null;
       if (expectedRecords != null) {
         final expected = expectedRecords[entry.path];
         if (expected == null
@@ -636,12 +679,11 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
             store.local(_exclusionKey(sourceId, entry.path)) == true) {
           continue;
         }
-        final existingLocation = store.locationFor(sourceId, entry.path);
         final orphanId = existingLocation?['id'];
         // A synchronized binding can arrive before its media record. Preserve
         // that identity so the later record enriches this file instead of
         // creating a competing library entry. Tombstones remain new imports.
-        final id = orphanId is String && store.get('media', orphanId) == null
+        final id = orphanId is String && boundRecord == null
             ? orphanId
             : const Uuid().v4();
         final identity =
@@ -656,14 +698,23 @@ DirectoryMetadataResult synchronizeDirectoryCollection(
           'duration': 0,
           if (sourceId == 'local') 'localOnly': true,
         });
+        final previewRevision =
+            id == orphanId && existingLocation?['previewRevision'] is String
+            ? existingLocation!['previewRevision'] as String
+            : matchingBrowsingPreviewRevision(
+                store,
+                sourceId,
+                entry.path,
+                entry.size,
+                entry.modified,
+              );
         store.setLocal('location:$id', {
           'id': id,
           'source': sourceId,
           'path': entry.path,
           'size': entry.size,
           'modified': entry.modified,
-          if (id == orphanId && existingLocation?['previewRevision'] is String)
-            'previewRevision': existingLocation!['previewRevision'],
+          'previewRevision': ?previewRevision,
         });
         record = store.get('media', id)!;
         imported.add(id);
@@ -763,6 +814,7 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
   String path,
   List<SourceEntry> entries, {
   required bool hideHidden,
+  bool importUnrecognized = true,
   String? anchorId,
   CancelToken? cancel,
   DirectoryListingGuard? guard,
@@ -919,6 +971,11 @@ Future<DirectoryMetadataResult?> synchronizeDirectoryListing(
     }
   }
   if (collection == null) return null;
+  if (!importUnrecognized && !collection.recognized && !verifiedAnchor) {
+    // Passive browsing can parse candidates for a later explicit/automatic
+    // lookup, but filename guesses must not create partial library episodes.
+    return DirectoryMetadataResult(collection, false, const []);
+  }
   final donors = DirectoryMetadataDonorCache(sourceId, collection.videos);
   final ids = <String>[];
   final identities = <String, ReleaseName>{};
@@ -1117,9 +1174,17 @@ class DirectoryMetadataWorker {
     String? sourceId,
     List<SourceEntry> entries = const [],
     bool allowLocal = false,
+    bool includeAllFiles = false,
+    bool personalMedia = false,
     CancelToken? cancel,
-  }) =>
-      _call('downloads', [ids, sourceId, entries, allowLocal], cancel: cancel);
+  }) => _call('downloads', [
+    ids,
+    sourceId,
+    entries,
+    allowLocal,
+    includeAllFiles,
+    personalMedia,
+  ], cancel: cancel);
 
   Future<DirectoryInspection> prepareInspection(
     String sourceId,
@@ -1153,6 +1218,7 @@ class DirectoryMetadataWorker {
     String path,
     List<SourceEntry> entries, {
     required bool hideHidden,
+    bool importUnrecognized = true,
     String? anchorId,
     CancelToken? cancel,
     DirectoryListingGuard? guard,
@@ -1163,6 +1229,7 @@ class DirectoryMetadataWorker {
     hideHidden,
     anchorId,
     guard,
+    importUnrecognized,
   ], cancel: cancel);
 
   Future<DirectoryRecognitionProgress> recognize(
@@ -1278,6 +1345,8 @@ void _directoryWorkerMain(List<dynamic> startup) async {
             sourceId: row[3] as String?,
             entries: row[4] as List<SourceEntry>,
             allowLocal: row[5] as bool,
+            includeAllFiles: row[6] as bool,
+            personalMedia: row[7] as bool,
           );
         });
       } else if (row[0] == 'records') {
@@ -1351,6 +1420,7 @@ void _directoryWorkerMain(List<dynamic> startup) async {
           hideHidden: row[5] as bool,
           anchorId: row[6] as String?,
           guard: row[7] as DirectoryListingGuard?,
+          importUnrecognized: row[8] as bool,
           cancel: cancel,
         );
       } else if (row[0] == 'episodeNames') {

@@ -46,7 +46,9 @@ void main() {
       await _wait(
         () => find.textContaining('Video 00000').evaluate().isNotEmpty,
       );
-      await tester.tap(find.byTooltip('搜索'));
+      await tester.tap(find.byTooltip('文件夹选项'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('搜索'));
       await tester.pumpAndSettle();
       final input = find.byKey(const ValueKey('folder-search-field'));
       final readsBefore = store.fullReads;
@@ -171,7 +173,7 @@ void main() {
 class _Model extends AppModel {
   _Model(super.store, super.documents) : super(backgroundWork: false);
   @override
-  void ensureMediaPreview(String id) {}
+  bool ensureMediaPreview(String id) => true;
 }
 
 class _CountingStore extends AppStore {
@@ -263,7 +265,6 @@ Future<void> _writeReport(Map<String, Object?> report) => Isolate.run(() {
     defaultValue: '../artifacts/folder-search-20261024',
   );
   Directory(path).createSync(recursive: true);
-  File(
-    '$path/folder-search-profile.json',
-  ).writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
+  File('$path/folder-search-profile.json')
+      .writeAsStringSync(const JsonEncoder.withIndent('  ').convert(report));
 });

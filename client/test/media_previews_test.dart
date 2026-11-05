@@ -23,6 +23,89 @@ class _Local extends LocalSource {
 }
 
 void main() {
+  test(
+    'personal covers select the first frame without changing resume covers',
+    () {
+      expect(
+        const MediaPreviewRequest(
+          'browse-album-personal',
+          'local',
+          '/clip.mp4',
+          3,
+        ).firstFrame,
+        isTrue,
+      );
+      expect(
+        const MediaPreviewRequest(
+          'browse-personal',
+          'local',
+          '/clip.mp4',
+          3,
+        ).firstFrame,
+        isFalse,
+      );
+      expect(
+        const MediaPreviewRequest('film', 'local', '/film.mp4', 3).firstFrame,
+        isFalse,
+      );
+      expect(
+        const MediaPreviewRequest(
+          'film',
+          'local',
+          '/film.mp4',
+          3,
+          position: 30,
+        ).firstFrame,
+        isFalse,
+      );
+    },
+  );
+  test(
+    'source edits revoke an active capture without publishing its late result',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'preview-source-edit-',
+      );
+      final captured = Completer<CancelToken>();
+      final finish = Completer<void>();
+      var published = 0, captures = 0;
+      final queue = MediaPreviewQueue(
+        directory: root,
+        openSource: (_) async => _Local(),
+        isCurrent: (_) => true,
+        onReady: (_, _, _) => published++,
+        onError: (error) => fail('$error'),
+        capture: (_, token) async {
+          captures++;
+          captured.complete(token);
+          await finish.future;
+          return MediaPreview(Uint8List.fromList([1, 2, 3]), 20, 480, 270);
+        },
+      );
+      try {
+        queue.schedule(
+          const MediaPreviewRequest('old', 'nas', '/video.mkv', 3),
+        );
+        queue.schedule(
+          const MediaPreviewRequest('queued', 'nas', '/next.mkv', 3),
+        );
+        final token = await captured.future.timeout(const Duration(seconds: 2));
+        queue.cancelSource('nas');
+        expect(token.cancelled, true);
+        finish.complete();
+        await queue.pause();
+        queue.resume();
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        expect(captures, 1);
+        expect(published, 0);
+      } finally {
+        if (!finish.isCompleted) finish.complete();
+        await queue.close();
+        await root.delete(recursive: true);
+      }
+    },
+  );
+
   testWidgets(
     'foreground resume covers update immediately and reject a frame from an older progress',
     (tester) async {
@@ -188,52 +271,48 @@ void main() {
     await queue.close();
   });
 
-  test(
-    'queue bounds pending work, deduplicates, and closes without starting paused work',
-    () async {
-      final root = await Directory.systemTemp.createTemp('aiplayer-preview-');
-      var captures = 0;
-      final queue = MediaPreviewQueue(
-        directory: root,
-        openSource: (_) async => _Local(),
-        isCurrent: (_) => true,
-        onReady: (_, _, _) {},
-        onError: (_) {},
-        capture: (_, _) async {
-          captures++;
-          return MediaPreview(Uint8List.fromList([1]), 1, 1, 1);
-        },
-      );
-      await queue.pause();
-      for (var i = 0; i < 64; i++) {
-        expect(
-          queue.schedule(MediaPreviewRequest('$i', 'local', '/$i.mkv', 3)),
-          true,
-        );
-      }
+  test('queue bounds pending work, deduplicates, and closes without starting paused work', () async {
+    final root = await Directory.systemTemp.createTemp('aiplayer-preview-');
+    var captures = 0;
+    final queue = MediaPreviewQueue(
+      directory: root,
+      openSource: (_) async => _Local(),
+      isCurrent: (_) => true,
+      onReady: (_, _, _) {},
+      onError: (_) {},
+      capture: (_, _) async {
+        captures++;
+        return MediaPreview(Uint8List.fromList([1]), 1, 1, 1);
+      },
+    );
+    await queue.pause();
+    for (var i = 0; i < 64; i++) {
       expect(
-        queue.schedule(const MediaPreviewRequest('0', 'local', '/0.mkv', 3)),
-        false,
-      );
-      expect(
-        queue.schedule(
-          const MediaPreviewRequest('0', 'local', '/replacement.mkv', 3),
-        ),
+        queue.schedule(MediaPreviewRequest('$i', 'local', '/$i.mkv', 3)),
         true,
-        reason:
-            'Replacing one pending ID must work even when all slots are occupied.',
       );
-      expect(
-        queue.schedule(
-          const MediaPreviewRequest('extra', 'local', '/extra.mkv', 3),
-        ),
-        false,
-      );
-      await queue.close();
-      expect(captures, 0);
-      await root.delete(recursive: true);
-    },
-  );
+    }
+    expect(
+      queue.schedule(const MediaPreviewRequest('0', 'local', '/0.mkv', 3)),
+      false,
+    );
+    expect(
+      queue.schedule(
+        const MediaPreviewRequest('0', 'local', '/replacement.mkv', 3),
+      ),
+      true,
+      reason: 'Replacing one pending ID must work even when all slots are occupied.',
+    );
+    expect(
+      queue.schedule(
+        const MediaPreviewRequest('extra', 'local', '/extra.mkv', 3),
+      ),
+      false,
+    );
+    await queue.close();
+    expect(captures, 0);
+    await root.delete(recursive: true);
+  });
 
   test(
     'playback cancellation releases resources and resumes one job only',
@@ -316,6 +395,188 @@ void main() {
       expect(source.closes, 1);
       await queue.close();
       await root.delete(recursive: true);
+    },
+  );
+
+  test('transient preview failures retry with a finite backoff and then become silent', () async {
+    final root = await Directory.systemTemp.createTemp('preview-retry-');
+    var captures = 0, errors = 0;
+    final exhausted = Completer<void>();
+    final queue = MediaPreviewQueue(
+      directory: root,
+      openSource: (_) async => _Local(),
+      isCurrent: (_) => true,
+      retryDelays: const [
+        Duration(milliseconds: 20),
+        Duration(milliseconds: 40),
+      ],
+      onReady: (_, _, _) => fail('failed capture saved a cover'),
+      onError: (_) {
+        if (++errors == 3) exhausted.complete();
+      },
+      capture: (_, _) async {
+        captures++;
+        throw const AppFailure('temporary network failure');
+      },
+    );
+    try {
+      queue.schedule(
+        const MediaPreviewRequest('retry', 'local', '/clip.mp4', 3),
+      );
+      await exhausted.future.timeout(const Duration(seconds: 3));
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      expect(captures, 3);
+      expect(errors, 3);
+    } finally {
+      await queue.close();
+      await root.delete(recursive: true);
+    }
+  });
+
+  test(
+    'persistent preview commit failures exhaust the same finite retry budget',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'preview-commit-retry-',
+      );
+      var captures = 0, commits = 0, errors = 0;
+      final exhausted = Completer<void>();
+      final queue = MediaPreviewQueue(
+        directory: root,
+        openSource: (_) async => _Local(),
+        isCurrent: (_) => true,
+        retryDelays: const [
+          Duration(milliseconds: 20),
+          Duration(milliseconds: 40),
+        ],
+        onReady: (_, _, _) {
+          commits++;
+          throw const AppFailure('persistent database failure');
+        },
+        onError: (_) {
+          if (++errors == 3) exhausted.complete();
+        },
+        capture: (_, _) async {
+          captures++;
+          return MediaPreview(Uint8List.fromList([1]), 1, 1, 1);
+        },
+      );
+      try {
+        queue.schedule(
+          const MediaPreviewRequest('retry', 'local', '/clip.mp4', 3),
+        );
+        await exhausted.future.timeout(const Duration(seconds: 3));
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        expect(captures, 3);
+        expect(commits, 3);
+        expect(errors, 3);
+      } finally {
+        await queue.close();
+        await root.delete(recursive: true);
+      }
+    },
+  );
+
+  test(
+    'retry pauses without frames and cancelled visible demand does not restart',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'preview-retry-paused-',
+      );
+      final failed = Completer<void>(), ready = Completer<void>();
+      var captures = 0;
+      final queue = MediaPreviewQueue(
+        directory: root,
+        openSource: (_) async => _Local(),
+        isCurrent: (_) => true,
+        retryDelays: const [Duration(milliseconds: 60)],
+        onReady: (_, _, _) => ready.complete(),
+        onError: (_) => failed.complete(),
+        capture: (_, _) async {
+          if (++captures == 1) throw const AppFailure('temporary failure');
+          return MediaPreview(Uint8List.fromList([1]), 1, 1, 1);
+        },
+      );
+      const request = MediaPreviewRequest('retry', 'local', '/clip.mp4', 3);
+      try {
+        queue.schedule(request);
+        await failed.future.timeout(const Duration(seconds: 2));
+        await queue.pause();
+        await Future<void>.delayed(const Duration(milliseconds: 180));
+        expect(captures, 1);
+        queue.cancelPending(request.id);
+        queue.resume();
+        await Future<void>.delayed(const Duration(milliseconds: 180));
+        expect(captures, 1);
+        expect(queue.schedule(request), true);
+        await ready.future.timeout(const Duration(seconds: 2));
+        expect(captures, 2);
+      } finally {
+        await queue.close();
+        await root.delete(recursive: true);
+      }
+    },
+  );
+
+  test(
+    'model retains bounded cover demand when the native queue fills',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'preview-model-capacity-',
+      );
+      final store = AppStore(':memory:');
+      final first = Completer<void>(),
+          release = Completer<void>(),
+          complete = Completer<void>();
+      var captures = 0;
+      final model = AppModel(
+        store,
+        root,
+        backgroundWork: false,
+        enableThumbnails: true,
+        previewCapture: (_, token) async {
+          if (++captures == 1) {
+            first.complete();
+            await Future.any([release.future, token.whenCancelled]);
+            token.check();
+          }
+          return MediaPreview(Uint8List.fromList([1]), 1, 1, 1);
+        },
+      );
+      try {
+        final ids = <String>[];
+        for (var i = 0; i < 128; i++) {
+          final file = await File('${root.path}/$i.mp4').writeAsBytes([1]);
+          ids.add(
+            model.addMedia(
+              'local',
+              SourceEntry(name: '$i.mp4', path: file.path, size: 1),
+            ),
+          );
+        }
+        for (final id in ids) {
+          expect(model.ensureMediaPreview(id), true);
+        }
+        void changed() {
+          if (ids.every((id) => store.local('preview:$id') != null) &&
+              !complete.isCompleted) {
+            complete.complete();
+          }
+        }
+
+        model.addListener(changed);
+        await first.future.timeout(const Duration(seconds: 3));
+        release.complete();
+        await complete.future.timeout(const Duration(seconds: 10));
+        expect(captures, 128);
+        model.removeListener(changed);
+      } finally {
+        if (!release.isCompleted) release.complete();
+        model.dispose();
+        await model.flushMetadataTasks();
+        store.dispose();
+        await root.delete(recursive: true);
+      }
     },
   );
 

@@ -20,7 +20,7 @@ class MediaDetailsOverview extends StatelessWidget {
   final String? latestLabel;
   final ValueChanged<SyncRecord> onPlay;
   final VoidCallback? onMatch;
-  final VoidCallback onSort;
+  final VoidCallback? onSort;
   final VoidCallback? onDownload;
   final String? availabilityLabel;
 
@@ -32,7 +32,7 @@ class MediaDetailsOverview extends StatelessWidget {
     required this.latest,
     this.latestLabel,
     required this.onPlay,
-    required this.onSort,
+    this.onSort,
     this.onMatch,
     this.availabilityLabel,
     this.onDownload,
@@ -93,14 +93,10 @@ class MediaDetailsContinue extends StatelessWidget {
 }
 
 class MediaDetailsPlaylistHeader extends StatelessWidget {
-  final VoidCallback onSort;
+  final VoidCallback? onSort;
   final VoidCallback? onDownload;
 
-  const MediaDetailsPlaylistHeader({
-    super.key,
-    required this.onSort,
-    this.onDownload,
-  });
+  const MediaDetailsPlaylistHeader({super.key, this.onSort, this.onDownload});
 
   @override
   Widget build(BuildContext context) => Row(
@@ -112,11 +108,12 @@ class MediaDetailsPlaylistHeader extends StatelessWidget {
           onPressed: onDownload,
           icon: const Icon(Icons.download_outlined),
         ),
-      IconButton(
-        tooltip: '排序与显示',
-        onPressed: onSort,
-        icon: const Icon(Icons.sort_rounded),
-      ),
+      if (onSort != null)
+        IconButton(
+          tooltip: '排序与显示',
+          onPressed: onSort,
+          icon: const Icon(Icons.sort_rounded),
+        ),
     ],
   );
 }
@@ -128,6 +125,7 @@ class MediaDetailsEpisodeTile extends StatefulWidget {
   final Widget? trailing;
   final VoidCallback? onLongPress;
   final bool showTechnical;
+  final bool showTrailing;
   final String? title;
   final String? sourceId;
   final SourceEntry? sourceEntry;
@@ -140,6 +138,7 @@ class MediaDetailsEpisodeTile extends StatefulWidget {
     this.trailing,
     this.onLongPress,
     this.showTechnical = true,
+    this.showTrailing = true,
     this.title,
     this.sourceId,
     this.sourceEntry,
@@ -266,9 +265,8 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile>
         (progress?['duration'] as num?)?.toDouble() ??
         model.mediaDuration(item);
     final progressLabel = playbackProgressLabel(progress, duration: duration);
-    final updated = DateTime.tryParse(
-      '${progress?['updatedAt'] ?? ''}',
-    )?.toLocal();
+    final updated = DateTime.tryParse('${progress?['updatedAt'] ?? ''}')
+        ?.toLocal();
     final position = (progress?['position'] as num?)?.toDouble() ?? 0;
     _view = (
       title: label.isEmpty ? model.displayTitle(item) : label,
@@ -342,6 +340,14 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile>
               children: [
                 MediaArtwork(
                   thumbnail: _view.thumbnail,
+                  thumbnailRevision: model.mediaPreviewImageRevision(item.id),
+                  thumbnailChanges: model,
+                  thumbnailRevisionOf: () =>
+                      model.mediaPreviewImageRevision(item.id),
+                  onThumbnailError: (path, error) =>
+                      model.retryMissingMediaPreview(item.id, path, error),
+                  onThumbnailReady: (path) =>
+                      model.mediaPreviewReady(item.id, path),
                   loadWhileScrolling: true,
                   placeholder: ColoredBox(
                     color: GlassPalette.of(context).field,
@@ -385,13 +391,16 @@ class _MediaDetailsEpisodeTileState extends State<MediaDetailsEpisodeTile>
         subtitle: _episodeProgress(context),
         onTap: widget.onPlay,
         onLongPress: widget.onLongPress,
-        trailing: SizedBox(
-          key: const ValueKey('episode-action'),
-          width: 40,
-          height: 48,
-          child:
-              widget.trailing ?? const Icon(Icons.play_arrow_rounded, size: 20),
-        ),
+        trailing: !widget.showTrailing
+            ? null
+            : SizedBox(
+                key: const ValueKey('episode-action'),
+                width: 40,
+                height: 48,
+                child:
+                    widget.trailing ??
+                    const Icon(Icons.play_arrow_rounded, size: 20),
+              ),
       ),
     );
   }

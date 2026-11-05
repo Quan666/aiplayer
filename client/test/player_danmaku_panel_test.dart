@@ -129,6 +129,34 @@ void main() {
     );
   });
 
+  testWidgets('a few comments size the sheet to their wrapped content', (
+    tester,
+  ) async {
+    _desktopSize(tester);
+    final (session, danmaku) = _sessions();
+    danmaku.showComments(const [
+      DanmakuComment(1, '第一条弹幕', 0xffffff, 0),
+      DanmakuComment(2, '第二条弹幕', 0xffffff, 0),
+      DanmakuComment(3, '第三条弹幕', 0xffffff, 0),
+    ]);
+    session.position.value = const Duration(seconds: 2);
+    await _open(tester, session, danmaku);
+    await tester.tap(find.text('列表'));
+    await tester.pumpAndSettle();
+    final list = tester.getSize(find.byType(PlayerDanmakuList));
+    expect(list.height, 72);
+    expect(tester.getSize(find.byType(PlayerGlass)).height, lessThan(220));
+    expect(_timeScroll(tester).maxScrollExtent, 0);
+    expect(
+      tester
+          .widget<Semantics>(find.byKey(const ValueKey('danmaku-comment-1')))
+          .properties
+          .selected,
+      isTrue,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('tapping a comment time or text copies the complete row', (
     tester,
   ) async {

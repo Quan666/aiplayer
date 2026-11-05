@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+
 import '../data/app_model.dart';
 import 'glass.dart';
 import 'theme/library_styles.dart';
@@ -11,13 +12,13 @@ Future<void> showMetadataTasks(
   context: context,
   isScrollControlled: true,
   builder: (sheet) => SafeArea(
-    child: SizedBox(
-      height: MediaQuery.sizeOf(sheet).height * .6,
+    child: GlassSheetBody(
       child: AnimatedBuilder(
         animation: model,
         builder: (context, _) {
           final tasks = model.metadataTasks;
           return Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 4, 4, 4),
@@ -37,8 +38,9 @@ Future<void> showMetadataTasks(
                   ],
                 ),
               ),
-              Expanded(
+              Flexible(
                 child: ListView.builder(
+                  shrinkWrap: true,
                   padding: const EdgeInsets.only(bottom: 8),
                   itemCount: tasks.length,
                   itemBuilder: (context, index) {

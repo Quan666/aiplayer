@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:math' as math;
+
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+
 import '../core/logger.dart';
 import '../core/network.dart';
 import '../data/app_model.dart';
@@ -597,6 +599,7 @@ class _MediaSummaryState extends State<MediaSummary> {
       if (result == null) {
         result = await translateText(
           widget.summary,
+          transport: widget.model.thirdPartyAiTransport,
           config: config,
           cancel: token,
         );

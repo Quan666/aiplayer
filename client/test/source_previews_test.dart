@@ -1,4 +1,5 @@
 import 'package:aiplayer/ui/media_artwork.dart';
+
 import 'dart:async';
 import 'dart:io';
 
@@ -67,6 +68,16 @@ void main() {
     (tester) async {
       final fixture = _Fixture();
       try {
+        // Recognition belongs to an earlier explicit directory entry. Merely
+        // showing child folders now reads their existing previews locally.
+        for (var index = 0; index < _names.length; index++) {
+          await fixture.model.catalog.inspect(
+            'nas',
+            '$index/',
+            _files(index),
+            directoryModified: 7,
+          );
+        }
         await fixture.mount(tester);
         await tester.tap(find.text('NAS'));
         await tester.pumpAndSettle();
@@ -99,85 +110,79 @@ void main() {
     },
   );
 
-  test(
-    'directory previews survive catalog recreation and invalidate on content, source and preferences',
-    () async {
-      final store = AppStore(':memory:');
-      addTearDown(store.dispose);
-      store.setLocal('sources', [
-        {'id': 'nas', 'kind': 'webdav', 'url': 'https://old.example/'},
-      ]);
-      final catalog = _PreviewCatalog(store, completeNames: true);
-      final entries = _files(0);
-      final first = await catalog.inspect(
+  test('directory previews survive catalog recreation and invalidate on content, source and preferences', () async {
+    final store = AppStore(':memory:');
+    addTearDown(store.dispose);
+    store.setLocal('sources', [
+      {'id': 'nas', 'kind': 'webdav', 'url': 'https://old.example/'},
+    ]);
+    final catalog = _PreviewCatalog(store, completeNames: true);
+    final entries = _files(0);
+    final first = await catalog.inspect(
+      'nas',
+      '0/',
+      entries,
+      directoryModified: 7,
+    );
+    expect(first!.poster, 'https://posters.example/作品甲.jpg');
+    await catalog.inspect('nas', '0/', entries, directoryModified: 7);
+    expect(catalog.resolutions, 1);
+    final restored = _PreviewCatalog(store, completeNames: true);
+    expect(
+      restored.directoryPreview('nas', '0/', modified: 7)!.collection!.poster,
+      first.poster,
+    );
+    expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
+    final replacement = [
+      for (final entry in _files(1))
+        SourceEntry(
+          name: entry.name,
+          path: entry.path.replaceFirst('1/', '0/'),
+          size: entry.size,
+          modified: 8,
+        ),
+    ];
+    expect(
+      (await restored.inspect(
         'nas',
         '0/',
-        entries,
-        directoryModified: 7,
-      );
-      expect(first!.poster, 'https://posters.example/作品甲.jpg');
-      await catalog.inspect('nas', '0/', entries, directoryModified: 7);
-      expect(catalog.resolutions, 1);
-      final restored = _PreviewCatalog(store, completeNames: true);
-      expect(
-        restored.directoryPreview('nas', '0/', modified: 7)!.collection!.poster,
-        first.poster,
-      );
-      expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
-      final replacement = [
-        for (final entry in _files(1))
-          SourceEntry(
-            name: entry.name,
-            path: entry.path.replaceFirst('1/', '0/'),
-            size: entry.size,
-            modified: 8,
-          ),
-      ];
-      expect(
-        (await restored.inspect(
-          'nas',
-          '0/',
-          replacement,
-          directoryModified: 8,
-        ))!.title,
-        '作品乙',
-      );
-      expect(restored.resolutions, 1);
-      store.setLocal('sources', [
-        {'id': 'nas', 'kind': 'webdav', 'url': 'https://new.example/'},
-      ]);
-      expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
-      await restored.inspect('nas', '0/', replacement, directoryModified: 8);
-      store.setLocal('settings', {'metadataStrategy': 'balanced'});
-      expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
-      await restored.inspect('nas', '0/', replacement, directoryModified: 8);
-      restored.invalidateDirectoryPreviews('nas');
-      expect(restored.directoryPreview('nas', '0/'), isNull);
-      expect(store.localEntries('directory-preview:'), isEmpty);
-    },
-  );
+        replacement,
+        directoryModified: 8,
+      ))!.title,
+      '作品乙',
+    );
+    expect(restored.resolutions, 1);
+    store.setLocal('sources', [
+      {'id': 'nas', 'kind': 'webdav', 'url': 'https://new.example/'},
+    ]);
+    expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
+    await restored.inspect('nas', '0/', replacement, directoryModified: 8);
+    store.setLocal('settings', {'metadataStrategy': 'balanced'});
+    expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
+    await restored.inspect('nas', '0/', replacement, directoryModified: 8);
+    restored.invalidateDirectoryPreviews('nas');
+    expect(restored.directoryPreview('nas', '0/'), isNull);
+    expect(store.localEntries('directory-preview:'), isEmpty);
+  });
 
-  test(
-    'old successful preview remains available until its directory identity changes',
-    () async {
-      final store = AppStore(':memory:');
-      addTearDown(store.dispose);
-      final catalog = _PreviewCatalog(store);
-      await catalog.inspect('nas', '0/', _files(0), directoryModified: 7);
-      final entry = store.localEntries('directory-preview:').entries.single;
-      store.setLocal(entry.key, {...entry.value as Map, 'at': 0});
-      final restored = _PreviewCatalog(store);
-      expect(restored.directoryPreview('nas', '0/', modified: 7), isNotNull);
-      expect(
-        restored
-            .directoryPreview('nas', '0/', modified: 7, allowStale: true)!
-            .collection!
-            .poster,
-        'https://posters.example/作品甲.jpg',
-      );
-      expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
-    },
-  );
+  test('old successful preview remains available until its directory identity changes', () async {
+    final store = AppStore(':memory:');
+    addTearDown(store.dispose);
+    final catalog = _PreviewCatalog(store);
+    await catalog.inspect('nas', '0/', _files(0), directoryModified: 7);
+    final entry = store.localEntries('directory-preview:').entries.single;
+    store.setLocal(entry.key, {...entry.value as Map, 'at': 0});
+    final restored = _PreviewCatalog(store);
+    expect(restored.directoryPreview('nas', '0/', modified: 7), isNotNull);
+    expect(
+      restored
+          .directoryPreview('nas', '0/', modified: 7, allowStale: true)!
+          .collection!
+          .poster,
+      'https://posters.example/作品甲.jpg',
+    );
+    expect(restored.directoryPreview('nas', '0/', modified: 8), isNull);
+  });
 }
 
 const _names = ['作品甲', '作品乙', '作品丙', '作品丁'];

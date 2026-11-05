@@ -16,7 +16,10 @@ extension MediaAiIdentification on AppModel {
   ]);
 
   Future<SubtitleAiConfig> _metadataAiConfig() async {
+    thirdPartyNetwork.check();
     final token = await secrets.read(key: 'aiSubtitleToken') ?? '';
+    thirdPartyNetwork.check();
+    if (token.trim().isEmpty) throw const AppFailure('请先填写 AI 服务 API Key。');
     AppLog.instance.rememberSecret(token);
     return SubtitleAiConfig(
       origin: '${settings['aiSubtitleOrigin'] ?? 'https://api.openai.com/v1'}',
@@ -77,13 +80,21 @@ extension MediaAiIdentification on AppModel {
   }) async {
     cancel.check();
     if (_disposed || _clearingCaches) throw const Cancelled();
-    final parsed = store.path == ':memory:'
-        ? await MediaAiRecognition(
-            store,
-          ).analyzeFolderFilenames(fileNames, config: config, cancel: cancel)
-        : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
-            store.path,
-          )).analyzeFolderFilenames(fileNames, config, cancel: cancel);
+    final parsed = await thirdPartyNetwork.run((request) async {
+      final current = await secrets.read(key: 'aiSubtitleToken') ?? '';
+      request.check();
+      if (current.trim().isEmpty || current.trim() != config.token.trim()) {
+        throw const AppFailure('AI 服务配置已变更，请重新发起请求。');
+      }
+      return store.path == ':memory:'
+          ? MediaAiRecognition(
+              store,
+              transport: thirdPartyAiTransport,
+            ).analyzeFolderFilenames(fileNames, config: config, cancel: request)
+          : (_directoryMetadataWorker ??= DirectoryMetadataWorker(
+              store.path,
+            )).analyzeFolderFilenames(fileNames, config, cancel: request);
+    }, cancel: cancel);
     cancel.check();
     if (_disposed || _clearingCaches) throw const Cancelled();
     return parsed;
@@ -186,8 +197,9 @@ extension MediaAiIdentification on AppModel {
       return false;
     }
     return manual ||
-        (preferences.aiMetadataEnabled &&
-            preferences.metadataStrategy != 'off' &&
+        (current.data['personalMedia'] != true &&
+            preferences.aiMetadataEnabled &&
+            automaticMetadataEnabled &&
             _metadataAiContext == context &&
             store.local('manualMetadata:${record.id}') != true &&
             current.data['bangumiId'] == null &&
@@ -259,8 +271,7 @@ extension MediaAiIdentification on AppModel {
     List<SourceEntry> entries,
     CancelToken? cancel,
   ) async {
-    if (!preferences.aiMetadataEnabled ||
-        preferences.metadataStrategy == 'off') {
+    if (!preferences.aiMetadataEnabled || !automaticMetadataEnabled) {
       return null;
     }
     final context = _metadataAiContext;
@@ -280,7 +291,7 @@ extension MediaAiIdentification on AppModel {
       token.check();
       if (_disposed ||
           context != _metadataAiContext ||
-          preferences.metadataStrategy == 'off') {
+          !automaticMetadataEnabled) {
         return null;
       }
       final match = matches[MediaAiRecognition.filenameOnly(video.name)];
@@ -302,7 +313,7 @@ extension MediaAiIdentification on AppModel {
     token.check();
     if (_disposed ||
         context != _metadataAiContext ||
-        preferences.metadataStrategy == 'off') {
+        !automaticMetadataEnabled) {
       return null;
     }
     final subject = first!.subject!;

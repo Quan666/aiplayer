@@ -16,6 +16,8 @@ class _Downloads extends OfflineDownloads {
   int entryReads = 0, listReads = 0, listeners = 0;
   int _active = 0, _paused = 0, _failed = 0, _completed = 0;
   Completer<void>? pauseGate;
+  Completer<OfflineDownloadSelection>? selectionGate;
+  final captures = <String, List<String>>{};
 
   _Downloads(Directory directory)
     : super(
@@ -146,6 +148,49 @@ class _Downloads extends OfflineDownloads {
   }
 
   @override
+  Future<OfflineDownloadSelection> captureSelection() async {
+    if (selectionGate != null) return selectionGate!.future;
+    final token = 'selection:${captures.length}';
+    captures[token] = List.of(ids);
+    return OfflineDownloadSelection(token: token, ids: ids);
+  }
+
+  @override
+  Future<void> releaseSelection(OfflineDownloadSelection selection) async {
+    captures.remove(selection.token);
+  }
+
+  @override
+  Future<void> applyBatch(
+    OfflineDownloadSelection selection,
+    OfflineDownloadBatchAction action, {
+    bool all = false,
+    Set<String> ids = const {},
+  }) async {
+    actions.add('batch:${action.name}');
+    for (final id in captures[selection.token] ?? const <String>[]) {
+      if (all == ids.contains(id)) continue;
+      final status = values[id]?.status;
+      if (status == null) continue;
+      switch (action) {
+        case OfflineDownloadBatchAction.pause:
+          if (status == OfflineDownloadStatus.queued ||
+              status == OfflineDownloadStatus.downloading ||
+              status == OfflineDownloadStatus.paused) {
+            put(id, status: OfflineDownloadStatus.paused);
+          }
+        case OfflineDownloadBatchAction.resume:
+          if (status == OfflineDownloadStatus.paused ||
+              status == OfflineDownloadStatus.failed) {
+            put(id);
+          }
+        case OfflineDownloadBatchAction.delete:
+          remove(id);
+      }
+    }
+  }
+
+  @override
   Future<void> pauseAll() async {
     actions.add('pause-all');
     for (final id in List<String>.of(ids)) {
@@ -198,6 +243,135 @@ void main() {
   );
 
   testWidgets(
+    'download sheet fits empty and short queues and caps long queues',
+    (tester) async {
+      await tester.pumpWidget(
+        shell(
+          Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showDownloadTasks(context, model),
+              child: const Text('打开下载'),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('打开下载'));
+      await tester.pumpAndSettle();
+      final body = find.byType(GlassSheetBody);
+      final emptyHeight = tester.getSize(body).height;
+      expect(emptyHeight, lessThan(160));
+      manager.put('single');
+      await tester.pumpAndSettle();
+      final shortHeight = tester.getSize(body).height;
+      expect(shortHeight, greaterThan(emptyHeight));
+      expect(shortHeight, lessThan(280));
+      for (var index = 0; index < 5000; index++) {
+        manager.put('long-$index', notify: false);
+      }
+      manager.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(tester.getSize(body).height, lessThanOrEqualTo(600 * .82));
+      expect(
+        find.byType(LinearProgressIndicator).evaluate().length,
+        lessThan(30),
+      );
+      expect(find.text('long-4999.mkv'), findsOneWidget);
+      await tester.tap(find.byTooltip('关闭'));
+      await tester.pumpAndSettle();
+      expect(body, findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'stable multi-selection pauses resumes and confirms mixed deletion',
+    (tester) async {
+      manager.put('done', status: OfflineDownloadStatus.completed);
+      manager.put('failed', status: OfflineDownloadStatus.failed);
+      manager.put('paused', status: OfflineDownloadStatus.paused);
+      manager.put('active');
+      await tester.pumpWidget(shell(DownloadTasksSheet(model: model)));
+      await tester.tap(find.byTooltip('多选'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('全选'));
+      await tester.pump();
+      expect(find.text('已选 4'), findsOneWidget);
+      manager.put('late');
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('download-task-select:late')),
+        findsNothing,
+      );
+      await tester.tap(find.byTooltip('暂停所选'));
+      await tester.pumpAndSettle();
+      expect(manager.values['active']!.status, OfflineDownloadStatus.paused);
+      expect(manager.values['late']!.status, OfflineDownloadStatus.downloading);
+      expect(manager.values['failed']!.status, OfflineDownloadStatus.failed);
+      expect(manager.values['done']!.status, OfflineDownloadStatus.completed);
+      await tester.tap(
+        find.byKey(const ValueKey('download-task-select:active')),
+      );
+      await tester.pump();
+      expect(find.text('已选 3'), findsOneWidget);
+      await tester.tap(find.byTooltip('继续所选'));
+      await tester.pumpAndSettle();
+      expect(manager.values['active']!.status, OfflineDownloadStatus.paused);
+      expect(
+        manager.values['failed']!.status,
+        OfflineDownloadStatus.downloading,
+      );
+      expect(
+        manager.values['paused']!.status,
+        OfflineDownloadStatus.downloading,
+      );
+      await tester.tap(find.byTooltip('删除所选'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('清理其临时文件'), findsOneWidget);
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+      expect(manager.actions, isNot(contains('batch:delete')));
+      expect(find.text('已选 3'), findsOneWidget);
+      await tester.tap(find.byTooltip('删除所选'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('删除'));
+      await tester.pumpAndSettle();
+      expect(manager.values.keys, unorderedEquals(['active', 'late']));
+      expect(manager.actions.where((a) => a.startsWith('batch:')), [
+        'batch:pause',
+        'batch:resume',
+        'batch:delete',
+      ]);
+      expect(manager.captures, isEmpty);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'select all is lazy and an open confirmation cannot outlive its sheet',
+    (tester) async {
+      for (var i = 0; i < 5000; i++) {
+        manager.put('task-$i', notify: false);
+      }
+      await tester.pumpWidget(shell(DownloadTasksSheet(model: model)));
+      await tester.tap(find.byTooltip('多选'));
+      await tester.pumpAndSettle();
+      manager.entryReads = 0;
+      await tester.tap(find.text('全选'));
+      await tester.pump();
+      expect(find.text('已选 5000'), findsOneWidget);
+      expect(find.byType(Checkbox).evaluate().length, lessThan(30));
+      expect(manager.entryReads, lessThan(100));
+      await tester.tap(find.byTooltip('删除所选'));
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpAndSettle();
+      expect(manager.actions, isEmpty);
+      expect(manager.captures, isEmpty);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
     'task button hides with no tasks and returns for completed or pending tasks',
     (tester) async {
       await tester.pumpWidget(
@@ -220,7 +394,15 @@ void main() {
       await tester.tap(find.byTooltip('下载任务'));
       await tester.pumpAndSettle();
       expect(find.text('done.mkv'), findsOneWidget);
-      await tester.tap(find.byTooltip('删除离线视频'));
+      await tester.tap(find.byTooltip('保存位置'));
+      await tester.pumpAndSettle();
+      expect(
+        find.widgetWithText(SelectableText, '/offline/done.mkv'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('关闭').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('删除下载文件'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('删除'));
       await tester.pumpAndSettle();
@@ -289,7 +471,7 @@ void main() {
     await tester.pumpWidget(shell(DownloadTasksSheet(model: model)));
     await tester.pumpAndSettle();
     expect(find.text('Season 1'), findsOneWidget);
-    expect(find.text('读取文件夹 · 12 个视频'), findsOneWidget);
+    expect(find.text('读取文件夹 · 12 个文件'), findsOneWidget);
     expect(find.byIcon(Icons.folder_outlined), findsOneWidget);
     expect(find.byType(LinearProgressIndicator), findsNothing);
     expect(find.byTooltip('暂停下载'), findsOneWidget);
@@ -301,7 +483,7 @@ void main() {
       status: OfflineDownloadStatus.paused,
     );
     await tester.pump();
-    expect(find.text('已暂停 · 20 个视频'), findsOneWidget);
+    expect(find.text('已暂停 · 20 个文件'), findsOneWidget);
     expect(find.byTooltip('继续下载'), findsOneWidget);
     await tester.tap(find.byTooltip('取消下载'));
     await tester.pumpAndSettle();
@@ -342,7 +524,7 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(manager.actions, contains('cancel:active'));
-    await tester.tap(find.byTooltip('删除离线视频'));
+    await tester.tap(find.byTooltip('删除下载文件'));
     await tester.pumpAndSettle();
     expect(manager.actions, isNot(contains('delete:done')));
     await tester.tap(find.text('删除'));

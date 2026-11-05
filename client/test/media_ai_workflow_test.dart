@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/library_catalog.dart';
@@ -172,6 +173,7 @@ void main() {
     store = AppStore(':memory:')
       ..setLocal('settings', {
         'metadataStrategy': 'conservative',
+        'autoIdentifyOnFolderOpen': true,
         'aiSubtitleOrigin': 'https://ai.example/v1',
         'aiSubtitleModel': 'configured-model',
         'aiSubtitlePrompt': 'Subtitle-only custom instructions',
@@ -199,7 +201,7 @@ void main() {
 
   test('automatic AI stays disabled unless opted in', () async {
     final record = add('one');
-    await model.refreshMetadata();
+    await model.startMetadataTask([record], manual: false).done;
     expect(model.fakeCatalog.normalCalls, 1);
     expect(model.ai.filenames, isEmpty);
     expect(store.get('media', record.id)!.revision, record.revision);
@@ -209,7 +211,7 @@ void main() {
     await model.updatePreferences({'aiMetadataEnabled': true});
     model.fakeCatalog.normalSubject = _subject();
     final record = add('one');
-    await model.refreshMetadata();
+    await model.startMetadataTask([record], manual: false).done;
     expect(store.get('media', record.id)!.data['bangumiId'], '7');
     expect(model.ai.filenames, isEmpty);
   });
@@ -220,7 +222,7 @@ void main() {
       'metadataStrategy': 'off',
     });
     final record = add('one');
-    await model.refreshMetadata();
+    await model.startMetadataTask([record], manual: false).done;
     expect(model.fakeCatalog.normalCalls, 0);
     expect(model.ai.filenames, isEmpty);
     expect(store.get('media', record.id)!.revision, record.revision);
@@ -229,7 +231,7 @@ void main() {
   test('automatic fallback uses configured AI and official metadata', () async {
     await model.updatePreferences({'aiMetadataEnabled': true});
     final record = add('one');
-    await model.refreshMetadata();
+    await model.startMetadataTask([record], manual: false).done;
     final data = store.get('media', record.id)!.data;
     expect(model.ai.filenames, [record.data['fileName']]);
     expect(model.ai.configs.single.origin, Uri.parse('https://ai.example/v1'));
@@ -354,23 +356,20 @@ void main() {
     expect(store.get('media', record.id)!.revision, record.revision);
   });
 
-  test(
-    'multilingual search preserves provider and media-type candidate identities',
-    () async {
-      model.ai.titles = {'zh': '示例作品', 'ja': '作品例'};
-      model.fakeCatalog.candidates = [
-        _subject(),
-        {..._subject(), 'provider': 'tmdb'},
-        {..._subject(), 'provider': 'tmdb', 'mediaType': 'movie'},
-      ];
-      final match = await model.searchMetadataWithAi(
-        'Example.mkv',
-        cancel: CancelToken(),
-      );
-      expect(model.fakeCatalog.queries, ['Example', '示例作品', '作品例']);
-      expect(match.candidates, hasLength(3));
-    },
-  );
+  test('multilingual search preserves provider and media-type candidate identities', () async {
+    model.ai.titles = {'zh': '示例作品', 'ja': '作品例'};
+    model.fakeCatalog.candidates = [
+      _subject(),
+      {..._subject(), 'provider': 'tmdb'},
+      {..._subject(), 'provider': 'tmdb', 'mediaType': 'movie'},
+    ];
+    final match = await model.searchMetadataWithAi(
+      'Example.mkv',
+      cancel: CancelToken(),
+    );
+    expect(model.fakeCatalog.queries, ['Example', '示例作品', '作品例']);
+    expect(match.candidates, hasLength(3));
+  });
 
   test(
     'folder progress leaves parsing while shared catalogue work is pending',

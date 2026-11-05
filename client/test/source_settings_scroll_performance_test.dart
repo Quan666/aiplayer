@@ -62,6 +62,14 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  void seedRecognizedEpisodes() {
+    for (final entry in _Episodes.entries) {
+      final id = model.addMedia('nas', entry);
+      final record = store.get('media', id)!;
+      store.save('media', id, {...record.data, 'bangumiId': '42'});
+    }
+  }
+
   testWidgets('source notifications reuse folder and local media snapshots', (
     tester,
   ) async {
@@ -156,9 +164,7 @@ void main() {
   testWidgets('hidden source browser coalesces metadata notifications', (
     tester,
   ) async {
-    for (final entry in _Episodes.entries) {
-      model.addMedia('nas', entry);
-    }
+    seedRecognizedEpisodes();
     late StateSetter update;
     var active = true;
     await mount(
@@ -219,7 +225,16 @@ void main() {
           widget is TextField &&
           widget.decoration?.labelText == 'TMDB API Key / 读取令牌',
     );
-    await tester.ensureVisible(field);
+    await tester.scrollUntilVisible(
+      field,
+      250,
+      scrollable: find
+          .descendant(
+            of: find.byKey(const PageStorageKey('settings-general')),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
     await tester.enterText(field, 'unsaved-private-key');
     FocusManager.instance.primaryFocus?.unfocus();
     await tester.pumpAndSettle();
@@ -231,7 +246,11 @@ void main() {
       model.changed();
       await tester.pumpAndSettle();
     }
-    expect(model.preferencesReads, 0);
+    expect(
+      model.preferencesReads,
+      1,
+      reason: 'The model reads the network policy once for the changed settings revision; the hidden page must not read it again.',
+    );
     update(() => active = true);
     await tester.pumpAndSettle();
     expect(
@@ -398,9 +417,7 @@ void main() {
   testWidgets(
     'browser layout rebuilds reuse collection records until data changes',
     (tester) async {
-      for (final entry in _Episodes.entries) {
-        model.addMedia('nas', entry);
-      }
+      seedRecognizedEpisodes();
       Widget browser(double width) => SizedBox(
         width: width,
         child: SourceBrowser(

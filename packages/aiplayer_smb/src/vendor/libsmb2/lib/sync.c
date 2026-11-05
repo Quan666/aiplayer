@@ -114,8 +114,14 @@ static int wait_for_reply(struct smb2_context *smb2,
 		pfd.events = smb2_which_events(smb2);
 
 		if (poll(&pfd, 1, 1000) < 0) {
-			smb2_set_error(smb2, "Poll failed");
-			return -1;
+			if (errno != EINTR) {
+				smb2_set_error(smb2, "Poll failed");
+				return -1;
+			}
+                        /* A runtime/profiler signal does not break the SMB
+                         * connection. Still run timeout handling below: a
+                         * signal stream must not extend a stalled request. */
+                        pfd.revents = 0;
 		}
                 if (smb2->timeout) {
                         smb2_timeout_pdus(smb2);

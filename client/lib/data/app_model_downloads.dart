@@ -74,8 +74,9 @@ extension AppModelDownloads on AppModel {
 
   Future<void> _downloadSourceEntries(
     String sourceId,
-    Iterable<SourceEntry> entries,
-  ) async {
+    Iterable<SourceEntry> entries, {
+    bool personalMedia = false,
+  }) async {
     if (_disposed) throw const Cancelled();
     if (sourceId == 'local') return;
     final selected = entries.take(2001).toList();
@@ -87,13 +88,18 @@ extension AppModelDownloads on AppModel {
         sourceId: sourceId,
         entries: files,
         allowEmpty: folders.isNotEmpty,
+        personalMedia: personalMedia,
       );
     }
     for (final folder in folders) {
       if (_disposed) throw const Cancelled();
-      await downloads.enqueueFolder(sourceId: sourceId, entry: folder);
+      await downloads.enqueueFolder(
+        sourceId: sourceId,
+        entry: folder,
+        personalMedia: personalMedia,
+      );
     }
-    if (selected.isEmpty) throw const AppFailure('没有可下载的视频或文件夹。');
+    if (selected.isEmpty) throw const AppFailure('没有可下载的文件或文件夹。');
   }
 
   Future<void> _prepareAndDownload({
@@ -101,6 +107,7 @@ extension AppModelDownloads on AppModel {
     String? sourceId,
     List<SourceEntry> entries = const [],
     bool allowEmpty = false,
+    bool personalMedia = false,
   }) async {
     final bindings = store.path == ':memory:'
         ? prepareOfflineMediaBindings(
@@ -108,6 +115,8 @@ extension AppModelDownloads on AppModel {
             ids: ids,
             sourceId: sourceId,
             entries: entries,
+            includeAllFiles: true,
+            personalMedia: personalMedia,
           )
         : await (_directoryMetadataWorker ??= DirectoryMetadataWorker(
             store.path,
@@ -115,14 +124,19 @@ extension AppModelDownloads on AppModel {
             ids: ids,
             sourceId: sourceId,
             entries: entries,
+            includeAllFiles: true,
+            personalMedia: personalMedia,
             cancel: _metadataCancel,
           );
     if (_disposed) throw const Cancelled();
     if (bindings.isEmpty) {
       if (allowEmpty) return;
-      throw const AppFailure('没有可下载的视频位置。');
+      throw const AppFailure('没有可下载的文件位置。');
     }
-    if (entries.isNotEmpty) _notifyDownloadsChanged();
+    if (entries.isNotEmpty &&
+        bindings.any((binding) => binding.$1.data['downloadOnly'] != true)) {
+      _notifyDownloadsChanged();
+    }
     for (final (media, location) in bindings) {
       if (_disposed) throw const Cancelled();
       await downloads.enqueue(media: media, location: location);
@@ -175,7 +189,17 @@ extension AppModelDownloads on AppModel {
     if (deleted()) return null;
     final location = store.local('location:${media.id}');
     checkBinding(location);
-    final downloaded = manager.entryFor(media.id);
+    final downloaded =
+        manager.entryFor(media.id) ??
+        (media.data['personalMedia'] == true &&
+                location is Map &&
+                location['source'] is String &&
+                location['path'] is String
+            ? manager.entryForSource(
+                location['source'] as String,
+                location['path'] as String,
+              )
+            : null);
     final matching =
         downloaded != null &&
         (location == null ||
@@ -186,7 +210,7 @@ extension AppModelDownloads on AppModel {
     String? path;
     if (matching) {
       try {
-        path = await manager.localPath(media.id);
+        path = await manager.localPath(downloaded.mediaId);
       } catch (error) {
         if (_disposed) throw const Cancelled();
         if (requireOffline) rethrow;
@@ -205,7 +229,7 @@ extension AppModelDownloads on AppModel {
       }
       return latest is Map ? Map<String, dynamic>.from(latest) : null;
     }
-    final entry = manager.entryFor(media.id);
+    final entry = manager.entryFor(downloaded?.mediaId ?? media.id);
     final stillMatching =
         entry != null &&
         entry.sourceId == downloaded?.sourceId &&

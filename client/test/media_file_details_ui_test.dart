@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:collection';
+import 'dart:isolate';
 import 'dart:io';
 
 import 'package:aiplayer/core/network.dart';
@@ -14,6 +16,34 @@ import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+class _ObservedParameters extends MapBase<String, String> {
+  final Map<String, String> _values;
+  final int _owner = Isolate.current.hashCode;
+  int uiKeyScans = 0;
+  _ObservedParameters(this._values);
+
+  @override
+  int get length => _values.length;
+
+  @override
+  Iterable<String> get keys {
+    if (Isolate.current.hashCode == _owner) uiKeyScans++;
+    return _values.keys;
+  }
+
+  @override
+  String? operator [](Object? key) => _values[key];
+
+  @override
+  void operator []=(String key, String value) => _values[key] = value;
+
+  @override
+  String? remove(Object? key) => _values.remove(key);
+
+  @override
+  void clear() => _values.clear();
+}
+
 class _DetailsModel extends AppModel {
   int opens = 0;
   _DetailsModel(super.store, super.documents) : super(backgroundWork: false);
@@ -25,7 +55,7 @@ class _DetailsModel extends AppModel {
   }) async => store.all('media');
 
   @override
-  void ensureMediaPreview(String id) {}
+  bool ensureMediaPreview(String id) => true;
 
   @override
   Future<SourceAdapter> adapter(String id) async {
@@ -94,8 +124,24 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
   }
 
+  Future<void> finishIndexing(WidgetTester tester) async {
+    for (var attempt = 0; attempt < 100; attempt++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 5)),
+      );
+      await tester.pump();
+      if (find
+          .byKey(const ValueKey('media-parameters-indexing'))
+          .evaluate()
+          .isEmpty) {
+        return;
+      }
+    }
+    fail('Parameter indexing did not finish');
+  }
+
   testWidgets(
-    'live details show all tracks and container metadata in a lazy list',
+    'common track details precede collapsed metadata in a lazy list',
     (tester) async {
       var reads = 0;
       final pending = Completer<MediaFileDetails>();
@@ -115,7 +161,7 @@ void main() {
             matching: find.byType(Scrollable),
           )
           .first;
-      for (final value in ['H.264', '48000 Hz', '中文', 'fixture-encoder']) {
+      for (final value in ['H.264', '48000 Hz', '中文']) {
         await tester.scrollUntilVisible(
           find.text(value),
           150,
@@ -123,7 +169,102 @@ void main() {
         );
         expect(find.text(value), findsOneWidget);
       }
+      expect(find.text('fixture-encoder'), findsNothing);
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('media-parameters-more')),
+        150,
+        scrollable: scrollable,
+      );
+      await tester.tap(find.byKey(const ValueKey('media-parameters-more')));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.text('fixture-encoder'),
+        150,
+        scrollable: scrollable,
+      );
+      expect(find.text('fixture-encoder'), findsOneWidget);
       expect(reads, 1);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets('large advanced metadata stays lazy on a narrow screen', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await open(
+      tester,
+      (_) async => MediaFileDetails(
+        fileName: 'A long camera video file name 2024-08-10.mp4',
+        size: 2 * 1024 * 1024,
+        format: 'MP4',
+        metadata: {for (var i = 0; i < 2000; i++) 'tag-$i': 'value-$i'},
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('2.0 MiB'), findsOneWidget);
+    expect(find.text('value-0'), findsNothing);
+    expect(find.byType(SelectableText).evaluate().length, lessThan(10));
+    await tester.tap(find.byKey(const ValueKey('media-parameters-more')));
+    await tester.pump();
+    await finishIndexing(tester);
+    await tester.pumpAndSettle();
+    expect(find.byType(SelectableText).evaluate().length, lessThan(30));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets(
+    'scrolling raw parameter tails never scans a map on the UI isolate',
+    (tester) async {
+      final observed = _ObservedParameters({
+        for (var i = 0; i < 2000; i++) 'tag-$i': 'value-$i',
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: GlassPalette.theme(),
+          home: Scaffold(
+            body: MediaFileParameterList(
+              sections: const [
+                MediaParameterSection(values: {'文件名': 'photo.jpg'}),
+              ],
+              moreSections: [MediaParameterSection(values: observed)],
+            ),
+          ),
+        ),
+      );
+      expect(observed.uiKeyScans, 0);
+      await tester.tap(find.byKey(const ValueKey('media-parameters-more')));
+      await tester.pump();
+      await finishIndexing(tester);
+      final scrollable = tester.state<ScrollableState>(
+        find.byType(Scrollable).first,
+      );
+      for (
+        var attempt = 0;
+        attempt < 5 && find.text('value-1999').evaluate().isEmpty;
+        attempt++
+      ) {
+        scrollable.position.jumpTo(scrollable.position.maxScrollExtent);
+        await tester.pump();
+      }
+      expect(find.text('value-1999'), findsOneWidget);
+      expect(find.byType(SelectableText).evaluate().length, lessThan(40));
+      scrollable.position.jumpTo(0);
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('media-parameters-more')));
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('media-parameters-more')));
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('media-parameters-indexing')),
+        findsNothing,
+      );
+      expect(observed.uiKeyScans, 0);
+      expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
     },
   );

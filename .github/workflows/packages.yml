@@ -48,59 +48,154 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - name: Match the release tag to the source version
         if: startsWith(github.ref, 'refs/tags/')
         run: python3 scripts/publish_release.py --tag "$GITHUB_REF_NAME" --check-only
 
-  android:
+  native_android:
     needs: validate
-    # Never pass the persistent signing key to pull request code.
     if: github.event_name != 'pull_request' && (inputs.target == '' || inputs.target == 'all' || inputs.target == 'android')
-    name: Android (${{ matrix.abi }})
+    name: Android native libraries (${{ matrix.abi }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [armeabi-v7a, arm64-v8a, x86, x86_64]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install native build tools and the pinned NDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build nasm autoconf automake libtool pkg-config cmake build-essential patch
+          sdkmanager 'ndk;28.2.13676358'
+          printf 'ANDROID_NDK_HOME=%s/ndk/28.2.13676358\n' "$ANDROID_HOME" >> "$GITHUB_ENV"
+      - name: Cache source downloads that the recipe verifies again
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/native-sources
+          key: native-sources-${{ hashFiles('packages/media_kit_libs_android_video/native/sources.lock.json') }}
+      - name: Build native libraries from the verified source lock
+        env:
+          NATIVE_ABI: ${{ matrix.abi }}
+        run: python3 scripts/build_android_native.py --abi "$NATIVE_ABI" --output "$RUNNER_TEMP/native-libs" --cache-dir "$RUNNER_TEMP/native-sources" --jobs 2
+      - name: Transfer the native library and source metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-android-${{ matrix.abi }}
+          path: ${{ runner.temp }}/native-libs/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  android_build:
+    needs: [validate, native_android]
+    if: github.event_name != 'pull_request' && (inputs.target == '' || inputs.target == 'all' || inputs.target == 'android')
+    name: Android build (${{ matrix.abi }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        abi: [universal, arm64]
+        include:
+          - abi: universal
+            apk: app-release.apk
+          - abi: arm64
+            apk: app-arm64-v8a-release.apk
+    env:
+      # Build dependencies run only here; this runner never receives the key.
+      AIPLAYER_ANDROID_UNSIGNED: 'true'
+      AIPLAYER_ANDROID_NATIVE_DIR: ${{ runner.temp }}/native-libs
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '17'
-      - name: Restore and verify the existing Android key
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          AIPLAYER_ANDROID_KEYSTORE: ${{ runner.temp }}/aiplayer-signing/debug.keystore
-        run: |
-          printf 'AIPLAYER_ANDROID_KEYSTORE=%s\n' "$AIPLAYER_ANDROID_KEYSTORE" >> "$GITHUB_ENV"
-          python3 scripts/restore_android_signing.py
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           flutter-version: '3.47.7'
           channel: stable
           cache: true
+      - name: Download the verified native libraries from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: native-android-*
+          path: ${{ runner.temp }}/native-libs
+          merge-multiple: true
       - run: flutter pub get --enforce-lockfile
         working-directory: client
-      - name: Build and validate APK
-        run: python3 scripts/package.py android --android-abi "${{ matrix.abi }}" --no-android-alias
-      # One APK per ABI; do not upload aliases or separate reports.
+      - name: Build without the persistent signing key
+        working-directory: client
+        env:
+          ANDROID_ABI: ${{ matrix.abi }}
+        run: |
+          if [ "$ANDROID_ABI" = arm64 ]; then
+            flutter build apk --release --target-platform android-arm64 --split-per-abi --android-project-arg=force-version-code-ignoring-abi=true
+          else
+            flutter build apk --release --target-platform android-arm,android-arm64,android-x64
+          fi
+      - name: Transfer unsigned APK to a fresh signing runner
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          path: client/build/app/outputs/flutter-apk/${{ matrix.apk }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+  android:
+    needs: [validate, android_build]
+    # Never sign pull request code. This runner does not execute dependencies.
+    if: github.event_name != 'pull_request' && (inputs.target == '' || inputs.target == 'all' || inputs.target == 'android')
+    name: Android sign (${{ matrix.abi }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: universal
+            apk: app-release.apk
+          - abi: arm64
+            apk: app-arm64-v8a-release.apk
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Download only the current unsigned build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ matrix.apk }}
+          path: ${{ runner.temp }}/unsigned-apk
+          skip-decompress: true
+      - name: Sign with the existing certificate and validate the APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_ABI: ${{ matrix.abi }}
+        run: python3 scripts/sign_android_apk.py --input-dir "$RUNNER_TEMP/unsigned-apk" --abi "$ANDROID_ABI"
+      # The signing script deletes its key before artifact code runs.
       - name: Upload APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           path: artifacts/aiplayer-*-android*.apk
           archive: false
           if-no-files-found: error
           retention-days: 30
-      - name: Remove restored signing key
-        if: always()
-        run: rm -f -- "$RUNNER_TEMP/aiplayer-signing/debug.keystore"
 
   # Temporarily paused platforms. Uncomment these jobs and target options to restore.
   # windows:
@@ -109,10 +204,10 @@ jobs:
   #   runs-on: windows-2022
   #   timeout-minutes: 60
   #   steps:
-  #     - uses: actions/checkout@v5
+  #     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
   #       with:
   #         persist-credentials: false
-  #     - uses: subosito/flutter-action@v2
+  #     - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
   #       with:
   #         flutter-version: '3.47.7'
   #         channel: stable
@@ -144,7 +239,7 @@ jobs:
   #         exit $buildExitCode
   #     - name: Upload failed Windows build log
   #       if: failure() && steps.windows_package.outcome == 'failure'
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         name: aiplayer-windows-build-log-${{ github.run_number }}
   #         path: |
@@ -166,21 +261,21 @@ jobs:
   #         if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstall.ExitCode)" }
   #         if (Test-Path (Join-Path $installDir 'aiplayer.exe')) { throw 'Uninstaller left the application executable behind' }
   #     - name: Upload Windows installer
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         path: artifacts/aiplayer-windows-x64-setup.exe
   #         archive: false
   #         if-no-files-found: error
   #         retention-days: 30
   #     - name: Upload Windows portable ZIP
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         path: artifacts/aiplayer-windows-x64.zip
   #         archive: false
   #         if-no-files-found: error
   #         retention-days: 30
   #     - name: Upload Windows build metadata
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         name: aiplayer-windows-x64-metadata-${{ github.run_number }}
   #         path: |
@@ -195,14 +290,14 @@ jobs:
   #   runs-on: ubuntu-24.04
   #   timeout-minutes: 60
   #   steps:
-  #     - uses: actions/checkout@v5
+  #     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
   #       with:
   #         persist-credentials: false
   #     - name: Install build dependencies
   #       run: |
   #         sudo apt-get update
   #         sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libmpv-dev libsecret-1-dev dpkg-dev binutils
-  #     - uses: subosito/flutter-action@v2
+  #     - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
   #       with:
   #         flutter-version: '3.47.7'
   #         channel: stable
@@ -214,21 +309,21 @@ jobs:
   #     - name: Verify DEB was produced
   #       run: dpkg-deb --info artifacts/aiplayer-linux-amd64.deb
   #     - name: Upload Linux DEB
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         path: artifacts/aiplayer-linux-amd64.deb
   #         archive: false
   #         if-no-files-found: error
   #         retention-days: 30
   #     - name: Upload Linux portable archive
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         path: artifacts/aiplayer-linux-x64.tar.gz
   #         archive: false
   #         if-no-files-found: error
   #         retention-days: 30
   #     - name: Upload Linux build metadata
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         name: aiplayer-linux-x64-metadata-${{ github.run_number }}
   #         path: |
@@ -245,10 +340,10 @@ jobs:
   #   env:
   #     COCOAPODS_DISABLE_STATS: 'true'
   #   steps:
-  #     - uses: actions/checkout@v5
+  #     - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
   #       with:
   #         persist-credentials: false
-  #     - uses: subosito/flutter-action@v2
+  #     - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
   #       with:
   #         flutter-version: '3.47.7'
   #         channel: stable
@@ -258,21 +353,21 @@ jobs:
   #       working-directory: client
   #     - run: python3 scripts/package.py ios
   #     - name: Upload unsigned iOS IPA
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         path: artifacts/aiplayer-ios-unsigned.ipa
   #         archive: false
   #         if-no-files-found: error
   #         retention-days: 30
   #     - name: Upload iOS app ZIP
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         path: artifacts/aiplayer-ios-unsigned.zip
   #         archive: false
   #         if-no-files-found: error
   #         retention-days: 30
   #     - name: Upload iOS build metadata
-  #       uses: actions/upload-artifact@v7
+  #       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
   #       with:
   #         name: aiplayer-ios-unsigned-metadata-${{ github.run_number }}
   #         path: |
@@ -298,10 +393,10 @@ jobs:
     env:
       COCOAPODS_DISABLE_STATS: 'true'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           flutter-version: '3.47.7'
           channel: stable
@@ -313,8 +408,16 @@ jobs:
           pod --version
       - name: Build and package for personal use
         run: bash scripts/package_macos.sh --app-only
+      - name: Preserve the actual macOS dependency resolution
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: macos-dependency-lock
+          path: client/macos/Podfile.lock
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Upload macOS app ZIP
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           path: artifacts/aiplayer-macos-unsigned.zip
           archive: false
@@ -358,11 +461,11 @@ jobs:
       group: release-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - name: Download packages from this run
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: aiplayer-*
           path: release-assets

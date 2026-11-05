@@ -82,7 +82,17 @@ void main() {
     }
     await tester.enterText(search, query);
     await tester.pumpAndSettle();
-    await tester.ensureVisible(action);
+    await tester.scrollUntilVisible(
+      action,
+      300,
+      scrollable: find
+          .descendant(
+            of: find.byKey(ValueKey('settings-search:${query.trim()}')),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
+    await tester.pumpAndSettle();
   }
 
   Future<void> confirmClearing(WidgetTester tester) async {

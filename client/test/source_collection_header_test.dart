@@ -178,6 +178,13 @@ void main() {
       () => _DirectoryFixture.create('甲'),
     ))!;
     try {
+      fixture.seed('known-first', '甲 S01E01.mkv', {
+        'series': '甲',
+        'season': '1',
+        'episode': '1',
+        'bangumiId': '7',
+        'metadataTitle': '甲',
+      });
       await fixture.open(tester, 3);
       expect(find.byType(MediaDetailsOverview), findsOneWidget);
       expect(find.textContaining('已收录 3 集'), findsOneWidget);
@@ -202,6 +209,13 @@ void main() {
         () => _DirectoryFixture.create('Current'),
       ))!;
       try {
+        fixture.seed('known-first', 'Current S01E01.mkv', {
+          'series': 'Current',
+          'season': '1',
+          'episode': '1',
+          'bangumiId': '7',
+          'metadataTitle': 'Current',
+        });
         await fixture.open(tester, 3);
         final path = '${fixture.folder.path}/Current S01E01.mkv';
         final tile = find.byKey(ValueKey(path));
@@ -217,9 +231,11 @@ void main() {
         // The browser snapshot still describes a nonempty file. Inspecting it
         // must stat it again, detect the change, and avoid native demuxing.
         await tester.runAsync(() => File(path).writeAsBytes(const []));
-        await tester.tap(
+        expect(
           find.descendant(of: tile, matching: find.byTooltip('视频选项')),
+          findsNothing,
         );
+        await tester.longPress(tile);
         await tester.pumpAndSettle();
         expect(find.text('查看文件详情'), findsOneWidget);
         expect(fixture.model.sourceOpens, opens);
@@ -271,6 +287,13 @@ void main() {
             'bangumiId': '${episode + 6}',
           });
         }
+        // A previously imported raw file must not inherit either conflicting
+        // provider identity. Passive OFF browsing does not import guesses.
+        fixture.seed('current-3', 'Current S01E03.mkv', {
+          'series': 'Current',
+          'season': '1',
+          'episode': '3',
+        });
         await fixture.open(tester, 3);
         expect(find.byType(MediaDetailsOverview), findsNothing);
         expect(fixture.store.get('media', 'current-1')!.data['bangumiId'], '7');

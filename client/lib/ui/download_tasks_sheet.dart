@@ -7,6 +7,7 @@ import '../data/app_model.dart';
 import '../data/offline_downloads.dart';
 import 'artwork_lifecycle.dart';
 import 'glass.dart';
+import 'offline_download_controls.dart';
 import 'theme/library_styles.dart';
 
 Future<void> showDownloadTasks(BuildContext context, AppModel model) =>
@@ -68,6 +69,14 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
   bool _visible = true, _loadDirty = false;
   String _error = '';
   int _loadRevision = 0;
+  OfflineDownloadSelection? _selection;
+  final _selected = <String>{};
+  bool _allSelected = false, _batchBusy = false;
+  int get _selectedCount => _selection == null
+      ? 0
+      : _allSelected
+      ? _selection!.ids.length - _selected.length
+      : _selected.length;
   OfflineDownloads get downloads => widget.model.downloads;
   bool get _active => _visible && ArtworkLifecycle.instance.value;
 
@@ -103,7 +112,86 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
   @override
   void didUpdateWidget(DownloadTasksSheet oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.model != widget.model) _load();
+    if (oldWidget.model != widget.model) {
+      _releaseSelection(oldWidget.model.downloads);
+      _load();
+    }
+  }
+
+  void _releaseSelection(OfflineDownloads owner) {
+    final selection = _selection;
+    _selection = null;
+    _selected.clear();
+    _allSelected = false;
+    if (selection != null) {
+      unawaited(owner.releaseSelection(selection).catchError((Object _) {}));
+    }
+  }
+
+  Future<void> _startSelection() async {
+    final owner = downloads;
+    final selection = await owner.captureSelection();
+    if (!mounted || owner != downloads || !_active) {
+      await owner.releaseSelection(selection);
+      return;
+    }
+    setState(() {
+      _selection = selection;
+      _selected.clear();
+      _allSelected = false;
+    });
+  }
+
+  Future<void> _batch(OfflineDownloadBatchAction action) async {
+    final selection = _selection;
+    if (_batchBusy || selection == null || _selectedCount == 0) return;
+    final owner = downloads;
+    setState(() => _batchBusy = true);
+    try {
+      if (action == OfflineDownloadBatchAction.delete) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text('删除 $_selectedCount 个下载任务？'),
+            content: const Text(
+              '将删除已下载的本机文件，取消未完成的下载并清理其临时文件。'
+              '原始来源和媒体资料会保留。',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('删除'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true) return;
+      }
+      if (!mounted ||
+          owner != downloads ||
+          _selection != selection ||
+          !(ModalRoute.of(context)?.isCurrent ?? true) ||
+          !ArtworkLifecycle.instance.value) {
+        return;
+      }
+      await owner.applyBatch(
+        selection,
+        action,
+        all: _allSelected,
+        ids: _selected,
+      );
+      if (mounted &&
+          _selection == selection &&
+          action == OfflineDownloadBatchAction.delete) {
+        _releaseSelection(owner);
+      }
+    } finally {
+      if (mounted) _loaded(() => _batchBusy = false);
+    }
   }
 
   void _load() {
@@ -130,15 +218,16 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
 
   @override
   void dispose() {
+    _releaseSelection(downloads);
     ArtworkLifecycle.instance.removeListener(_lifecycleChanged);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) => SafeArea(
-    child: SizedBox(
-      height: MediaQuery.sizeOf(context).height * .68,
+    child: GlassSheetBody(
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 4, 4),
@@ -146,31 +235,57 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
               children: [
                 Expanded(
                   child: Text(
-                    '下载任务',
+                    _selection == null ? '下载任务' : '已选 $_selectedCount',
                     style: LibraryStyles.of(context).taskTitle,
                   ),
                 ),
-                _DownloadValue<(int, int)>(
-                  downloads: downloads,
-                  select: (value) => (value.activeCount, value.pausedCount),
-                  builder: (context, counts) => Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _ActionIcon(
-                        key: ValueKey((downloads, 'pause-all')),
-                        tooltip: '全部暂停',
-                        icon: Icons.pause_rounded,
-                        action: counts.$1 > 0 ? downloads.pauseAll : null,
-                      ),
-                      _ActionIcon(
-                        key: ValueKey((downloads, 'resume-all')),
-                        tooltip: '全部继续',
-                        icon: Icons.play_arrow_rounded,
-                        action: counts.$2 > 0 ? downloads.resumeAll : null,
-                      ),
-                    ],
+                if (_selection != null) ...[
+                  TextButton(
+                    onPressed: _batchBusy
+                        ? null
+                        : () => setState(() {
+                            _allSelected =
+                                !_allSelected || _selected.isNotEmpty;
+                            _selected.clear();
+                          }),
+                    child: Text(
+                      _allSelected && _selected.isEmpty ? '取消全选' : '全选',
+                    ),
                   ),
-                ),
+                  TextButton(
+                    onPressed: _batchBusy
+                        ? null
+                        : () => setState(() => _releaseSelection(downloads)),
+                    child: const Text('完成'),
+                  ),
+                ] else ...[
+                  _DownloadValue<(int, int)>(
+                    downloads: downloads,
+                    select: (value) => (value.activeCount, value.pausedCount),
+                    builder: (context, counts) => Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _ActionIcon(
+                          key: ValueKey((downloads, 'pause-all')),
+                          tooltip: '全部暂停',
+                          icon: Icons.pause_rounded,
+                          action: counts.$1 > 0 ? downloads.pauseAll : null,
+                        ),
+                        _ActionIcon(
+                          key: ValueKey((downloads, 'resume-all')),
+                          tooltip: '全部继续',
+                          icon: Icons.play_arrow_rounded,
+                          action: counts.$2 > 0 ? downloads.resumeAll : null,
+                        ),
+                      ],
+                    ),
+                  ),
+                  _ActionIcon(
+                    tooltip: '多选',
+                    icon: Icons.checklist_rounded,
+                    action: _loading ? null : _startSelection,
+                  ),
+                ],
                 IconButton(
                   tooltip: '关闭',
                   onPressed: () => Navigator.pop(context),
@@ -179,11 +294,15 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
               ],
             ),
           ),
-          Expanded(
+          Flexible(
             child: _loading
-                ? const Center(child: Text('正在加载…'))
+                ? const Padding(
+                    padding: EdgeInsets.all(16),
+                    child: Text('正在加载…'),
+                  )
                 : _error.isNotEmpty
-                ? Center(
+                ? Align(
+                    heightFactor: 1,
                     child: Padding(
                       padding: const EdgeInsets.all(16),
                       child: Text(_error),
@@ -196,11 +315,17 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
                       // The manager exposes a live read-only view. Freeze only
                       // on membership refresh so retained/covered lists cannot
                       // index a task removed before their next visible frame.
-                      final ids = List<String>.unmodifiable(downloads.taskIds);
+                      final ids =
+                          _selection?.ids ??
+                          List<String>.unmodifiable(downloads.taskIds);
                       if (ids.isEmpty) {
-                        return const Center(child: Text('暂无下载任务'));
+                        return const Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Text('暂无下载任务'),
+                        );
                       }
                       return ListView.builder(
+                        shrinkWrap: true,
                         key: const PageStorageKey('download-task-list'),
                         padding: const EdgeInsets.only(bottom: 12),
                         itemCount: ids.length,
@@ -211,11 +336,50 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
                           )),
                           model: widget.model,
                           id: ids[ids.length - 1 - index],
+                          selected: _selection == null
+                              ? null
+                              : _allSelected !=
+                                    _selected.contains(
+                                      ids[ids.length - 1 - index],
+                                    ),
+                          onSelect: _batchBusy
+                              ? null
+                              : () => setState(() {
+                                  final id = ids[ids.length - 1 - index];
+                                  if (!_selected.add(id)) _selected.remove(id);
+                                }),
                         ),
                       );
                     },
                   ),
           ),
+          if (_selection != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  for (final action in OfflineDownloadBatchAction.values)
+                    _ActionIcon(
+                      tooltip: switch (action) {
+                        OfflineDownloadBatchAction.pause => '暂停所选',
+                        OfflineDownloadBatchAction.resume => '继续所选',
+                        OfflineDownloadBatchAction.delete => '删除所选',
+                      },
+                      icon: switch (action) {
+                        OfflineDownloadBatchAction.pause => Icons.pause_rounded,
+                        OfflineDownloadBatchAction.resume =>
+                          Icons.play_arrow_rounded,
+                        OfflineDownloadBatchAction.delete =>
+                          Icons.delete_outline_rounded,
+                      },
+                      action: _batchBusy || _selectedCount == 0
+                          ? null
+                          : () => _batch(action),
+                    ),
+                ],
+              ),
+            ),
         ],
       ),
     ),
@@ -225,6 +389,7 @@ class _DownloadTasksSheetState extends State<DownloadTasksSheet> {
 typedef _TaskView = ({
   String name,
   String error,
+  String localPath,
   OfflineDownloadStatus status,
   int received,
   int total,
@@ -236,7 +401,15 @@ typedef _TaskView = ({
 class _DownloadTaskRow extends StatelessWidget {
   final AppModel model;
   final String id;
-  const _DownloadTaskRow({super.key, required this.model, required this.id});
+  final bool? selected;
+  final VoidCallback? onSelect;
+  const _DownloadTaskRow({
+    super.key,
+    required this.model,
+    required this.id,
+    this.selected,
+    this.onSelect,
+  });
 
   @override
   Widget build(BuildContext context) => _DownloadValue<_TaskView?>(
@@ -248,6 +421,7 @@ class _DownloadTaskRow extends StatelessWidget {
           : (
               name: entry.name,
               error: entry.error,
+              localPath: entry.localPath,
               status: entry.status,
               received: entry.received,
               total: entry.total,
@@ -282,6 +456,12 @@ class _DownloadTaskRow extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (selected != null)
+              Checkbox(
+                key: ValueKey('download-task-select:$id'),
+                value: selected,
+                onChanged: onSelect == null ? null : (_) => onSelect!(),
+              ),
             Padding(
               padding: const EdgeInsets.only(top: 2, right: 12),
               child: Icon(
@@ -311,7 +491,7 @@ class _DownloadTaskRow extends StatelessWidget {
                   const SizedBox(height: 3),
                   Text(
                     entry.isDirectory
-                        ? '$status · ${entry.discoveredFiles} 个视频'
+                        ? '$status · ${entry.discoveredFiles} 个文件'
                         : '$status · $size${!completed && entry.total > 0 ? ' · ${(progress * 100).floor()}%' : ''}',
                     style: AppStyles.of(context).micro,
                   ),
@@ -338,7 +518,9 @@ class _DownloadTaskRow extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            if (!completed) ...[
+            if (selected != null)
+              const SizedBox(width: 4)
+            else if (!completed) ...[
               _ActionIcon(
                 tooltip: paused
                     ? '继续下载'
@@ -361,12 +543,19 @@ class _DownloadTaskRow extends StatelessWidget {
                 icon: Icons.close_rounded,
                 action: () => manager.cancel(id),
               ),
-            ] else
+            ] else ...[
               _ActionIcon(
-                tooltip: '删除离线视频',
+                tooltip: '保存位置',
+                icon: Icons.folder_open_outlined,
+                action: () =>
+                    showDownloadedFileLocation(context, entry.localPath),
+              ),
+              _ActionIcon(
+                tooltip: '删除下载文件',
                 icon: Icons.delete_outline_rounded,
                 action: () => _deleteDownloadedFile(context, model, id),
               ),
+            ],
           ],
         ),
       );
@@ -391,7 +580,7 @@ Future<void> _deleteDownloadedFile(
   final confirmed = await showDialog<bool>(
     context: context,
     builder: (context) => AlertDialog(
-      title: const Text('删除离线视频？'),
+      title: const Text('删除下载文件？'),
       content: const Text('将删除本机下载的文件，保留原始来源和影视资料。'),
       actions: [
         TextButton(
@@ -454,9 +643,8 @@ class _ActionIconState extends State<_ActionIcon> {
       await action();
     } catch (error) {
       if (mounted && _active) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(safeFailure(error).message)));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(safeFailure(error).message)));
       }
     } finally {
       if (mounted) {
