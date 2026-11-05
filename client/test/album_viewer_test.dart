@@ -401,13 +401,18 @@ void main() {
     testWidgets(
       'photo toolbar auto-hides and reveals with television=$television',
       (tester) async {
+        // Loading workers can keep mount's settle loop advancing the fake clock
+        // for up to 4.8 seconds. Start beyond that preparation window so a slow
+        // runner cannot consume the toolbar timeout before the first assertion.
+        const hideSeconds = 10;
+        const afterHide = Duration(seconds: hideSeconds + 1);
         await tester.runAsync(
-          () => model.updatePreferences({'controlsHideSeconds': 1}),
+          () => model.updatePreferences({'controlsHideSeconds': hideSeconds}),
         );
         await mount(tester, television: television);
         final toolbar = find.byKey(const ValueKey('album-viewer-toolbar'));
         expect(toolbar, findsOneWidget);
-        await tester.pump(const Duration(seconds: 2));
+        await tester.pump(afterHide);
         expect(toolbar, findsNothing);
         if (television) {
           await tester.sendKeyEvent(LogicalKeyboardKey.contextMenu);
@@ -421,12 +426,12 @@ void main() {
           await tester.pump();
         }
         expect(toolbar, findsOneWidget);
-        await tester.pump(const Duration(seconds: 2));
+        await tester.pump(afterHide);
         expect(toolbar, television ? findsOneWidget : findsNothing);
         if (television) {
           await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
           await tester.pump();
-          await tester.pump(const Duration(seconds: 2));
+          await tester.pump(afterHide);
           expect(toolbar, findsNothing);
         }
         await unmount(tester);

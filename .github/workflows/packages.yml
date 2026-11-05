@@ -114,7 +114,6 @@ jobs:
     env:
       # Build dependencies run only here; this runner never receives the key.
       AIPLAYER_ANDROID_UNSIGNED: 'true'
-      AIPLAYER_ANDROID_NATIVE_DIR: ${{ runner.temp }}/native-libs
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -140,6 +139,7 @@ jobs:
         working-directory: client
         env:
           ANDROID_ABI: ${{ matrix.abi }}
+          AIPLAYER_ANDROID_NATIVE_DIR: ${{ runner.temp }}/native-libs
         run: |
           if [ "$ANDROID_ABI" = arm64 ]; then
             flutter build apk --release --target-platform android-arm64 --split-per-abi --android-project-arg=force-version-code-ignoring-abi=true
