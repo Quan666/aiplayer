@@ -142,8 +142,27 @@ class Registry:
             raise ValueError("Invalid native registry repository")
         self.repo = repo
 
-    def release(self, tag: str) -> dict | None:
-        url = f"https://api.github.com/repos/{self.repo}/releases/tags/{tag}"
+    def release(self, tag: str, *, include_drafts: bool = False) -> dict | None:
+        release = self._get(f"releases/tags/{tag}")
+        if release is not None or not include_drafts:
+            return release
+        # The tag endpoint only finds published releases. Drafts have a pending
+        # tag (and an untagged-* URL), so publishers must search the authenticated
+        # release listing. Paginate to find drafts left by older failed runs.
+        page = 1
+        while True:
+            releases = self._get(f"releases?per_page=20&page={page}")
+            if not isinstance(releases, list):
+                raise ValueError("Cannot list native dependency drafts")
+            for release in releases:
+                if release.get("tag_name") == tag:
+                    return release
+            if len(releases) < 20:
+                return None
+            page += 1
+
+    def _get(self, path: str) -> dict | list | None:
+        url = f"https://api.github.com/repos/{self.repo}/{path}"
         headers = {"Accept": "application/vnd.github+json", "User-Agent": "AIPlayer-native-registry"}
         token = os.environ.get("GH_TOKEN")
         if token:
@@ -179,8 +198,8 @@ class Registry:
         return path
 
 
-def release_assets(release: dict, ident: dict) -> dict:
-    if release.get("tag_name") != ident["tag"] or not release.get("prerelease"):
+def release_assets(release: dict | None, ident: dict) -> dict:
+    if not isinstance(release, dict) or release.get("tag_name") != ident["tag"] or not release.get("prerelease"):
         raise ValueError("Unexpected native dependency release")
     expected = {bundle_name(**target) for target in ident["targets"]}
     assets = release.get("assets", [])
@@ -236,14 +255,22 @@ def publish(registry: Registry, directory: Path, *, root: Path = ROOT) -> None:
         for target in ident["targets"]:
             unpack(directory / bundle_name(**target), temporary / str(target["api"]),
                    **target, repo=registry.repo, root=root)
-    release = registry.release(ident["tag"])
+    release = registry.release(ident["tag"], include_drafts=True)
+    # Recheck after local validation: a newly published fingerprint must never
+    # be overwritten, even if the initial availability check missed it.
+    if release is not None and not release.get("draft"):
+        release_assets(release, ident)
+        print(f"Reusing published native dependency {ident['tag']}")
+        return
     if release is None:
         registry.command("release", "create", ident["tag"], "--draft", "--prerelease", "--latest=false",
                          "--target", os.environ["GITHUB_SHA"], "--title", f"Android native {ident['fingerprint'][:12]}",
                          "--notes", "构建依赖，供 CI 复用；应用安装包请下载 v 开头的正式版本。")
     # Only drafts can be repaired. A published fingerprint is never overwritten.
     registry.command("release", "upload", ident["tag"], *(str(directory / name) for name in sorted(expected)), "--clobber")
-    release = registry.release(ident["tag"])
+    release = registry.release(ident["tag"], include_drafts=True)
+    if release is None:
+        raise RuntimeError(f"Native dependency draft {ident['tag']} is missing after upload; refusing to publish")
     uploaded = release_assets(release, ident)
     for name, asset in uploaded.items():
         if asset["digest"] != f"sha256:{digest(directory / name)}" or asset["size"] != (directory / name).stat().st_size:

@@ -1,6 +1,7 @@
 """Verify native reuse, publication and corruption boundaries without GitHub."""
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -255,6 +256,77 @@ class NativeRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "upload failed"):
                 registry.publish(self.client, self.bundles, root=self.root)
         self.assertEqual([call.args[1] for call in command.call_args_list], ["upload"])
+
+    def test_publish_and_retry_find_drafts_when_tag_endpoint_returns_404(self):
+        self.all_bundles()
+        for existing_draft in (False, True):
+            with self.subTest(existing_draft=existing_draft):
+                draft = self.release(draft=True) if existing_draft else None
+                commands = []
+
+                def request(request, timeout):
+                    url = request.full_url
+                    if "/releases/tags/" in url:
+                        # GitHub does not resolve a draft's pending tag here,
+                        # even after all assets have been uploaded by gh.
+                        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+                    self.assertIn("/releases?per_page=20&page=1", url)
+                    return io.BytesIO(json.dumps([draft] if draft else []).encode())
+
+                def command(*args):
+                    nonlocal draft
+                    commands.append(args[1])
+                    if args[1] == "create":
+                        self.assertIsNone(draft, "Retry must reuse the existing draft")
+                        draft = dict(self.release(draft=True), assets=[])
+                    elif args[1] == "upload":
+                        self.assertTrue(draft["draft"])
+                        draft["assets"] = self.release()["assets"]
+                    elif args[1] == "edit":
+                        registry.release_assets(draft, self.ident)
+                        self.assertIn("--draft=false", args)
+                        draft["draft"] = False
+
+                with patch.object(registry.urllib.request, "urlopen", side_effect=request), \
+                     patch.object(self.client, "command", side_effect=command):
+                    registry.publish(self.client, self.bundles, root=self.root)
+                self.assertEqual(commands, (["upload", "edit"] if existing_draft else ["create", "upload", "edit"]))
+                self.assertFalse(draft["draft"])
+
+    def test_draft_lookup_paginates_and_matches_exact_pending_tag(self):
+        draft = self.release(draft=True)
+        unrelated = dict(draft, tag_name=self.ident["tag"] + "-other")
+        responses = [urllib.error.HTTPError("https://api.github.com/test", 404, "Not Found", {}, None),
+                     io.BytesIO(json.dumps([unrelated] * 20).encode()),
+                     io.BytesIO(json.dumps([unrelated, draft]).encode())]
+        with patch.object(registry.urllib.request, "urlopen", side_effect=responses) as request:
+            self.assertEqual(self.client.release(self.ident["tag"], include_drafts=True), draft)
+        self.assertTrue(request.call_args_list[-1].args[0].full_url.endswith("per_page=20&page=2"))
+
+    def test_failed_draft_listing_is_not_a_request_to_create_another_release(self):
+        self.all_bundles()
+        responses = [urllib.error.HTTPError("https://api.github.com/test", code, "fixture", {}, None)
+                     for code in (404, 404, 403)]
+        with patch.object(registry.urllib.request, "urlopen", side_effect=responses), \
+             patch.object(self.client, "command") as command:
+            with self.assertRaises(urllib.error.HTTPError):
+                registry.publish(self.client, self.bundles, root=self.root)
+            command.assert_not_called()
+
+    def test_publication_between_probe_and_upload_is_reused_without_overwrite(self):
+        self.all_bundles()
+        with patch.object(self.client, "release", side_effect=[None, self.release()]), \
+             patch.object(self.client, "command") as command:
+            registry.publish(self.client, self.bundles, root=self.root)
+            command.assert_not_called()
+
+    def test_missing_draft_after_upload_does_not_publish(self):
+        self.all_bundles()
+        with patch.object(self.client, "release", return_value=None), \
+             patch.object(self.client, "command") as command:
+            with self.assertRaisesRegex(RuntimeError, "missing after upload"):
+                registry.publish(self.client, self.bundles, root=self.root)
+        self.assertEqual([call.args[1] for call in command.call_args_list], ["create", "upload"])
 
     def test_missing_target_prevents_creating_any_release(self):
         self.build_bundle()
