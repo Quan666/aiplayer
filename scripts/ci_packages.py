@@ -71,6 +71,10 @@ def package_summary(directory: Path, target: str, version: str) -> str:
         lock = ROOT / "client/macos/Podfile.lock"
         rows.extend([lock.read_text() if lock.is_file() else "未生成依赖锁", "```", "</details>"])
     else:
+        native = os.environ.get("NATIVE_FINGERPRINT", "")
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        if native and repo:
+            rows.extend(["", f"播放依赖：[native-android-{native[:12]}](https://github.com/{repo}/releases/tag/native-android-{native})"])
         rows.extend(["", "三个版本使用同一应用 ID 和原证书；通用版及 ARM64 版要求 Android 7+，Android 6.0.1 请下载 legacy。",
                      "兼容版使用独立 Flutter 3.32.8 / Dart 3.8.1、API 23 和双 ARM 原生库。",
                      "<details><summary>APK 校验记录</summary>\n", "```json"])

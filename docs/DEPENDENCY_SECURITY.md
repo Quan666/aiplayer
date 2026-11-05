@@ -6,19 +6,21 @@
 - Flutter 发布依赖使用已提交的 `client/pubspec.lock`，CI 执行 `flutter pub get --enforce-lockfile`。
 - Android 提交官方 Gradle 9.3.1 Wrapper、JAR 校验值和分发 ZIP 校验值；`verification-metadata.xml` 校验 Maven 构件及其元数据，不配置全局信任例外。
 - Kotlin Gradle Plugin 使用 2.4.21，覆盖 CVE-2026-53914 的修复。升级 AGP / Flutter 时仍需核对插件兼容性。
-- `.github/dependabot.yml` 为 Actions、Pub、Gradle、Go 和 Docker 提供每周更新检查。固定摘要不会自动获得安全更新，更新请求仍需审查和验证。
+- Actions、Pub、Gradle、Go 和 Docker 依赖由维护者按需更新，更新时核对上游版本及摘要，并完成审查和验证。
 
 ## Android 原生播放器
 
-`packages/media_kit_libs_android_video/native/sources.lock.json` 保存源码 URL、版本或提交、SHA-256 和本地补丁摘要。`scripts/build_android_native.py` 从这些源码构建原生库，CI 只缓存每次重新校验的源码归档，不恢复源码树、安装前缀或编译输出。
+`packages/media_kit_libs_android_video/native/sources.lock.json` 保存源码 URL、版本或提交、SHA-256 和本地补丁摘要。`scripts/build_android_native.py` 由独立原生工作流从这些源码构建原生库；编译工作只缓存每次重新校验的源码归档，不恢复源码树或安装前缀。应用构建复用本仓库按原生输入指纹命名的依赖 Release，校验 GitHub 托管资产的 SHA-256、来源指纹及 API / ABI / recipe 元数据，不接收任意编译缓存。
 
 官方 media-kit Android v1.1.11 与 Darwin v0.7.3 的构建源码仍选择 FFmpeg 6.0，不能通过仅更新原生包版本号声称修复底层漏洞。Android 使用固定提交的 FFmpeg 6.1 维护分支及更新后的 TLS / XML / 字幕依赖；更新时必须复核上游安全修复，不能跟随可变分支。
 
 正常发布分为三个隔离阶段：
 
-1. 原生库从源码构建并输出每个 ABI 的 JAR 和来源摘要。
-2. 无长期签名密钥的 runner 构建 APK。
+1. 原生工作流仅在准确指纹的依赖版本缺失时从源码编译五套 API / ABI；独立发布作业验证全部 ZIP 后发布专用依赖预发布版本，不标记为 Latest，不覆盖已发布版本。
+2. 无长期签名密钥、无仓库写权限的 runner 下载准确的预编译依赖，验证后构建 APK；缺失或损坏不允许回退到其他版本。
 3. 新 runner 只运行仓库签名脚本和 Android SDK 工具；签名后立即删除密钥，再校验版本、ABI、PGS、16 KB 对齐和原有证书。
+
+指纹包含源码锁、补丁、编译 / 校验 / 封装脚本、原生工作流和 toolchain 声明；普通应用或上传步骤变化不触发原生重编。宿主工具升级时维护 toolchain 的 `revision`，NDK 使用源码锁中的固定版本。来源清单记录构建提交、运行 ID 和工具链环境；这些记录用于追溯，不等同于独立第三方签名证明。依赖发布与读取信任同一仓库的维护者、GitHub Release API 和 runner。
 
 签名作业不执行 Flutter、Gradle 或 APK 内代码。信任边界仍包括所构建的仓库提交、GitHub runner、编译器和 Android SDK 工具；源码锁定与作业隔离不能证明所有上游代码没有恶意行为。
 

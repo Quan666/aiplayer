@@ -149,6 +149,8 @@ python3 scripts/package.py macos
 python3 scripts/package.py ios      # 未签名 IPA 和 .app 压缩包，不可直接安装
 ```
 
+CI 的 Android 播放依赖由 **Build Android native** 独立工作流准备，按源码、补丁和工具链指纹发布专用预编译版本；日常应用打包下载准确版本并重新校验，无需重编 FFmpeg / mpv。首次版本缺失时自动准备，详细规则见 [构建文档](docs/BUILDING.md)。
+
 Android 打包先校验清单、ZIP CRC、重复条目、v1/v2/v3 签名、每个 ABI 的核心原生库与 16KB 对齐；生成带版本名的 APK、文件大小、SHA256 与验证记录。更新继续使用原证书，避免丢失本机数据。
 
 Android 6.0 / 6.0.1 电视使用独立工具链的 [Android 6 兼容构建](compat/android6/README.md)，支持 ARM32 / ARM64。**Actions → Build packages** 默认包含兼容包，单独构建可选择 `android-legacy`；四类成品的系统、架构、大小、下载链接和校验记录见运行摘要。

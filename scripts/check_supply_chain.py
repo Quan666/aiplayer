@@ -2,7 +2,7 @@
 """Reject unpinned executable build dependencies without network access.
 
 This checks repository policy, not whether a pinned version has new CVEs.
-Dependabot and upstream security review remain necessary when updating pins.
+Upstream security review remains necessary when updating pins.
 """
 
 from __future__ import annotations

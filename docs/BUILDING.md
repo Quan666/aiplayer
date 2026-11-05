@@ -53,24 +53,46 @@ PR 运行构建计划、打包回归和 macOS 构建，不接触 Android 签名�
 构建在 push / 手动运行执行。标签必须匹配源码版本；发布 Android 时缺少 legacy
 会阻止 Release，不能静默漏发。
 
-现代 Android、兼容 Android、macOS 并行。每个 Android runner 在同一环境内
-完成自己的原生依赖和 APK 构建；现代通用、ARM64 顺序共用 Flutter / Gradle
-工作区，避免竞争构建目录。CI 仍调用 `bash scripts/build_release.sh <目标>`：
-设置 `AIPLAYER_ANDROID_UNSIGNED=true` 时进入专用 CI 暂存分支，使用 runner
-上的 Flutter / Android SDK，不加载本地密钥或改写本机构建环境。
-构建阶段拒绝接收签名密钥；原证书仅在独立、无依赖构建的签名 runner 中恢复，
-用完删除，再做校验及上传。
+现代 Android、兼容 Android、macOS 并行。Android 打包前调用独立的
+**Build Android native** 工作流，按原生输入的 SHA-256 指纹查找依赖版本：
+已存在时只检查版本，不启动原生编译；缺失时并行构建 API 24 的 ARM32 / ARM64 /
+x86_64 和 API 23 的 ARM32 / ARM64，全部验证通过后发布，再继续应用打包。
+也可单独手动运行原生工作流提前准备依赖。相同指纹的自动准备使用
+`queue: max` 串行排队去重，不因第三个调用替换第二个等待任务。
 
-原生 JAR 仅从 GitHub Actions 分支隔离缓存恢复，不接收 PR 构建缓存作为发布输入。
-缓存键包含 OS、CPU、API、源码及补丁锁、编译 / 校验脚本和工作流，
-不使用宽泛 fallback；命中后仍逐 ABI 核对源码锁、补丁、recipe、API 和 JAR 摘要。
-原生编译验证后立即保存缓存，后续 Flutter 构建失败不必在下次重编原生依赖。
-冷缓存只编译需要的 ABI，现代版不编译 x86；兼容版的 API 23 缓存独立。
-源压缩包每次使用前重新哈希；Gradle 只缓存依赖下载及 wrapper，保留严格依赖校验。
-macOS 缓存 CocoaPods 下载和同依赖版本的锁文件，实际依赖锁写入任务摘要。
-首次构建或缓存失效仍须完整原生编译，提速效果需以真实 Actions 冷 / 热运行测量。
+依赖保存在本仓库 `native-android-<完整指纹>` 的专用预发布版本中，
+不标记为 Latest，不占用 `v*` 应用版本；保留五个按 API / ABI 命名的依赖 ZIP。
+每个 ZIP 只包含播放器 JAR、其元数据和来源清单。依赖版本不受 Actions
+缓存过期影响，已发布版本不覆盖；草稿上传失败可重试，缺包不发布。
+校验 API 失败或已发布版本损坏时直接报错，不能退回旧版依赖或在应用 runner
+悄悄重编。发布 / 重试前必须拥有仓库 Contents 写权限；构建代码和 APK 签名
+runner 不获得该写权限。
 
-签名前临时传递最多两个 `internal-unsigned-*` 压缩产物，原生库不上传。
+指纹包含原生源码锁、已锁定补丁、编译和校验脚本、依赖封装脚本、
+原生工作流及 `native/toolchain.json`；修改 Dart、版本号、应用打包工作流或上传说明
+不会使原生版本失效。NDK 在源码锁中固定，宿主 runner、Python、工具包集合、
+并发和维护修订号在 toolchain 文件中声明；需要升级宿主编译工具时修改该声明或
+增加 `revision`，不能假设同名 runner 的系统镜像永久不变。
+来源清单记录生产提交、运行 ID、镜像版本、Python 和 NDK。
+
+应用 runner 只下载对应 API 的预编译库，先对照 GitHub Releases API 的文件大小和
+SHA-256，再校验来源指纹、仓库、源码锁、补丁、recipe、API、ABI、JAR 摘要。
+所有需要的 ABI 通过后才交给 Gradle；插件继续逐次校验，提供库无效时拒绝构建。
+SQLite 和 SMB 仍按应用构建编译，本次只拆分 Android FFmpeg / mpv 播放链。
+现代通用、ARM64 顺序共用 Flutter / Gradle 工作区，避免竞争构建目录。
+
+CI 仍调用 `bash scripts/build_release.sh <目标>`：设置
+`AIPLAYER_ANDROID_UNSIGNED=true` 时进入专用 CI 暂存分支，使用 runner 上的
+Flutter / Android SDK。构建阶段拒绝接收签名密钥；原证书仅在独立、无依赖构建的
+签名 runner 中恢复，用完删除，再做 APK 校验及上传。
+
+原生工作流只缓存每次使用前重新哈希的源码压缩包，不恢复任意编译工作目录。
+应用 Gradle 只缓存依赖下载及 wrapper，保留严格依赖校验；macOS 缓存 CocoaPods
+下载和同依赖版本的锁文件，实际依赖锁写入任务摘要。首次依赖准备仍须完整原生
+编译，提速效果需以真实 Actions 首次 / 复用运行测量。
+
+原生依赖发布使用的 `internal-native-*` 临时产物由原生工作流清理；
+签名前另临时传递最多两个 `internal-unsigned-*` 压缩产物。
 签名消费结束后清理当前运行的中间产物（包括构建 / 签名失败路径），正常结束只留下
 三个 APK 和一个 macOS ZIP；不上传依赖锁、日志和重复 APK。
 如果任务被强制终止导致清理未完成，中间产物最多保留一天。

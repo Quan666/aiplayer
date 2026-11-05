@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "revision": 1,
+  "runner": "ubuntu-24.04",
+  "python": "3.12",
+  "max_jobs": 4,
+  "packages": [
+    "meson", "ninja-build", "nasm", "autoconf", "automake", "libtool",
+    "pkg-config", "cmake", "build-essential", "patch"
+  ],
+  "targets": [
+    {"api": 24, "abi": "armeabi-v7a"},
+    {"api": 24, "abi": "arm64-v8a"},
+    {"api": 24, "abi": "x86_64"},
+    {"api": 23, "abi": "armeabi-v7a"},
+    {"api": 23, "abi": "arm64-v8a"}
+  ]
+}

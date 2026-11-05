@@ -42,8 +42,9 @@ bash scripts/package_android_legacy.sh --no-android-alias
 
 统一运行 **Actions → Build packages → Run workflow**。默认 `all` 或
 `android` 都包含兼容包；只需要兼容包时选择 `android-legacy`。
-两种 ARM 原生库和无密钥 APK 在同一 runner 构建，原生缓存与 API 24 隔离，
-独立签名 runner 使用已有 `ANDROID_KEYSTORE_BASE64` secret 校验并上传。
+原生工作流先准备按输入指纹版本化的预编译库；API 23 两种 ARM 与 API 24
+分别构建、校验和下载，日常兼容 APK 构建只复用准确版本。独立签名 runner
+使用已有 `ANDROID_KEYSTORE_BASE64` secret 校验并上传。
 匹配版本的标签发布包含兼容包，缺失时拒绝发布。旧的独立手动工作流已合并。
 下载区只保留成品，临时传递会被清理，版本、大小、SHA-256、系统与架构说明
 在运行摘要中。缓存、重跑与签名边界见 [构建文档](../../docs/BUILDING.md)。

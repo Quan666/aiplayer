@@ -1,5 +1,37 @@
 # 验证记录
 
+## 2026-11-05：独立原生依赖版本与日常打包复用
+
+- 新增 `Build Android native` 独立、可复用工作流。主打包流程只计算输入指纹并
+  等待准确的依赖版本就绪；已存在时不运行编译，首次缺失时并行编译 API 24
+  三架构及 API 23 双 ARM，完整校验后发布 `native-android-<SHA-256>` 专用预发布
+  版本，不标记 Latest，也不覆盖已发布版本。可手动预先准备。
+- 指纹覆盖源码锁、锁定补丁、编译 / 校验 / 封装脚本、原生工具链声明与原生工作流；
+  Dart、应用版本或打包上传步骤变化不触发原生重编。下载对照 GitHub Release
+  资产摘要及大小，再核对来源、源码锁、recipe、API、ABI 和 JAR 摘要。
+  所有需要的 ABI 验证后才交给 Gradle；失败不回退其他版本，不静默本地重编。
+- 原生编译、依赖发布、应用构建和 APK 签名分别隔离权限；临时 native 传递在
+  发布结束后清理，应用打包下载区仍只保留四类成品。SQLite / SMB、macOS 构建、
+  Flutter 引擎、播放能力、原 Android 签名及最终 APK 校验保持原来的路径。
+- 全部 Python 打包 / 依赖回归 **138 项：135 通过、3 跳过、0 失败**；跳过的是
+  原生 Windows batch 和两项需显式启用的 SMB 信号服务夹具。允许本地 HTTPS
+  监听的环境下执行，下载完整性回归未跳过。日志：
+  `/tmp/aiplayer-native-registry-full-tests.log`。
+- 17 项新回归覆盖无关文件修改不变更指纹、原生输入变化失效、五目标封装 / 解包、
+  跨 API / ABI / 仓库混用、内容损坏、错误来源、ZIP 路径与重复项、GitHub 资产摘要、
+  缺包拒发、已发布版本复用、草稿重试、上传失败和上传摘要不符时不发布。
+  额外使用本地真实 API 23 / 24 五套既有 JAR 完成封装、解包及校验往返；
+  均在 `/tmp` 的测试目录执行并清除，未发布这些测试包，也未将其称作新编译。
+- 供应链固定版本 / 摘要、差异检查通过。`packages.yml` 和 `verify.yml` 通过
+  actionlint 1.7.12；新原生工作流除了该工具尚不识别的两个 `concurrency.queue`
+  字段外通过，已用精确过滤复查其余诊断。`queue: max` 已按
+  [GitHub 官方并发文档](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+  核对，与 `cancel-in-progress: false` 配合，防止并发调用覆盖排队任务。
+- 本轮未推送、触发 GitHub Actions 或创建实际依赖 Release，未重新完整编译
+  FFmpeg / mpv 或发布安装包。真实托管 runner 上的首次构建、排队、发布与下载
+  还需推送后验证；没有冷 / 热 CI 耗时实测。此前 Android 6.0.1 安装问题仍缺
+  失败包 / 错误码，不能据此宣称修复。
+
 ## 2026-11-05：统一安装包 CI 与 Android 6 安装检查
 
 - 主打包工作流默认交付 Android 通用、ARM64、API 23 双 ARM legacy 和 macOS ZIP。
