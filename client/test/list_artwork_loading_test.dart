@@ -5,6 +5,7 @@ import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/library_catalog.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
+import 'package:aiplayer/ui/artwork_decode_queue.dart';
 import 'package:aiplayer/ui/glass.dart';
 import 'package:aiplayer/ui/library_page.dart';
 import 'package:aiplayer/ui/media_artwork.dart';
@@ -109,14 +110,22 @@ Future<void> _waitFor(
   bool Function() ready,
   String failure,
 ) async {
-  for (var attempt = 0; attempt < 100; attempt++) {
-    await tester.pump();
+  // Native file reads/decodes use the real event loop, while scroll idle and
+  // layout callbacks use the test clock. Advance both, and bound the wait by
+  // elapsed time instead of assuming CI can decode the nearby band in 1 s.
+  final elapsed = Stopwatch()..start();
+  while (elapsed.elapsed < const Duration(seconds: 10)) {
+    await tester.pump(const Duration(milliseconds: 16));
     if (ready()) return;
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 10)),
     );
   }
-  fail(failure);
+  final queue = ArtworkDecodeQueue.instance;
+  fail(
+    '$failure (active decodes: ${queue.activeCount}, '
+    'pending decodes: ${queue.pendingCount})',
+  );
 }
 
 Future<String> _assertNextCoverReady(
@@ -226,14 +235,14 @@ void main() {
   Future<void> mount(WidgetTester tester, Widget child) async {
     addTearDown(() async {
       await tester.pumpWidget(const SizedBox());
-      // Native decodes cannot be interrupted. Let their completion callbacks
-      // release the shared queue before this test's fake async zone closes.
-      for (var attempt = 0; attempt < 10; attempt++) {
-        await tester.runAsync(
-          () => Future<void>.delayed(const Duration(milliseconds: 10)),
-        );
-        await tester.pump();
-      }
+      // Native decodes cannot be interrupted. Drain actual work before this
+      // fake async zone closes, including on a slower shared CI runner.
+      final queue = ArtworkDecodeQueue.instance;
+      await _waitFor(
+        tester,
+        () => queue.activeCount == 0 && queue.pendingCount == 0,
+        'The artwork decode queue did not drain during teardown.',
+      );
     });
     tester.view.physicalSize = const Size(600, 600);
     tester.view.devicePixelRatio = 1;

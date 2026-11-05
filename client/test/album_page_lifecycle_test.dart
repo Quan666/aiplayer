@@ -20,8 +20,14 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as images;
 
-Future<void> _until(WidgetTester tester, bool Function() ready) async {
-  for (var n = 0; n < 180 && !ready(); n++) {
+Future<void> _until(
+  WidgetTester tester,
+  bool Function() ready, {
+  Duration? timeout,
+}) async {
+  final wait = Stopwatch()..start();
+  for (var n = 0; !ready(); n++) {
+    if (timeout == null ? n >= 180 : wait.elapsed >= timeout) break;
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 15)),
     );
@@ -716,10 +722,16 @@ void main() {
             .service;
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
         expect(service.active, isFalse);
-        // No pump or requested UI frame while the existing worker unwinds.
-        await tester.runAsync(
-          () => Future<void>.delayed(const Duration(milliseconds: 100)),
-        );
+        // Cancellation closes admission immediately, but the worker still has
+        // to finish its current I/O and acknowledge it. Wait for that state
+        // without pumping a frame or assuming a runner's completion speed.
+        await tester.runAsync(() async {
+          final wait = Stopwatch()..start();
+          while (service.activeCount > 0 &&
+              wait.elapsed < const Duration(seconds: 10)) {
+            await Future<void>.delayed(const Duration(milliseconds: 15));
+          }
+        });
         expect(service.activeCount, 0);
         final pausedCount = service.pendingCount;
         await tester.runAsync(
@@ -875,7 +887,12 @@ void main() {
           tester,
           () =>
               service.pendingCount == 0 &&
+              service.activeCount == 0 &&
+              ArtworkDecodeQueue.instance.activeCount == 0 &&
+              ArtworkDecodeQueue.instance.pendingCount == 0 &&
+              !tester.binding.hasScheduledFrame &&
               service.peek(thumbnail.entry)?.path != null,
+          timeout: const Duration(seconds: 10),
         );
         var updates = 0;
         void changed() => updates++;
