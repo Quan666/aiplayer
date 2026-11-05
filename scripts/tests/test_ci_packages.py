@@ -265,6 +265,11 @@ class LegacyMetadataTest(unittest.TestCase):
         for key in (
             ('com.google.guava', 'guava-parent', '33.3.1-jre', 'guava-parent-33.3.1-jre.pom'),
             ('org.junit', 'junit-bom', '5.10.2', 'junit-bom-5.10.2.module'),
+            ('org.junit', 'junit-bom', '5.9.2', 'junit-bom-5.9.2.module'),
+            ('org.junit', 'junit-bom', '5.9.3', 'junit-bom-5.9.3.module'),
+            ('org.junit', 'junit-bom', '5.11.0-M2', 'junit-bom-5.11.0-M2.module'),
+            ('org.junit', 'junit-bom', '5.13.1', 'junit-bom-5.13.1.module'),
+            ('org.junit', 'junit-bom', '5.13.4', 'junit-bom-5.13.4.module'),
             ('org.jetbrains.kotlinx', 'kotlinx-coroutines-bom', '1.8.0', 'kotlinx-coroutines-bom-1.8.0.pom'),
         ):
             with self.subTest(artifact=key):
