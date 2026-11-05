@@ -15,8 +15,14 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as images;
 
-Future<void> until(WidgetTester tester, bool Function() ready) async {
-  for (var i = 0; i < 180 && !ready(); i++) {
+Future<void> until(
+  WidgetTester tester,
+  bool Function() ready, {
+  Duration? timeout,
+}) async {
+  final wait = Stopwatch()..start();
+  for (var i = 0; !ready(); i++) {
+    if (timeout == null ? i >= 180 : wait.elapsed >= timeout) break;
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 15)),
     );
@@ -397,6 +403,9 @@ void main() {
         ];
         final offsetBeforeMetadata = wall().controller.offset;
         final publications = Set<AlbumSnapshot>.identity()..add(initial);
+        // The worker reads all 96 EXIF headers sequentially. Its readiness
+        // depends on real I/O, so keep checking layout while allowing a slower
+        // runner to complete the batch instead of budgeting fake frames.
         await until(tester, () {
           final current = wall().snapshot;
           publications.add(current);
@@ -407,7 +416,7 @@ void main() {
           ], initialSections);
           expect(wall().controller.offset, closeTo(offsetBeforeMetadata, .01));
           return current.items.every((item) => item.capturedAt != null);
-        });
+        }, timeout: const Duration(seconds: 10));
         // Default indexing batches its facts without repeatedly publishing the
         // full wall. Both order and date rows stay fixed when facts arrive.
         expect(publications.length, lessThanOrEqualTo(2));
