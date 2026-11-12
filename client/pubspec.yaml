@@ -1,7 +1,7 @@
 name: aiplayer
 description: 四端动漫播放器与个人影视库
 publish_to: none
-version: 0.5.27+33
+version: 0.5.28+34
 environment:
   sdk: '>=3.13.0 <4.0.0'
 dependencies:

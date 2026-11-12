@@ -842,7 +842,7 @@ class LibraryCatalog {
     tmdb = TmdbCatalog(this.transport, this.tmdbCredential, store: store);
   }
   static const headers = {
-    'User-Agent': 'AIPlayer/0.5.27 (personal anime library)',
+    'User-Agent': 'AIPlayer/0.5.28 (personal anime library)',
   };
 
   /// Revokes automatic requests immediately, without affecting explicit search
