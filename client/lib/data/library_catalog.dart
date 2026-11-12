@@ -1932,15 +1932,24 @@ class LibraryCatalog {
           strategy() != 'off') {
         try {
           final episodeRevision = episodeNamesRevision;
-          final subject = await resolve(
-            collection.title,
-            collection.season,
-            cancel: cancel,
-          );
+          // File membership can change after a work was identified. Reuse its
+          // verified ID when filling new episode titles; a filename lookup can
+          // fail or select another work after a manual correction.
+          final subject =
+              (collection.recognized ? collection.subject : null) ??
+              (cached?.fingerprint == key &&
+                      currentWithCachedMetadata?.recognized == true
+                  ? currentWithCachedMetadata!.subject
+                  : null) ??
+              await resolve(
+                collection.title,
+                collection.season,
+                cancel: cancel,
+              );
           // Keep the resolved work visible if episode-title loading fails.
           result = collection.withMetadata(
             subject,
-            const {},
+            collection.episodeTitles,
             metadataComplete: subject == null,
           );
           final names = subject == null

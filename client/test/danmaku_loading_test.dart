@@ -54,6 +54,96 @@ Map<String, dynamic> matchedResult(String id) => {
 };
 
 void main() {
+  for (final scenario in [
+    (
+      description: 'first season without a season suffix',
+      guess: const ReleaseName('作品', '1', '5'),
+      titles: ['作品'],
+      selected: '1',
+    ),
+    (
+      description: 'an exact later season among similar search results',
+      guess: const ReleaseName('作品 第二季', '2', '5'),
+      titles: ['其他作品 第二季', '作品 第二季', '作品'],
+      selected: '2',
+    ),
+    (
+      description: 'a unique later season among the same series',
+      guess: const ReleaseName('作品', '2', '5'),
+      titles: ['作品', '作品 第二季', '作品 第三季'],
+      selected: '2',
+    ),
+    (
+      description: 'ambiguous episodes of the same work',
+      guess: const ReleaseName('作品', '1', '5'),
+      titles: ['作品', '作品'],
+      selected: null,
+    ),
+    (
+      description: 'an unqualified title cannot verify a later season',
+      guess: const ReleaseName('作品', '2', '5'),
+      titles: ['作品'],
+      selected: null,
+    ),
+    (
+      description: 'a different season cannot be selected automatically',
+      guess: const ReleaseName('作品', '2', '5'),
+      titles: ['作品 第三季'],
+      selected: null,
+    ),
+  ]) {
+    test('automatic danmaku handles ${scenario.description}', () async {
+      final store = AppStore(':memory:');
+      final transport = LoadingTransport((uri) async {
+        if (uri.path.endsWith('search/episodes')) {
+          return {
+            'animes': [
+              for (var i = 0; i < scenario.titles.length; i++)
+                {
+                  'animeTitle': scenario.titles[i],
+                  'episodes': [
+                    {'episodeId': '${i + 1}', 'episodeTitle': '第五集'},
+                  ],
+                },
+            ],
+          };
+        }
+        if (uri.path.endsWith('/match')) {
+          return {'isMatched': false, 'matches': []};
+        }
+        return snapshot;
+      });
+      final session = DanmakuSession(
+        store,
+        DanmuApiClient(
+          DanmuApiClient.defaultOrigin,
+          'fixture',
+          transport: transport,
+        ),
+        'video',
+      );
+      addTearDown(store.dispose);
+      addTearDown(session.dispose);
+
+      await session.identify(scenario.guess);
+
+      expect(session.episodeId, scenario.selected);
+      expect(
+        transport.paths.any((path) => path.endsWith('/match')),
+        scenario.selected == null,
+      );
+      if (scenario.selected != null) {
+        expect(session.comments.single.text, 'ready');
+      } else {
+        expect(session.candidates, hasLength(scenario.titles.length));
+        expect(
+          transport.paths.any((path) => path.contains('/comment/')),
+          isFalse,
+        );
+      }
+    });
+  }
+
   test(
     'third-party switch cancels in-flight danmaku and timers without frames',
     () {

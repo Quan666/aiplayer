@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:aiplayer/core/network.dart';
 import 'package:aiplayer/danmaku/release_name.dart';
+import 'package:aiplayer/data/directory_metadata_worker.dart';
 import 'package:aiplayer/data/library_catalog.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/sources/source.dart';
@@ -70,6 +71,56 @@ void main() {
       );
     });
     tearDown(() => store.dispose());
+
+    test(
+      '$provider recognized directory fills new titles without matching the work again',
+      () async {
+        final files = _collection().videos;
+        store.save('media', 'first', {
+          ...subjectMediaFields(savedSubject),
+          'series': 'Manually corrected series',
+          'season': '2',
+          'episode': '1',
+          'episodeTitle': 'First',
+        });
+        store.setLocal('manualMetadata:first', true);
+        store.setLocal('location:first', {
+          'id': 'first',
+          'source': 'nas',
+          'path': files.first.path,
+        });
+        catalog = LibraryCatalog(
+          store,
+          transport: transport,
+          tmdbCredential: () async => 'test-token',
+          prepareDirectory: (source, path, context, entries, cancel) async =>
+              prepareStoredDirectoryInspection(
+                store,
+                source,
+                path,
+                context,
+                entries,
+              ),
+        );
+        await catalog.episodeNames('7', subject: savedSubject);
+        transport.names = _full;
+
+        final result = await catalog.inspect('nas', 'Example', files);
+
+        expect(result?.subject?['id'], '7');
+        expect(result?.title, 'Manually corrected series');
+        expect(result?.episodeTitles, _full);
+        expect(result?.metadataComplete, isTrue);
+        expect(transport.calls, hasLength(2));
+        expect(
+          transport.calls.every(
+            (uri) =>
+                uri.path == '/v0/episodes' || uri.path.endsWith('/season/2'),
+          ),
+          isTrue,
+        );
+      },
+    );
 
     test(
       '$provider other series requests cannot suppress this cache refresh',

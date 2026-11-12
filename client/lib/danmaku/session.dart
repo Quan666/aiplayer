@@ -100,6 +100,33 @@ class DanmakuSession extends ChangeNotifier {
     return _request = CancelToken();
   }
 
+  EpisodeMatch? _uniqueSearchMatch(
+    ReleaseName guess,
+    List<EpisodeMatch> found,
+  ) {
+    final expected = subjectIdentity(guess.anime);
+    final season = guess.season.isEmpty ? expected.season : guess.season;
+    if (guess.season.isNotEmpty &&
+        expected.season.isNotEmpty &&
+        guess.season != expected.season) {
+      return null;
+    }
+    final title = normalizedSeries(expected.anime);
+    EpisodeMatch? selected;
+    for (final match in found) {
+      final identity = subjectIdentity(match.animeTitle);
+      // Providers commonly omit the first-season suffix. Later seasons still
+      // require explicit evidence so a lone first-season hit cannot be used.
+      final candidateSeason = identity.season.isEmpty ? '1' : identity.season;
+      if (season.isNotEmpty && candidateSeason != season) continue;
+      if (found.length == 1) return match;
+      if (title.isEmpty || normalizedSeries(identity.anime) != title) continue;
+      if (selected != null) return null;
+      selected = match;
+    }
+    return selected;
+  }
+
   Future<void> identify(ReleaseName guess, {bool restore = true}) async {
     if (!_networkAllowed || _disposed) return;
     final cancel = _begin(), generation = _generation;
@@ -152,11 +179,9 @@ class DanmakuSession extends ChangeNotifier {
           /* name matching can still succeed */
         }
         if (!_current(generation)) return;
-        if (found.length == 1 &&
-            (guess.season.isEmpty ||
-                subjectIdentity(found.first.animeTitle).season ==
-                    guess.season)) {
-          if (await load(found.first) || !_current(generation)) return;
+        final matched = _uniqueSearchMatch(guess, found);
+        if (matched != null) {
+          if (await load(matched) || !_current(generation)) return;
         }
       }
       final result = await api.match(
