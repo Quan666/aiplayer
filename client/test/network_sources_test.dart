@@ -433,7 +433,7 @@ void main() {
     },
   );
   test(
-    'HTTP source validates random ranges and does not follow redirects',
+    'HTTP source validates random ranges through relative redirects',
     () async {
       final server = await HttpServer.bind('127.0.0.1', 0);
       server.listen((r) async {
@@ -466,7 +466,11 @@ void main() {
         List.generate(10, (i) => i + 20),
       );
       final redirect = HttpSource('http://127.0.0.1:${server.port}/redirect');
-      await expectLater(redirect.stat(''), throwsA(isA<AppFailure>()));
+      expect((await redirect.stat('')).size, 100);
+      expect(
+        await redirect.read('', 20, 29).expand((v) => v).toList(),
+        List.generate(10, (i) => i + 20),
+      );
       await source.close();
       await redirect.close();
       await server.close(force: true);

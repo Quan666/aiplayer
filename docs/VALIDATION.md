@@ -1,5 +1,13 @@
 # 验证记录
 
+## 2026-11-13：WebDAV 视频重定向
+
+- 定位到来源请求统一关闭自动重定向后，视频 `HEAD` 探测及 `GET` 范围读取未接续 `Location`，导致合法的 302 下载跳转直接报错。两条路径现支持 301 / 302 / 303 / 307 / 308，保留请求方法、Range、原文件身份及签名查询参数，每次请求最多跟随五跳；不缓存临时下载地址。目录 `PROPFIND` 继续使用既有目录身份规则。
+- 每一跳单独解析系统代理；Basic 认证仅沿同源跳转传递，跨主机、端口或协议后在该请求链内保持移除。无效地址、嵌入账号密码、非 HTTP(S) 地址及过多跳转返回不包含签名地址或凭据的错误。立即取消重定向响应体，避免未结束的响应阻塞播放；关闭来源后不再发起迟到的目标请求。视频转发继续在现有独立 isolate 执行。
+- 四个定向测试文件共 **50 项通过、0 跳过、0 失败**：`http_source_redirect_test.dart`、`network_sources_test.dart`、`http_range_bridge_test.dart`、`system_proxy_routes_test.dart`。覆盖五种重定向状态的真实桥接 worker、中文文件名、前后定位读取、HEAD 不可用的 GET 探测回退、多跳及跨站后返回原站的认证隔离、逐跳代理、非法地址、循环、未结束响应体及取消。首轮新增断言误把 URI 编码路径当作解码路径，修正测试断言后通过；测试端口需在允许本机回环监听的环境运行。日志：`/tmp/aiplayer-webdav-redirect-tests.log`。
+- 新增 `webdav_redirect_playback_test.dart`，使用 FFmpeg 生成的 20 秒、320×180 / 24fps H.264 MP4 夹具及本机两站模拟 WebDAV → 302 → CDN。**Linux 原生播放器集成 1 项通过**，实际解码、播放、跳到第 10 秒，检查 mpv `pause=yes` 且 400ms 后 `time-pos` 不再增长；验证源站携带认证、CDN 不携带认证。日志：`/tmp/aiplayer-webdav-redirect-native.log`。夹具可用 `ffmpeg -v error -f lavfi -i testsrc2=size=320x180:rate=24 -t 20 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -g 24 -movflags +faststart -y /tmp/aiplayer-redirect-fixture.mp4` 重建。
+- `flutter analyze --no-pub` 无问题；差异检查通过。本轮未制作安装包，未连接用户的 WebDAV 服务或 Android / Android TV 真机；上述 Linux 软件渲染验证不代表 Android 真机的安装、播放、遥控、输入法、原生音量、帧率或功耗结果。
+
 ## 2026-11-12：0.5.28 发布前检查
 
 - 源码版本升为 `0.5.28+34`，对应标签 `v0.5.28`；同步启动日志、设置 / 关于信息、请求 User-Agent 和 README 发布示例，补充[更新说明](releases/v0.5.28.md)。本版包含弹幕唯一候选与季度匹配、已识别目录新增文件的集名补齐，以及统一安装包 CI、独立原生依赖版本和 Android 发布插件 / 依赖校验修复。

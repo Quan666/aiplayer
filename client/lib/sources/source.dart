@@ -150,22 +150,59 @@ class HttpSource extends SourceAdapter {
     String? body,
   }) async {
     try {
-      final r = await openProxyAwareRequest(
-        _client,
-        method,
-        uri,
-        proxyResolver: proxyResolver,
-        cancel: _cancel,
-      ).timeout(const Duration(seconds: 25));
-      if (user.isNotEmpty) {
-        r.headers.set(
-          'Authorization',
-          'Basic ${base64Encode(utf8.encode('$user:$password'))}',
-        );
+      var sendCredentials = uri.origin == base.origin;
+      for (var redirects = 0; ; redirects++) {
+        final r = await openProxyAwareRequest(
+          _client,
+          method,
+          uri,
+          proxyResolver: proxyResolver,
+          cancel: _cancel,
+        ).timeout(const Duration(seconds: 25));
+        if (sendCredentials && user.isNotEmpty) {
+          r.headers.set(
+            'Authorization',
+            'Basic ${base64Encode(utf8.encode('$user:$password'))}',
+          );
+        }
+        headers.forEach(r.headers.set);
+        if (body != null) r.write(body);
+        final response = await r.close().timeout(const Duration(seconds: 25));
+        _cancel.check();
+        // Media may redirect to a signed CDN URL. Keep HEAD and Range intact,
+        // and resolve the system proxy separately for every destination.
+        // PROPFIND retains its directory identity and is not redirected.
+        if ((method != 'GET' && method != 'HEAD') ||
+            !const {301, 302, 303, 307, 308}.contains(response.statusCode)) {
+          return response;
+        }
+        final status = response.statusCode;
+        final location = response.headers.value(HttpHeaders.locationHeader);
+        // A redirect body can be unbounded or stalled; never wait to drain it.
+        await response.listen(null, onError: (Object _) {}).cancel();
+        _cancel.check();
+        if (redirects >= 5) {
+          throw AppFailure('HTTP $status · 来源重定向次数过多，请检查服务器配置。', status);
+        }
+        Uri? next;
+        try {
+          if (location != null && location.trim().isNotEmpty) {
+            next = uri.resolve(location);
+          }
+        } on FormatException {
+          // Do not expose a signed URL or embedded credentials in errors.
+        }
+        if (next == null ||
+            !const {'http', 'https'}.contains(next.scheme) ||
+            next.host.isEmpty ||
+            next.userInfo.isNotEmpty) {
+          throw AppFailure('HTTP $status · 来源返回了无效的重定向地址。', status);
+        }
+        // Never forward WebDAV credentials across origins, including changes
+        // of port or scheme. Once stripped, keep them stripped for this chain.
+        sendCredentials = sendCredentials && next.origin == uri.origin;
+        uri = next;
       }
-      headers.forEach(r.headers.set);
-      if (body != null) r.write(body);
-      return await r.close().timeout(const Duration(seconds: 25));
     } catch (error) {
       _cancel.check();
       throw safeFailure(error, action: '连接来源失败');
@@ -189,8 +226,8 @@ class HttpSource extends SourceAdapter {
     if (!webdav) throw const AppFailure('HTTP 直链不支持目录浏览。');
     final requested = url(path);
     // Browser entries retain WebDAV collection slashes, whereas an existing
-    // video's dirname does not. Request the collection directly in both cases;
-    // following redirects could send source credentials to another location.
+    // video's dirname does not. Request the collection directly in both cases
+    // so listing hrefs stay relative to the configured WebDAV root.
     final uri = requested.path.endsWith('/')
         ? requested
         : requested.replace(path: '${requested.path}/');

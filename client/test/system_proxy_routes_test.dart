@@ -113,6 +113,75 @@ void main() {
     },
   );
 
+  test(
+    'HTTP source resolves each redirect through its destination proxy',
+    () async {
+      final first = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final second = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final requests = <(String, String)>[];
+      first.listen((request) async {
+        requests.add((request.method, request.uri.host));
+        request.response.statusCode = 302;
+        request.response.headers.set(
+          'Location',
+          'http://cdn.unresolvable.invalid/signed?token=a%2Bb',
+        );
+        await request.response.close();
+      });
+      second.listen((request) async {
+        requests.add((request.method, request.uri.host));
+        expect(request.headers.value('authorization'), isNull);
+        expect(request.uri.query, 'token=a%2Bb');
+        request.response.headers.set('Accept-Ranges', 'bytes');
+        request.response.contentLength = 4;
+        if (request.method == 'GET') {
+          expect(request.headers.value('range'), 'bytes=0-3');
+          request.response.statusCode = 206;
+          request.response.headers.set('Content-Range', 'bytes 0-3/4');
+          request.response.add([1, 2, 3, 4]);
+        }
+        await request.response.close();
+      });
+      final targets = <String>[];
+      final source = HttpOverrides.runWithHttpOverrides(
+        () => HttpSource(
+          'http://dav.unresolvable.invalid/video.mp4',
+          webdav: true,
+          user: 'user',
+          password: 'password',
+          proxyResolver: (uri, {cancel}) async {
+            targets.add(uri.host);
+            final port = uri.host == 'dav.unresolvable.invalid'
+                ? first.port
+                : second.port;
+            return 'PROXY 127.0.0.1:$port';
+          },
+        ),
+        _RealHttp(),
+      );
+      try {
+        expect((await source.stat('')).size, 4);
+        expect(await source.read('', 0, 3).expand((bytes) => bytes).toList(), [
+          1,
+          2,
+          3,
+          4,
+        ]);
+        expect(requests, [
+          ('HEAD', 'dav.unresolvable.invalid'),
+          ('HEAD', 'cdn.unresolvable.invalid'),
+          ('GET', 'dav.unresolvable.invalid'),
+          ('GET', 'cdn.unresolvable.invalid'),
+        ]);
+        expect(targets, requests.map((request) => request.$2).toList());
+      } finally {
+        await source.close();
+        await first.close(force: true);
+        await second.close(force: true);
+      }
+    },
+  );
+
   test('HTTPS proxy removal does not reuse an idle CONNECT tunnel', () async {
     final context = SecurityContext()
       ..useCertificateChainBytes(
