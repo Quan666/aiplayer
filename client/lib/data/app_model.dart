@@ -38,6 +38,7 @@ import 'library_sort.dart';
 import 'continue_watching_presentation.dart';
 import 'directory_metadata_worker.dart';
 import 'local_state_worker.dart';
+import 'subtitle_translation_cache.dart';
 import 'local_video_removal.dart';
 import 'local_directory_removal.dart';
 import 'offline_downloads.dart';
@@ -125,6 +126,47 @@ class AppModel extends ChangeNotifier {
         credential: () async =>
             await secrets.read(key: 'aiSubtitleToken') ?? '',
       );
+
+  SubtitleTranslator subtitleTranslator(CancelToken cancel) {
+    final epoch = store.local('cacheClearEpoch');
+    Future<Map<String, dynamic>?> cache(
+      String key, {
+      Map<String, dynamic>? batch,
+      bool finish = false,
+    }) async {
+      cancel.check();
+      if (store.path == ':memory:') {
+        Map<String, dynamic>? result;
+        store.transaction(() {
+          result = subtitleTranslationCache(
+            store,
+            key,
+            batch: batch,
+            finish: finish,
+            epoch: epoch,
+          );
+        });
+        return result;
+      }
+      return (_localStateWorker ??= LocalStateWorker(
+        store.path,
+      )).cacheSubtitleTranslation(
+        key,
+        batch: batch,
+        finish: finish,
+        epoch: epoch,
+        cancel: cancel,
+      );
+    }
+
+    return SubtitleTranslator.checkpointed(
+      transport: thirdPartyAiTransport,
+      load: cache,
+      saveBatch: (key, batch) async => await cache(key, batch: batch),
+      finish: (key) async => await cache(key, finish: true),
+    );
+  }
+
   Object? _thirdPartyCredentialRevision;
   int _thirdPartyStoreRevision = -1;
   OfflineDownloads? _downloads;

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+
 import '../core/network.dart';
 
 class SubtitleCue {
@@ -16,6 +17,15 @@ class SubtitleCue {
   );
 }
 
+void rejectSubtitleHtml(String text) {
+  if (RegExp(
+    r'^\s*(<!doctype\s+html|<html)',
+    caseSensitive: false,
+  ).hasMatch(text)) {
+    throw const AppFailure('读取到网页而非字幕，请检查来源认证及文件。');
+  }
+}
+
 /// Source offsets are retained: conversion never regenerates timestamps, ASS
 /// styling, drawing commands, VTT settings, or newline conventions.
 class SubtitleDocument {
@@ -26,15 +36,7 @@ class SubtitleDocument {
     if (!['ass', 'ssa', 'srt', 'vtt'].contains(format)) {
       throw const AppFailure('不支持此字幕格式。请选择 ASS、SSA、SRT 或 VTT。');
     }
-    if (source.length > 16 * 1024 * 1024) {
-      throw const AppFailure('字幕超过 16 MiB，暂不支持文字转换。原字幕仍可播放。');
-    }
-    if (RegExp(
-      r'^\s*(<!doctype\s+html|<html)',
-      caseSensitive: false,
-    ).hasMatch(source)) {
-      throw const AppFailure('读取到网页而非字幕，请检查来源认证及文件。');
-    }
+    rejectSubtitleHtml(source);
     if (format == 'ass' || format == 'ssa') {
       var events = false;
       var fields = <String>[];
@@ -180,19 +182,25 @@ class SubtitleDocument {
 
 /// Unicode BOMs are common in Windows subtitle collections. Legacy encodings
 /// are left to mpv for playback; transforming them must never silently corrupt.
-String decodeSubtitle(Uint8List bytes) {
+String decodeSubtitle(Uint8List bytes, {bool allowIncomplete = false}) {
   if (bytes.length >= 2 &&
       ((bytes[0] == 0xff && bytes[1] == 0xfe) ||
           (bytes[0] == 0xfe && bytes[1] == 0xff))) {
-    if (bytes.length.isOdd) throw const AppFailure('UTF-16 字幕数据被截断。');
+    if (!allowIncomplete && bytes.length.isOdd) {
+      throw const AppFailure('UTF-16 字幕数据被截断。');
+    }
     final data = ByteData.sublistView(bytes), little = bytes[0] == 0xff;
-    return String.fromCharCodes([
-      for (var i = 2; i < bytes.length; i += 2)
-        data.getUint16(i, little ? Endian.little : Endian.big),
-    ]);
+    final endian = little ? Endian.little : Endian.big;
+    final units = Uint16List((bytes.length - 2) ~/ 2);
+    for (var i = 0; i < units.length; i++) {
+      units[i] = data.getUint16(2 + 2 * i, endian);
+    }
+    return String.fromCharCodes(units);
   }
   try {
-    return utf8.decode(bytes).replaceFirst('\uFEFF', '');
+    return utf8
+        .decode(bytes, allowMalformed: allowIncomplete)
+        .replaceFirst('\uFEFF', '');
   } on FormatException {
     throw const AppFailure(
       '字幕不是 UTF-8 / UTF-16。原字幕可继续播放；请先另存为 UTF-8 再进行繁简转换或翻译。',

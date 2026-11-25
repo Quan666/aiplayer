@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:aiplayer/core/network.dart';
+import 'package:aiplayer/data/local_state_worker.dart';
+import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/subtitles/ai.dart';
 import 'package:aiplayer/subtitles/document.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -230,9 +233,13 @@ void main() {
     },
   );
   test('late cancelled model results cannot populate cache', () async {
-    final pending = Completer<String>(),
+    final called = Completer<void>(),
+        pending = Completer<String>(),
         cache = <String, Map<String, dynamic>>{};
-    final fake = FakeAi((body, token) => pending.future);
+    final fake = FakeAi((body, token) {
+      called.complete();
+      return pending.future;
+    });
     final translator = SubtitleTranslator(
       transport: fake,
       load: (k) => cache[k],
@@ -245,10 +252,69 @@ void main() {
       token,
     );
     final assertion = expectLater(future, throwsA(isA<Cancelled>()));
+    await called.future;
     token.cancel();
     pending.complete('[{"id":0,"text":"迟到结果"}]');
     await assertion;
     expect(cache, isEmpty);
+  });
+
+  test('persisted subtitle batches survive interruption and become portable once complete', () async {
+    final temp = await Directory.systemTemp.createTemp('subtitle-ai-cache-');
+    final store = AppStore('${temp.path}/app.sqlite');
+    var worker = LocalStateWorker(store.path);
+    final cancel = CancelToken();
+    final batchSizes = <int>[];
+    var interrupted = true;
+    late String key;
+    final fake = FakeAi((body, _) async {
+      final cues = _cues(body);
+      batchSizes.add(cues.length);
+      if (interrupted && cues.first['id'] == 30) {
+        throw const AppFailure('模拟断网');
+      }
+      return translated(body);
+    });
+    final translator = SubtitleTranslator.checkpointed(
+      transport: fake,
+      load: (id) {
+        key = id;
+        return worker.cacheSubtitleTranslation(id, cancel: cancel);
+      },
+      saveBatch: (id, batch) async => await worker.cacheSubtitleTranslation(
+        id,
+        batch: batch,
+        cancel: cancel,
+      ),
+      finish: (id) async => await worker.cacheSubtitleTranslation(
+        id,
+        finish: true,
+        cancel: cancel,
+      ),
+    );
+    final document = _document(31);
+    final config = SubtitleAiConfig(model: 'm');
+    try {
+      await expectLater(
+        translator.translate(document, config, cancel),
+        throwsA(isA<AppFailure>()),
+      );
+      expect(store.local(key), isNull);
+      await worker.close();
+      worker = LocalStateWorker(store.path);
+      interrupted = false;
+      expect(
+        await translator.translate(document, config, cancel),
+        contains('译文 30'),
+      );
+      expect(batchSizes, [30, 1, 1]);
+      expect((store.local(key)['values'] as Map).length, 31);
+      expect(store.db.select('SELECT key FROM cache'), isEmpty);
+    } finally {
+      await worker.close();
+      store.dispose();
+      await temp.delete(recursive: true);
+    }
   });
   test(
     'all batch IDs, placeholders and new formatting must validate atomically',

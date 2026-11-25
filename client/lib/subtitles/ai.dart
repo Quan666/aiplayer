@@ -9,6 +9,7 @@ import '../core/third_party_network.dart';
 import '../core/system_proxy_stub.dart'
     if (dart.library.ui) '../core/system_proxy.dart';
 import 'document.dart';
+import 'worker.dart';
 
 const defaultSubtitlePrompt =
     'Translate movie/anime subtitles naturally and concisely into the target language. Keep character names and terminology consistent. Preserve tone, avoid explanations, and leave text already in the target language unchanged.';
@@ -323,8 +324,10 @@ class IoSubtitleAiTransport implements SubtitleAiTransport {
   }
 }
 
-typedef SubtitleCacheLoad = Map<String, dynamic>? Function(String key);
-typedef SubtitleCacheSave = void Function(
+typedef SubtitleCacheLoad = FutureOr<Map<String, dynamic>?> Function(
+  String key,
+);
+typedef SubtitleCacheSave = FutureOr<void> Function(
   String key,
   Map<String, dynamic> value,
 );
@@ -378,11 +381,22 @@ class SubtitleTranslator {
   final SubtitleAiTransport transport;
   final SubtitleCacheLoad load;
   final SubtitleCacheSave save;
+  final Future<void> Function(String key)? finish;
   SubtitleTranslator({
     SubtitleAiTransport? transport,
     required this.load,
     required this.save,
-  }) : transport = transport ?? IoSubtitleAiTransport();
+  }) : transport = transport ?? IoSubtitleAiTransport(),
+       finish = null;
+
+  /// Persists each completed batch and compacts it into the portable cache
+  /// after the whole subtitle has been translated.
+  SubtitleTranslator.checkpointed({
+    required this.transport,
+    required this.load,
+    required SubtitleCacheSave saveBatch,
+    required Future<void> Function(String key) this.finish,
+  }) : save = saveBatch;
 
   Future<String> translate(
     SubtitleDocument document,
@@ -393,40 +407,28 @@ class SubtitleTranslator {
     if (config.model.trim().isEmpty) {
       throw const AppFailure('请先在设置中填写 AI 翻译模型。');
     }
-    final sourceHash = sha256
-        .convert(utf8.encode('${document.format}\u0000${document.source}'))
-        .toString();
-    final key = 'subtitle-ai:$sourceHash:${config.identity}';
-    final cached = load(key), values = <int, String>{};
-    if (cached?['version'] == 1 && cached?['values'] is Map) {
-      for (final entry in (cached!['values'] as Map).entries) {
-        final id = int.tryParse('${entry.key}');
-        if (id == null ||
-            id < 0 ||
-            id >= document.cues.length ||
-            entry.value is! String) {
-          continue;
-        }
-        try {
-          document.validate(document.cues[id], entry.value);
-          values[id] = entry.value;
-        } on AppFailure {
-          /* Retry incomplete or old malformed cache entries. */
-        }
-      }
-    }
+    final key = await _subtitleCacheKey(
+      document.format,
+      document.source,
+      config,
+      cancel,
+    );
+    final cached = await load(key);
+    final (values, missing) = await _prepareSubtitleTranslation(
+      document,
+      cached,
+      cancel,
+    );
     cancel.check();
     onProgress?.call(values.length, document.cues.length);
-    final remaining = document.cues
-        .where((cue) => !values.containsKey(cue.id))
-        .toList();
+    final remaining = missing?.length ?? document.cues.length;
     var nextCue = 0;
-    while (nextCue < remaining.length) {
+    while (nextCue < remaining) {
       cancel.check();
       final batch = <SubtitleCue>[];
       var characters = 0;
-      while (nextCue < remaining.length) {
-        final cue = remaining[nextCue];
+      while (nextCue < remaining) {
+        final cue = document.cues[missing?[nextCue] ?? nextCue];
         if (batch.isNotEmpty &&
             (batch.length >= 30 || characters + cue.text.length > 8000)) {
           break;
@@ -480,18 +482,75 @@ class SubtitleTranslator {
       // result from a cancelled track cannot populate the cache or UI.
       cancel.check();
       values.addAll(next);
-      save(key, {
+      await save(key, {
         'version': 1,
         'values': {
-          for (final entry in values.entries) '${entry.key}': entry.value,
+          for (final entry in (finish == null ? values : next).entries)
+            '${entry.key}': entry.value,
         },
       });
+      cancel.check();
       onProgress?.call(values.length, document.cues.length);
     }
+    final result = await _renderSubtitleTranslation(document, values, cancel);
+    await finish?.call(key);
     cancel.check();
-    return document.render(values);
+    return result;
   }
 }
+
+Future<String> _subtitleCacheKey(
+  String format,
+  String source,
+  SubtitleAiConfig config,
+  CancelToken cancel,
+) => runSubtitleWork(() {
+  final hash = sha256.convert(utf8.encode('$format\u0000$source'));
+  return 'subtitle-ai:$hash:${config.identity}';
+}, cancel);
+
+Future<(Map<int, String>, List<int>?)> _prepareSubtitleTranslation(
+  SubtitleDocument document,
+  Map<String, dynamic>? cached,
+  CancelToken cancel,
+) async {
+  if (cached?['version'] != 1 || cached?['values'] is! Map) {
+    return (<int, String>{}, null);
+  }
+  final saved = cached!['values'] as Map;
+  return runSubtitleWork(() {
+    final values = <int, String>{};
+    for (final entry in saved.entries) {
+      final id = int.tryParse('${entry.key}');
+      if (id == null ||
+          id < 0 ||
+          id >= document.cues.length ||
+          entry.value is! String) {
+        continue;
+      }
+      try {
+        document.validate(document.cues[id], entry.value);
+        values[id] = entry.value;
+      } on AppFailure {
+        // Retry incomplete or old malformed cache entries.
+      }
+    }
+    if (values.isEmpty) return (values, null);
+    return (
+      values,
+      [
+        for (var id = 0; id < document.cues.length; id++)
+          if (!values.containsKey(id)) id,
+      ],
+    );
+  }, cancel);
+}
+
+Future<String> _renderSubtitleTranslation(
+  SubtitleDocument document,
+  Map<int, String> values,
+  CancelToken cancel,
+) => runSubtitleWork(() => document.render(values), cancel);
 
 Map<int, String> validateTranslationBatch(
   SubtitleDocument document,

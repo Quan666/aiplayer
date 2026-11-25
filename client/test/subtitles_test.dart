@@ -1,14 +1,119 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+
 import 'package:aiplayer/core/network.dart';
+import 'package:aiplayer/sources/source.dart';
 import 'package:aiplayer/subtitles/chinese.dart';
 import 'package:aiplayer/subtitles/choice.dart';
 import 'package:aiplayer/subtitles/document.dart';
+import 'package:aiplayer/subtitles/io.dart';
 import 'package:aiplayer/subtitles/mkv.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'large WebDAV subtitles download with a plain GET across redirects',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final directory = await Directory.systemTemp.createTemp('webdav-ass-');
+      final file = File('${directory.path}/episode.ass');
+      final requests = <(String, String, String?)>[];
+      final padding = Uint8List(1024 * 1024);
+      final subtitle = utf8.encode(
+        '[Events]\nFormat: Start, End, Text\n'
+        'Dialogue: 0:00:00.00,0:00:05.00,{\\move(640,50,0,50)}弹幕\n',
+      );
+      server.listen((request) async {
+        final range = request.headers.value(HttpHeaders.rangeHeader);
+        requests.add((request.method, request.uri.pathSegments.last, range));
+        final response = request.response;
+        if (request.method != 'GET' || range != null) {
+          response.statusCode = HttpStatus.methodNotAllowed;
+        } else if (request.uri.pathSegments.first == 'dav') {
+          response.statusCode = HttpStatus.found;
+          response.headers.set(
+            HttpHeaders.locationHeader,
+            '/download?key=a%2Bb',
+          );
+        } else if (request.uri.query == 'key=a%2Bb') {
+          response.add(subtitle);
+          await response.addStream(
+            Stream.fromIterable(List.filled(17, padding)),
+          );
+        } else {
+          response.statusCode = HttpStatus.notFound;
+        }
+        await response.close();
+      });
+      final source = HttpSource(
+        'http://127.0.0.1:${server.port}/dav/',
+        webdav: true,
+      );
+      try {
+        await downloadExternalSubtitle(
+          source,
+          '作品 01.ass',
+          file,
+          CancelToken(),
+        );
+        expect(await file.length(), subtitle.length + 17 * padding.length);
+        final input = await file.open();
+        try {
+          expect(await input.read(subtitle.length), subtitle);
+        } finally {
+          await input.close();
+        }
+        expect(requests, [
+          ('GET', '作品 01.ass', null),
+          ('GET', 'download', null),
+        ]);
+      } finally {
+        await source.close();
+        await server.close(force: true);
+        await directory.delete(recursive: true);
+      }
+    },
+  );
+
+  test(
+    'a cancelled subtitle download stops waiting for the response body',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final directory = await Directory.systemTemp.createTemp('cancel-ass-');
+      final file = File('${directory.path}/episode.ass');
+      server.listen((request) async {
+        final response = request.response..bufferOutput = false;
+        response.add(utf8.encode('[Script Info]'));
+        await response.flush();
+        // Leave the body open while the client waits for the rest.
+      });
+      final source = HttpSource('http://127.0.0.1:${server.port}/');
+      final cancel = CancelToken();
+      try {
+        final transfer = expectLater(
+          downloadExternalSubtitle(source, 'episode.ass', file, cancel),
+          throwsA(isA<Cancelled>()),
+        );
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!await file.exists() || await file.length() == 0) {
+          if (DateTime.now().isAfter(deadline)) {
+            fail('Subtitle bytes did not arrive.');
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        cancel.cancel();
+        await transfer.timeout(const Duration(seconds: 5));
+      } finally {
+        cancel.cancel();
+        await source.close();
+        await server.close(force: true);
+        await directory.delete(recursive: true);
+      }
+    },
+  );
+
   test('Chinese preference includes scripts, ISO codes and Chinese names', () {
     expect(chineseVariant('zho', null), 'zh');
     expect(chineseVariant('zh-TW', null), 'zh-Hant');

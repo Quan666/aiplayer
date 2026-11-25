@@ -348,6 +348,24 @@ class HttpSource extends SourceAdapter {
     if (remaining > 0) throw const AppFailure('视频读取提前结束，请重试。');
   }
 
+  /// Standalone files can be downloaded without requiring Range or HEAD.
+  Future<Stream<List<int>>> readFile(String path) async {
+    final response = await _request(
+      'GET',
+      url(path),
+      headers: {'Accept-Encoding': 'identity'},
+    );
+    final status = response.statusCode;
+    if (status != HttpStatus.ok) {
+      await response.listen(null, onError: (Object _) {}).cancel();
+      if (status == HttpStatus.methodNotAllowed) {
+        throw AppFailure('HTTP $status · 来源拒绝文件下载（GET），请检查服务配置。', status);
+      }
+      throw sourceHttpFailure(status);
+    }
+    return response;
+  }
+
   @override
   Future<void> close() async {
     _cancel.cancel();

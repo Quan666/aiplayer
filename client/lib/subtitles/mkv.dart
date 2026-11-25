@@ -1,7 +1,9 @@
 import 'dart:math' as math;
 import 'dart:convert';
 import 'dart:typed_data';
+
 import '../core/network.dart';
+import 'worker.dart';
 
 // Port of openlist-enhancer's indexed Matroska reader. Only SeekHead metadata,
 // subtitle Cues and their Blocks are read. No fallback scans movie payloads.
@@ -110,6 +112,7 @@ double _float(Uint8List b) {
 }
 
 class _Reader {
+  static const _byteBudget = 64 * 1024 * 1024;
   final SubtitleRangeRead read;
   final int length;
   final CancelToken cancel;
@@ -121,7 +124,6 @@ class _Reader {
     if (start < 0 || amount < 0 || start + amount > length) {
       _fail('MKV 读取位置超出文件。');
     }
-    if (amount > 16 * 1024 * 1024) _fail('MKV 字幕索引或文本超过 16 MiB，请使用外挂字幕。');
     for (final entry in cache.entries) {
       if (entry.key <= start &&
           entry.key + entry.value.length >= start + amount) {
@@ -135,21 +137,25 @@ class _Reader {
     final size = window
         ? math.min(math.max(256, amount), length - start)
         : amount;
-    final out = BytesBuilder(copy: false);
+    if (size > _byteBudget - received) {
+      _fail('字幕索引读取量过大，已停止读取。请使用外挂字幕或重新封装 MKV。');
+    }
+    Uint8List? output;
     for (var offset = 0; offset < size; offset += 1024 * 1024) {
       cancel.check();
       final count = math.min(1024 * 1024, size - offset);
       received += count;
       requests++;
-      if (received > 64 * 1024 * 1024 || requests > 50000) {
+      if (requests > 50000) {
         _fail('字幕索引读取量过大，已停止读取。请使用外挂字幕或重新封装 MKV。');
       }
       final data = await read(start + offset, count);
       cancel.check();
       if (data.length != count) _fail('来源没有返回完整的 Range 数据，无法提取 MKV 字幕。');
-      out.add(data);
+      output ??= count == size ? data : Uint8List(size);
+      if (count != size) output.setRange(offset, offset + count, data);
     }
-    final data = out.takeBytes();
+    final data = output ?? Uint8List(0);
     if (data.length <= 16384) {
       cache[start] = data;
       if (cache.length > 128) cache.remove(cache.keys.first);
@@ -259,6 +265,29 @@ String _renderAss(_Track track, List<_Event> events) {
   return '$preamble\n\n[Events]\nFormat: ${ssa ? 'Marked' : 'Layer'}, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${lines.map((v) => v.$3).join('\n')}\n';
 }
 
+Future<String> _decodeMkvText(Uint8List bytes, CancelToken cancel) =>
+    runSubtitleWork(() => _str(bytes), cancel);
+
+Future<MkvSubtitle> _renderMkvSubtitle(
+  _Track track,
+  List<_Event> events,
+  CancelToken cancel,
+) => runSubtitleWork(() {
+  events.sort((a, b) => a.start.compareTo(b.start));
+  if (track.codec == 'S_TEXT/UTF8') {
+    return MkvSubtitle(
+      'WEBVTT\n\n${events.indexed.map((e) => '${e.$1 + 1}\n${_time(e.$2.start)} --> ${_time(e.$2.end)}\n${e.$2.text.replaceAll('\r\n', '\n').replaceAll(RegExp(r'\n{2,}'), '\n')}\n').join('\n')}',
+      'vtt',
+      track.title,
+    );
+  }
+  return MkvSubtitle(
+    _renderAss(track, events),
+    track.codec == 'S_TEXT/SSA' ? 'ssa' : 'ass',
+    track.title,
+  );
+}, cancel);
+
 Future<MkvSubtitle> extractMkvSubtitle({
   required SubtitleRangeRead read,
   required int fileSize,
@@ -355,7 +384,6 @@ Future<MkvSubtitle> extractMkvSubtitle({
   final clusters = <int, (_Element, int)>{},
       seen = <int>{},
       events = <_Event>[];
-  var textBytes = 0;
   for (var index = 0; index < cues.length; index++) {
     cancel.check();
     final cue = cues[index];
@@ -408,25 +436,14 @@ Future<MkvSubtitle> extractMkvSubtitle({
         !start.isFinite) {
       _fail('字幕块缺少有效持续时间。');
     }
-    final text = _str(Uint8List.sublistView(raw, prefix + 3));
-    textBytes += text.length;
-    if (textBytes > 16 * 1024 * 1024) _fail('字幕文本超过 16 MiB，暂不支持转换。');
+    final bytes = Uint8List.sublistView(raw, prefix + 3);
+    final text = bytes.length < 64 * 1024
+        ? _str(bytes)
+        : await _decodeMkvText(bytes, cancel);
     if (duration > 0 && start + duration > 0) {
       events.add(_Event(math.max(0, start), start + duration, text));
     }
     onProgress?.call(index + 1, cues.length);
   }
-  events.sort((a, b) => a.start.compareTo(b.start));
-  if (track.codec == 'S_TEXT/UTF8') {
-    return MkvSubtitle(
-      'WEBVTT\n\n${events.indexed.map((e) => '${e.$1 + 1}\n${_time(e.$2.start)} --> ${_time(e.$2.end)}\n${e.$2.text.replaceAll('\r\n', '\n').replaceAll(RegExp(r'\n{2,}'), '\n')}\n').join('\n')}',
-      'vtt',
-      track.title,
-    );
-  }
-  return MkvSubtitle(
-    _renderAss(track, events),
-    track.codec == 'S_TEXT/SSA' ? 'ssa' : 'ass',
-    track.title,
-  );
+  return _renderMkvSubtitle(track, events, cancel);
 }

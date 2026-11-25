@@ -1,5 +1,10 @@
+import 'dart:isolate';
+
 import 'package:flutter/services.dart';
+
+import '../core/network.dart';
 import 'document.dart';
+import 'worker.dart';
 
 class _Node {
   final children = <int, _Node>{};
@@ -25,16 +30,31 @@ class ChineseConverter {
     }
   }
   static Future<ChineseConverter>? _shared;
-  static Future<ChineseConverter> load() => _shared ??= () async {
-    return ChineseConverter.fromDictionaries(
-      await Future.wait(
+  static Future<List<String>>? _dictionaries;
+  static Future<List<String>> _loadDictionaries() =>
+      _dictionaries ??= Future.wait(
         [
           'TSCharacters.txt',
           'TSPhrases.txt',
-        ].map((f) => rootBundle.loadString('assets/opencc/$f')),
-      ),
-    );
+        ].map((file) => rootBundle.loadString('assets/opencc/$file')),
+      );
+
+  static Future<ChineseConverter> load() => _shared ??= () async {
+    final dictionaries = await _loadDictionaries();
+    return Isolate.run(() => ChineseConverter.fromDictionaries(dictionaries));
   }();
+
+  static Future<String> simplifyDocument(
+    SubtitleDocument document,
+    CancelToken cancel,
+  ) async {
+    final dictionaries = await subtitleCancelable(_loadDictionaries(), cancel);
+    return runSubtitleWork(
+      () => ChineseConverter.fromDictionaries(dictionaries).document(document),
+      cancel,
+    );
+  }
+
   String convert(String text) {
     final runes = text.runes.toList(), out = StringBuffer();
     for (var offset = 0; offset < runes.length;) {

@@ -34,6 +34,7 @@ import '../subtitles/chinese.dart';
 import '../subtitles/ai.dart';
 import '../subtitles/io.dart';
 import '../subtitles/mkv.dart';
+import '../subtitles/worker.dart';
 
 // One directory-sized task, with only its input crossing the isolate boundary.
 // A large NAS folder must not sort/rank its entries on the rendering isolate.
@@ -53,6 +54,9 @@ Future<List<SourceEntry>> _rankExternalSubtitles(
       });
   return [for (final item in ranked) item.$1];
 });
+
+Future<Uint8List> _encodeSubtitle(String text, CancelToken token) =>
+    runSubtitleWork(() => utf8.encode(text), token);
 
 class PlaybackSession extends ChangeNotifier {
   // libass's embedded-font provider matches the legacy family (name ID 1),
@@ -612,25 +616,8 @@ class PlaybackSession extends ChangeNotifier {
     subtitleTransformed = _subtitleTransformation.isNotEmpty;
     if (track.uri) {
       final path = _localSubtitlePath(track.id);
-      final stat = await subtitleCancelable(LocalSource().stat(path), token);
-      if (stat.size > 16 * 1024 * 1024) {
-        throw const AppFailure('外挂字幕超过 16 MiB，暂不支持加载。');
-      }
-      final bytes = await readSubtitleRange(
-        LocalSource(),
-        path,
-        0,
-        stat.size,
-        token,
-      );
-      try {
-        _originalDocument = SubtitleDocument(
-          decodeSubtitle(bytes),
-          p.extension(path),
-        );
-      } on AppFailure catch (e) {
-        if (!e.message.startsWith('字幕不是 UTF-8')) rethrow;
-      }
+      if (!isSubtitle(path)) throw const AppFailure('不支持此字幕格式。');
+      await validateExternalSubtitle(File(path), token);
       token.check();
       _externalSubtitleAdded = true;
     }
@@ -1252,46 +1239,26 @@ class PlaybackSession extends ChangeNotifier {
     final generation = _subtitleGeneration;
     final location = _playbackLocation;
     if (location == null) throw const AppFailure('视频来源尚未准备好。');
+    final format = p.extension(entry.name).replaceFirst('.', '').toLowerCase();
+    final file = await _subtitleCacheFile(format);
     final adapter = await _openSource(location['source'] as String, token);
+    var retained = false;
     try {
-      final stat = await subtitleCancelable(adapter.stat(entry.path), token);
-      if (stat.size > 16 * 1024 * 1024) {
-        throw const AppFailure('外挂字幕超过 16 MiB，暂不支持加载。');
-      }
-      final bytes = await readSubtitleRange(
-        adapter,
-        entry.path,
-        0,
-        stat.size,
-        token,
-      );
+      await downloadExternalSubtitle(adapter, entry.path, file, token);
       token.check();
-      if (closed || generation != _subtitleGeneration) return;
-      final format = p
-          .extension(entry.name)
-          .replaceFirst('.', '')
-          .toLowerCase();
-      SubtitleDocument? document;
-      try {
-        document = SubtitleDocument(decodeSubtitle(bytes), format);
-      } on AppFailure catch (e) {
-        // Legacy encodings can still be decoded by mpv; report the limitation
-        // only when text conversion is explicitly requested.
-        if (!e.message.startsWith('字幕不是 UTF-8')) rethrow;
-      }
-      final file = await _subtitleFile(bytes, format);
+      await updateSettings({'subtitlesEnabled': true});
       token.check();
       if (closed || generation != _subtitleGeneration) return;
       final track = SubtitleTrack.uri(file.path, title: entry.name);
       _originalSubtitle = track;
-      _originalDocument = document;
+      _originalDocument = null;
       subtitleTransformed = false;
       _subtitleTransformation = '';
       _externalSubtitleAdded = true;
-      await updateSettings({'subtitlesEnabled': true});
-      token.check();
+      _subtitleFiles.add(file);
+      retained = true;
       await player.setSubtitleTrack(track);
-      await _rememberSubtitleSelection(track, document, '', token);
+      await _rememberSubtitleSelection(track, null, '', token);
       token.check();
       subtitleTaskStatus = '外挂字幕已加载';
       subtitleTaskError = '';
@@ -1299,7 +1266,17 @@ class PlaybackSession extends ChangeNotifier {
       _notify();
       if (_shouldAutomaticallySimplify) unawaited(simplifySubtitle());
     } finally {
-      await adapter.close();
+      try {
+        await adapter.close();
+      } finally {
+        if (!retained) {
+          try {
+            await file.delete();
+          } on FileSystemException {
+            // A failed request may end before creating a subtitle file.
+          }
+        }
+      }
     }
   }
 
@@ -1321,25 +1298,49 @@ class PlaybackSession extends ChangeNotifier {
     return adapter;
   }
 
-  Future<File> _subtitleFile(List<int> bytes, String format) async {
+  Future<File> _subtitleCacheFile(String format) async {
     if (!['srt', 'ass', 'ssa', 'vtt'].contains(format)) {
       throw const AppFailure('不支持此字幕格式。');
     }
     final directory = Directory(p.join(model.documents.path, 'subtitle-cache'));
     await directory.create(recursive: true);
-    final file = File(
+    return File(
       p.join(
         directory.path,
         '${DateTime.now().microsecondsSinceEpoch}.$format',
       ),
     );
-    _subtitleFiles.add(file);
-    await file.writeAsBytes(bytes, flush: true);
-    if (closed) {
+  }
+
+  Future<File> _subtitleFile(
+    Uint8List bytes,
+    String format,
+    CancelToken token,
+  ) async {
+    final file = await _subtitleCacheFile(format);
+    token.check();
+    try {
+      final output = await file.open(mode: FileMode.writeOnly);
+      try {
+        const chunkSize = 1024 * 1024;
+        for (var offset = 0; offset < bytes.length; offset += chunkSize) {
+          token.check();
+          final end = (offset + chunkSize).clamp(0, bytes.length);
+          await output.writeFrom(Uint8List.sublistView(bytes, offset, end));
+        }
+      } finally {
+        await output.close();
+      }
+      token.check();
+    } catch (_) {
       try {
         await file.delete();
-      } catch (_) {}
+      } on FileSystemException {
+        // The output may not have been created.
+      }
+      rethrow;
     }
+    _subtitleFiles.add(file);
     return file;
   }
 
@@ -1366,31 +1367,21 @@ class PlaybackSession extends ChangeNotifier {
     _originalSubtitle = track;
     if (track.uri) {
       final path = _localSubtitlePath(track.id);
-      final stat = await subtitleCancelable(File(path).stat(), token);
-      if (stat.size > 16 * 1024 * 1024) {
-        throw const AppFailure('字幕超过 16 MiB，暂不支持转换。');
-      }
-      final data = await readSubtitleRange(
-        LocalSource(),
-        path,
-        0,
-        stat.size,
-        token,
-      );
-      return SubtitleDocument(decodeSubtitle(data), p.extension(path));
+      return readExternalSubtitleDocument(path, p.extension(path), token);
     }
     final index = _embeddedSubtitleTracks.indexWhere((t) => t.id == track.id);
     if (index < 0) throw const AppFailure('无法找到原始字幕轨道，请重新选择内嵌字幕或加载外挂字幕。');
     final location = _playbackLocation;
     if (location == null) throw const AppFailure('视频来源尚未准备好。');
     final adapter = await _openSource(location['source'] as String, token);
+    final MkvSubtitle extracted;
     try {
       final path = location['path'] as String;
       final stat = await subtitleCancelable(adapter.stat(path), token);
       if (!stat.seekable) {
         throw const AppFailure('来源不支持 Range，无法有界读取内嵌字幕。请加载外挂字幕。');
       }
-      final extracted = await extractMkvSubtitle(
+      extracted = await extractMkvSubtitle(
         read: (offset, length) =>
             readSubtitleRange(adapter, path, offset, length, token),
         fileSize: stat.size,
@@ -1404,11 +1395,10 @@ class PlaybackSession extends ChangeNotifier {
           }
         },
       );
-      token.check();
-      return SubtitleDocument(extracted.text, extracted.format);
     } finally {
       await adapter.close();
     }
+    return parseSubtitleDocument(extracted.text, extracted.format, token);
   }
 
   Future<void> _transformSubtitle(bool ai) {
@@ -1446,17 +1436,7 @@ class PlaybackSession extends ChangeNotifier {
             target: '${settings['aiSubtitleTarget'] ?? '简体中文'}',
             prompt: '${settings['aiSubtitlePrompt'] ?? defaultSubtitlePrompt}',
           );
-          final translator = SubtitleTranslator(
-            transport: model.thirdPartyAiTransport,
-            load: (key) {
-              final value = model.store.local(key);
-              return value is Map ? Map<String, dynamic>.from(value) : null;
-            },
-            save: (key, value) {
-              token.check();
-              model.store.setLocal(key, value);
-            },
-          );
+          final translator = model.subtitleTranslator(token);
           text = await translator.translate(
             document,
             config,
@@ -1472,15 +1452,12 @@ class PlaybackSession extends ChangeNotifier {
         } else {
           subtitleTaskStatus = '正在转换为简体';
           _notify();
-          final converter = await subtitleCancelable(
-            ChineseConverter.load(),
-            token,
-          );
-          token.check();
-          text = converter.document(document);
+          text = await ChineseConverter.simplifyDocument(document, token);
         }
         token.check();
-        final file = await _subtitleFile(utf8.encode(text), document.format);
+        final bytes = await _encodeSubtitle(text, token);
+        token.check();
+        final file = await _subtitleFile(bytes, document.format, token);
         token.check();
         if (closed || generation != _subtitleGeneration) return;
         _externalSubtitleAdded = true;
@@ -1939,6 +1916,7 @@ class PlaybackSession extends ChangeNotifier {
     closed = true;
     _resumeAfterBackground = false;
     _startupCancel.cancel();
+    cancelSubtitleTask();
     _firstFrameRetry?.cancel();
     if (_watchingVideoOutput) {
       video.rect.removeListener(_videoOutputChanged);
@@ -1961,7 +1939,6 @@ class PlaybackSession extends ChangeNotifier {
     }
     model.removeListener(_preferencesChanged);
     model.thirdPartyNetwork.removeListener(_thirdPartyPolicyChanged);
-    cancelSubtitleTask();
     _errorTimer?.cancel();
     _technicalTimer?.cancel();
     _clock.stop();

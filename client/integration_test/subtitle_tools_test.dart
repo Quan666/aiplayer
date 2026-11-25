@@ -1,7 +1,10 @@
+import 'dart:convert';
 import 'dart:io';
+
 import 'package:aiplayer/data/app_model.dart';
 import 'package:aiplayer/data/store.dart';
 import 'package:aiplayer/playback/session.dart';
+import 'package:aiplayer/sources/range_bridge.dart';
 import 'package:aiplayer/sources/source.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -17,6 +20,183 @@ void main() {
     'MEDIA_FIXTURE',
     defaultValue: '/tmp/aiplayer-media-fixture/Example S01E01.mkv',
   );
+  testWidgets(
+    'native player loads, simplifies and translates large WebDAV ASS',
+    (tester) async {
+      MediaKit.ensureInitialized();
+      FlutterSecureStorage.setMockInitialValues({
+        'aiSubtitleToken': 'mock-key',
+      });
+      final movie = File(fixture);
+      final size = await movie.length();
+      final root = await Directory.systemTemp.createTemp(
+        'aiplayer-webdav-ass-',
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final subtitleRequests = <(String, String?)>[];
+      final aiRequests = <Object?>[];
+      final padding = utf8.encode((';${' ' * 1022}\n') * 1024);
+      server.listen((request) async {
+        final response = request.response;
+        final rangeHeader = request.headers.value(HttpHeaders.rangeHeader);
+        if (request.method == 'POST' &&
+            request.uri.path == '/v1/chat/completions') {
+          final body =
+              jsonDecode(await utf8.decoder.bind(request).join()) as Map;
+          final message = (body['messages'] as List).last as Map;
+          aiRequests.add(jsonDecode(message['content'] as String));
+          response.headers.contentType = ContentType.json;
+          response.write(
+            jsonEncode({
+              'choices': [
+                {
+                  'finish_reason': 'stop',
+                  'message': {
+                    'content': jsonEncode([
+                      {'id': 0, 'text': '⟦S0⟧模拟翻译弹幕'},
+                    ]),
+                  },
+                },
+              ],
+            }),
+          );
+        } else if (request.method == 'PROPFIND') {
+          response.statusCode = 207;
+          response.write(
+            '<d:multistatus xmlns:d="DAV:"><d:response>'
+            '<d:href>/dav/Episode.ass</d:href></d:response></d:multistatus>',
+          );
+        } else if (request.uri.path == '/dav/Episode.ass') {
+          subtitleRequests.add((request.method, rangeHeader));
+          if (request.method != 'GET' || rangeHeader != null) {
+            response.statusCode = HttpStatus.methodNotAllowed;
+          } else {
+            response.add(
+              utf8.encode(
+                '[Script Info]\nScriptType: v4.00+\n'
+                '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, '
+                'MarginR, MarginV, Effect, Text\n'
+                'Dialogue: 0,0:00:00.00,0:00:29.00,Default,,0,0,0,,'
+                '{\\move(640,50,0,50)}外掛彈幕回歸\n',
+              ),
+            );
+            await response.addStream(
+              Stream.fromIterable(List.filled(17, padding)),
+            );
+          }
+        } else if (request.uri.path == '/dav/Episode.mkv') {
+          response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+          if (request.method == 'HEAD') {
+            response.contentLength = size;
+          } else {
+            final range = ByteRange.parse(rangeHeader, size)!;
+            response.statusCode = HttpStatus.partialContent;
+            response.contentLength = range.length;
+            response.headers.set(
+              HttpHeaders.contentRangeHeader,
+              'bytes ${range.start}-${range.end}/$size',
+            );
+            await response.addStream(
+              movie.openRead(range.start, range.end + 1),
+            );
+          }
+        } else {
+          response.statusCode = HttpStatus.notFound;
+        }
+        await response.close();
+      });
+      final store = AppStore('${root.path}/library.db');
+      final model = AppModel(store, root, backgroundWork: false);
+      store.setLocal('sources', [
+        {
+          'id': 'dav',
+          'kind': 'webdav',
+          'url': 'http://127.0.0.1:${server.port}/dav/',
+        },
+      ]);
+      await model.updatePreferences({
+        'autoPlay': false,
+        'hardwareDecoding': false,
+        'subtitleSimplify': false,
+        'autoLoadExternalSubtitles': true,
+      });
+      await model.setSettings({
+        'aiSubtitleOrigin': 'http://127.0.0.1:${server.port}/v1',
+        'aiSubtitleModel': 'mock',
+      });
+      final media = await model.prepareSourceMediaForPlayback(
+        'dav',
+        SourceEntry(name: 'Episode.mkv', path: 'Episode.mkv', size: size),
+      );
+      final session = PlaybackSession(model, media);
+      try {
+        await tester.pumpWidget(
+          MaterialApp(home: Video(controller: session.video)),
+        );
+        final native = session.player.platform as NativePlayer;
+        await native.setProperty('ao', 'null');
+        await session.open();
+        expect(session.ready, true, reason: session.error);
+        for (
+          var i = 0;
+          i < 100 && session.subtitleTaskStatus != '外挂字幕已加载';
+          i++
+        ) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+        expect(
+          session.subtitleTaskStatus,
+          '外挂字幕已加载',
+          reason: session.subtitleTaskError,
+        );
+        await session.player.seek(const Duration(seconds: 2));
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(await native.getProperty('sub-text'), contains('外掛彈幕回歸'));
+        await session.simplifySubtitle();
+        expect(
+          session.subtitleTaskStatus,
+          '已转换为简体',
+          reason: session.subtitleTaskError,
+        );
+        await session.player.seek(const Duration(seconds: 3));
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(await native.getProperty('sub-text'), contains('外挂弹幕回归'));
+        await session.translateSubtitle();
+        expect(
+          session.subtitleTaskStatus,
+          '翻译完成',
+          reason: session.subtitleTaskError,
+        );
+        await session.player.seek(const Duration(seconds: 4));
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(await native.getProperty('sub-text'), contains('模拟翻译弹幕'));
+        expect(aiRequests.single, {
+          'targetLanguage': '简体中文',
+          'previousContext': [],
+          'cues': [
+            {'id': 0, 'text': '⟦S0⟧外掛彈幕回歸'},
+          ],
+        });
+        final outputs = Directory('${root.path}/subtitle-cache').list();
+        await for (final entity in outputs) {
+          expect(
+            await (entity as File).length(),
+            greaterThan(16 * 1024 * 1024),
+          );
+        }
+        expect(subtitleRequests, [('GET', null)]);
+      } finally {
+        await session.close();
+        await model.flushPlaybackPreviews();
+        await tester.pumpWidget(const SizedBox.shrink());
+        await server.close(force: true);
+        model.dispose();
+        store.dispose();
+        await root.delete(recursive: true);
+      }
+    },
+  );
+
   testWidgets(
     'real external and indexed MKV subtitles render Chinese and convert without losing ASS styles',
     (tester) async {

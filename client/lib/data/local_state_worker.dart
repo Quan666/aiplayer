@@ -12,6 +12,7 @@ import 'local_video_removal.dart';
 import 'media_technical_info.dart';
 import 'media_preview_persistence.dart';
 import 'source_preview.dart';
+import 'subtitle_translation_cache.dart';
 
 /// Serializes local state on one connection outside the UI isolate.
 class LocalStateWorker {
@@ -131,6 +132,16 @@ class LocalStateWorker {
   Future<List<SyncRecord>> unmatchedMetadataCandidates() async =>
       (await _call('metadataCandidates', const [], null) as List)
           .cast<SyncRecord>();
+
+  Future<Map<String, dynamic>?> cacheSubtitleTranslation(
+    String key, {
+    Map<String, dynamic>? batch,
+    bool finish = false,
+    Object? epoch,
+    required CancelToken cancel,
+  }) async =>
+      await _call('subtitleTranslation', [key, batch, finish, epoch], cancel)
+          as Map<String, dynamic>?;
 
   Future<SyncRecord> preparePersonalMediaForPlayback(
     String sourceId,
@@ -273,6 +284,14 @@ void _localStateWorkerMain(List<Object?> startup) async {
             (row[2] as List).cast<String>(),
             cancel!,
           );
+        } else if (row[0] == 'subtitleTranslation' &&
+            row[3] == null &&
+            row[4] == false) {
+          cancel!.check();
+          result = await retryStoreBusy(() {
+            cancel.check();
+            return subtitleTranslationCache(store, row[2] as String);
+          });
         } else {
           await retryStoreBusy(() {
             cancel?.check();
@@ -296,6 +315,14 @@ void _localStateWorkerMain(List<Object?> startup) async {
                 );
               } else if (row[0] == 'invalidateBrowsePreviews') {
                 invalidateSourceBrowsePreviews(store, row[2] as String);
+              } else if (row[0] == 'subtitleTranslation') {
+                result = subtitleTranslationCache(
+                  store,
+                  row[2] as String,
+                  batch: row[3] as Map<String, dynamic>?,
+                  finish: row[4] as bool,
+                  epoch: row[5],
+                );
               } else if (row[0] == 'personalMedia') {
                 result = registerPersonalMediaForPlayback(
                   store,
@@ -386,6 +413,7 @@ void _localStateWorkerMain(List<Object?> startup) async {
           row[0] == 'preview' ||
           row[0] == 'personalMedia' ||
           row[0] == 'deleteLocalVideo' ||
+          row[0] == 'subtitleTranslation' ||
           row[0] == 'mediaTechnicalLabels') {
         cancellable[row[1] as int] = CancelToken();
       }
